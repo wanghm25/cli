@@ -2,6 +2,17 @@
 
 本文件用于补充说明 block XML 扩展能力。常用标签和通用规则见 [`lark-doc-xml.md`](lark-doc-xml.md)；后续新增其他 block 说明时可继续追加到本文件。
 
+## 拓展标签
+- `<figure view-type>视图容器</figure>`
+- `<bookmark name href="网络链接"></bookmark>`
+- `<button action=OpenLink|DuplicatePage|FollowPage>操作按钮；可选 background-color、src</button>`
+- `<time expire-time notify-time should-notify=bool>提醒；使用毫秒时间戳。</time>`
+- `<sheet type=blank>创建空白表格</sheet>`、`<sheet sheet-id token>复制已有表格。</sheet>`
+- `<task task-id>挂载任务；task-id 为任务 GUID。</task>`
+- `<chat_card chat-id>挂载聊天卡片。</chat_card>`
+- `<sub-page-list>子页面列表块；仅 wiki 文档可插入。</sub-page-list>`
+- `<okr cycle-id>挂载已有 OKR。</okr>`
+
 ## HTML5 block
 
 1. 写入 HTML 内容块时，把完整单文件 HTML 存为本地 `.html` 文件，XML 写 `<html5-block path="@widget.html"></html5-block>`；已有 `data-ref` 时配合 `--reference-map @reference-map.json`。读取时 `<html5-block data-ref="html5_1"></html5-block>` 只是占位，必须从 `document.reference_map["html5-block"]["html5_1"].data` 读取 HTML；若 entry 是 `path`，读取对应 `@doc-fetch-resources/...html` 文件。
@@ -44,6 +55,7 @@
 - HTML 总长度上限为 500KB。不要内联大图片、Base64、字体、长 JSON/CSV 或大量 mock 数据。
 
 ## OKR block
+`<okr cycle-id>挂载已有 OKR。</okr>`：创建时仅支持 root-only
 
 OKR block 可用 XML 格式完整表达。创建前先参考 [`lark-okr`](../../lark-okr/SKILL.md) 确认可用周期；创建时只写 root-only `<okr cycle-id="..."/>` 挂载已有 OKR，不构造 Objective/KR/Progress 子树。
 

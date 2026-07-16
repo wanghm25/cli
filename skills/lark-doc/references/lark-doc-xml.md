@@ -1,183 +1,45 @@
-基于 HTML 子集的 XML 格式描述飞书文档内容。
+# 飞书 XML 语法
 
-# 一、标准 HTML 标签
-p, h1-h9, ul, ol, li, table, thead, tbody, tr, th, td, blockquote, pre, code, hr, img, b, em, u, del, a, br, span 语义不变
+**语法遵循 HTML，渲染遵循 Markdown-Enhanced**。
 
-# 二、扩展标签速查表
-## 块级标签
-|标签|说明|关键属性|
-|-|-|-|
-| `<title>` | 文档标题（每篇唯一）| `align` |
-| `<checkbox>` | 待办项| `done="true"\|"false"` |
+以下为自解释的标签签名：必填属性写在开始标签内，可选属性写在说明中；`bool`=`true|false`，`A|B`=任选一，`T[]`=英文逗号分隔的多值。签名不是可直接复制的 XML；实际输出须为属性值加引号并填写真实值。
 
-## 容器标签
-|标签|说明|关键属性|
-|-|-|-|
-| `<callout>` | 高亮框，子块仅支持文本、标题、列表、待办、引用 | `emoji`(默认 bulb), `background-color`, `border-color`, `text-color` |
-| `<grid>` + `<column>` | 分栏布局，各列 width-ratio 之和为 1 | `width-ratio` |
-| `<whiteboard>` | 嵌入画板 | `type`: `blank` \| `mermaid` \| `plantuml` \| `svg` |
-| `<pre>` | （代码块，内含 `code`）| `lang`, `caption` |
-| `<figure>` | 视图容器 | `view-type` |
-| `<bookmark>` | 书签链接 | `<bookmark name="标题" href="https://..."></bookmark>`，必传 name 和 href |
+## Markdown 常用映射标签
 
-## 行内组件
-| 标签 | 说明 | 关键属性 |
-|-|-|-|
-| `<cite type="user">` | @人 | XML 导入时必须显式传入 `user-id`：`<cite type="user" user-id="userID"></cite>` |
-| `<cite type="doc">` | @文档 | `<cite type="doc" doc-id="docx_token"></cite>` |
-| `<latex>` | 行内公式 | `<latex>E = mc^2</latex>` |
-| `<img>` | 图片（可独立成块或内联） | `<img width="800" height="600" caption="说明" name="图.png" href="http 或 https"/>` |
-| `<source>` | 文件附件（可独立成块或内联） | `<source name="报告.pdf"/>` |
-| `<a type="url-preview">` | 预览卡片 | `<a type="url-preview" href="...">标题</a>` |
-| `<button>` | 操作按钮 | `background-color`、`src`，必须包含 `action=OpenLink\|DuplicatePage\|FollowPage` |
-| `<time>` | 提醒 | 必包含 `expire-time`、`notify-time`（毫秒时间戳）、`should-notify=true\|false` |
+- `p, h1-h6, blockquote, hr, img, b, em, u, del, br, span` 语义不变。
+- `<a type=url-preview href>链接标题；渲染为预览卡片。</a>`
+- `<latex>行内公式，如 E = mc^2。</latex>`
+- `<ol><li seq="1">order1：seq=1 表示序号从1开始，为空时表示继承前序<ul><li>item1：子列表放在 li 内；新增列表项必须包在 ul 或 ol；</li><li>item2</li></ul></li><li>order1</li></ol>`
+- `<table><colgroup><col/><col/></colgroup><thead><tr><th><p></p></th><th><p></p></th></tr></thead><tbody><tr><td><p></p></td><td><p></p></td></tr></tbody></table>`：表格。
+- `<pre lang="类型"><code>代码内容</code></pre>`：代码块；可选 `caption`；代码必须放在 `<code>` 内，禁止直接放在 `<pre>` 下。
+- `<img/>`：href="上传网络图片，支持 HTTP(S)"；src="token，复制原始图片"；href 和 src 必须存在一个；可选 `width, height, caption, name`。
+- `<source name/>`：文件附件，可独立成块或内联。
+- `<checkbox done=bool>待办项</checkbox>`
+- `p, h1-h9, li, checkbox, title` 可选属性 `align=left|center|right`。
 
-## 文本块通用属性
-- `align` — `"left"`|`"center"`|`"right"`（适用于 p / h1-h9 / li / checkbox）
-- 有序列表项用 `seq="auto"` 自动编号
+## 必备标签
 
-# 三、资源块
+- `<title>必有文档标题，每篇唯一</title>`
 
-文档中可嵌入外部资源块（属于容器标签的特殊形式），需要额外语法创建：
+## 飞书特有拓展标签
 
-- `<img>` — `<img href="https://..."/>` 上传网络图片
-- `<whiteboard>` — 简单图由 SubAgent 直接插入 `<whiteboard type="svg">完整自包含 SVG</whiteboard>`；也可用本地文件简写 `<whiteboard type="svg" path="@diagram.svg"></whiteboard>`、`<whiteboard type="mermaid" path="@flow.mmd"></whiteboard>`、`<whiteboard type="plantuml" path="@sequence.puml"></whiteboard>`，CLI 会写入前展开为内联内容；复杂图使用 `<whiteboard type="blank"></whiteboard>` 先创建空白画板，再按 [`lark-doc-whiteboard.md`](lark-doc-whiteboard.md) 启动 SubAgent 调用 `lark-whiteboard` 写入；
-- `<sheet>` — `<sheet type="blank"></sheet>` 空白；`<sheet sheet-id="SID" token="TOKEN"></sheet>` 复制已有
-- `<task>` — `<task task-id="GUID"></task>`，必传 task-id（任务 guid）
-- `<chat_card>` — `<chat_card chat-id="CHAT_ID"></chat_card>`，必传 chat-id
-- `<sub-page-list>` — `<sub-page-list></sub-page-list>` 子页面列表块；仅 wiki 文档可插入
-- `<html5-block>`、`<okr>` — 前者在飞书文档「HTML 块」iframe 中加载单文件 HTML，内容可用 HTML 渲染时直接使用；后者创建时仅支持 root-only `<okr cycle-id="..."/>` 挂载已有 OKR。完整语法与字段规则见 [`lark-doc-xml-extended-blocks.md`](lark-doc-xml-extended-blocks.md)。
-- bitable、base_ref、synced_reference、synced_source — 不可创建，仅支持移动
+- `<cite type=user user-id="open-id"></cite>`：@人，会渲染为用户头像，不得写纯文本名字，必须显式传入 `user-id`
+- `<cite type=doc doc-id="doc-token"></cite>`：@文档，会渲染为文档标题
+- `<whiteboard type=blank|mermaid|plantuml|svg path="@相对路径文件">支持通过 path 直接导入，也支持直接写入。</whiteboard>`
+- `<grid><column width-ratio=0.5><p>分栏；各列 width-ratio 之和必须为 1。</p></column><column width-ratio=0.5><p>内容</p></column></grid>`
+- `<callout><p>高亮块内容，无特殊渲染要求、正式场景慎用；子块仅支持文本、标题、列表、待办、引用；可选 emoji（默认 bulb）、background-color、border-color、text-color。</p></callout>`
+- 其他拓展标签时，figure、bookmark、button、time、sheet、task、chat_card、sub-page-list、okr, 可查看 [`lark-doc-xml-extended-blocks.md`](lark-doc-xml-extended-blocks.md#okr-block)。
 
-# 四、块级复制与移动
+## 颜色与美化
+- 基础色：`red, orange, yellow, green, blue, purple, gray`；常用 emoji：💡（默认）、✅、❌、📝、❓、❗、👍、❤️、📌、🏁、⭐。
+- `<span text-color>`、`<callout text-color>`、`<callout border-color>`：基础色。
+- `<span background-color>`、`<th/td background-color>`、`<button background-color>`：基础色 + `light-{色}` + `medium-gray`。
+- `<callout background-color>`：`gray` + `light-{色}` + `medium-{色}`。
 
-## 移动（block_move_after）
-支持**所有**块类型（块级标签、容器标签、行内组件、资源块），使用 `docs +update --command block_move_after --block-id "<锚点>" --src-block-ids "id1,id2"`。
+## 转义规则
 
-## 复制（block_copy_insert_after）
-- **基础标签**（块级标签、容器标签、行内组件）：均支持复制
-- **资源块**：仅 img、source、whiteboard、sheet、chat_card、sub-page-list 支持复制；task、bitable、base_ref、synced_reference、synced_source、okr 不支持复制
+禁止转义标签本身；只转义标签内部的文本内容。
 
-使用 `docs +update --command block_copy_insert_after --block-id "<锚点>" --src-block-ids "id1,id2"`。
-
-> 详见 [lark-doc-update.md](lark-doc-update.md)。
-
-# 五、补充规则
-
-## 富文本样式嵌套顺序
-- 行内样式标签必须按以下固定顺序嵌套（外 → 内），关闭顺序严格反转：`<a> → <b> → <em> → <del> → <u> → <code> → <span> → 文本内容`
-
-## 列表分组
-- 连续同类型列表项自动合并为一个 `<ul>` 或 `<ol>`
-- 嵌套子列表放在 `<li>` 内部
-- 新增列表项必须包在 `<ul>` 或 `<ol>` 内：
-   ```xml
-   <ul>
-     <li>第一项</li>
-     <li>第二项</li>
-   </ul>
-   ```
-
-## 代码块
-- 代码块必须写成 `<pre lang="xxx" caption="可选说明"><code>代码内容</code></pre>`。
-- 不要将代码文本直接放在 `<pre>` 下；应放在内层 `<code>` 中。
-
-
-## 用户名写入规则
-
-- 任何包含 `<cite type="user">` 的 XML 在导入、新建或编辑回写时，都必须显式传入 `user-id`；其值为用户的 `open_id`，不得省略。
-- 当从 IM 消息、日历、审批、任务等来源获取到用户的 `open_id` 时，写入文档**必须**使用 `<cite type="user" user-id="open_id">` 标签，而非纯文本名字。这样文档中会渲染为可点击的 @人。
-- 典型场景：IM 消息的 `sender`、`mentions`、reactions 的 `operator`、卡片消息中引用的用户、系统消息中的用户名、合并转发中的用户名。
-- 当只有纯文本名字而没有 `open_id` 时（如系统消息、合并转发内容），先通过 `lark-cli contact +search-user --query "名字" --as user` 反查 `open_id`，再写入 cite 标签。
-
-## 表格扩展
-标准 HTML table 结构不变，扩展点：
-- `<colgroup>` / `<col>` 定义列宽，紧跟 `<table>` 之后：`<col span="2" width="100"/>`
-- `<th>` / `<td>` 增加 `background-color` 和 `vertical-align`（top | middle | bottom）
-- 有表头时第一行在 `<thead>` 用 `<th>`，其余在 `<tbody>` 用 `<td>`
-- 合并单元格仅起始格输出 `colspan` / `rowspan`，被合并的格不出现
-
-# 六、美化系统
-- 颜色优先使用命名色，也可写 `rgb(r,g,b)` / `rgba(r,g,b,a)`。**基础色（7 色）**：red, orange, yellow, green, blue, purple, gray
-  | 属性 | 支持的命名色 |                                                                                                                                                                                                        
-  |-|-|
-  | 文字颜色 `<span text-color>` | 基础色 |
-  | 高亮框字色 `<callout text-color>` | 基础色 |
-  | 高亮框边框 `<callout border-color>` | 基础色 |                                                                                                                                                                                 
-  | 文字背景 `<span background-color>` | 基础色 + `light-{色}` + `medium-gray` |                                                                                                                                                   
-  | 高亮框填充 `<callout background-color>` | `gray` + `light-{色}` + `medium-{色}` |                                                                                                                                              
-  | 单元格背景 `<th/td background-color>` | 同文字背景 |                                                                                                                                                                           
-  | 按钮背景 `<button background-color>` | 同文字背景 |
-- 常用 emoji： 💡(默认)✅❌📝❓❗👍❤️📌🏁⭐
-
-# 七、**重要规则**
-## 转义规则：标签本身 **禁止转义**，只有标签内部的文本内容才需要转义
-
-**错误** ❌：`&lt;p&gt;内容&lt;/p&gt;`（把标签也转义了）
-**正确** ✅：`<p>A &amp; B 的对比：1 &lt; 2</p>`（标签保持原样，文本中的 `&` 和 `<` 才转义）
-
-转义字符表：
-- `<` → `&lt;`
-- `>` → `&gt;`
-- `&` → `&amp;`
-- `\n`（换行符） → `<br/>`
-
-
-# 八、完整示例
-
-```xml
-<title>文档标题</title>
-
-<h1>一级标题</h1>
-
-<p><b>加粗文本</b>，<span text-color="green">绿色文本</span></p>
-
-<callout emoji="💡" background-color="light-yellow" border-color="yellow">
-  <p>高亮框内容，子块仅支持文本/标题/列表/待办/引用</p>
-</callout>
-
-<checkbox done="true">已完成事项</checkbox>
-<checkbox done="false">未完成事项</checkbox>
-
-<grid>
-  <column width-ratio="0.5">
-    <p>左栏</p>
-  </column>
-  <column width-ratio="0.5">
-    <p>右栏</p>
-  </column>
-</grid>
-
-<table>
-  <colgroup><col span="2" width="120"/></colgroup>
-  <thead><tr><th background-color="light-gray">表头</th><th background-color="light-gray">表头</th></tr></thead>
-  <tbody><tr><td>单元格</td><td>单元格</td></tr></tbody>
-</table>
-
-<p><cite type="doc" doc-id="DOC_TOKEN"></cite> <cite type="user" user-id="USER_ID"></cite></p>
-
-<ol><li seq="auto">第一项</li><li seq="auto">第二项</li></ol>
-
-<p><a type="url-preview" href="https://example.com">链接标题</a></p>
-
-<p><latex>E = mc^2</latex></p>
-
-<pre lang="go" caption="示例"><code>fmt.Println("hello")</code></pre>
-
-<hr/>
-
-<source name="文件名.pdf"/>
-<img src="IMG_TOKEN" width="800" height="400" caption="说明" name="图.png"/>
-<img href="https://example.com/photo.png"/>
-
-<button action="OpenLink" src="https://example.com">按钮文字</button>
-
-<time expire-time="1775916000000" notify-time="1775912400000" should-notify="false">时间戳毫秒</time>
-
-<cite type="citation"><a href="https://example.com">引文标题</a></cite>
-<bookmark name="书签标题" href="https://example.com"></bookmark>
-
-<task task-id="TASK_GUID"></task>
-<chat_card chat-id="CHAT_ID"></chat_card>
-<sub-page-list></sub-page-list>
-```
+- 文本转义：`<` → `&lt;`，`>` → `&gt;`，`&` → `&amp;`，换行符 `\n` → `<br/>`。
+- 错误：`&lt;p&gt;内容&lt;/p&gt;`
+- 正确：`<p>A &amp; B 的对比：1 &lt; 2</p>`

@@ -42,6 +42,7 @@ tests/mail/reports/
 
 # Generated / test artifacts
 .hammer/
+.lark-cli-e2e-test/reports/
 .lark-slides/
 /notes/
 /minutes/

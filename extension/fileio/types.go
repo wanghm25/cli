@@ -42,6 +42,15 @@ type FileIO interface {
 	Save(path string, opts SaveOptions, body io.Reader) (SaveResult, error)
 }
 
+// TempDirFileCreator is an optional FileIO capability for atomically creating
+// a unique directory and an empty named file inside it. The directory pattern
+// follows os.MkdirTemp semantics: the last '*' is replaced with a random
+// value. Implementations return a relative file path that can be passed back
+// to FileIO.
+type TempDirFileCreator interface {
+	CreateTempDirFile(directoryPattern, fileName string) (string, error)
+}
+
 // FileInfo is a minimal subset of os.FileInfo covering actual CLI usage.
 // os.FileInfo satisfies this interface.
 type FileInfo interface {

@@ -4,10 +4,12 @@
 package localfileio
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/larksuite/cli/extension/fileio"
@@ -247,6 +249,81 @@ func TestLocalFileIO_ResolvePath_RejectsAbsolute(t *testing.T) {
 	_, err := fio.ResolvePath("/etc/passwd")
 	if err == nil {
 		t.Error("expected error for absolute path in ResolvePath")
+	}
+}
+
+func TestLocalFileIO_CreateTempDirFileIsUniqueUnderConcurrency(t *testing.T) {
+	dir := t.TempDir()
+	testChdir(t, dir)
+
+	const count = 32
+	type result struct {
+		path string
+		err  error
+	}
+	results := make(chan result, count)
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			path, err := (&LocalFileIO{}).CreateTempDirFile("川西_*_folder", "川西.xml")
+			results <- result{path: path, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	seen := make(map[string]struct{}, count)
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("CreateTempDirFile failed: %v", result.err)
+		}
+		directory := filepath.Dir(result.path)
+		if filepath.Base(result.path) != "川西.xml" || filepath.Base(directory) != directory ||
+			!strings.HasPrefix(directory, "川西_") || !strings.HasSuffix(directory, "_folder") {
+			t.Fatalf("CreateTempDirFile path = %q, want 川西_<random>_folder/川西.xml", result.path)
+		}
+		if _, ok := seen[directory]; ok {
+			t.Fatalf("CreateTempDirFile returned duplicate directory %q", directory)
+		}
+		seen[directory] = struct{}{}
+		info, err := os.Stat(result.path)
+		if err != nil {
+			t.Fatalf("stat temporary file %q: %v", result.path, err)
+		}
+		if info.Size() != 0 {
+			t.Fatalf("temporary file %q size = %d, want 0", result.path, info.Size())
+		}
+	}
+	if len(seen) != count {
+		t.Fatalf("unique temporary files = %d, want %d", len(seen), count)
+	}
+}
+
+func TestLocalFileIO_CreateTempDirFileRejectsUnsafeComponents(t *testing.T) {
+	dir := t.TempDir()
+	testChdir(t, dir)
+	fio := &LocalFileIO{}
+
+	for _, test := range []struct {
+		pattern  string
+		fileName string
+	}{
+		{pattern: "../lark-doc-*", fileName: "draft.xml"},
+		{pattern: "lark-doc-*", fileName: "../draft.xml"},
+		{pattern: "lark-doc-*", fileName: `folder\draft.xml`},
+	} {
+		if _, err := fio.CreateTempDirFile(test.pattern, test.fileName); !errors.Is(err, fileio.ErrPathValidation) {
+			t.Errorf("CreateTempDirFile(%q, %q) error = %v, want path validation", test.pattern, test.fileName, err)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read work directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("invalid inputs created files: %+v", entries)
 	}
 }
 

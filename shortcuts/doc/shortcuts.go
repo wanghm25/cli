@@ -33,6 +33,8 @@ func docsSkillReadCommandForShortcut(shortcut string) string {
 		return docsSkillReadCommand + " references/lark-doc-update.md"
 	case "history-list", "history-revert", "history-revert-status":
 		return docsSkillReadCommand + " references/lark-doc-history.md"
+	case "script":
+		return docsSkillReadCommand + " references/lark-doc-script.md"
 	default:
 		return docsSkillReadCommand
 	}
@@ -52,6 +54,8 @@ func docsHelpCommandForShortcut(shortcut string) string {
 		return "lark-cli docs +history-revert --help"
 	case "history-revert-status":
 		return "lark-cli docs +history-revert-status --help"
+	case "script":
+		return "lark-cli docs +script --help"
 	default:
 		return "lark-cli docs --help"
 	}
@@ -64,6 +68,7 @@ func Shortcuts() []common.Shortcut {
 		DocsCreate,
 		DocsFetch,
 		DocsUpdate,
+		DocsScript,
 		DocsHistoryList,
 		DocsHistoryRevert,
 		DocsHistoryRevertStatus,
