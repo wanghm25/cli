@@ -6,12 +6,20 @@ package event
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+
+	_ "github.com/larksuite/cli/events" // registers the real catalog: im.message.created_v1 (refined base) + im.message.receive_v1 (legacy)
 )
 
 func TestParseParams(t *testing.T) {
@@ -152,8 +160,9 @@ func TestResolveTenantToken_ResolverFailure(t *testing.T) {
 }
 
 // assertInvalidArgumentParam verifies err is a typed validation error with
-// subtype invalid_argument naming the given flag in its param field.
-func assertInvalidArgumentParam(t *testing.T, err error, param string) {
+// subtype invalid_argument naming the given flag in its param field. Returns
+// the typed error so callers can additionally inspect Message/Hint.
+func assertInvalidArgumentParam(t *testing.T, err error, param string) *errs.ValidationError {
 	t.Helper()
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
@@ -164,6 +173,141 @@ func assertInvalidArgumentParam(t *testing.T, err error, param string) {
 	}
 	if ve.Param != param {
 		t.Errorf("param = %q, want %q", ve.Param, param)
+	}
+	return ve
+}
+
+// newRefinedConsumeTestFactory builds a Factory for exercising the full
+// runConsume entry (via NewCmdConsume + cmd.Execute()) against the REAL
+// global EventKey registry (im.message.created_v1 refined base +
+// im.message.receive_v1 legacy — both registered by the blank import above,
+// from events/refined/refined_keys_mock.json and events/im/register.go).
+//
+// It also plants the same safety net as
+// TestBusCommandLoggerSetupFailureIsTypedFileIO (cmd/event/bus_test.go):
+// LARKSUITE_CLI_CONFIG_DIR points at a temp dir whose "events" entry is a
+// regular file, not a directory. This is defense in depth, not a workaround
+// for the behavior under test: if the consume-entry gate ever regresses and
+// lets a call fall through toward the real bus (EnsureBus -> forkBus),
+// forkBus's vfs.MkdirAll fails deterministically on that blocked path
+// BEFORE forkBus ever reaches os.Executable()/exec.Command — so a
+// regression surfaces here as a typed internal error inside this
+// in-process test, never as a forked child process. (Under `go test`,
+// os.Executable() resolves to the compiled test binary, not lark-cli; the
+// blocked path guarantees runConsume can never reach that call.)
+func newRefinedConsumeTestFactory(t *testing.T) *cmdutil.Factory {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
+	if err := os.WriteFile(filepath.Join(dir, "events"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{
+		AppID: "cli_consume_test", AppSecret: "secret", Brand: core.BrandFeishu,
+	})
+	return f
+}
+
+// newConsumeCmd wires cmd.Execute()'s own error/usage banner to io.Discard —
+// the returned error (what every test below asserts on) is unaffected;
+// this only keeps `go test -v` output free of cobra's usage dump for
+// expected-error cases.
+func newConsumeCmd(f *cmdutil.Factory, args ...string) *cobra.Command {
+	cmd := NewCmdConsume(f)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs(args)
+	return cmd
+}
+
+// TestRunConsume_BareRefinedBaseKeyRejected locks design spec §2.3 R1 at the
+// consume entry: a refined-subscription base key with no template segment
+// (im.message.created_v1) must be rejected — typed invalid_argument, hint
+// pointing at `event schema` — before any identity resolution or bus
+// activity, never silently treated as an ordinary consumable key.
+func TestRunConsume_BareRefinedBaseKeyRejected(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "im.message.created_v1").Execute()
+
+	ve := assertInvalidArgumentParam(t, err, "event_key")
+	if !strings.Contains(ve.Hint, "event schema") {
+		t.Errorf("Hint = %q, want it to point at `event schema`", ve.Hint)
+	}
+}
+
+// TestRunConsume_RefinedMaterializedKey_RuntimeNotYetAvailable locks that a
+// fully materialized refined EventKey (R1 satisfied — ResolveEventKey
+// returns no error) is rejected with failed_precondition, not silently
+// consumed and not routed into the real bus: the refined consume runtime
+// (bus/IPC/BindUser wiring, design spec §4) is Phase C and does not exist
+// yet. Must never start the bus or make a remote write.
+func TestRunConsume_RefinedMaterializedKey_RuntimeNotYetAvailable(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a").Execute()
+
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if !strings.Contains(ve.Message, "not yet available") && !strings.Contains(ve.Hint, "not yet available") {
+		t.Errorf("message/hint should say the refined runtime is not yet available; message=%q hint=%q", ve.Message, ve.Hint)
+	}
+	if !strings.Contains(ve.Hint, "event subscription") {
+		t.Errorf("Hint = %q, want it to point at `event subscription`", ve.Hint)
+	}
+}
+
+// TestRunConsume_LegacyKeyWithSuffixRejected locks that a legacy EventKey
+// rejects any "/"-suffix (exact match only — legacy keys never enter the
+// refined split path, design spec §2.3 step 1) with a message distinct from
+// "unknown EventKey" — contrast
+// TestRunConsume_UnknownEventKeyContractPreserved, which must keep the old
+// wording for a genuinely unregistered base.
+func TestRunConsume_LegacyKeyWithSuffixRejected(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "im.message.receive_v1/foo").Execute()
+
+	ve := assertInvalidArgumentParam(t, err, "event_key")
+	if strings.Contains(ve.Message, "unknown EventKey") {
+		t.Errorf("legacy+suffix must not be reported as an unknown key: %q", ve.Message)
+	}
+	if !strings.Contains(ve.Hint, "exact match") {
+		t.Errorf("Hint = %q, want guidance that legacy keys only accept an exact match", ve.Hint)
+	}
+}
+
+// TestRunConsume_UnknownEventKeyContractPreserved is the cmd/event/consume.go
+// in-process counterpart of the committed regression
+// tests/cli_e2e/event/event_consume_error_test.go
+// (TestEventConsumeUnknownKeyRegression). ResolveEventKey's own "unknown"
+// wording ("unknown EventKey %q (base %q is not registered)") differs from
+// the pre-existing contract ("unknown EventKey: <key>"), so runConsume must
+// map the unknown-base case back onto the established unknownEventKeyErr
+// message/hint rather than surfacing ResolveEventKey's message verbatim.
+func TestRunConsume_UnknownEventKeyContractPreserved(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "bogus.key").Execute()
+
+	p, ok := errs.ProblemOf(err)
+	if !ok {
+		t.Fatalf("expected typed errs error, got %T: %v", err, err)
+	}
+	if p.Category != errs.CategoryValidation || p.Subtype != errs.SubtypeInvalidArgument {
+		t.Errorf("problem = %s/%s, want %s/%s", p.Category, p.Subtype,
+			errs.CategoryValidation, errs.SubtypeInvalidArgument)
+	}
+	if !strings.Contains(p.Message, "unknown EventKey: bogus.key") {
+		t.Errorf("message = %q, want it to contain %q", p.Message, "unknown EventKey: bogus.key")
+	}
+	if !strings.Contains(p.Hint, "event list") {
+		t.Errorf("hint = %q, want it to mention `event list`", p.Hint)
 	}
 }
 

@@ -90,10 +90,26 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		return err
 	}
 
-	keyDef, ok := eventlib.Lookup(eventKey)
-	if !ok {
-		return unknownEventKeyErr(eventKey)
+	resolved, err := eventlib.ResolveEventKey(eventKey)
+	if err != nil {
+		// ResolveEventKey's own "base is not registered" wording differs from
+		// the pre-existing "unknown EventKey: <key>" contract (locked by
+		// tests/cli_e2e/event/event_consume_error_test.go); map that one case
+		// back onto it. Every other rejection (R1 bare base key, legacy+suffix,
+		// bad template segment, ...) is returned unchanged.
+		if !eventKeyBaseRegistered(eventKey) {
+			return unknownEventKeyErr(eventKey)
+		}
+		return err
 	}
+	if resolved.IsRefined {
+		// R1 passed (this is a materialized refined key), but the refined
+		// consume runtime — bus/IPC/BindUser wiring, design spec §4 — is
+		// Phase C and does not exist yet. Never start the bus or perform a
+		// remote write for it.
+		return errRefinedConsumeRuntimeUnavailable(resolved.MaterializedKey)
+	}
+	keyDef := resolved.Definition
 
 	identity, err := resolveIdentity(cmd, f, keyDef)
 	if err != nil {
@@ -221,6 +237,35 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		return err
 	}
 	return nil
+}
+
+// eventKeyBaseRegistered reports whether eventKey itself, or the segment
+// before its first "/", names a registered EventKey definition — mirroring
+// the exact-match-then-split order ResolveEventKey applies internally
+// (design spec §2.3 steps 1-2). It exists solely to distinguish
+// ResolveEventKey's "the base isn't registered at all" failure from every
+// other typed rejection it can return (bare refined base key / legacy key
+// with a path suffix / unknown template path segment / ...), so runConsume
+// can keep surfacing the pre-existing "unknown EventKey" message+hint
+// (tests/cli_e2e/event/event_consume_error_test.go) for the former while
+// passing every other ResolveEventKey error through unchanged.
+func eventKeyBaseRegistered(eventKey string) bool {
+	if _, ok := eventlib.Lookup(eventKey); ok {
+		return true
+	}
+	base, _, _ := strings.Cut(eventKey, "/")
+	_, ok := eventlib.Lookup(base)
+	return ok
+}
+
+// errRefinedConsumeRuntimeUnavailable rejects a successfully-resolved
+// refined EventKey at the consume entry: R1 already passed (ResolveEventKey
+// returned no error), but the refined consume runtime — bus/IPC/BindUser
+// wiring, design spec §4 — is Phase C and is not built yet.
+func errRefinedConsumeRuntimeUnavailable(materializedKey string) error {
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"refined consume runtime not yet available for EventKey %s", materializedKey).
+		WithHint("refined consume runtime not yet available; use `lark-cli event subscription` to manage the remote subscription (coming in a later change)")
 }
 
 // resolveIdentity resolves the session identity and enforces keyDef.AuthTypes as a whitelist.
