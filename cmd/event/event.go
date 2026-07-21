@@ -6,6 +6,7 @@ package event
 import (
 	"github.com/spf13/cobra"
 
+	"github.com/larksuite/cli/cmd/event/subscription"
 	"github.com/larksuite/cli/internal/cmdutil"
 )
 
@@ -24,6 +25,7 @@ func NewCmdEvents(f *cmdutil.Factory) *cobra.Command {
 	cmd.AddCommand(NewCmdStatus(f))
 	cmd.AddCommand(NewCmdStop(f))
 	cmd.AddCommand(NewCmdBus(f))
+	cmd.AddCommand(subscription.NewCmdSubscription(f))
 
 	return cmd
 }
