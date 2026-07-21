@@ -58,10 +58,9 @@ func registerResolveFixtures(t *testing.T) {
 }
 
 // assertInvalidArgument asserts err is a typed *errs.ValidationError with
-// Subtype invalid_argument and Param "<EventKey>" (design spec §2.3: every
-// ResolveEventKey failure carries param=<EventKey>, mirroring the existing
-// WithParam("<method>") convention for a single unnamed positional argument
-// in cmd/api/api.go). When hintSubstr is non-empty it must appear in Hint.
+// Subtype invalid_argument and Param "event_key" (errs/ERROR_CONTRACT.md §
+// "Validation parameters": positional arguments use the canonical name
+// without dashes). When hintSubstr is non-empty it must appear in Hint.
 func assertInvalidArgument(t *testing.T, err error, hintSubstr string) *errs.ValidationError {
 	t.Helper()
 	if err == nil {
@@ -74,8 +73,8 @@ func assertInvalidArgument(t *testing.T, err error, hintSubstr string) *errs.Val
 	if ve.Subtype != errs.SubtypeInvalidArgument {
 		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeInvalidArgument)
 	}
-	if ve.Param != "<EventKey>" {
-		t.Errorf("Param = %q, want %q", ve.Param, "<EventKey>")
+	if ve.Param != "event_key" {
+		t.Errorf("Param = %q, want %q", ve.Param, "event_key")
 	}
 	if hintSubstr != "" && !strings.Contains(ve.Hint, hintSubstr) {
 		t.Errorf("Hint = %q, want substring %q", ve.Hint, hintSubstr)

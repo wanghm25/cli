@@ -43,12 +43,12 @@ type ResolvedEventKey struct {
 // paramEventKey is the Param every invalid_argument produced by
 // ResolveEventKey carries. The whole function operates on a single
 // positional <EventKey> argument (as shown in `event consume <EventKey>` /
-// `event subscription create <refined EventKey>`), so — per design spec
-// §2.3 ("param=<EventKey>") — Param names that argument by its usage
-// placeholder rather than the (already-invalid) value itself, mirroring the
-// existing WithParam("<method>") convention for a single unnamed positional
-// argument in cmd/api/api.go.
-const paramEventKey = "<EventKey>"
+// `event subscription create <refined EventKey>`), so — per
+// errs/ERROR_CONTRACT.md § "Validation parameters" ("for positional
+// arguments, use the canonical name without dashes") — Param is the
+// canonical snake_case name for that argument, not its bracketed usage
+// placeholder.
+const paramEventKey = "event_key"
 
 // ResolveEventKey resolves a caller-supplied EventKey string to either a
 // legacy KeyDefinition (exact registry match) or a materialized
