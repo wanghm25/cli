@@ -299,3 +299,34 @@ func TestRegisterKey_InvalidSubscriptionTypePanics(t *testing.T) {
 		Schema:           SchemaDef{Native: &SchemaSpec{Raw: []byte(`{"type":"object"}`)}},
 	})
 }
+
+// assertPanics runs fn and fails the test if it does not panic.
+func assertPanics(t *testing.T, fn func()) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic")
+		}
+	}()
+	fn()
+}
+
+func TestRegisterKey_RefinedValidation(t *testing.T) {
+	defer UnregisterKeyForTest("x.y.created_v1")
+
+	// refined key missing templates -> panic
+	bad := KeyDefinition{Key: "x.y.created_v1", EventType: "x.y.created_v1", Schema: nativeSchema(),
+		AuthTypes: []string{"user"}, RefinedSubscription: true}
+	assertPanics(t, func() { RegisterKey(bad) })
+
+	// valid refined key registers successfully and is Lookup-able
+	good := KeyDefinition{Key: "x.y.created_v1", EventType: "x.y.created_v1", ResourceType: "x.y", Schema: nativeSchema(),
+		AuthTypes: []string{"user", "bot"}, RefinedSubscription: true,
+		KeyTemplates: []KeyTemplate{{Template: "x.y.created_v1/z-id/{z_id}", Example: "x.y.created_v1/z-id/z1",
+			SelectorKey: "z_id", PathSegment: "z-id", AuthTypes: []string{"user", "bot"}}}}
+	RegisterKey(good)
+	def, ok := Lookup("x.y.created_v1")
+	if !ok || !def.RefinedSubscription || len(def.KeyTemplates) != 1 {
+		t.Fatalf("refined key not registered correctly: %+v", def)
+	}
+}

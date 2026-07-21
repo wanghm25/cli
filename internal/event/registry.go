@@ -37,6 +37,7 @@ func RegisterKey(def KeyDefinition) {
 	validateSchema(def)
 	validateParams(def)
 	validateAuth(def)
+	validateRefinedSubscription(def)
 
 	if def.BufferSize > MaxBufferSize {
 		def.BufferSize = MaxBufferSize
@@ -102,6 +103,31 @@ func validateAuth(def KeyDefinition) {
 	for _, t := range def.AuthTypes {
 		if t != "user" && t != "bot" {
 			panic(fmt.Sprintf("EventKey %s: AuthTypes elements must be \"user\" or \"bot\"; got %q", def.Key, t))
+		}
+	}
+}
+
+// validateRefinedSubscription: RefinedSubscription requires non-empty
+// KeyTemplates; each template requires non-empty PathSegment/SelectorKey and
+// AuthTypes restricted to {"user","bot"}.
+func validateRefinedSubscription(def KeyDefinition) {
+	if !def.RefinedSubscription {
+		return
+	}
+	if len(def.KeyTemplates) == 0 {
+		panic(fmt.Sprintf("EventKey %s: RefinedSubscription requires non-empty KeyTemplates", def.Key))
+	}
+	for i, tmpl := range def.KeyTemplates {
+		if tmpl.PathSegment == "" {
+			panic(fmt.Sprintf("EventKey %s: KeyTemplates[%d] PathSegment must not be empty", def.Key, i))
+		}
+		if tmpl.SelectorKey == "" {
+			panic(fmt.Sprintf("EventKey %s: KeyTemplates[%d] SelectorKey must not be empty", def.Key, i))
+		}
+		for _, t := range tmpl.AuthTypes {
+			if t != "user" && t != "bot" {
+				panic(fmt.Sprintf("EventKey %s: KeyTemplates[%d] AuthTypes elements must be \"user\" or \"bot\"; got %q", def.Key, i, t))
+			}
 		}
 	}
 }

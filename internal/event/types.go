@@ -168,4 +168,38 @@ type KeyDefinition struct {
 	// SingleConsumer rejects a second consumer for the same SubscriptionID at
 	// the bus handshake. Default false = unlimited consumers (fan-out).
 	SingleConsumer bool `json:"single_consumer,omitempty"`
+
+	// RefinedSubscription marks this KeyDefinition as a refined-subscription
+	// base key: it is not consumed directly, only materialized through one of
+	// KeyTemplates (resolution added in a later task). Default false = an
+	// ordinary EventKey, looked up and consumed as-is.
+	RefinedSubscription bool `json:"refined_subscription,omitempty"`
+
+	// ResourceType is the OAPI resource type that KeyTemplates select against
+	// (e.g. "im.message"). Only meaningful when RefinedSubscription is true.
+	ResourceType string `json:"resource_type,omitempty"`
+
+	// KeyTemplates enumerates the resource-selector materialization paths this
+	// refined base key accepts. Required and non-empty when
+	// RefinedSubscription is true; validated by RegisterKey.
+	KeyTemplates []KeyTemplate `json:"key_templates,omitempty"`
+}
+
+// KeyTemplate describes one resource-selector materialization path for a
+// refined-subscription base KeyDefinition (see KeyDefinition.RefinedSubscription).
+type KeyTemplate struct {
+	Template    string `json:"template"` // e.g. im.message.created_v1/chat-id/{chat_id}
+	Example     string `json:"example"`  // e.g. im.message.created_v1/chat-id/oc_9f3b1c2d8a
+	Description string `json:"description"`
+
+	// SelectorKey is the OAPI selector key this template resolves to (e.g. "chat_id").
+	SelectorKey string `json:"selector_key"`
+	// PathSegment is the kebab-case command path segment for this template (e.g. "chat-id").
+	PathSegment string `json:"path_segment"`
+	// FixedValue, when set, requires the materialized value to equal it verbatim
+	// (e.g. "me" for an owner/me template) instead of accepting any value.
+	FixedValue string `json:"fixed_value,omitempty"`
+	// AuthTypes: whitelist of identities this template accepts; must be a
+	// subset of {"user","bot"}.
+	AuthTypes []string `json:"auth_types"`
 }
