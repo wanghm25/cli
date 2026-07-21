@@ -1,0 +1,35 @@
+[
+  {
+    "key": "im.message.created_v1",
+    "display_name": "Message created (refined)",
+    "description": "监听指定资源上的新消息创建事件；必须结合模板使用",
+    "event_type": "im.message.created_v1",
+    "schema": {
+      "custom": {
+        "raw": {
+          "type": "object",
+          "description": "meta-swap placeholder: minimal mock output schema for im.message.created_v1, pending the fetch_meta-driven refined catalog (design spec section 2.2). Not the final resolved_output_schema.",
+          "properties": {
+            "message_id": { "type": "string", "description": "Message ID; placeholder mock field only" }
+          }
+        }
+      }
+    },
+    "refined_subscription": true,
+    "resource_type": "im.message",
+    "auth_types": ["user", "bot"],
+    "scopes": ["event:subscription:read", "event:subscription:write"],
+    "key_templates": [
+      { "template": "im.message.created_v1/chat-id/{chat_id}",
+        "example": "im.message.created_v1/chat-id/oc_9f3b1c2d8a",
+        "description": "监听指定会话内的新消息",
+        "selector_key": "chat_id", "path_segment": "chat-id",
+        "auth_types": ["user", "bot"] },
+      { "template": "im.message.created_v1/owner/me",
+        "example": "im.message.created_v1/owner/me",
+        "description": "监听当前登录用户可见的新消息；me 是固定值，按订阅身份解析",
+        "selector_key": "owner", "path_segment": "owner", "fixed_value": "me",
+        "auth_types": ["user"] }
+    ]
+  }
+]

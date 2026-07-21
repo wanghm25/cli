@@ -9,6 +9,7 @@ import (
 	"github.com/larksuite/cli/events/approval"
 	"github.com/larksuite/cli/events/im"
 	"github.com/larksuite/cli/events/minutes"
+	"github.com/larksuite/cli/events/refined"
 	"github.com/larksuite/cli/events/task"
 	"github.com/larksuite/cli/events/vc"
 	"github.com/larksuite/cli/events/whiteboard"
@@ -22,6 +23,7 @@ func init() {
 		approval.Keys(),
 		im.Keys(),
 		minutes.Keys(),
+		refined.Keys(),
 		task.Keys(),
 		vc.Keys(),
 		whiteboard.Keys(),
