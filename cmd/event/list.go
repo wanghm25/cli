@@ -105,9 +105,18 @@ func runList(f *cmdutil.Factory, asJSON bool) error {
 }
 
 func writeListJSON(f *cmdutil.Factory, all []*eventlib.KeyDefinition) error {
+	// row embeds *eventlib.KeyDefinition, so its existing fields (including the
+	// refined-subscription additive fields from KeyDefinition/KeyTemplate —
+	// refined_subscription, resource_type, key_templates[], auth_types) are
+	// already promoted into the JSON output unchanged. DryRunSupported and
+	// NextAction are the only genuinely new fields here (spec §2.5); both are
+	// omitempty and left zero-valued for non-refined keys, so legacy key JSON
+	// output is byte-for-byte unchanged.
 	type row struct {
 		*eventlib.KeyDefinition
-		ResolvedSchema json.RawMessage `json:"resolved_output_schema,omitempty"`
+		ResolvedSchema  json.RawMessage `json:"resolved_output_schema,omitempty"`
+		DryRunSupported bool            `json:"dry_run_supported,omitempty"`
+		NextAction      string          `json:"next_action,omitempty"`
 	}
 	rows := make([]row, len(all))
 	for i, def := range all {
@@ -115,7 +124,12 @@ func writeListJSON(f *cmdutil.Factory, all []*eventlib.KeyDefinition) error {
 		if err != nil {
 			return err
 		}
-		rows[i] = row{KeyDefinition: def, ResolvedSchema: resolved}
+		r := row{KeyDefinition: def, ResolvedSchema: resolved}
+		if def.RefinedSubscription {
+			r.DryRunSupported = true
+			r.NextAction = fmt.Sprintf("run `lark-cli event schema %s --json` before consume", def.Key)
+		}
+		rows[i] = r
 	}
 	output.PrintJson(f.IOStreams.Out, rows)
 	return nil
