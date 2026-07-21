@@ -382,6 +382,168 @@ func TestResolveSchemaJSON_CustomWithOverlay(t *testing.T) {
 	}
 }
 
+// TestSchemaJSON_RefinedSubscriptionAdditiveFields pins spec §2.6/§2.7: for a
+// RefinedSubscription key, `event schema --json` additively emits
+// refined_subscription/key_templates[]/auth_types/scopes/conditional_scopes/
+// risk/subscription/next_action on top of the existing resolved_output_schema
+// + jq_root_path. refined_subscription/key_templates/auth_types/scopes flow
+// for free via the *eventlib.KeyDefinition embed (already asserted here as a
+// contract, not because schema.go needs new code for them); conditional_scopes/
+// risk/subscription/next_action are genuinely new fields added by this task.
+func TestSchemaJSON_RefinedSubscriptionAdditiveFields(t *testing.T) {
+	f, stdout, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "test"})
+
+	if err := runSchema(f, "im.message.created_v1", true); err != nil {
+		t.Fatalf("runSchema json: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, stdout.String())
+	}
+
+	if payload["refined_subscription"] != true {
+		t.Errorf("refined_subscription = %v, want true", payload["refined_subscription"])
+	}
+	if payload["resource_type"] != "im.message" {
+		t.Errorf("resource_type = %v, want im.message", payload["resource_type"])
+	}
+	if payload["resolved_output_schema"] == nil {
+		t.Error("resolved_output_schema must be preserved for refined keys")
+	}
+	if payload["jq_root_path"] != "." {
+		t.Errorf("jq_root_path = %v, want . (Custom schema)", payload["jq_root_path"])
+	}
+
+	gotScopes, ok := payload["scopes"].([]interface{})
+	wantScopes := []string{"event:subscription:read", "event:subscription:write"}
+	if !ok || len(gotScopes) != len(wantScopes) {
+		t.Fatalf("scopes = %v, want %v", payload["scopes"], wantScopes)
+	}
+	for i, want := range wantScopes {
+		if gotScopes[i] != want {
+			t.Errorf("scopes[%d] = %v, want %q", i, gotScopes[i], want)
+		}
+	}
+
+	gotAuth, ok := payload["auth_types"].([]interface{})
+	if !ok || len(gotAuth) != 2 || gotAuth[0] != "user" || gotAuth[1] != "bot" {
+		t.Errorf("auth_types = %v, want [user bot]", payload["auth_types"])
+	}
+
+	templatesRaw, ok := payload["key_templates"].([]interface{})
+	if !ok || len(templatesRaw) != 2 {
+		t.Fatalf("key_templates = %v, want 2 entries", payload["key_templates"])
+	}
+	firstTemplate, ok := templatesRaw[0].(map[string]interface{})
+	if !ok || firstTemplate["template"] != "im.message.created_v1/chat-id/{chat_id}" {
+		t.Fatalf("key_templates[0] = %v, want chat-id template first", templatesRaw[0])
+	}
+
+	condRaw, ok := payload["conditional_scopes"].([]interface{})
+	if !ok || len(condRaw) != 1 {
+		t.Fatalf("conditional_scopes = %v, want 1 entry", payload["conditional_scopes"])
+	}
+	cond, ok := condRaw[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("conditional_scopes[0] wrong type: %T", condRaw[0])
+	}
+	if cond["scope"] != "event:encrypt_key:read" {
+		t.Errorf("conditional_scopes[0].scope = %v, want event:encrypt_key:read", cond["scope"])
+	}
+	wantWhen := "--include-resource-data set with --as user"
+	if cond["when"] != wantWhen {
+		t.Errorf("conditional_scopes[0].when = %v, want %q", cond["when"], wantWhen)
+	}
+
+	risk, ok := payload["risk"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("risk missing or wrong type: %v", payload["risk"])
+	}
+	if risk["ordinary_event_key"] != "read" {
+		t.Errorf("risk.ordinary_event_key = %v, want read", risk["ordinary_event_key"])
+	}
+	if risk["effective"] != "write" {
+		t.Errorf("risk.effective = %v, want write", risk["effective"])
+	}
+	wantReason := "refined consume may create, reuse, reactivate, or bind remote resources"
+	if risk["reason"] != wantReason {
+		t.Errorf("risk.reason = %v, want %q", risk["reason"], wantReason)
+	}
+	if risk["dry_run_recommended"] != true {
+		t.Errorf("risk.dry_run_recommended = %v, want true", risk["dry_run_recommended"])
+	}
+
+	sub, ok := payload["subscription"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("subscription missing or wrong type: %v", payload["subscription"])
+	}
+	payloadOpts, ok := sub["payload_options"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("subscription.payload_options missing: %v", sub)
+	}
+	if payloadOpts["include_resource_data_default"] != false {
+		t.Errorf("include_resource_data_default = %v, want false", payloadOpts["include_resource_data_default"])
+	}
+	if payloadOpts["include_resource_data_flag"] != "--include-resource-data" {
+		t.Errorf("include_resource_data_flag = %v, want --include-resource-data", payloadOpts["include_resource_data_flag"])
+	}
+	dryRun, ok := sub["dry_run"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("subscription.dry_run missing: %v", sub)
+	}
+	if dryRun["supported"] != true {
+		t.Errorf("subscription.dry_run.supported = %v, want true", dryRun["supported"])
+	}
+	wantExample := "lark-cli event subscription create im.message.created_v1/chat-id/oc_9f3b1c2d8a --dry-run --json"
+	if dryRun["example"] != wantExample {
+		t.Errorf("subscription.dry_run.example = %v, want %q", dryRun["example"], wantExample)
+	}
+
+	wantNextAction := "run `" + wantExample + "` before consume"
+	if payload["next_action"] != wantNextAction {
+		t.Errorf("next_action = %v, want %q", payload["next_action"], wantNextAction)
+	}
+}
+
+// TestSchemaJSON_LegacyKeyUnchanged is the regression half of spec §2.6: a
+// non-refined (legacy) EventKey must not gain any of the new refined-only
+// fields in `event schema --json` output, and its existing fields
+// (resolved_output_schema, jq_root_path, scopes, auth_types) must be
+// byte-for-byte preserved.
+func TestSchemaJSON_LegacyKeyUnchanged(t *testing.T) {
+	f, stdout, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "test"})
+
+	if err := runSchema(f, "im.message.receive_v1", true); err != nil {
+		t.Fatalf("runSchema json: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, stdout.String())
+	}
+
+	for _, field := range []string{
+		"refined_subscription", "key_templates", "resource_type",
+		"conditional_scopes", "risk", "subscription", "next_action",
+	} {
+		if v, present := payload[field]; present {
+			t.Errorf("legacy key im.message.receive_v1 must not have %q field; got %v", field, v)
+		}
+	}
+	for _, field := range []string{"key", "event_type", "schema", "resolved_output_schema", "jq_root_path", "scopes", "auth_types"} {
+		if _, present := payload[field]; !present {
+			t.Errorf("legacy key im.message.receive_v1 unexpectedly lost %q field", field)
+		}
+	}
+	if payload["jq_root_path"] != "." {
+		t.Errorf("jq_root_path = %v, want . (Custom schema)", payload["jq_root_path"])
+	}
+	if payload["key"] != "im.message.receive_v1" {
+		t.Errorf("key = %v, want im.message.receive_v1", payload["key"])
+	}
+}
+
 func TestRenderSpec_EmptySpecIsTypedInternalError(t *testing.T) {
 	_, err := renderSpec(&eventlib.SchemaSpec{})
 	if err == nil {

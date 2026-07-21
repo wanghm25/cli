@@ -202,12 +202,65 @@ func printIndentedJSON(out io.Writer, raw json.RawMessage) {
 	fmt.Fprintf(out, "  %s\n", string(formatted))
 }
 
+// ConditionalScope documents a scope that is only required under specific
+// flag/identity combinations (spec §2.6), as opposed to KeyDefinition.Scopes
+// which are always required. Currently static: every refined key discloses
+// the same encrypt-key read requirement for --include-resource-data + --as user.
+type ConditionalScope struct {
+	Scope string `json:"scope"`
+	When  string `json:"when"`
+}
+
+// RiskDisclosure statically discloses that refined consume has write-level
+// remote side effects (spec §2.7). The command framework only tracks
+// static per-command risk (cmdutil.SetRisk; consume is registered "read")
+// and this task does NOT change that to dynamic per-key risk — this is an
+// additive, informational strong-disclosure surfaced via `schema --json` only.
+type RiskDisclosure struct {
+	OrdinaryEventKey  string `json:"ordinary_event_key"`
+	Effective         string `json:"effective"`
+	Reason            string `json:"reason"`
+	DryRunRecommended bool   `json:"dry_run_recommended"`
+}
+
+// PayloadOptions documents the resource-data payload flags that apply to
+// refined-key subscription management (`event subscription create/update`).
+type PayloadOptions struct {
+	IncludeResourceDataDefault bool   `json:"include_resource_data_default"`
+	IncludeResourceDataFlag    string `json:"include_resource_data_flag"`
+}
+
+// DryRunInfo documents the dry-run contract for refined-key subscription management.
+type DryRunInfo struct {
+	Supported bool   `json:"supported"`
+	Example   string `json:"example"`
+}
+
+// SubscriptionInfo documents refined-key subscription-management affordances (spec §2.6).
+type SubscriptionInfo struct {
+	PayloadOptions PayloadOptions `json:"payload_options"`
+	DryRun         DryRunInfo     `json:"dry_run"`
+}
+
 // writeSchemaJSON emits the EventKey definition plus resolved schema; jq_root_path tells callers whether fields live at `.` or `.event`.
+//
+// payload embeds *eventlib.KeyDefinition, so refined_subscription/resource_type/
+// key_templates[]/auth_types/scopes (spec §2.6) are already promoted into the
+// JSON output unchanged for every key — no new code needed for those. Only
+// ConditionalScopes/Risk/Subscription/NextAction are genuinely new here, and
+// they use pointer/slice/string types so `omitempty` actually omits them
+// (Go's encoding/json omitempty has no effect on plain struct fields) — all
+// four are left unset for non-refined keys, so legacy key JSON output is
+// byte-for-byte unchanged.
 func writeSchemaJSON(f *cmdutil.Factory, def *eventlib.KeyDefinition) error {
 	type payload struct {
 		*eventlib.KeyDefinition
-		ResolvedSchema json.RawMessage `json:"resolved_output_schema,omitempty"`
-		JQRootPath     string          `json:"jq_root_path,omitempty"`
+		ResolvedSchema    json.RawMessage    `json:"resolved_output_schema,omitempty"`
+		JQRootPath        string             `json:"jq_root_path,omitempty"`
+		ConditionalScopes []ConditionalScope `json:"conditional_scopes,omitempty"`
+		Risk              *RiskDisclosure    `json:"risk,omitempty"`
+		Subscription      *SubscriptionInfo  `json:"subscription,omitempty"`
+		NextAction        string             `json:"next_action,omitempty"`
 	}
 	resolved, _, err := resolveSchemaJSON(def)
 	if err != nil {
@@ -222,10 +275,44 @@ func writeSchemaJSON(f *cmdutil.Factory, def *eventlib.KeyDefinition) error {
 			jqRootPath = ".event"
 		}
 	}
-	output.PrintJson(f.IOStreams.Out, payload{
+
+	p := payload{
 		KeyDefinition:  def,
 		ResolvedSchema: resolved,
 		JQRootPath:     jqRootPath,
-	})
+	}
+
+	if def.RefinedSubscription {
+		p.ConditionalScopes = []ConditionalScope{
+			{Scope: "event:encrypt_key:read", When: "--include-resource-data set with --as user"},
+		}
+		p.Risk = &RiskDisclosure{
+			OrdinaryEventKey:  "read",
+			Effective:         "write",
+			Reason:            "refined consume may create, reuse, reactivate, or bind remote resources",
+			DryRunRecommended: true,
+		}
+
+		// Anchor the example on the first KeyTemplate so it's a concrete,
+		// copy-pasteable command rather than a placeholder.
+		exampleKey := def.Key
+		if len(def.KeyTemplates) > 0 {
+			exampleKey = def.KeyTemplates[0].Example
+		}
+		dryRunExample := fmt.Sprintf("lark-cli event subscription create %s --dry-run --json", exampleKey)
+		p.Subscription = &SubscriptionInfo{
+			PayloadOptions: PayloadOptions{
+				IncludeResourceDataDefault: false,
+				IncludeResourceDataFlag:    "--include-resource-data",
+			},
+			DryRun: DryRunInfo{
+				Supported: true,
+				Example:   dryRunExample,
+			},
+		}
+		p.NextAction = fmt.Sprintf("run `%s` before consume", dryRunExample)
+	}
+
+	output.PrintJson(f.IOStreams.Out, p)
 	return nil
 }
