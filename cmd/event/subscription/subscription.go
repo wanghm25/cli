@@ -74,9 +74,25 @@ func addAsFlag(cmd *cobra.Command) {
 // (core.AsUser or core.AsBot) and rejects anything else — including a
 // literal "auto" leaking through (f.ResolveAs always resolves it to a
 // concrete identity first) and any other garbage flag value.
+//
+// It also enforces the administrator's configured strict-mode identity
+// policy (f.CheckStrictMode) immediately after f.ResolveAs, mirroring every
+// other --as call site in this CLI: cmd/api/api.go's apiRun,
+// cmd/service/service.go's serviceMethodRun, and cmd/whoami/whoami.go's
+// whoamiRun all call CheckStrictMode right after ResolveAs, before any
+// further identity check. Factory.ResolveAs preserves an explicit --as
+// through strict mode by design (internal/cmdutil/factory.go's own comment
+// on that branch) specifically so the caller can reject it here — skipping
+// this call would let an explicit --as of the disallowed type reach the API
+// whenever a credential of that type still happened to be resolvable (e.g.
+// a cached user token under a bot-only strict-mode account), silently
+// bypassing the policy.
 func resolveEffectiveIdentity(cmd *cobra.Command, f *cmdutil.Factory) (core.Identity, error) {
 	flagAs := core.Identity(cmd.Flag("as").Value.String())
 	as := f.ResolveAs(cmd.Context(), cmd, flagAs)
+	if err := f.CheckStrictMode(cmd.Context(), as); err != nil {
+		return "", err
+	}
 	if err := f.CheckIdentity(as, []string{"user", "bot"}); err != nil {
 		return "", err
 	}

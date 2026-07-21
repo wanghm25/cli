@@ -216,6 +216,37 @@ func TestResolveEffectiveIdentity_AcceptsUserAndBot(t *testing.T) {
 	}
 }
 
+// TestResolveEffectiveIdentity_StrictModeRejectsCrossIdentity locks the fix
+// for the Task 8 review finding: resolveEffectiveIdentity must enforce the
+// administrator's configured strict-mode identity policy (f.CheckStrictMode)
+// right after f.ResolveAs — exactly like cmd/api/api.go's apiRun,
+// cmd/service/service.go's serviceMethodRun, and cmd/whoami/whoami.go's
+// whoamiRun (see TestWhoami_StrictModeRejectsCrossIdentity for the mirrored
+// pattern this locks for subscription list/get). Without that call, an
+// explicit --as of the disallowed identity would sail through
+// resolveEffectiveIdentity's {"user","bot"} CheckIdentity list whenever a
+// credential of that type was still resolvable (e.g. a cached user token
+// under a bot-only strict-mode account), bypassing the policy.
+func TestResolveEffectiveIdentity_StrictModeRejectsCrossIdentity(t *testing.T) {
+	// Bot-only account -> strict mode bot (SupportedIdentities bit 2). A real
+	// API call under this account would reject an explicit --as user via
+	// f.CheckStrictMode; resolveEffectiveIdentity must reject it identically.
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{
+		ProfileName: "p", AppID: "test-app", AppSecret: "test-secret", Brand: core.BrandFeishu,
+		SupportedIdentities: 2, // bot only
+	})
+	cmd := newCmdWithAsFlag(t, "user")
+
+	_, err := resolveEffectiveIdentity(cmd, f)
+	if err == nil {
+		t.Fatal("expected an error for --as user under strict mode bot, got nil")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+}
+
 // ---- mapSubscriptionDetail / formatAuthority ----
 
 func TestMapSubscriptionDetail_NilDetail_ReturnsZeroValue(t *testing.T) {
