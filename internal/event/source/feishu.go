@@ -83,6 +83,22 @@ func (s *FeishuSource) buildRawHandler(emit func(*event.RawEvent)) func(context.
 				EventID    string `json:"event_id"`
 				EventType  string `json:"event_type"`
 				CreateTime string `json:"create_time"`
+				// Subscription is the refined-subscription push envelope
+				// (spec §4.3/§0.4): SDK event/model.go's EventHeader.Subscription
+				// shape (resource/authority{type,principal_id}), NOT the OpenAPI
+				// management-side Subscription (target_resource/authority{open_id,
+				// union_id,app_id}) — do not conflate the two. Absent on
+				// non-refined events, in which case every subfield below
+				// zero-values to "".
+				Subscription struct {
+					SubscriptionID string `json:"subscription_id"`
+					Resource       string `json:"resource"`
+					Authority      struct {
+						Type        string `json:"type"`
+						PrincipalID string `json:"principal_id"`
+					} `json:"authority"`
+					SubscriptionEventID string `json:"subscription_event_id"`
+				} `json:"subscription"`
 			} `json:"header"`
 		}
 		if err := json.Unmarshal(e.Body, &envelope); err != nil {
@@ -108,8 +124,41 @@ func (s *FeishuSource) buildRawHandler(emit func(*event.RawEvent)) func(context.
 			SourceTime: envelope.Header.CreateTime,
 			Payload:    json.RawMessage(e.Body),
 			Timestamp:  time.Now(),
+
+			RemoteSubscriptionID: envelope.Header.Subscription.SubscriptionID,
+			Resource:             envelope.Header.Subscription.Resource,
+			Authority: formatSubscriptionAuthority(
+				envelope.Header.Subscription.Authority.Type,
+				envelope.Header.Subscription.Authority.PrincipalID,
+			),
+			SubscriptionEventID: envelope.Header.Subscription.SubscriptionEventID,
 		})
 		return nil
+	}
+}
+
+// formatSubscriptionAuthority normalizes the push-envelope's
+// header.subscription.authority{type,principal_id} into this spec's compact
+// identity vocabulary. Mirrors cmd/event/subscription/subscription.go's
+// formatAuthority (same "user:<id>" / "user" / "app" / passthrough rules),
+// but takes the push-envelope's {type, principal_id} shape rather than the
+// management-side larkeventv1.Authority{Type,OpenId,...} — principal_id IS
+// the open_id for a "user" authority, so no separate OpenId field is needed.
+// authType is an open string, not a closed enum, so an unrecognized value is
+// passed through verbatim rather than dropped.
+func formatSubscriptionAuthority(authType, principalID string) string {
+	switch authType {
+	case "":
+		return ""
+	case "user":
+		if principalID != "" {
+			return "user:" + principalID
+		}
+		return "user"
+	case "app":
+		return "app"
+	default:
+		return authType
 	}
 }
 

@@ -25,6 +25,34 @@ type RawEvent struct {
 	SourceTime string          `json:"source_time,omitempty"`
 	Payload    json.RawMessage `json:"payload"`
 	Timestamp  time.Time       `json:"timestamp"`
+
+	// --- refined-subscription push-envelope fields (spec §4.3/§0.4).
+	// Normalized from the WS push envelope's header.subscription block,
+	// which is a DIFFERENT shape from the OpenAPI management-side
+	// Subscription (target_resource/authority{open_id,union_id,app_id}) —
+	// the two must not be mixed. Empty for events with no
+	// header.subscription (i.e. non-refined events, or events observed
+	// before this normalization existed).
+	//
+	// A later task copies RemoteSubscriptionID/Authority/SubscriptionEventID
+	// verbatim into protocol.Event's fields of the same name; Resource maps
+	// to protocol.Event.TargetResource (name differs intentionally from
+	// Resource here — do not rename either field to match the other).
+
+	// RemoteSubscriptionID identifies which remote Subscription delivered
+	// this event, from header.subscription.subscription_id.
+	RemoteSubscriptionID string `json:"remote_subscription_id,omitempty"`
+	// Resource is the target resource this event was delivered for (e.g.
+	// "im.message?chat_id=oc_xxx"), from header.subscription.resource, verbatim.
+	Resource string `json:"resource,omitempty"`
+	// Authority is the normalized subscription authority descriptor (e.g.
+	// "user:ou_xxx" or "app"), derived from
+	// header.subscription.authority{type,principal_id}.
+	Authority string `json:"authority,omitempty"`
+	// SubscriptionEventID is header.subscription.subscription_event_id: the
+	// preferred component of the refined dedup key, paired with
+	// RemoteSubscriptionID.
+	SubscriptionEventID string `json:"subscription_event_id,omitempty"`
 }
 
 // APIClient: identity is opaque so business code can't bypass pre-flight checks.
