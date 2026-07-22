@@ -54,23 +54,41 @@ func NewCmdCreate(f *cmdutil.Factory) *cobra.Command {
 		Short: "Create (or idempotently reuse) a remote event Subscription",
 		Long: `Create a remote Subscription for a materialized refined EventKey (e.g.
 'im.message.created_v1/chat-id/oc_xxx'), or idempotently reuse an existing
-compatible one. Requires BOTH the event:subscription:read and
-event:subscription:write scopes: this command always reads remote state
-first (to detect an existing subscription and analyze impact) before it may
-create anything.
+compatible one.
 
 A bare refined base key (no template segment) is rejected — pass a
 materialized key such as one of the key_templates[].example values from
 'event schema <base> --json'.
 
-The resolved --as identity must be supported by the EventKey's matched
-KeyTemplate specifically (not just the EventKey in general) — e.g. the
-'owner/me' template only supports --as user.
+IDENTITY: --as user|bot|auto. The resolved identity must be supported by the
+EventKey's matched KeyTemplate SPECIFICALLY (not just the EventKey in
+general) — e.g. the 'owner/me' template only supports --as user even though
+its base key allows user+bot. A mismatch is a typed error naming the
+allowed identities; it never silently falls back to another identity.
 
-Use --dry-run to preview the plan (parse/identity/scope preflight + a
-remote read + impact analysis) without creating, reusing, or changing
-anything. Creating a subscription does not start listening — run 'event
-consume <refined EventKey>' afterwards.`,
+SCOPE: requires BOTH event:subscription:read and event:subscription:write:
+this command always reads remote state first (to detect an existing
+subscription and analyze impact) before it may create anything.
+
+OUTPUT: {operation, action: "created"|"reused", remote_subscription_id,
+subscription{...}, next_action}. A conflicting active subscription
+(different payload_options) or a suspended one is never silently
+overwritten — both return a typed failed_precondition guiding you to 'get'
+or 'reactivate' instead.
+
+NEXT STEP: creating a subscription does not start listening — run 'event
+consume <refined EventKey>' afterwards.
+
+SAFETY: --include-resource-data=true is gated in this phase (typed
+failed_precondition, reason resource_data_encryption_deferred; the default
+false is fully functional). Use --dry-run to preview the plan
+(parse/identity/scope preflight + a remote read + impact analysis) without
+creating, reusing, or changing anything; create never requires --yes
+(additive and pre-checked for conflicts).`,
+		Example: `  lark-cli event schema im.message.created_v1 --json                                          # find key_templates[].example first
+  lark-cli event subscription create im.message.created_v1/chat-id/oc_xxx --dry-run --as bot --json
+  lark-cli event subscription create im.message.created_v1/chat-id/oc_xxx --as bot --json
+  lark-cli event subscription create im.message.created_v1/owner/me --as user --json               # fixed-value template, user only`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCreate(cmd, f, args[0], o)

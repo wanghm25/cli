@@ -57,20 +57,28 @@ func NewCmdDelete(f *cmdutil.Factory) *cobra.Command {
 		Use:   "delete <remote_subscription_id>",
 		Short: "Delete a remote event Subscription",
 		Long: `Delete an existing remote Subscription by its remote_subscription_id.
-Requires BOTH the event:subscription:read and event:subscription:write
-scopes: this command always reads the current remote state first, both to
-report impact for --dry-run and to describe what is about to be deleted
-when confirmation is required.
 
-This is a high-risk write on a resource other identities/processes may
-share: without --yes it returns a confirmation-required error (exit code
-10) instead of proceeding; pass --yes only after a human has confirmed.
+IDENTITY: --as user|bot|auto, resolved to one effective identity (no
+per-template check — this command carries no EventKey context).
 
-Deleting the remote Subscription is NOT a substitute for stopping a local
-'event consume' process that may still be using it — stop that separately
-with 'lark-cli event stop'.
+SCOPE: requires BOTH event:subscription:read and event:subscription:write:
+this command always reads the current remote state first, both to report
+impact for --dry-run and to describe what is about to be deleted when
+confirmation is required.
 
-Use --dry-run to preview the plan without deleting anything.`,
+OUTPUT: {operation, remote_subscription_id, deleted: true, subscription{
+...last known state...}, next_action}.
+
+NEXT STEP: deleting the remote Subscription is NOT a substitute for
+stopping a local 'event consume' process that may still be using it — stop
+that separately with 'lark-cli event stop'.
+
+SAFETY: this is a high-risk write on a resource other identities/processes
+may share — without --yes it returns a confirmation-required error (exit
+code 10) instead of proceeding; pass --yes only after a human has
+confirmed. Use --dry-run to preview the plan without deleting anything.`,
+		Example: `  lark-cli event subscription delete sub_xxx --dry-run --as bot --json
+  lark-cli event subscription delete sub_xxx --yes --as bot --json`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runDelete(cmd, f, args[0], o)

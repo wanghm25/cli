@@ -47,11 +47,34 @@ func NewCmdList(f *cmdutil.Factory) *cobra.Command {
 		Use:   "list",
 		Short: "List remote event Subscriptions",
 		Long: `List the platform's persistent remote Subscription resources visible to
-the effective identity. Requires the event:subscription:read scope.
+the effective identity.
 
 Use --state/--event-key to filter, and --page-size/--page-token to page
 through results. Use 'event subscription get <remote_subscription_id>' for
-full detail on one entry.`,
+full detail on one entry.
+
+IDENTITY: --as user|bot|auto, resolved to one effective identity (no
+per-template check — this command carries no EventKey context). user and
+bot see different remote Subscriptions (each identity only sees its own
+authority's records).
+
+SCOPE: event:subscription:read.
+
+ALLOWED VALUES: --state active|suspended|expired (server-defined; passed
+through verbatim, not validated client-side).
+
+OUTPUT: {subscriptions[]: {remote_subscription_id, event_key,
+target_resource, identity, payload_options, remote{state, expire_time,
+suspension_reason, create_time, update_time}}, has_more, next_page_token,
+next_action}.
+
+NEXT STEP: 'lark-cli event subscription get <remote_subscription_id> --json'
+for one entry's full detail.
+
+SAFETY: read-only; never writes, never requires --yes.`,
+		Example: `  lark-cli event subscription list --as bot --json
+  lark-cli event subscription list --state suspended --as bot --json
+  lark-cli event subscription list --event-key im.message.created_v1 --page-size 20 --as bot --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runList(cmd, f, o)
 		},

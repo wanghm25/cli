@@ -21,6 +21,7 @@ metadata:
 | `lark-cli event consume <EventKey> [flags]` | Blocking consume; events → stdout NDJSON |
 | `lark-cli event status [--json] [--fail-on-orphan]` | Inspect the local bus daemon status |
 | `lark-cli event stop [--all] [--force]` | Stop the bus daemon |
+| `lark-cli event subscription list\|get\|create\|update\|renew\|reactivate\|delete` | Manage remote Subscriptions behind a **refined** (per-resource) EventKey — see [Refined subscriptions](#refined-per-resource-subscriptions) below |
 
 
 ## Common flags
@@ -60,6 +61,19 @@ wait
 1. `lark-cli event list --json` → pick a legal key
 2. `lark-cli event schema <key> --json` → read `resolved_output_schema` + `jq_root_path` to determine field paths
 3. `lark-cli event consume <key> [--jq '<expr>']` → consume
+
+## Refined (per-resource) subscriptions
+
+Some EventKeys aren't consumed directly — `list`/`schema` are still the source of truth, but an EventKey with `refined_subscription:true` must be **materialized** with a resource selector first. Full routing:
+
+1. `lark-cli event list --json` or `lark-cli event schema <key> --json` → check `refined_subscription:true`. If absent, it's a normal key — use the Call flow above.
+2. If present, read `key_templates[]` from the `schema` output and pick one — `key_templates[].example` is a ready-to-use materialized key (e.g. `im.message.created_v1/chat-id/oc_9f3b1c2d8a`).
+3. Prefer `lark-cli event consume <materialized-key> --dry-run --as ...` (or `lark-cli event subscription create <materialized-key> --dry-run --json`) first — refined consume has write-level remote side effects (it may create/reuse/reactivate a remote resource) even though the command itself reads as "just consume".
+4. Drop `--dry-run` to actually consume — same NDJSON/ready-marker/exit-code contract as any other key.
+5. Manage the remote resource independently of the local consumer via `lark-cli event subscription list|get|create|update|renew|reactivate|delete`, keyed by `remote_subscription_id` (from `create`'s or `list`'s output) — this is a *separate* control plane from the local `event consume` process.
+6. Stop chain: `event stop` (or SIGTERM/stdin-close) only stops the LOCAL streaming process; `event subscription delete <remote_subscription_id> --yes` only removes the REMOTE resource. Neither implies the other — see the reference below for the full teardown sequence.
+
+Full details (templates, TTL/renew, the `--as` identity gate and `stale_identity`, the automatic lifecycle recovery behavior, the management-plane command/scope/confirmation table, and the current encryption-deferred boundary on `--include-resource-data`) are in [`references/refined-subscription.md`](references/refined-subscription.md) — read it before using any `event subscription` command or any refined (templated) EventKey.
 
 ## Subprocess contract
 
@@ -154,3 +168,4 @@ Lark-defined semantic tags (**not** JSON Schema's standard `format`). Common val
 | VC         | [`references/lark-event-vc.md`](references/lark-event-vc.md)                 | Catalog of 4 VC EventKeys (`vc.meeting.participant_meeting_started_v1`, `vc.meeting.participant_meeting_joined_v1`, `vc.meeting.participant_meeting_ended_v1`, `vc.note.generated_v1`) + field reference + source type semantics (meeting only) |
 | Minutes    | [`references/lark-event-minutes.md`](references/lark-event-minutes.md)       | Catalog of 1 Minutes EventKey (`minutes.minute.generated_v1`) + field reference + source type semantics (meeting only) |
 | Whiteboard | [`references/lark-event-whiteboard.md`](references/lark-event-whiteboard.md) | Catalog of 1 Board EventKey (`board.whiteboard.updated_v1`) + per-whiteboard subscription model (requires `-p whiteboard_id=<token>`) + payload field reference (whiteboard_id / operator_ids triple-id) |
+| Refined subscriptions | [`references/refined-subscription.md`](references/refined-subscription.md) | Cross-cutting: `key_templates`/materialization/`--dry-run`, TTL/renew, the `--as` identity gate + `stale_identity`, the 6-event lifecycle control plane, the `event subscription` management plane (scope/confirmation table), the stop chain, and the current `--include-resource-data` encryption-deferred boundary |

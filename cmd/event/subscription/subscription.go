@@ -38,7 +38,7 @@ import (
 func NewCmdSubscription(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "subscription",
-		Short: "Manage remote event Subscriptions",
+		Short: "Manage remote event Subscriptions behind a refined EventKey",
 		Long: `Manage the platform's persistent remote Subscription resources that back
 refined (per-resource) event delivery — as opposed to 'event consume', which
 starts a local process that consumes already-delivered events.
@@ -47,9 +47,38 @@ Use 'list' / 'get <remote_subscription_id>' to inspect what is currently
 subscribed remotely, 'create <refined EventKey>' to create (or idempotently
 reuse) one, 'update <remote_subscription_id>' to change its payload_options,
 'renew'/'reactivate' to extend its TTL or resume delivery, and
-'delete <remote_subscription_id>' to remove it. update/delete are high-risk
-writes on a shared remote resource and require --yes after a human confirms
-(spec §3.7); renew/reactivate do not.`,
+'delete <remote_subscription_id>' to remove it.
+
+IDENTITY: --as user|bot|auto on every subcommand, resolved to one effective
+identity per call — user and bot tokens are never mixed within one call.
+Every subcommand EXCEPT 'create' (list/get/update/renew/reactivate/delete)
+carries no EventKey/template context, so there is no extra per-template
+identity check for them; only 'create' enforces one, since it is the sole
+subcommand that takes an EventKey (see 'event subscription create --help').
+
+SCOPE: list/get need event:subscription:read only. create/update/renew/
+reactivate/delete need BOTH event:subscription:read AND
+event:subscription:write — every mutating subcommand always reads remote
+state first (for idempotency / conflict / impact analysis) before it may
+write, so read is required even where the underlying platform call alone
+would not strictly need it.
+
+SAFETY: update/delete are high-risk writes on a resource other identities/
+processes may share and require --yes after a human confirms — without it,
+a typed confirmation-required error (exit code 10); create/renew/reactivate
+never prompt for confirmation. Every subcommand except list/get supports
+--dry-run (parse + identity + scope preflight + a remote read + impact
+analysis, zero writes). 'delete' removing the remote Subscription is NOT a
+substitute for stopping a local 'event consume' process still bound to it —
+stop that separately with 'lark-cli event stop'.
+
+NEXT STEP: after 'create' succeeds, run 'lark-cli event consume <refined
+EventKey>' to actually start receiving events — creating/updating a
+Subscription here never starts, stops, or changes a local consumer.`,
+		Example: `  lark-cli event subscription list --as bot --json
+  lark-cli event subscription get sub_xxx --as bot --json
+  lark-cli event subscription create im.message.created_v1/chat-id/oc_xxx --dry-run --as bot --json
+  lark-cli event subscription delete sub_xxx --dry-run --as bot --json`,
 		SilenceUsage: true,
 	}
 

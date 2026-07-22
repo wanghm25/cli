@@ -36,7 +36,36 @@ func NewCmdStatus(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show event bus daemon status for all discovered apps",
-		Long:  "Connect to each bus daemon under the config-dir/events/ tree and show PID, uptime, and active consumers. Use --current for only the current profile's app. Use --json for machine-readable output. Use --fail-on-orphan to exit 2 when any orphan bus is detected (for health checks).",
+		Long: `Connect to each bus daemon under the config-dir/events/ tree and show PID,
+uptime, and active consumers. Use --current for only the current profile's
+app. Use --json for machine-readable output. Use --fail-on-orphan to exit 2
+when any orphan bus is detected (for health checks).
+
+REFINED CONSUMERS: additive, read-only fields on top of the legacy output —
+refined_subscription, remote_subscription_id, owner{identity, app_id,
+user_open_id}, current_profile_match, stale_identity, remote_state,
+last_lifecycle_event, suspension_reason, last_action/last_action_error,
+degraded_reason, next_action. Legacy consumer output is unchanged.
+
+SCOPE: the local view (bus in-memory state) needs no scope and is always
+shown. For a refined consumer, remote_state/expire_time/
+include_resource_data are additionally supplemented from a live 'subscription
+get' call, but ONLY as a weak, optional dependency: it requires
+event:subscription:read on the CURRENT app + CURRENT identity's already-valid
+(never refreshed) token; a missing scope, no token, or an unreachable remote
+all silently fall back to the local-only view — this never fails the
+command.
+
+OUTPUT: current_profile_match/stale_identity are advisory/informational
+only — they never mean "this consumer is dead"; no liveness signal exists
+here. next_action is read-only guidance, never an action this command takes
+itself.
+
+SAFETY: strictly read-only end to end — never refreshes a token, never calls
+BindUser, never writes anything remote, regardless of flags.`,
+		Example: `  lark-cli event status --json
+  lark-cli event status --current --json
+  lark-cli event status --fail-on-orphan`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runStatus(cmd, f, current, asJSON, failOnOrphan)
 		},

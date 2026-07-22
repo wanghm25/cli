@@ -54,14 +54,28 @@ func NewCmdReactivate(f *cmdutil.Factory) *cobra.Command {
 		Use:   "reactivate <remote_subscription_id>",
 		Short: "Resume delivery on a suspended remote event Subscription",
 		Long: `Reactivate an existing remote Subscription by its remote_subscription_id,
-resuming delivery after it was suspended. Requires BOTH the
-event:subscription:read and event:subscription:write scopes: this command
-always reads the current remote state first to report impact for --dry-run.
+resuming delivery after it was suspended.
 
-reactivate only resumes remote delivery — it is not a high-risk
-confirmation-gated action and does not accept --yes.
+IDENTITY: --as user|bot|auto, resolved to one effective identity (no
+per-template check — this command carries no EventKey context).
 
-Use --dry-run to preview the plan without reactivating anything.`,
+SCOPE: requires BOTH event:subscription:read and event:subscription:write:
+this command always reads the current remote state first to report impact
+for --dry-run.
+
+OUTPUT: {operation, remote_subscription_id, subscription{...}, next_action}.
+
+NEXT STEP: a local 'event consume' process may still need to be (re)started
+separately — reactivate only resumes remote delivery, it never starts,
+stops, or changes a local consumer. Run 'lark-cli event status' to check.
+
+SAFETY: reactivate only resumes remote delivery — it is NOT a high-risk
+confirmation-gated action and does not accept --yes. There is no 'suspend'
+command (the platform exposes none); the only path back from suspended is
+this command. Use --dry-run to preview the plan without reactivating
+anything.`,
+		Example: `  lark-cli event subscription reactivate sub_xxx --dry-run --as bot --json
+  lark-cli event subscription reactivate sub_xxx --as bot --json`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runReactivate(cmd, f, args[0], o)

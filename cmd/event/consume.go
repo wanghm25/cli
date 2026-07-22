@@ -55,7 +55,49 @@ Output is one JSON object per line (NDJSON). Pipe through 'jq .' if you need
 pretty-printed formatting.
 
 Use 'event list' to see all available EventKeys.
-Use 'event schema <EventKey>' for parameter details.`,
+Use 'event schema <EventKey>' for parameter details.
+
+REFINED EVENTKEYS: a key with refined_subscription:true ('event schema <key>
+--json') must be materialized with a resource selector before it can be
+consumed, e.g. 'im.message.created_v1/chat-id/oc_xxx' (see
+key_templates[].example in its schema). The bare base key is rejected with a
+hint pointing at 'event schema'.
+
+IDENTITY: --as user|bot|auto. For a refined key the resolved identity must
+be one the MATCHED template accepts specifically, which can be narrower than
+the key's own declared identities (e.g. an 'owner/me' template only accepts
+'user' even though its base key allows user+bot) — a mismatch is a typed
+error naming the allowed identities, never a silent switch.
+
+SCOPE: a refined key's consume additionally requires BOTH
+event:subscription:read and event:subscription:write on the resolved
+identity's token (it reads remote state before it may create, reuse, or
+reactivate a Subscription). A legacy key only needs its own declared scopes
+(see 'event schema <key>').
+
+OUTPUT: stdout is always business-event NDJSON only. For a refined key,
+diagnostic lines (remote_subscription_id, whether this run created it, the
+ready marker) go to stderr — never stdout.
+
+NEXT STEP: manage the remote Subscription this run created/reused via
+'lark-cli event subscription get|update|renew|reactivate|delete
+<remote_subscription_id>'; run 'lark-cli event status' to see its current
+remote_state.
+
+SAFETY: for a refined key, consuming has write-level side effects (create,
+reuse, or reactivate a remote Subscription) even though this command reads
+as pure observe — run with --dry-run first to preview the plan with zero
+writes. Unlike a legacy key, exiting a refined consumer never deletes the
+remote Subscription (there is no cleanup hook): it is TTL-persistent and
+reused by the next matching consume/create — delete it explicitly via
+'event subscription delete' if you no longer want it to exist. This command
+has no --include-resource-data flag: a refined consume's remote Subscription
+is always created/reused with resource data disabled, consistent with this
+phase's encryption-deferred gate (see 'event subscription create --help').`,
+		Example: `  lark-cli event consume im.message.receive_v1 --as bot                        # legacy key: unlimited stream
+  lark-cli event schema im.message.created_v1 --json                            # refined key: find its templates first
+  lark-cli event consume im.message.created_v1/chat-id/oc_xxx --dry-run --as bot  # preview the refined plan, zero writes
+  lark-cli event consume im.message.created_v1/chat-id/oc_xxx --as bot          # apply the plan, then stream`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runConsume(cmd, f, args[0], o)

@@ -68,17 +68,31 @@ remote_subscription_id. The candidate SDK's Patch call only ever touches
 payload_options — --include-resource-data is the only mutable field, and it
 must be passed explicitly (true or false); there is nothing else to update.
 
-Requires BOTH the event:subscription:read and event:subscription:write
-scopes: this command always reads the current remote state first, both to
-detect a suspended target (which update refuses to touch — run
-'event subscription reactivate <remote_subscription_id>' first) and to
-report impact for --dry-run.
+IDENTITY: --as user|bot|auto, resolved to one effective identity (no
+per-template check — this command carries no EventKey context).
 
-This is a high-risk write on a resource other identities/processes may
-share: without --yes it returns a confirmation-required error (exit code
-10) instead of proceeding; pass --yes only after a human has confirmed.
+SCOPE: requires BOTH event:subscription:read and event:subscription:write:
+this command always reads the current remote state first, both to detect a
+suspended target (which update refuses to touch — run 'event subscription
+reactivate <remote_subscription_id>' first) and to report impact for
+--dry-run.
 
-Use --dry-run to preview the plan without changing anything.`,
+ALLOWED VALUES: --include-resource-data true|false (required — no default is
+silently applied); true is gated in this phase (typed failed_precondition,
+reason resource_data_encryption_deferred).
+
+OUTPUT: {operation, remote_subscription_id, subscription{...}, next_action}.
+
+NEXT STEP: run 'event subscription reactivate <remote_subscription_id>'
+first if the target is suspended — update refuses to touch a suspended
+Subscription.
+
+SAFETY: this is a high-risk write on a resource other identities/processes
+may share — without --yes it returns a confirmation-required error (exit
+code 10) instead of proceeding; pass --yes only after a human has
+confirmed. Use --dry-run to preview the plan without changing anything.`,
+		Example: `  lark-cli event subscription update sub_xxx --include-resource-data false --dry-run --as bot --json
+  lark-cli event subscription update sub_xxx --include-resource-data false --yes --as bot --json`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runUpdate(cmd, f, args[0], o)

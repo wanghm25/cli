@@ -35,13 +35,26 @@ func NewCmdGet(f *cmdutil.Factory) *cobra.Command {
 		Use:   "get <remote_subscription_id>",
 		Short: "Show one remote event Subscription",
 		Long: `Show the current remote state of one Subscription by its
-remote_subscription_id (as returned by 'event subscription list', or by a
-future 'create'). Requires the event:subscription:read scope.
+remote_subscription_id (as returned by 'event subscription list' or
+'create').
 
-The 'local' field is reserved for a future change once local-consumer
-association ('event consume' <-> remote subscription) exists; it is always
-omitted for now.`,
-		Args: cobra.ExactArgs(1),
+IDENTITY: --as user|bot|auto, resolved to one effective identity (no
+per-template check — this command carries no EventKey context).
+
+SCOPE: event:subscription:read.
+
+OUTPUT: {remote_subscription_id, event_key, target_resource, identity,
+payload_options, remote{state, expire_time, suspension_reason, create_time,
+update_time}}. The 'local' field is reserved for a future change once
+local-consumer association ('event consume' <-> remote subscription)
+exists; it is always omitted for now.
+
+NEXT STEP: 'lark-cli event status' shows any LOCAL consumer currently bound
+to this same remote_subscription_id, if one is running.
+
+SAFETY: read-only; never writes, never requires --yes.`,
+		Example: `  lark-cli event subscription get sub_xxx --as bot --json`,
+		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runGet(cmd, f, args[0], asJSON)
 		},

@@ -13,8 +13,38 @@ import (
 func NewCmdEvents(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "event",
-		Short: "Consume and manage real-time events",
-		Long:  `Unified event consumption system. Use 'event consume <EventKey>' to start consuming events.`,
+		Short: "Consume and manage real-time events, including per-resource (refined) subscriptions",
+		Long: `Unified event consumption system for Lark/Feishu real-time events.
+
+Two shapes of EventKey:
+  - legacy (most keys): consume directly, e.g. 'event consume im.message.receive_v1'.
+  - refined (per-resource): the key must be materialized with a resource
+    selector before it can be consumed or subscribed, e.g.
+    'im.message.created_v1/chat-id/oc_xxx'. Check 'event schema <key> --json'
+    for refined_subscription:true + key_templates before using one.
+
+Subcommands:
+  list          Discover EventKeys (marks refined_subscription:true + key_templates for refined ones)
+  schema        Inspect one EventKey's params / output schema / templates
+  consume       Start consuming events for an EventKey (streams NDJSON)
+  status        Show local bus daemon + consumer status
+  stop          Stop the local bus daemon
+  subscription  Manage remote Subscription resources behind a refined EventKey
+                (list/get/create/update/renew/reactivate/delete, keyed by
+                remote_subscription_id) — independent of any local 'consume'
+                process; see 'event subscription --help'.
+
+SAFETY: consuming a refined EventKey has write-level side effects (it may
+create, reuse, or reactivate a remote Subscription before it starts
+streaming) even though the command itself is framed as read/observe. Prefer
+--dry-run first when in doubt.
+
+NEXT STEP: 'lark-cli event list --json' to see what's available, then
+'lark-cli event schema <EventKey> --json' for details.`,
+		Example: `  lark-cli event list --json
+  lark-cli event schema im.message.created_v1 --json
+  lark-cli event consume im.message.created_v1/chat-id/oc_xxx --dry-run --as bot
+  lark-cli event subscription list --as bot --json`,
 		// Without SilenceUsage, RunE errors print the full flag help banner.
 		SilenceUsage: true,
 	}

@@ -52,14 +52,29 @@ func NewCmdRenew(f *cmdutil.Factory) *cobra.Command {
 		Use:   "renew <remote_subscription_id>",
 		Short: "Renew (extend the TTL of) a remote event Subscription",
 		Long: `Renew an existing remote Subscription by its remote_subscription_id,
-extending its TTL. Requires BOTH the event:subscription:read and
-event:subscription:write scopes: this command always reads the current
-remote state first to report impact for --dry-run.
+extending its TTL.
 
-renew only extends an existing subscription's TTL — it is not a high-risk
-confirmation-gated action and does not accept --yes.
+IDENTITY: --as user|bot|auto, resolved to one effective identity (no
+per-template check — this command carries no EventKey context).
 
-Use --dry-run to preview the plan without renewing anything.`,
+SCOPE: requires BOTH event:subscription:read and event:subscription:write:
+this command always reads the current remote state first to report impact
+for --dry-run (a CLI-side design choice, not a platform requirement).
+
+OUTPUT: {operation, remote_subscription_id, subscription{...}, next_action}
+— check subscription.remote.expire_time (unix seconds) for the new TTL.
+
+NEXT STEP: 'lark-cli event subscription get <remote_subscription_id> --json'
+to confirm the new expire_time.
+
+SAFETY: renew only extends TTL — it is NOT a high-risk confirmation-gated
+action and does not accept --yes. Use --dry-run to preview the plan without
+renewing anything. Note: the bus also renews automatically (best-effort,
+single attempt, no retry) on receiving an expiration reminder for a
+Subscription with a matching active local consumer — see 'lark-cli event
+status' for whether that already happened.`,
+		Example: `  lark-cli event subscription renew sub_xxx --dry-run --as bot --json
+  lark-cli event subscription renew sub_xxx --as bot --json`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runRenew(cmd, f, args[0], o)
