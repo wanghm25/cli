@@ -198,6 +198,125 @@ func TestHandleHello_ModernClient_UsesSubscriptionID(t *testing.T) {
 	}
 }
 
+// findSubscriberByPID whitebox-iterates hub.subscribers (same package) to
+// recover the Conn handleHello registered — handleHello doesn't return it,
+// and Hub.Consumers()/ConsumerInfo intentionally don't expose
+// RemoteSubscriptionID (out of scope for this task).
+func findSubscriberByPID(hub *Hub, pid int) (Subscriber, bool) {
+	for s := range hub.subscribers {
+		if s.PID() == pid {
+			return s, true
+		}
+	}
+	return nil, false
+}
+
+// TestHandleHello_PopulatesRemoteSubscriptionID: a Hello carrying a non-empty
+// RemoteSubscriptionID (populated client-side by the Task-15 startup
+// handshake; server-side reading of the field is this task's concern) must
+// flow into the registered Conn, satisfying Subscriber.RemoteSubscriptionID()
+// for Hub.Publish's refined routing (spec §4.3).
+func TestHandleHello_PopulatesRemoteSubscriptionID(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	hub := NewHub()
+	b := &Bus{
+		hub:        hub,
+		logger:     logger,
+		conns:      make(map[*Conn]struct{}),
+		idleTimer:  time.NewTimer(30 * time.Second),
+		shutdownCh: make(chan struct{}, 1),
+	}
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	const pid = 7777
+	hello := &protocol.Hello{
+		PID:                  pid,
+		EventKey:             "im.message.receive_v1/chat-id/oc_1",
+		EventTypes:           []string{"im.message.receive_v1"},
+		RemoteSubscriptionID: "sub_xyz789",
+	}
+
+	br := bufio.NewReader(server)
+	done := make(chan struct{})
+	go func() {
+		b.handleHello(server, br, hello)
+		close(done)
+	}()
+
+	clientReader := bufio.NewReader(client)
+	if _, err := clientReader.ReadString('\n'); err != nil {
+		t.Fatalf("failed to read HelloAck: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleHello did not return within 3s")
+	}
+
+	sub, found := findSubscriberByPID(hub, pid)
+	if !found {
+		t.Fatal("registered conn for pid=7777 not found in hub")
+	}
+	if got := sub.RemoteSubscriptionID(); got != "sub_xyz789" {
+		t.Errorf("RemoteSubscriptionID() on the registered conn = %q, want %q", got, "sub_xyz789")
+	}
+}
+
+// TestHandleHello_EmptyRemoteSubscriptionID_DefaultsToLegacy: a v1 Hello
+// (RemoteSubscriptionID absent/empty) must register a conn whose
+// RemoteSubscriptionID() is "" — the existing/legacy path is unchanged.
+func TestHandleHello_EmptyRemoteSubscriptionID_DefaultsToLegacy(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	hub := NewHub()
+	b := &Bus{
+		hub:        hub,
+		logger:     logger,
+		conns:      make(map[*Conn]struct{}),
+		idleTimer:  time.NewTimer(30 * time.Second),
+		shutdownCh: make(chan struct{}, 1),
+	}
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	const pid = 7778
+	hello := &protocol.Hello{
+		PID:        pid,
+		EventKey:   "im.message.receive_v1",
+		EventTypes: []string{"im.message.receive_v1"},
+		// RemoteSubscriptionID intentionally left unset (legacy v1 client).
+	}
+
+	br := bufio.NewReader(server)
+	done := make(chan struct{})
+	go func() {
+		b.handleHello(server, br, hello)
+		close(done)
+	}()
+
+	clientReader := bufio.NewReader(client)
+	if _, err := clientReader.ReadString('\n'); err != nil {
+		t.Fatalf("failed to read HelloAck: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleHello did not return within 3s")
+	}
+
+	sub, found := findSubscriberByPID(hub, pid)
+	if !found {
+		t.Fatal("registered conn for pid=7778 not found in hub")
+	}
+	if got := sub.RemoteSubscriptionID(); got != "" {
+		t.Errorf("RemoteSubscriptionID() on a legacy-Hello conn = %q, want \"\" (legacy default)", got)
+	}
+}
+
 // TestHandleHello_SingleConsumerRejectsSecond: a SingleConsumer EventKey accepts
 // the first consumer and rejects the second for the same SubscriptionID.
 func TestHandleHello_SingleConsumerRejectsSecond(t *testing.T) {

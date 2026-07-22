@@ -162,3 +162,27 @@ func TestConn_SubscriptionID_EmptyFallsBackToEventKey(t *testing.T) {
 		t.Errorf("SubscriptionID() with empty input = %q, want fallback %q", got, "mail.x")
 	}
 }
+
+// RemoteSubscriptionID defaults to "" (legacy) until explicitly set — a fresh
+// Conn built via NewConn (the Task-15 client hasn't populated Hello.RemoteSubscriptionID
+// yet) must satisfy Subscriber's "empty = legacy" contract.
+func TestConn_RemoteSubscriptionID_DefaultEmpty(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	if got := conn.RemoteSubscriptionID(); got != "" {
+		t.Errorf("RemoteSubscriptionID() on a fresh Conn = %q, want \"\" (legacy default)", got)
+	}
+}
+
+func TestConn_RemoteSubscriptionID_SetterRoundTrips(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	conn.SetRemoteSubscriptionID("sub_abc123")
+	if got := conn.RemoteSubscriptionID(); got != "sub_abc123" {
+		t.Errorf("RemoteSubscriptionID() after SetRemoteSubscriptionID(%q) = %q, want %q", "sub_abc123", got, "sub_abc123")
+	}
+}

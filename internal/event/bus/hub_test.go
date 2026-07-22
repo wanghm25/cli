@@ -4,7 +4,9 @@
 package bus
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -93,6 +95,258 @@ func TestHub_Publish_NonBlocking(t *testing.T) {
 	case <-done:
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("Publish blocked on full channel")
+	}
+}
+
+// recvEvent drains ch with a bounded wait, reporting whether ANY message
+// arrived (msg!=nil) and, if so, whether it decoded as *protocol.Event.
+func recvEvent(ch chan interface{}, timeout time.Duration) (evt *protocol.Event, isEvent bool, msg interface{}) {
+	select {
+	case msg = <-ch:
+		evt, isEvent = msg.(*protocol.Event)
+		return evt, isEvent, msg
+	case <-time.After(timeout):
+		return nil, false, nil
+	}
+}
+
+// mustReceiveEvent asserts a *protocol.Event arrives on ch within 100ms.
+func mustReceiveEvent(t *testing.T, ch chan interface{}, label string) *protocol.Event {
+	t.Helper()
+	evt, isEvent, msg := recvEvent(ch, 100*time.Millisecond)
+	if msg == nil {
+		t.Fatalf("%s: timed out waiting for event", label)
+	}
+	if !isEvent {
+		t.Fatalf("%s: expected *protocol.Event, got %T", label, msg)
+	}
+	return evt
+}
+
+// mustNotReceive asserts NOTHING arrives on ch within 50ms.
+func mustNotReceive(t *testing.T, ch chan interface{}, label string) {
+	t.Helper()
+	if _, _, msg := recvEvent(ch, 50*time.Millisecond); msg != nil {
+		t.Fatalf("%s: should not have received a message, got %#v", label, msg)
+	}
+}
+
+// --- Task 13: Hub dual-index routing + split dedup (spec §4.3/§11.1) ---
+
+// Four-quadrant routing matrix: {with, without} remote_subscription_id ×
+// {legacy, refined} consumer. Refined consumers are matched ONLY by
+// remote_subscription_id equality (never by guessing from event_type alone);
+// legacy consumers keep today's event_type matching regardless of whether the
+// event happens to carry a remote_subscription_id.
+func TestHub_Publish_FourQuadrantRouting(t *testing.T) {
+	h := NewHub()
+	legacy := newTestConn("im.msg", []string{"im.message.receive_v1"})
+	refinedR1 := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
+	refinedR2 := newRefinedTestConn("im.msg/chat-id/oc_2", []string{"im.message.receive_v1"}, "R2")
+	h.RegisterAndIsFirst(legacy)
+	h.RegisterAndIsFirst(refinedR1)
+	h.RegisterAndIsFirst(refinedR2)
+
+	// Quadrant A: event carries remote_subscription_id="R1" — the matching
+	// refined consumer (R1) gets it, R2 (a DIFFERENT remote subscription) does
+	// NOT; legacy still gets it via event_type-compat delivery.
+	h.Publish(&event.RawEvent{
+		EventID:              "evt-with-remote",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		Payload:              json.RawMessage(`{}`),
+	})
+
+	mustReceiveEvent(t, legacy.sendCh, "legacy consumer (event carries remote_subscription_id, routed by event_type)")
+	mustReceiveEvent(t, refinedR1.sendCh, "refined R1 consumer (matching remote_subscription_id)")
+	mustNotReceive(t, refinedR2.sendCh, "refined R2 consumer (non-matching remote_subscription_id must NOT receive)")
+
+	// Quadrant B: event carries NO remote_subscription_id — legacy still gets
+	// it by event_type; NEITHER refined consumer gets it (spec: "不投，不猜
+	// 资源" — never guess which resource an unqualified event belongs to).
+	h.Publish(&event.RawEvent{
+		EventID:   "evt-no-remote",
+		EventType: "im.message.receive_v1",
+		Payload:   json.RawMessage(`{}`),
+	})
+
+	mustReceiveEvent(t, legacy.sendCh, "legacy consumer (event without remote_subscription_id, by event_type)")
+	mustNotReceive(t, refinedR1.sendCh, "refined R1 consumer (event has no remote_subscription_id — must not guess)")
+	mustNotReceive(t, refinedR2.sendCh, "refined R2 consumer (event has no remote_subscription_id — must not guess)")
+}
+
+// Refined events additionally set v2 fields on the fanned-out message
+// (RemoteSubscriptionID/TargetResource/Authority/SubscriptionEventID),
+// normalized from RawEvent's Resource/Authority/SubscriptionEventID (spec
+// §4.3; note the intentional Resource -> TargetResource name change).
+func TestHub_Publish_SetsV2FieldsForRefinedEvent(t *testing.T) {
+	h := NewHub()
+	refinedR1 := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
+	h.RegisterAndIsFirst(refinedR1)
+
+	h.Publish(&event.RawEvent{
+		EventID:              "evt-1",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		Resource:             "im.message?chat_id=oc_1",
+		Authority:            "user:ou_abc123",
+		SubscriptionEventID:  "sub-evt-1",
+		Payload:              json.RawMessage(`{}`),
+	})
+
+	evt := mustReceiveEvent(t, refinedR1.sendCh, "refined R1 consumer")
+	if evt.RemoteSubscriptionID != "R1" {
+		t.Errorf("RemoteSubscriptionID = %q, want %q", evt.RemoteSubscriptionID, "R1")
+	}
+	if evt.TargetResource != "im.message?chat_id=oc_1" {
+		t.Errorf("TargetResource = %q, want %q (from raw.Resource)", evt.TargetResource, "im.message?chat_id=oc_1")
+	}
+	if evt.Authority != "user:ou_abc123" {
+		t.Errorf("Authority = %q, want %q", evt.Authority, "user:ou_abc123")
+	}
+	if evt.SubscriptionEventID != "sub-evt-1" {
+		t.Errorf("SubscriptionEventID = %q, want %q", evt.SubscriptionEventID, "sub-evt-1")
+	}
+}
+
+// Split dedup (spec §4.3): the same event_id delivered under two DIFFERENT
+// remote_subscription_id contexts (the underlying event matched two separate
+// remote Subscriptions, so the source emits it as two distinct RawEvents
+// sharing event_id) must reach EACH refined consumer once — dedup is
+// per-domain, not a single global event_id gate — while the legacy consumer
+// (whose dedup domain is unconditionally event_id) sees it only once.
+func TestHub_Publish_SplitDedupAcrossRemoteSubscriptions(t *testing.T) {
+	h := NewHub()
+	legacy := newTestConn("im.msg", []string{"im.message.receive_v1"})
+	refinedR1 := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
+	refinedR2 := newRefinedTestConn("im.msg/chat-id/oc_2", []string{"im.message.receive_v1"}, "R2")
+	h.RegisterAndIsFirst(legacy)
+	h.RegisterAndIsFirst(refinedR1)
+	h.RegisterAndIsFirst(refinedR2)
+
+	const sharedEventID = "evt-shared-across-subs"
+	h.Publish(&event.RawEvent{
+		EventID:              sharedEventID,
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		SubscriptionEventID:  "sub-evt-r1",
+		Payload:              json.RawMessage(`{}`),
+	})
+	h.Publish(&event.RawEvent{
+		EventID:              sharedEventID,
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R2",
+		SubscriptionEventID:  "sub-evt-r2",
+		Payload:              json.RawMessage(`{}`),
+	})
+
+	mustReceiveEvent(t, refinedR1.sendCh, "refined R1 (own domain, first time)")
+	mustReceiveEvent(t, refinedR2.sendCh, "refined R2 (own domain, first time - distinct remote_subscription_id, must NOT be swallowed by R1's dedup)")
+
+	// legacy dedups by event_id alone: it already saw sharedEventID from the
+	// first Publish, so the second Publish (same event_id, different remote
+	// subscription) must NOT reach it a second time.
+	first := mustReceiveEvent(t, legacy.sendCh, "legacy (first delivery)")
+	if first.EventID != sharedEventID {
+		t.Fatalf("legacy got event_id %q, want %q", first.EventID, sharedEventID)
+	}
+	mustNotReceive(t, legacy.sendCh, "legacy (must be deduped by event_id on the second, same-event_id delivery)")
+}
+
+// Redelivering the identical remote_subscription_id + subscription_event_id
+// must be deduped for that refined consumer (priority ①), exercised through
+// Hub.Publish itself (not just the standalone RefinedDedupKey unit tests).
+func TestHub_Publish_RefinedDedupSameKeyTwice(t *testing.T) {
+	h := NewHub()
+	refinedR1 := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
+	h.RegisterAndIsFirst(refinedR1)
+
+	raw := &event.RawEvent{
+		EventID:              "evt-1",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		SubscriptionEventID:  "sub-evt-1",
+		Payload:              json.RawMessage(`{}`),
+	}
+	h.Publish(raw)
+	h.Publish(raw) // redelivery: identical remote_subscription_id + subscription_event_id
+
+	mustReceiveEvent(t, refinedR1.sendCh, "first delivery")
+	mustNotReceive(t, refinedR1.sendCh, "redelivery with identical dedup key must be dropped")
+}
+
+// Priority ③ (spec §4.3): when both subscription_event_id and event_id are
+// empty, the refined domain cannot build a dedup key — Publish must deliver
+// EVERY time (no dedup, never silently drop) and log a warning.
+func TestHub_Publish_RefinedNoDedupKeyDeliversEveryTimeAndWarns(t *testing.T) {
+	var logBuf bytes.Buffer
+	h := NewHub()
+	h.SetLogger(log.New(&logBuf, "", 0))
+	refinedR1 := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
+	h.RegisterAndIsFirst(refinedR1)
+
+	raw := &event.RawEvent{
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		// EventID and SubscriptionEventID both intentionally empty.
+		Payload: json.RawMessage(`{}`),
+	}
+	h.Publish(raw)
+	h.Publish(raw)
+
+	mustReceiveEvent(t, refinedR1.sendCh, "first delivery (no dedup key possible)")
+	mustReceiveEvent(t, refinedR1.sendCh, "second delivery MUST still arrive: no dedup key means no dedup, not a drop")
+
+	if !strings.Contains(logBuf.String(), "WARN") {
+		t.Errorf("expected a WARN log for the un-dedupable refined event, got log: %q", logBuf.String())
+	}
+}
+
+// fan-out: multiple LOCAL consumers may share one remote_subscription_id
+// (spec §4.3) — registration is unrestricted (unlike SingleConsumer legacy
+// keys); each must receive the event independently with its OWN monotonic
+// seq (Conn.NextSeq()), never aliasing another subscriber's Seq.
+func TestHub_Publish_FanOutMultipleConsumersSameRemoteSubID(t *testing.T) {
+	h := NewHub()
+	connA, _ := net.Pipe()
+	connB, _ := net.Pipe()
+	defer connA.Close()
+	defer connB.Close()
+
+	subA := NewConn(connA, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "im.msg/chat-id/oc_1:consumerA")
+	subA.SetRemoteSubscriptionID("R1")
+	subB := NewConn(connB, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 2, "im.msg/chat-id/oc_1:consumerB")
+	subB.SetRemoteSubscriptionID("R1")
+
+	if !h.RegisterAndIsFirst(subA) {
+		t.Fatal("subA should be first for its own SubscriptionID")
+	}
+	if !h.RegisterAndIsFirst(subB) {
+		t.Fatal("subB should ALSO be first (distinct SubscriptionID - fan-out is not exclusive)")
+	}
+
+	h.Publish(&event.RawEvent{
+		EventID:              "evt-fanout",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		SubscriptionEventID:  "sub-evt-fanout",
+		Payload:              json.RawMessage(`{"x":1}`),
+	})
+
+	evtA := mustReceiveEvent(t, subA.SendCh(), "consumer A")
+	evtB := mustReceiveEvent(t, subB.SendCh(), "consumer B")
+
+	if evtA.Seq != 1 {
+		t.Errorf("consumer A seq = %d, want 1 (fresh per-conn counter)", evtA.Seq)
+	}
+	if evtB.Seq != 1 {
+		t.Errorf("consumer B seq = %d, want 1 (independent per-conn counter, must not alias A's)", evtB.Seq)
+	}
+	if evtA.RemoteSubscriptionID != "R1" || evtB.RemoteSubscriptionID != "R1" {
+		t.Errorf("both fan-out consumers should see RemoteSubscriptionID=R1: A=%q B=%q", evtA.RemoteSubscriptionID, evtB.RemoteSubscriptionID)
+	}
+	if evtA.SubscriptionEventID != "sub-evt-fanout" || evtB.SubscriptionEventID != "sub-evt-fanout" {
+		t.Errorf("both fan-out consumers should see SubscriptionEventID propagated: A=%q B=%q", evtA.SubscriptionEventID, evtB.SubscriptionEventID)
 	}
 }
 
@@ -221,11 +475,12 @@ func TestHub_UnregisterAndIsLast_Concurrent(t *testing.T) {
 }
 
 type testConn struct {
-	eventKey   string
-	eventTypes []string
-	sendCh     chan interface{}
-	pid        int
-	received   atomic.Int64
+	eventKey             string
+	eventTypes           []string
+	sendCh               chan interface{}
+	pid                  int
+	received             atomic.Int64
+	remoteSubscriptionID string
 }
 
 func newTestConn(eventKey string, eventTypes []string) *testConn {
@@ -237,15 +492,28 @@ func newTestConn(eventKey string, eventTypes []string) *testConn {
 	}
 }
 
+// newRefinedTestConn builds a mock subscriber bound to a remote_subscription_id
+// (spec §4.3): a non-empty RemoteSubscriptionID() marks it "refined" for Hub.Publish
+// routing, matched by remote_subscription_id equality rather than EventTypes().
+func newRefinedTestConn(eventKey string, eventTypes []string, remoteSubscriptionID string) *testConn {
+	c := newTestConn(eventKey, eventTypes)
+	c.remoteSubscriptionID = remoteSubscriptionID
+	return c
+}
+
 func (c *testConn) EventKey() string { return c.eventKey }
 
 // SubscriptionID falls back to EventKey for test mocks that don't set a separate subscription ID.
-func (c *testConn) SubscriptionID() string   { return c.eventKey }
-func (c *testConn) EventTypes() []string     { return c.eventTypes }
-func (c *testConn) SendCh() chan interface{} { return c.sendCh }
-func (c *testConn) PID() int                 { return c.pid }
-func (c *testConn) IncrementReceived()       { c.received.Add(1) }
-func (c *testConn) Received() int64          { return c.received.Load() }
+func (c *testConn) SubscriptionID() string { return c.eventKey }
+func (c *testConn) EventTypes() []string   { return c.eventTypes }
+
+// RemoteSubscriptionID: "" (the zero value) means legacy — matches Subscriber's
+// documented contract. Tests opt into refined behavior via newRefinedTestConn.
+func (c *testConn) RemoteSubscriptionID() string { return c.remoteSubscriptionID }
+func (c *testConn) SendCh() chan interface{}     { return c.sendCh }
+func (c *testConn) PID() int                     { return c.pid }
+func (c *testConn) IncrementReceived()           { c.received.Add(1) }
+func (c *testConn) Received() int64              { return c.received.Load() }
 
 func (c *testConn) DroppedCount() int64 { return 0 }
 

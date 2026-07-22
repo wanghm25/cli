@@ -22,23 +22,30 @@ const (
 
 // Conn represents a single consume client connection in the Bus.
 type Conn struct {
-	conn            net.Conn
-	reader          *bufio.Reader
-	sendCh          chan interface{}
-	sendMu          sync.Mutex // serialises drop+push atomically
-	writeMu         sync.Mutex // serialises all net.Conn writes (Encode+SetWriteDeadline is a 2-call sequence)
-	eventKey        string
-	eventTypes      []string
-	subID           string
-	pid             int
-	onClose         func(*Conn)
-	checkLastForKey func(scope string) bool
-	logger          *log.Logger
-	closed          chan struct{}
-	closeOnce       sync.Once
-	received        atomic.Int64  // events fanned out to us (post-filter)
-	seqCounter      atomic.Uint64 // per-conn monotonic seq assigned by Hub.Publish
-	dropped         atomic.Int64  // events evicted via drop-oldest backpressure
+	conn       net.Conn
+	reader     *bufio.Reader
+	sendCh     chan interface{}
+	sendMu     sync.Mutex // serialises drop+push atomically
+	writeMu    sync.Mutex // serialises all net.Conn writes (Encode+SetWriteDeadline is a 2-call sequence)
+	eventKey   string
+	eventTypes []string
+	subID      string
+	pid        int
+	// remoteSubscriptionID is set post-construction via SetRemoteSubscriptionID
+	// (mirrors SetLogger/SetOnClose: no locking needed, populated once before
+	// Start() and only read afterward). Empty ("") means legacy — populated
+	// from Hello.RemoteSubscriptionID in handleHello (spec §4.3); the CLIENT
+	// that sends a non-empty value is Task 15, so this is "" in practice
+	// until then.
+	remoteSubscriptionID string
+	onClose              func(*Conn)
+	checkLastForKey      func(scope string) bool
+	logger               *log.Logger
+	closed               chan struct{}
+	closeOnce            sync.Once
+	received             atomic.Int64  // events fanned out to us (post-filter)
+	seqCounter           atomic.Uint64 // per-conn monotonic seq assigned by Hub.Publish
+	dropped              atomic.Int64  // events evicted via drop-oldest backpressure
 }
 
 // NewConn creates a Conn; pass a reader with pre-buffered bytes (handoff from Bus.handleConn) or nil for a fresh one.
@@ -75,12 +82,23 @@ func (c *Conn) SetCheckLastForKey(fn func(string) bool) { c.checkLastForKey = fn
 // SetLogger attaches a logger (nil tolerated).
 func (c *Conn) SetLogger(l *log.Logger) { c.logger = l }
 
-func (c *Conn) EventKey() string         { return c.eventKey }
-func (c *Conn) EventTypes() []string     { return c.eventTypes }
-func (c *Conn) SendCh() chan interface{} { return c.sendCh }
-func (c *Conn) PID() int                 { return c.pid }
-func (c *Conn) IncrementReceived()       { c.received.Add(1) }
-func (c *Conn) Received() int64          { return c.received.Load() }
+// SetRemoteSubscriptionID records which remote Subscription (OpenAPI primary
+// key, e.g. "sub_xxx") this consumer is bound to, read from
+// Hello.RemoteSubscriptionID in handleHello. Call before Start() (same
+// convention as SetLogger/SetOnClose/SetCheckLastForKey) — set once,
+// read-only afterward, so no additional locking is needed.
+func (c *Conn) SetRemoteSubscriptionID(id string) { c.remoteSubscriptionID = id }
+
+func (c *Conn) EventKey() string     { return c.eventKey }
+func (c *Conn) EventTypes() []string { return c.eventTypes }
+
+// RemoteSubscriptionID satisfies Subscriber: "" means legacy (the default
+// for every Conn until SetRemoteSubscriptionID is called).
+func (c *Conn) RemoteSubscriptionID() string { return c.remoteSubscriptionID }
+func (c *Conn) SendCh() chan interface{}     { return c.sendCh }
+func (c *Conn) PID() int                     { return c.pid }
+func (c *Conn) IncrementReceived()           { c.received.Add(1) }
+func (c *Conn) Received() int64              { return c.received.Load() }
 
 // NextSeq returns the next monotonic seq for this conn (first call returns 1).
 func (c *Conn) NextSeq() uint64 { return c.seqCounter.Add(1) }

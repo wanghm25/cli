@@ -41,6 +41,12 @@ type Subscriber interface {
 	// When no resource qualifier is needed it equals EventKey.
 	SubscriptionID() string
 	EventTypes() []string
+	// RemoteSubscriptionID is the remote Subscription (OpenAPI primary key,
+	// e.g. "sub_xxx") this consumer is bound to; "" means legacy (routed by
+	// EventTypes() only, spec §4.3's dual-index routing matrix). Distinct
+	// from SubscriptionID, which is the local per-resource fingerprint used
+	// for the registration/cleanup machinery above and is unrelated to this.
+	RemoteSubscriptionID() string
 	SendCh() chan interface{}
 	PID() int
 	IncrementReceived()
@@ -65,6 +71,19 @@ type Hub struct {
 	// presence means a cleanup lock is held for that subscription.
 	cleanupInProgress map[string]chan struct{}
 	logger            atomic.Pointer[log.Logger]
+
+	// legacyDedup and refinedDedup are separate dedup domains (spec §4.3:
+	// "去重在识别路由域后执行，不在 Source 入口全局吞" — dedup runs AFTER
+	// routing-domain identification, never as one global gate at the source
+	// entry). legacyDedup keys by event_id alone (today's behavior, applied
+	// to every event regardless of remote_subscription_id — legacy consumers
+	// receive refined events too). refinedDedup keys by RefinedDedupKey
+	// (remote_subscription_id-scoped), so the SAME event_id delivered under
+	// two different remote_subscription_id contexts dedups independently in
+	// each, rather than the second delivery being swallowed globally. Each
+	// *event.DedupFilter is self-locking; do not add locking around them.
+	legacyDedup  *event.DedupFilter
+	refinedDedup *event.DedupFilter
 }
 
 func NewHub() *Hub {
@@ -72,6 +91,8 @@ func NewHub() *Hub {
 		subscribers:       make(map[Subscriber]struct{}),
 		subCounts:         make(map[string]int),
 		cleanupInProgress: make(map[string]chan struct{}),
+		legacyDedup:       event.NewDedupFilter(),
+		refinedDedup:      event.NewDedupFilter(),
 	}
 }
 
@@ -202,7 +223,24 @@ func (h *Hub) existingPIDForSubscriptionLocked(sid string) int {
 	return 0
 }
 
+// publishMatch pairs a matched Subscriber with which routing domain matched it,
+// so the dedup gate (computed once per domain per Publish, below) is applied
+// per-recipient without re-deriving refined-vs-legacy from scratch.
+type publishMatch struct {
+	sub     Subscriber
+	refined bool
+}
+
 // Publish fans out a RawEvent to all matching subscribers (non-blocking).
+//
+// Dual-index routing (spec §4.3): a refined consumer (Subscriber.RemoteSubscriptionID()
+// != "") is matched ONLY by remote_subscription_id equality — never by
+// event_type alone, and never when raw has no remote_subscription_id (never
+// guess which resource an unqualified event belongs to; the consumer-side
+// re-checks event_type/owner/identity later, spec §4.3:300). A legacy
+// consumer (RemoteSubscriptionID() == "") keeps today's event_type matching
+// unconditionally — including for refined-native events, which legacy
+// consumers still receive via event_type compat delivery.
 //
 // A fresh *protocol.Event is allocated per subscriber so each consumer sees
 // its own monotonically-increasing Seq (assigned via Conn.NextSeq) — sharing
@@ -211,11 +249,17 @@ func (h *Hub) existingPIDForSubscriptionLocked(sid string) int {
 // cheap compared to the socket write that follows.
 func (h *Hub) Publish(raw *event.RawEvent) {
 	h.mu.RLock()
-	matches := make([]Subscriber, 0, len(h.subscribers))
+	matches := make([]publishMatch, 0, len(h.subscribers))
 	for s := range h.subscribers {
+		if remoteSubID := s.RemoteSubscriptionID(); remoteSubID != "" {
+			if raw.RemoteSubscriptionID != "" && remoteSubID == raw.RemoteSubscriptionID {
+				matches = append(matches, publishMatch{sub: s, refined: true})
+			}
+			continue
+		}
 		for _, et := range s.EventTypes() {
 			if et == raw.EventType {
-				matches = append(matches, s)
+				matches = append(matches, publishMatch{sub: s, refined: false})
 				break
 			}
 		}
@@ -232,7 +276,44 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 		sourceTime = fmt.Sprintf("%d", raw.Timestamp.UnixMilli())
 	}
 
-	for _, s := range matches {
+	// Split dedup (spec §4.3): runs AFTER routing-domain identification, not
+	// as one global event_id gate at the source entry — otherwise the same
+	// physical event delivered under two remote_subscription_id contexts
+	// would have its second delivery swallowed before Hub.Publish even got to
+	// route it to the second refined consumer. Each IsDuplicate call is
+	// self-locking and has side effects (marks the key seen); called exactly
+	// once per domain per Publish, regardless of how many subscribers match.
+	//
+	// legacyDup is evaluated unconditionally: legacy consumers receive
+	// refined events too (routed by event_type above), so the legacy domain
+	// must dedup by event_id across BOTH kinds of raw events.
+	legacyDup := h.legacyDedup.IsDuplicate(raw.EventID)
+
+	// refinedDrop only applies when raw actually carries a
+	// remote_subscription_id (that's the domain gate — there is no refined
+	// domain otherwise). Priority ①②③ per RefinedDedupKey; ③ (ok=false) means
+	// no key could be built — deliver unconditionally (never silently drop)
+	// and log a warning instead.
+	var refinedDrop bool
+	if raw.RemoteSubscriptionID != "" {
+		if key, ok := event.RefinedDedupKey(raw.RemoteSubscriptionID, raw.SubscriptionEventID, raw.EventID); ok {
+			refinedDrop = h.refinedDedup.IsDuplicate(key)
+		} else if lg := h.logger.Load(); lg != nil {
+			lg.Printf("WARN: refined event undeduplicated: remote_subscription_id=%s event_id=%s has no subscription_event_id and no event_id (cannot build a dedup key); delivering without dedup",
+				raw.RemoteSubscriptionID, raw.EventID)
+		}
+	}
+
+	for _, m := range matches {
+		if m.refined {
+			if refinedDrop {
+				continue
+			}
+		} else if legacyDup {
+			continue
+		}
+		s := m.sub
+
 		msg := protocol.NewEvent(
 			raw.EventType,
 			raw.EventID,
@@ -240,6 +321,19 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 			s.NextSeq(),
 			raw.Payload,
 		)
+		// v2 fields (spec §4.3): populated whenever the RAW event is refined,
+		// regardless of which domain THIS recipient matched in — a legacy
+		// consumer receiving a refined-native event via event_type compat
+		// delivery gets them too (harmless: omitempty on the wire, and this
+		// recipient just ignores fields it doesn't look at). Resource ->
+		// TargetResource name difference is intentional (see RawEvent/Event
+		// doc comments) — do not rename either to match the other.
+		if raw.RemoteSubscriptionID != "" {
+			msg.RemoteSubscriptionID = raw.RemoteSubscriptionID
+			msg.TargetResource = raw.Resource
+			msg.Authority = raw.Authority
+			msg.SubscriptionEventID = raw.SubscriptionEventID
+		}
 
 		enqueued, dropped := s.PushDropOldest(msg)
 		if dropped {

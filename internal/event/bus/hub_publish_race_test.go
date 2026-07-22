@@ -5,6 +5,7 @@ package bus
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,7 +30,14 @@ func TestPublishRaceBookkeepingAccurate(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perPublisher; j++ {
+				// Unique EventID per call: Hub.Publish now dedups by event_id
+				// for the legacy domain (spec §4.3, relocated INSIDE Publish).
+				// This test stresses PushDropOldest/enqueue bookkeeping under
+				// concurrency, not dedup — every call must look like a
+				// genuinely distinct event or almost all of them would
+				// collapse into a single delivery.
 				h.Publish(&event.RawEvent{
+					EventID:   fmt.Sprintf("evt-%d-%d", i, j),
 					EventType: "race.type",
 					Payload:   json.RawMessage(`{}`),
 				})
@@ -91,7 +99,11 @@ func TestPublishDoesNotIncrementWhenPushDropOldestFails(t *testing.T) {
 	h.RegisterAndIsFirst(sub)
 
 	for i := 0; i < 100; i++ {
+		// Unique EventID per call (spec §4.3 dedup now lives inside
+		// Publish): keeps this genuinely exercising 100 independent
+		// PushDropOldest failures rather than 1 real attempt + 99 dedup-skips.
 		h.Publish(&event.RawEvent{
+			EventID:   fmt.Sprintf("evt-%d", i),
 			EventType: "fail.type",
 			Payload:   json.RawMessage(`{}`),
 		})
@@ -110,16 +122,20 @@ type alwaysFailSubscriber struct {
 	dropped    atomic.Int64
 }
 
-func (s *alwaysFailSubscriber) EventKey() string         { return s.eventKey }
-func (s *alwaysFailSubscriber) SubscriptionID() string   { return s.eventKey }
-func (s *alwaysFailSubscriber) EventTypes() []string     { return s.eventTypes }
-func (s *alwaysFailSubscriber) SendCh() chan interface{} { return s.sendCh }
-func (s *alwaysFailSubscriber) PID() int                 { return 0 }
-func (s *alwaysFailSubscriber) IncrementReceived()       { s.received.Add(1) }
-func (s *alwaysFailSubscriber) Received() int64          { return s.received.Load() }
-func (s *alwaysFailSubscriber) DroppedCount() int64      { return s.dropped.Load() }
-func (s *alwaysFailSubscriber) IncrementDropped()        { s.dropped.Add(1) }
-func (s *alwaysFailSubscriber) NextSeq() uint64          { return 0 }
+func (s *alwaysFailSubscriber) EventKey() string       { return s.eventKey }
+func (s *alwaysFailSubscriber) SubscriptionID() string { return s.eventKey }
+func (s *alwaysFailSubscriber) EventTypes() []string   { return s.eventTypes }
+
+// RemoteSubscriptionID: always legacy ("") — this mock only exercises the
+// PushDropOldest-failure/bookkeeping path, unrelated to refined routing.
+func (s *alwaysFailSubscriber) RemoteSubscriptionID() string { return "" }
+func (s *alwaysFailSubscriber) SendCh() chan interface{}     { return s.sendCh }
+func (s *alwaysFailSubscriber) PID() int                     { return 0 }
+func (s *alwaysFailSubscriber) IncrementReceived()           { s.received.Add(1) }
+func (s *alwaysFailSubscriber) Received() int64              { return s.received.Load() }
+func (s *alwaysFailSubscriber) DroppedCount() int64          { return s.dropped.Load() }
+func (s *alwaysFailSubscriber) IncrementDropped()            { s.dropped.Add(1) }
+func (s *alwaysFailSubscriber) NextSeq() uint64              { return 0 }
 func (s *alwaysFailSubscriber) TrySend(msg interface{}) bool {
 	select {
 	case s.sendCh <- msg:
@@ -153,16 +169,20 @@ func newRaceSubscriber(key string, types []string, capacity int) *raceSubscriber
 	}
 }
 
-func (s *raceSubscriber) EventKey() string         { return s.eventKey }
-func (s *raceSubscriber) SubscriptionID() string   { return s.eventKey }
-func (s *raceSubscriber) EventTypes() []string     { return s.eventTypes }
-func (s *raceSubscriber) SendCh() chan interface{} { return s.sendCh }
-func (s *raceSubscriber) PID() int                 { return s.pid }
-func (s *raceSubscriber) IncrementReceived()       { s.received.Add(1) }
-func (s *raceSubscriber) Received() int64          { return s.received.Load() }
-func (s *raceSubscriber) DroppedCount() int64      { return s.dropped.Load() }
-func (s *raceSubscriber) IncrementDropped()        { s.dropped.Add(1) }
-func (s *raceSubscriber) NextSeq() uint64          { return 0 }
+func (s *raceSubscriber) EventKey() string       { return s.eventKey }
+func (s *raceSubscriber) SubscriptionID() string { return s.eventKey }
+func (s *raceSubscriber) EventTypes() []string   { return s.eventTypes }
+
+// RemoteSubscriptionID: always legacy ("") — this mock exercises Publish's
+// concurrency/bookkeeping accuracy under load, unrelated to refined routing.
+func (s *raceSubscriber) RemoteSubscriptionID() string { return "" }
+func (s *raceSubscriber) SendCh() chan interface{}     { return s.sendCh }
+func (s *raceSubscriber) PID() int                     { return s.pid }
+func (s *raceSubscriber) IncrementReceived()           { s.received.Add(1) }
+func (s *raceSubscriber) Received() int64              { return s.received.Load() }
+func (s *raceSubscriber) DroppedCount() int64          { return s.dropped.Load() }
+func (s *raceSubscriber) IncrementDropped()            { s.dropped.Add(1) }
+func (s *raceSubscriber) NextSeq() uint64              { return 0 }
 
 func (s *raceSubscriber) TrySend(msg interface{}) bool {
 	s.sendMu.Lock()

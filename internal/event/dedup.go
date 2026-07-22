@@ -69,3 +69,36 @@ func (d *DedupFilter) cleanupExpired(now time.Time) {
 		}
 	}
 }
+
+// RefinedDedupKey builds the dedup key for the refined-subscription domain,
+// with a frozen fallback priority (spec §4.3):
+//
+//	① remote_subscription_id + subscription_event_id (preferred: unique within
+//	   the remote Subscription's own event enumeration).
+//	② remote_subscription_id + event_id (fallback when the push envelope
+//	   didn't carry a subscription_event_id).
+//	③ neither subEventID nor eventID present: no key can be built. ok=false
+//	   tells the caller dedup is impossible here — it MUST deliver the event
+//	   unconditionally (never silently drop) and should log a warning.
+//
+// remoteSubID=="" always returns ok=false: there is no refined domain
+// without a remote_subscription_id (that event isn't a refined-subscription
+// event in the first place; it belongs only to the legacy event_id domain).
+//
+// The key mixes a NUL byte between components so a boundary shift (e.g.
+// remoteSubID="R1"+subEventID="23" vs remoteSubID="R12"+subEventID="3")
+// can't collide via naive string concatenation. The returned key is an
+// opaque string handed straight to DedupFilter.IsDuplicate — this function
+// does no locking or TTL/ring bookkeeping of its own.
+func RefinedDedupKey(remoteSubID, subEventID, eventID string) (key string, ok bool) {
+	if remoteSubID == "" {
+		return "", false
+	}
+	if subEventID != "" {
+		return remoteSubID + "\x00" + subEventID, true
+	}
+	if eventID != "" {
+		return remoteSubID + "\x00" + eventID, true
+	}
+	return "", false
+}

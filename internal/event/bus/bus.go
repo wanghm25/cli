@@ -37,7 +37,6 @@ type Bus struct {
 	domain    string
 	transport transport.IPC
 	hub       *Hub
-	dedup     *event.DedupFilter
 	listener  net.Listener
 	logger    *log.Logger
 	startTime time.Time
@@ -58,7 +57,6 @@ func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logge
 		domain:    domain,
 		transport: tr,
 		hub:       NewHub(),
-		dedup:     event.NewDedupFilter(),
 		logger:    logger,
 		startTime: time.Now(),
 		conns:     make(map[*Conn]struct{}),
@@ -173,10 +171,11 @@ func (b *Bus) startSources(ctx context.Context) {
 			b.logger.Printf("Starting source: %s", s.Name())
 			err := s.Start(ctx, eventTypes, func(raw *event.RawEvent) {
 				b.logger.Printf("Event received: type=%s id=%s", raw.EventType, raw.EventID)
-				if b.dedup.IsDuplicate(raw.EventID) {
-					b.logger.Printf("Event deduplicated: id=%s", raw.EventID)
-					return
-				}
+				// Dedup runs INSIDE Hub.Publish, after routing-domain
+				// identification (spec §4.3) — not here as a single global
+				// event_id gate, which would swallow a refined event's second
+				// delivery (same event_id, different remote_subscription_id)
+				// before it ever reached its second refined consumer.
 				b.hub.Publish(raw)
 			}, func(state, detail string) {
 				b.hub.BroadcastSourceStatus(s.Name(), state, detail)
@@ -267,6 +266,13 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 		subID = hello.EventKey
 	}
 	bc := NewConn(conn, reader, hello.EventKey, hello.EventTypes, hello.PID, subID)
+	// Server-side read of the Task-11 Hello field; the CLIENT that populates
+	// it is Task 15, so this is "" (legacy) in practice until then — existing
+	// behavior is unchanged. Empty stays empty (Subscriber's "" = legacy
+	// contract), same fallback shape as SubscriptionID above but WITHOUT a
+	// fallback-to-EventKey: an absent remote_subscription_id must stay empty,
+	// never be repurposed from another field.
+	bc.SetRemoteSubscriptionID(hello.RemoteSubscriptionID)
 	bc.SetLogger(b.logger)
 
 	// SingleConsumer EventKeys allow only one consumer per SubscriptionID: reject extras at handshake.

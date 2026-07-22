@@ -132,6 +132,79 @@ func TestDedupFilter_TTLExpiryAfterCleanupRunRespected(t *testing.T) {
 	}
 }
 
+// RefinedDedupKey priority is frozen (spec §4.3): ① remote_subscription_id +
+// subscription_event_id; ② fallback to remote_subscription_id + event_id when
+// subscription_event_id is absent; ③ neither available → ok=false (caller must
+// deliver without dedup and log a warning). remoteSubID=="" always yields
+// ok=false: there is no refined domain without a remote_subscription_id.
+func TestRefinedDedupKey_Priority(t *testing.T) {
+	tests := []struct {
+		name        string
+		remoteSubID string
+		subEventID  string
+		eventID     string
+		wantOK      bool
+	}{
+		{"priority1_subEventID_preferred_over_eventID", "R1", "sub-evt-1", "evt-1", true},
+		{"priority2_fallback_to_eventID", "R1", "", "evt-1", true},
+		{"priority3_neither_present_not_dedupable", "R1", "", "", false},
+		{"no_remoteSubID_not_refined_domain", "", "sub-evt-1", "evt-1", false},
+		{"no_remoteSubID_and_nothing_else", "", "", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			key, ok := RefinedDedupKey(tc.remoteSubID, tc.subEventID, tc.eventID)
+			if ok != tc.wantOK {
+				t.Fatalf("RefinedDedupKey(%q,%q,%q) ok=%v, want %v", tc.remoteSubID, tc.subEventID, tc.eventID, ok, tc.wantOK)
+			}
+			if !ok && key != "" {
+				t.Errorf("RefinedDedupKey ok=false must return an empty key, got %q", key)
+			}
+		})
+	}
+}
+
+// Priority ①: when both subscription_event_id and event_id are present, the
+// key must be built from subscription_event_id (the preferred component),
+// never a key that would collide with the ② fallback shape.
+func TestRefinedDedupKey_PrefersSubscriptionEventIDOverEventID(t *testing.T) {
+	keyWithBoth, ok := RefinedDedupKey("R1", "sub-evt-1", "evt-1")
+	if !ok {
+		t.Fatal("expected ok=true when subscription_event_id is present")
+	}
+	keyFallbackOnly, ok := RefinedDedupKey("R1", "", "evt-1")
+	if !ok {
+		t.Fatal("expected ok=true for the fallback (event_id only) case")
+	}
+	if keyWithBoth == keyFallbackOnly {
+		t.Errorf("key built from subscription_event_id (%q) must differ from the event_id-only fallback key (%q) — priority ① must win, not silently degrade to ②", keyWithBoth, keyFallbackOnly)
+	}
+}
+
+// The key builder must not let a naive concatenation collide across a
+// component boundary (e.g. remoteSubID="R1"+subEventID="23" vs
+// remoteSubID="R12"+subEventID="3"): a real separator is required.
+func TestRefinedDedupKey_NoBoundaryCollision(t *testing.T) {
+	keyA, okA := RefinedDedupKey("R1", "23", "")
+	keyB, okB := RefinedDedupKey("R12", "3", "")
+	if !okA || !okB {
+		t.Fatal("both cases should be dedupable (ok=true)")
+	}
+	if keyA == keyB {
+		t.Errorf("boundary collision: RefinedDedupKey(%q,%q,_) == RefinedDedupKey(%q,%q,_) == %q; key builder needs an unambiguous separator", "R1", "23", "R12", "3", keyA)
+	}
+}
+
+// Same (remoteSubID, subEventID, eventID) inputs must always build the same
+// key: RefinedDedupKey is a pure function, its output feeds DedupFilter.IsDuplicate.
+func TestRefinedDedupKey_Deterministic(t *testing.T) {
+	k1, ok1 := RefinedDedupKey("R1", "sub-1", "evt-1")
+	k2, ok2 := RefinedDedupKey("R1", "sub-1", "evt-1")
+	if !ok1 || !ok2 || k1 != k2 {
+		t.Errorf("RefinedDedupKey must be deterministic: got (%q,%v) and (%q,%v)", k1, ok1, k2, ok2)
+	}
+}
+
 func TestDedupFilter_ConcurrentRingEviction(t *testing.T) {
 	const ringSize = 16
 	const writers = 8

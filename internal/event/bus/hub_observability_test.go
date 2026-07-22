@@ -4,6 +4,7 @@
 package bus
 
 import (
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -21,9 +22,14 @@ func TestHubDroppedCountIncrements(t *testing.T) {
 	c.sendCh = make(chan interface{}, 1)
 	h.RegisterAndIsFirst(c)
 
-	h.Publish(&event.RawEvent{EventType: "t"})
-	h.Publish(&event.RawEvent{EventType: "t"})
-	h.Publish(&event.RawEvent{EventType: "t"})
+	// Distinct EventIDs: Hub.Publish now dedups by event_id for the legacy
+	// domain (spec §4.3 relocated dedup INSIDE Publish, previously an
+	// upstream bus.go gate this direct-Publish test never went through).
+	// This test's subject is drop-oldest backpressure, not dedup, so each
+	// call must look like a genuinely distinct event.
+	h.Publish(&event.RawEvent{EventID: "evt-1", EventType: "t"})
+	h.Publish(&event.RawEvent{EventID: "evt-2", EventType: "t"})
+	h.Publish(&event.RawEvent{EventID: "evt-3", EventType: "t"})
 
 	if got := c.DroppedCount(); got != 2 {
 		t.Errorf("expected 2 drops, got %d", got)
@@ -39,8 +45,12 @@ func TestPublishAssignsIncrementalSeq(t *testing.T) {
 	c.sendCh = make(chan interface{}, 10)
 	h.RegisterAndIsFirst(c)
 
+	// Distinct EventIDs per call: Hub.Publish now dedups by event_id for the
+	// legacy domain (spec §4.3), so 5 identical/empty event_ids would
+	// collapse to a single delivery. This test's subject is seq assignment,
+	// not dedup.
 	for i := 0; i < 5; i++ {
-		h.Publish(&event.RawEvent{EventType: "t"})
+		h.Publish(&event.RawEvent{EventID: fmt.Sprintf("evt-%d", i), EventType: "t"})
 	}
 
 	for i := uint64(1); i <= 5; i++ {
