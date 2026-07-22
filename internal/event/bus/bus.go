@@ -386,6 +386,16 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 }
 
 // handleStatusQuery replies with status and closes.
+//
+// The v2 fields (ProtocolVersion/Capabilities/RegisteredEventTypes) are set
+// after NewStatusResponse's construction rather than by changing
+// NewStatusResponse's own signature (protocol/messages.go): that
+// constructor has other call sites (cmd/event/status_orphan_test.go,
+// internal/event/consume/startup_probe_test.go, protocol's own tests) that
+// build a StatusResponse with no bus/hub in scope at all — this keeps them
+// unchanged. An old (pre-Task-15a) bus never sets these three fields at
+// all; their absence is itself the incompatibility signal a later prober
+// (Task 15b's ProbeBusEligibility) checks for (spec §4.2).
 func (b *Bus) handleStatusQuery(conn net.Conn) {
 	defer conn.Close()
 	resp := protocol.NewStatusResponse(
@@ -394,6 +404,9 @@ func (b *Bus) handleStatusQuery(conn net.Conn) {
 		b.hub.ConnCount(),
 		b.hub.Consumers(),
 	)
+	resp.ProtocolVersion = protocol.ProtocolVersionV2
+	resp.Capabilities = []string{protocol.CapabilityRefinedRouting, protocol.CapabilityHelloV2}
+	resp.RegisteredEventTypes = b.hub.RegisteredEventTypes()
 	_ = protocol.EncodeWithDeadline(conn, resp, protocol.WriteTimeout)
 }
 

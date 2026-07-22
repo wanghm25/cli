@@ -142,3 +142,49 @@ func testNetPipe(t *testing.T) (net.Conn, net.Conn) {
 	t.Helper()
 	return net.Pipe()
 }
+
+// TestHubRegisteredEventTypes_DedupsAcrossSubscribers locks the aggregator
+// Task 15a adds so handleStatusQuery (bus.go) can populate
+// StatusResponse.RegisteredEventTypes (spec §4.2): the union of every
+// registered subscriber's EventTypes(), deduplicated — mirrors
+// subscribedEventTypes's dedup-via-seen-set shape, but over LIVE registered
+// consumers rather than the static event registry.
+func TestHubRegisteredEventTypes_DedupsAcrossSubscribers(t *testing.T) {
+	h := NewHub()
+	server1, client1 := testNetPipe(t)
+	defer server1.Close()
+	defer client1.Close()
+	server2, client2 := testNetPipe(t)
+	defer server2.Close()
+	defer client2.Close()
+
+	c1 := NewConn(server1, nil, "im.msg", []string{"im.message.receive_v1", "im.message.created_v1"}, 1, "")
+	c2 := NewConn(server2, nil, "vc.meeting", []string{"vc.meeting.started_v1", "im.message.created_v1"}, 2, "")
+	h.RegisterAndIsFirst(c1)
+	h.RegisterAndIsFirst(c2)
+
+	got := h.RegisteredEventTypes()
+	want := map[string]bool{
+		"im.message.receive_v1": true,
+		"im.message.created_v1": true,
+		"vc.meeting.started_v1": true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("RegisteredEventTypes() = %v, want %d deduped entries matching %v", got, len(want), want)
+	}
+	for _, et := range got {
+		if !want[et] {
+			t.Errorf("unexpected event type %q in RegisteredEventTypes()", et)
+		}
+	}
+}
+
+// TestHubRegisteredEventTypes_EmptyWhenNoSubscribers locks the no-consumers
+// baseline: an idle bus with nobody registered yet must report an empty
+// (not nil-panicking, not stale) list.
+func TestHubRegisteredEventTypes_EmptyWhenNoSubscribers(t *testing.T) {
+	h := NewHub()
+	if got := h.RegisteredEventTypes(); len(got) != 0 {
+		t.Errorf("RegisteredEventTypes() = %v, want empty", got)
+	}
+}

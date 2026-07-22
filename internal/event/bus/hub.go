@@ -469,6 +469,31 @@ func (h *Hub) SubCount(subscriptionID string) int {
 	return h.subCounts[subscriptionID]
 }
 
+// RegisteredEventTypes returns the deduplicated union of EventTypes() across
+// every currently registered subscriber (spec §4.2). Mirrors
+// subscribedEventTypes's (bus.go) dedup-via-seen-set shape, but aggregates
+// over LIVE registered consumers rather than the static event registry, and
+// EventKeyCount's h.mu-guarded read pattern. handleStatusQuery (bus.go)
+// calls this to populate StatusResponse.RegisteredEventTypes so a status
+// probe can tell whether a given event type currently has any consumer on
+// this bus — an old (pre-Task-15a) bus never reported this at all.
+func (h *Hub) RegisteredEventTypes() []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	seen := make(map[string]struct{})
+	var types []string
+	for s := range h.subscribers {
+		for _, et := range s.EventTypes() {
+			if _, ok := seen[et]; ok {
+				continue
+			}
+			seen[et] = struct{}{}
+			types = append(types, et)
+		}
+	}
+	return types
+}
+
 // BroadcastSourceStatus fans out a source-level status change to every
 // subscriber. Best-effort: channel full → drop silently (status isn't
 // worth applying back-pressure for). Routes through Subscriber.TrySend

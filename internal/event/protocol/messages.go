@@ -25,6 +25,34 @@ const (
 	SourceStateReconnecting = "reconnecting"
 )
 
+// Bus IPC protocol version + capability markers (spec §4.2). Defined once,
+// here, so every side that needs to agree on them — the bus, which
+// advertises them in StatusResponse (internal/event/bus's
+// handleStatusQuery), and a later prober (ProbeBusEligibility, Task 15b)
+// that reads them back over status_query/status_response — references the
+// SAME identifiers instead of each hand-rolling matching string literals
+// that could silently drift out of sync.
+const (
+	// ProtocolVersionV2 is the bus's IPC protocol marker once it advertises
+	// v2 status fields (ProtocolVersion/Capabilities/RegisteredEventTypes)
+	// and understands a v2 Hello. An old (pre-Phase-C) bus never sets
+	// StatusResponse.ProtocolVersion at all — its ABSENCE, not a mismatched
+	// value, is the incompatibility signal a prober checks for.
+	ProtocolVersionV2 = "v2"
+
+	// CapabilityRefinedRouting marks that this bus's Hub can route by
+	// remote_subscription_id (spec §4.3's dual-index routing matrix), not
+	// just by event_type.
+	CapabilityRefinedRouting = "refined_routing"
+
+	// CapabilityHelloV2 marks that this bus understands (and expects) the
+	// v2 Hello fields (ConsumerScopeID/RemoteSubscriptionID/Identity/
+	// Profile/UserOpenID) — mirrors Hello.Capabilities's own "hello_v2"
+	// marker below, so a status_response and a hello frame use the
+	// identical capability name for the same concept.
+	CapabilityHelloV2 = "hello_v2"
+)
+
 // SourceStatus is best-effort: hub drops it when consumer's send channel is full.
 type SourceStatus struct {
 	Type   string `json:"type"`
