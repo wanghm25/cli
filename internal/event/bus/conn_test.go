@@ -294,6 +294,95 @@ func TestConn_SetDegraded_RoundTrips(t *testing.T) {
 // command from yet another — hence its own dedicated mutex rather than the
 // zero-lock convention used for the write-once owner fields above. Run with
 // -race (mirrors hub_publish_race_test.go's style for the Hub side).
+// --- Task 17: lifecycle summary state (spec §5.1/§5.5) --------------------
+
+func TestConn_LifecycleSummary_DefaultEmpty(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	if got := conn.LastLifecycleEvent(); got != "" {
+		t.Errorf("LastLifecycleEvent() on a fresh Conn = %q, want \"\"", got)
+	}
+	if got := conn.LastLifecycleEventID(); got != "" {
+		t.Errorf("LastLifecycleEventID() on a fresh Conn = %q, want \"\"", got)
+	}
+	if got := conn.RemoteState(); got != "" {
+		t.Errorf("RemoteState() on a fresh Conn = %q, want \"\"", got)
+	}
+}
+
+func TestConn_SetLifecycleSummary_RoundTrips(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	conn.SetLifecycleSummary("event.subscription.suspended_v1", "evt-1", "suspended")
+	if got := conn.LastLifecycleEvent(); got != "event.subscription.suspended_v1" {
+		t.Errorf("LastLifecycleEvent() = %q, want %q", got, "event.subscription.suspended_v1")
+	}
+	if got := conn.LastLifecycleEventID(); got != "evt-1" {
+		t.Errorf("LastLifecycleEventID() = %q, want %q", got, "evt-1")
+	}
+	if got := conn.RemoteState(); got != "suspended" {
+		t.Errorf("RemoteState() = %q, want %q", got, "suspended")
+	}
+}
+
+// SetLifecycleSummary must NOT blank a previously-known remote_state when the
+// new event's state is "" (e.g. deleted_v1's SDK body carries no state field
+// at all) -- doing so would destroy real information for no benefit;
+// lastLifecycleEvent alone already records that the newer event happened.
+func TestConn_SetLifecycleSummary_EmptyStateDoesNotClearPriorRemoteState(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	conn.SetLifecycleSummary("event.subscription.activated_v1", "evt-1", "active")
+	conn.SetLifecycleSummary("event.subscription.deleted_v1", "evt-2", "")
+
+	if got := conn.LastLifecycleEvent(); got != "event.subscription.deleted_v1" {
+		t.Errorf("LastLifecycleEvent() = %q, want %q (must always update)", got, "event.subscription.deleted_v1")
+	}
+	if got := conn.LastLifecycleEventID(); got != "evt-2" {
+		t.Errorf("LastLifecycleEventID() = %q, want %q (must always update)", got, "evt-2")
+	}
+	if got := conn.RemoteState(); got != "active" {
+		t.Errorf("RemoteState() = %q, want %q (an empty new state must not clear a prior known value)", got, "active")
+	}
+}
+
+// TestConn_LifecycleSummaryState_ConcurrentAccessRace mirrors
+// TestConn_IdentityGateState_ConcurrentAccessRace's rationale for the Task 17
+// fields: SetLifecycleSummary is written from the lifecycle executor's
+// worker goroutines and read by a future status query concurrently. Run with
+// -race.
+func TestConn_LifecycleSummaryState_ConcurrentAccessRace(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	conn := NewConn(server, nil, "im.msg", []string{"im.msg"}, 1, "")
+
+	var wg sync.WaitGroup
+	const workers = 8
+	const iterations = 200
+	deadline := time.Now().Add(2 * time.Second)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < iterations && time.Now().Before(deadline); j++ {
+				conn.SetLifecycleSummary("event.subscription.activated_v1", "evt-race", "active")
+				_ = conn.LastLifecycleEvent()
+				_ = conn.LastLifecycleEventID()
+				_ = conn.RemoteState()
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
 func TestConn_IdentityGateState_ConcurrentAccessRace(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close()

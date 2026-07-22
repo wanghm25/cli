@@ -5,6 +5,7 @@ package source
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
@@ -241,5 +242,268 @@ func TestFormatSubscriptionAuthority(t *testing.T) {
 				t.Errorf("formatSubscriptionAuthority(%q, %q) = %q, want %q", tc.authType, tc.principalID, got, tc.want)
 			}
 		})
+	}
+}
+
+// --- Task 17: subscription lifecycle handler registration (spec §5.1) -----
+
+// lifecyclePayload synthesizes a raw WS push payload for one of the SDK's 6
+// subscription lifecycle meta-events, mirroring the SDK's own
+// event/dispatcher/subscription_dispatch_test.go fixture shape (that is what
+// dispatcher.Do(ctx, payload) parses in production — the same entry point
+// ws/client.go's real WS read loop calls).
+func lifecyclePayload(eventType, eventBody string) []byte {
+	return []byte(fmt.Sprintf(`{
+		"schema":"2.0",
+		"header":{
+			"event_id":"evt_lifecycle_test",
+			"event_type":%q
+		},
+		"event":%s
+	}`, eventType, eventBody))
+}
+
+// TestBuildDispatcher_RegistersAllSixLifecycleHandlers_NoPanic locks spec
+// §5.1: all 6 typed handlers must register without the SDK dispatcher's
+// duplicate-registration panic, and each must reach OnLifecycleEvent.
+func TestBuildDispatcher_RegistersAllSixLifecycleHandlers_NoPanic(t *testing.T) {
+	s := &FeishuSource{}
+	var captured []LifecycleEvent
+	s.OnLifecycleEvent = func(_ context.Context, le LifecycleEvent) { captured = append(captured, le) }
+
+	d := s.buildDispatcher([]string{"im.message.receive_v1"}, func(*event.RawEvent) {})
+
+	types := []string{
+		lifecycleEventTypeActivated,
+		lifecycleEventTypeUpdated,
+		lifecycleEventTypeSuspended,
+		lifecycleEventTypeExpirationReminder,
+		lifecycleEventTypeExpired,
+		lifecycleEventTypeDeleted,
+	}
+	const richBody = `{"subscription_id":"sub_test","target_resource":"im.message?chat_id=oc_x","state":"active"}`
+	const updatedBody = `{"before":{"subscription_id":"sub_test","state":"active"},"after":{"subscription_id":"sub_test","state":"suspended"}}`
+	const deletedBody = `{"subscription_id":"sub_test"}`
+
+	for _, et := range types {
+		body := richBody
+		switch et {
+		case lifecycleEventTypeUpdated:
+			body = updatedBody
+		case lifecycleEventTypeDeleted:
+			body = deletedBody
+		}
+		if _, err := d.Do(context.Background(), lifecyclePayload(et, body)); err != nil {
+			t.Fatalf("Do(%s) failed: %v", et, err)
+		}
+	}
+
+	if len(captured) != len(types) {
+		t.Fatalf("OnLifecycleEvent called %d times, want %d (captured=%+v)", len(captured), len(types), captured)
+	}
+}
+
+// TestBuildDispatcher_OnLifecycleEventNil_NoPanic: a FeishuSource with no
+// lifecycle executor configured (OnLifecycleEvent left nil, matching
+// OnConnReady's own nil-tolerant contract) must not panic when a lifecycle
+// event arrives.
+func TestBuildDispatcher_OnLifecycleEventNil_NoPanic(t *testing.T) {
+	s := &FeishuSource{}
+	d := s.buildDispatcher(nil, func(*event.RawEvent) {})
+	body := `{"subscription_id":"sub_1","state":"active"}`
+	if _, err := d.Do(context.Background(), lifecyclePayload(lifecycleEventTypeActivated, body)); err != nil {
+		t.Fatalf("Do failed: %v", err)
+	}
+}
+
+// TestBuildDispatcher_LifecycleEventNeverReachesEmit is the direct proof that
+// lifecycle meta-events are diverted away from business-consumer delivery
+// (spec §5.1: "生命周期 handler 属 bus 内部控制面，不直接输出给普通
+// consumer"): registering the 6 typed handlers makes the SDK route by
+// event_type to them instead of the customized-event handler that calls
+// emit/Hub.Publish. emit fires t.Fatal if ever invoked for any of the 6.
+func TestBuildDispatcher_LifecycleEventNeverReachesEmit(t *testing.T) {
+	s := &FeishuSource{}
+	s.OnLifecycleEvent = func(context.Context, LifecycleEvent) {}
+	d := s.buildDispatcher([]string{"im.message.receive_v1"}, func(e *event.RawEvent) {
+		t.Fatalf("emit must never be called for a subscription lifecycle event, got %+v", e)
+	})
+
+	types := []string{
+		lifecycleEventTypeActivated,
+		lifecycleEventTypeUpdated,
+		lifecycleEventTypeSuspended,
+		lifecycleEventTypeExpirationReminder,
+		lifecycleEventTypeExpired,
+		lifecycleEventTypeDeleted,
+	}
+	for _, et := range types {
+		body := `{"subscription_id":"sub_test","state":"active"}`
+		if et == lifecycleEventTypeUpdated {
+			body = `{"before":{"subscription_id":"sub_test"},"after":{"subscription_id":"sub_test","state":"active"}}`
+		} else if et == lifecycleEventTypeDeleted {
+			body = `{"subscription_id":"sub_test"}`
+		}
+		if _, err := d.Do(context.Background(), lifecyclePayload(et, body)); err != nil {
+			t.Fatalf("Do(%s) failed: %v", et, err)
+		}
+	}
+}
+
+// TestBuildDispatcher_LifecycleEvents_NormalizeFields covers every one of
+// the 6 handlers' field normalization (spec §5.1's payload facts): body
+// SubscriptionId preferred (After.SubscriptionId for updated, body-only for
+// deleted), event_id from header, suspension.code carried verbatim
+// (including an unrecognized/future value — spec §5.4's open vocabulary),
+// authority formatted via the shared formatSubscriptionAuthority vocabulary.
+func TestBuildDispatcher_LifecycleEvents_NormalizeFields(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType string
+		body      string
+		want      LifecycleEvent
+	}{
+		{
+			name:      "activated",
+			eventType: lifecycleEventTypeActivated,
+			body:      `{"subscription_id":"sub_1","target_resource":"im.message?chat_id=oc_1","authority":{"type":"user","open_id":"ou_1"},"state":"active","expire_time":1700000000}`,
+			want: LifecycleEvent{
+				EventType:            lifecycleEventTypeActivated,
+				EventID:              "evt_lifecycle_test",
+				RemoteSubscriptionID: "sub_1",
+				TargetResource:       "im.message?chat_id=oc_1",
+				Authority:            "user:ou_1",
+				State:                "active",
+				ExpireTime:           1700000000,
+			},
+		},
+		{
+			name:      "suspended carries a KNOWN suspension code verbatim",
+			eventType: lifecycleEventTypeSuspended,
+			body:      `{"subscription_id":"sub_2","state":"suspended","suspension":{"code":"authority_revoked"}}`,
+			want: LifecycleEvent{
+				EventType:            lifecycleEventTypeSuspended,
+				EventID:              "evt_lifecycle_test",
+				RemoteSubscriptionID: "sub_2",
+				State:                "suspended",
+				SuspensionCode:       "authority_revoked",
+			},
+		},
+		{
+			name:      "suspended carries an UNKNOWN suspension code verbatim (open vocabulary, spec §5.4)",
+			eventType: lifecycleEventTypeSuspended,
+			body:      `{"subscription_id":"sub_2b","state":"suspended","suspension":{"code":"some_future_reason_cli_has_never_seen"}}`,
+			want: LifecycleEvent{
+				EventType:            lifecycleEventTypeSuspended,
+				EventID:              "evt_lifecycle_test",
+				RemoteSubscriptionID: "sub_2b",
+				State:                "suspended",
+				SuspensionCode:       "some_future_reason_cli_has_never_seen",
+			},
+		},
+		{
+			name:      "expiration_reminder",
+			eventType: lifecycleEventTypeExpirationReminder,
+			body:      `{"subscription_id":"sub_3","state":"active","expire_time":42}`,
+			want: LifecycleEvent{
+				EventType:            lifecycleEventTypeExpirationReminder,
+				EventID:              "evt_lifecycle_test",
+				RemoteSubscriptionID: "sub_3",
+				State:                "active",
+				ExpireTime:           42,
+			},
+		},
+		{
+			name:      "expired",
+			eventType: lifecycleEventTypeExpired,
+			body:      `{"subscription_id":"sub_4","state":"expired"}`,
+			want: LifecycleEvent{
+				EventType:            lifecycleEventTypeExpired,
+				EventID:              "evt_lifecycle_test",
+				RemoteSubscriptionID: "sub_4",
+				State:                "expired",
+			},
+		},
+		{
+			name:      "deleted is body-only (no state/target_resource/authority in the SDK's own body shape)",
+			eventType: lifecycleEventTypeDeleted,
+			body:      `{"subscription_id":"sub_5"}`,
+			want: LifecycleEvent{
+				EventType:            lifecycleEventTypeDeleted,
+				EventID:              "evt_lifecycle_test",
+				RemoteSubscriptionID: "sub_5",
+			},
+		},
+		{
+			name:      "updated normalizes the AFTER snapshot, not before",
+			eventType: lifecycleEventTypeUpdated,
+			body:      `{"before":{"subscription_id":"sub_6","state":"active"},"after":{"subscription_id":"sub_6","state":"suspended","suspension":{"code":"authority_revoked"}}}`,
+			want: LifecycleEvent{
+				EventType:            lifecycleEventTypeUpdated,
+				EventID:              "evt_lifecycle_test",
+				RemoteSubscriptionID: "sub_6",
+				State:                "suspended",
+				SuspensionCode:       "authority_revoked",
+			},
+		},
+		{
+			name:      "updated with no after snapshot normalizes to an empty remote_subscription_id (dropped later by Submit's own validation)",
+			eventType: lifecycleEventTypeUpdated,
+			body:      `{"before":{"subscription_id":"sub_7","state":"active"}}`,
+			want: LifecycleEvent{
+				EventType: lifecycleEventTypeUpdated,
+				EventID:   "evt_lifecycle_test",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &FeishuSource{}
+			var got LifecycleEvent
+			var calls int
+			s.OnLifecycleEvent = func(_ context.Context, le LifecycleEvent) { got = le; calls++ }
+
+			d := s.buildDispatcher(nil, func(e *event.RawEvent) {
+				t.Fatalf("emit must never be called for a lifecycle event, got %+v", e)
+			})
+
+			if _, err := d.Do(context.Background(), lifecyclePayload(tc.eventType, tc.body)); err != nil {
+				t.Fatalf("Do failed: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("OnLifecycleEvent called %d times, want 1", calls)
+			}
+			if got != tc.want {
+				t.Errorf("normalized LifecycleEvent =\n  %+v\nwant\n  %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildDispatcher_LifecycleCollisionWithBusinessType_SkipsLifecycleHandler
+// is the panic-safety guard (spec §5.1: "同一事件类型不重复注册 custom
+// handler，否则 SDK Dispatcher panic"): IF a business EventKey's event_type
+// ever collided with one of the 6 lifecycle types (none do today), buildDispatcher
+// must not panic, and the business path (already registered first) keeps
+// serving that event_type instead.
+func TestBuildDispatcher_LifecycleCollisionWithBusinessType_SkipsLifecycleHandler(t *testing.T) {
+	s := &FeishuSource{}
+	var lifecycleCalls int
+	s.OnLifecycleEvent = func(context.Context, LifecycleEvent) { lifecycleCalls++ }
+
+	var emitted *event.RawEvent
+	d := s.buildDispatcher([]string{lifecycleEventTypeActivated}, func(e *event.RawEvent) { emitted = e })
+
+	body := `{"subscription_id":"sub_1","state":"active"}`
+	if _, err := d.Do(context.Background(), lifecyclePayload(lifecycleEventTypeActivated, body)); err != nil {
+		t.Fatalf("Do failed: %v", err)
+	}
+
+	if emitted == nil {
+		t.Fatal("expected the business OnCustomizedEvent handler (emit) to fire when a business type collides with a lifecycle type")
+	}
+	if lifecycleCalls != 0 {
+		t.Errorf("OnLifecycleEvent called %d times, want 0 (lifecycle handler must be skipped on collision)", lifecycleCalls)
 	}
 }

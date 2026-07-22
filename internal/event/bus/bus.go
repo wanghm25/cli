@@ -53,22 +53,31 @@ type Bus struct {
 	// today's behavior. Call SetIdentityProviders before Run() to enable it.
 	identityGate *identityGate
 
+	// lifecycleExecutor is the bounded, in-memory subscription lifecycle
+	// executor (spec §5.1/§5.2) every FeishuSource's 6 typed lifecycle
+	// handlers feed into. Unlike identityGate, this has no external
+	// dependency to inject (Task 17's summary-only action needs only b's own
+	// Hub) — always constructed by NewBus, never nil.
+	lifecycleExecutor *lifecycleExecutor
+
 	// pidHandle pins the alive.lock fd to the bus lifetime; OS releases on exit.
 	pidHandle *busdiscover.Handle
 }
 
 func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logger) *Bus {
+	hub := NewHub()
 	return &Bus{
 		appID:     appID,
 		appSecret: appSecret,
 		domain:    domain,
 		transport: tr,
-		hub:       NewHub(),
+		hub:       hub,
 		logger:    logger,
 		startTime: time.Now(),
 		conns:     make(map[*Conn]struct{}),
 		// Buffered so shutdown and source-exit paths never drop the signal.
-		shutdownCh: make(chan struct{}, 1),
+		shutdownCh:        make(chan struct{}, 1),
+		lifecycleExecutor: newLifecycleExecutor(hub, summaryLifecycleAction(hub), logger),
 	}
 }
 
@@ -164,6 +173,9 @@ func (b *Bus) Run(ctx context.Context) error {
 	// Don't delete the socket: Run() handles stale sockets on startup, and deletion races a new bus.
 	shutdownConns(b)
 	<-acceptDone
+	// Not-started lifecycle work is discarded; already-started runs finish
+	// under their own timeout (lifecycleExecutor.Cancel's own doc, spec §5.2).
+	b.lifecycleExecutor.Cancel()
 	b.logger.Printf("Bus exited cleanly")
 	return nil
 }
@@ -194,6 +206,7 @@ func (b *Bus) startSources(ctx context.Context) {
 		if b.identityGate != nil {
 			fs.OnConnReady = b.identityGate.onConnReady
 		}
+		fs.OnLifecycleEvent = b.lifecycleExecutor.Submit
 		sources = []source.Source{fs}
 	}
 	eventTypes := subscribedEventTypes()

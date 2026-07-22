@@ -153,6 +153,32 @@ func (h *Hub) userConns() []*Conn {
 	return out
 }
 
+// connsByRemoteSubscriptionID returns every registered *Conn bound to the
+// given remote Subscription id (mirrors userConns's shape/whitebox
+// s.(*Conn) type-assert above — only *Conn carries the lifecycle-summary
+// state LifecycleExecutor's summary action needs to mutate, spec §5.1/Task
+// 17). remoteSubID=="" always returns nil: there is no "legacy" bucket
+// here — callers only ever look this up with a concrete
+// remote_subscription_id already read off a LifecycleEvent, which validates
+// non-empty before reaching this point (internal/event/bus/lifecycle.go's
+// Submit).
+func (h *Hub) connsByRemoteSubscriptionID(remoteSubID string) []*Conn {
+	if remoteSubID == "" {
+		return nil
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	var out []*Conn
+	for s := range h.subscribers {
+		c, ok := s.(*Conn)
+		if !ok || c.RemoteSubscriptionID() != remoteSubID {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
 // UnregisterAndIsLast removes s and reports whether it was last for its SubscriptionID; stale unregisters are no-ops.
 func (h *Hub) UnregisterAndIsLast(s Subscriber) bool {
 	h.mu.Lock()
@@ -544,6 +570,11 @@ func (h *Hub) Consumers() []protocol.ConsumerInfo {
 			info.OwnerIdentity = c.OwnerIdentity()
 			info.StaleIdentity = c.StaleIdentity()
 			info.DegradedReason = c.DegradedReason()
+			// Task 17: populate the Task-16-added-but-unpopulated
+			// LastLifecycleEvent/RemoteState fields from the Conn getters
+			// LifecycleExecutor's summary action writes to (spec §5.1).
+			info.LastLifecycleEvent = c.LastLifecycleEvent()
+			info.RemoteState = c.RemoteState()
 		}
 		result = append(result, info)
 	}

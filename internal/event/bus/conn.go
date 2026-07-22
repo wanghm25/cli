@@ -68,6 +68,19 @@ type Conn struct {
 	staleIdentity  bool
 	degradedReason string
 
+	// --- lifecycle summary state (spec §5.1/§5.5, Task 17) -----------------
+	// lastLifecycleEvent/lastLifecycleEventID/remoteState summarize the most
+	// recent subscription lifecycle meta-event LifecycleExecutor's
+	// summary-only action (internal/event/bus/lifecycle.go) observed for this
+	// consumer's remote Subscription. Guarded by the SAME identityMu as the
+	// rest of this block: written by the executor's worker goroutines, read
+	// by Hub.Consumers() (a future status query). Action-related fields
+	// (suspensionReason/lastAction/lastActionError/nextAction, spec §5.5) are
+	// Task 18 — not added here.
+	lastLifecycleEvent   string
+	lastLifecycleEventID string
+	remoteState          string
+
 	onClose         func(*Conn)
 	checkLastForKey func(scope string) bool
 	logger          *log.Logger
@@ -207,6 +220,48 @@ func (c *Conn) SetDegraded(reason string) {
 	c.identityMu.Lock()
 	defer c.identityMu.Unlock()
 	c.degradedReason = reason
+}
+
+// LastLifecycleEvent returns the most recent subscription lifecycle event
+// type observed for this consumer's remote Subscription ("" = none yet).
+func (c *Conn) LastLifecycleEvent() string {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	return c.lastLifecycleEvent
+}
+
+// LastLifecycleEventID returns that event's event_id ("" = none yet).
+func (c *Conn) LastLifecycleEventID() string {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	return c.lastLifecycleEventID
+}
+
+// RemoteState returns the last known remote Subscription state string
+// reported by this consumer's lifecycle events ("" = unknown/none yet).
+func (c *Conn) RemoteState() string {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	return c.remoteState
+}
+
+// SetLifecycleSummary records one lifecycle event's summary
+// (LifecycleExecutor's summary-only action, spec §5.1). eventType/eventID
+// are recorded verbatim and always overwrite (both are always non-empty by
+// the time Submit's own validation lets an event through). state is applied
+// ONLY when non-empty: deleted_v1's SDK body carries no state field at all,
+// and blanking a previously-known remoteState to "" on delete would destroy
+// real information (e.g. the last known "active"/"suspended" snapshot) for
+// no benefit — lastLifecycleEvent alone already records that a delete
+// happened.
+func (c *Conn) SetLifecycleSummary(eventType, eventID, state string) {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	c.lastLifecycleEvent = eventType
+	c.lastLifecycleEventID = eventID
+	if state != "" {
+		c.remoteState = state
+	}
 }
 
 func (c *Conn) SendCh() chan interface{} { return c.sendCh }
