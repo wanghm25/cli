@@ -162,7 +162,7 @@ func suspendedDetail(id, reason string) *larkeventv1.SubscriptionDetail {
 		TargetResource: strPtr("im.message?chat_id=oc_aaa"),
 		Authority:      &larkeventv1.Authority{Type: strPtr("user"), OpenId: strPtr("ou_aaa")},
 		State:          strPtr("suspended"),
-		Suspension:     &larkeventv1.Suspension{Code: strPtr("authority_revoked")},
+		Suspension:     &larkeventv1.Suspension{Code: strPtr(reason)},
 	}
 }
 
@@ -394,7 +394,12 @@ func TestCreateOrReuseSubscription_Suspended_ReturnsTypedFailedPrecondition_Guid
 	resolved := resolveCreatedChatID(t)
 	fake := &fakeCreateAPI{
 		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-			suspendedDetail("sub_susp", "authority_revoked"),
+			// Deliberately a different reason than the "authority_revoked"
+			// used elsewhere in this file, so the assertion below on
+			// ve.Error() proves suspendedError's `reason :=
+			// strVal(...Suspension.Code)` extraction actually reads this
+			// fixture's value rather than happening to match a hardcoded one.
+			suspendedDetail("sub_susp", "identity_revoked"),
 		}, false, ""), nil),
 	}
 
@@ -414,6 +419,9 @@ func TestCreateOrReuseSubscription_Suspended_ReturnsTypedFailedPrecondition_Guid
 	}
 	if !strings.Contains(ve.Hint, "sub_susp") {
 		t.Errorf("Hint = %q, want it to mention remote_subscription_id sub_susp", ve.Hint)
+	}
+	if !strings.Contains(ve.Error(), "identity_revoked") {
+		t.Errorf("Error() = %q, want it to surface suspension_reason=identity_revoked from the fixture", ve.Error())
 	}
 	if fake.createCalls != 0 {
 		t.Errorf("createCalls = %d, want 0", fake.createCalls)
@@ -752,6 +760,28 @@ func TestRunCreate_MissingReadScope_ReturnsPermissionError(t *testing.T) {
 	}
 }
 
+func TestRunCreate_MissingWriteScope_ReturnsPermissionError(t *testing.T) {
+	registerCreateFixtures(t)
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "cli_x"})
+	f.Credential = credential.NewCredentialProvider(nil, nil, &fakeTokenResolver{
+		result: &credential.TokenResult{Token: "u-tok", Scopes: "event:subscription:read"},
+	}, nil)
+
+	cmd := NewCmdCreate(f)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "user"})
+
+	err := cmd.Execute()
+	var permErr *errs.PermissionError
+	if !errors.As(err, &permErr) {
+		t.Fatalf("expected *errs.PermissionError, got %T: %v", err, err)
+	}
+	if len(permErr.MissingScopes) != 1 || permErr.MissingScopes[0] != "event:subscription:write" {
+		t.Errorf("MissingScopes = %v, want [event:subscription:write]", permErr.MissingScopes)
+	}
+}
+
 func TestRunCreate_MissingBothScopes_ReturnsPermissionErrorListingBoth(t *testing.T) {
 	registerCreateFixtures(t)
 	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "cli_x"})
@@ -879,6 +909,85 @@ func TestDryRun_NotFound_EndToEndViaFakeService_JSONShapeAndNoCreateCall(t *test
 
 	if fake.createCalls != 0 {
 		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write", fake.createCalls)
+	}
+}
+
+// TestDryRun_ActiveConflicting_EndToEndViaFakeService_ReportsInformationallyNoCreateCall
+// and TestDryRun_Suspended_EndToEndViaFakeService_ReportsInformationallyNoCreateCall extend
+// TestDryRun_NotFound_EndToEndViaFakeService_JSONShapeAndNoCreateCall to the plan's other
+// two shapes. Per spec §3.4, dry-run always reports the reconcile plan
+// informationally and never itself errors on conflict/suspended — only the
+// preflight steps (identity/template/scope, already passed by the time
+// runCreate reaches --dry-run) are real dry-run failures. This is the
+// counterpart of TestCreateOrReuseSubscription_ActiveConflict_
+// ReturnsTypedFailedPrecondition and TestCreateOrReuseSubscription_Suspended_
+// ReturnsTypedFailedPrecondition_GuidesReactivate, which turn the exact same
+// two plan shapes into typed errors on a REAL (non-dry-run) run.
+func TestDryRun_ActiveConflicting_EndToEndViaFakeService_ReportsInformationallyNoCreateCall(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	fake := &fakeCreateAPI{listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
+		activeDetail("sub_conflict", true, "user"), // existing has include_resource_data=true
+	}, false, ""), nil)}
+
+	// requested include_resource_data=false (the default) mismatches the
+	// existing true -> conflict.
+	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsUser, false)
+	if err != nil {
+		t.Fatalf("reconcileExisting: unexpected error: %v", err)
+	}
+	if plan.Action != planActionConflict {
+		t.Fatalf("Action = %q, want %q", plan.Action, planActionConflict)
+	}
+	result := buildDryRunResult(resolved, core.AsUser, plan)
+
+	if result.PlannedChange.Action != planActionConflict {
+		t.Errorf("PlannedChange.Action = %q, want %q", result.PlannedChange.Action, planActionConflict)
+	}
+	if result.PlannedChange.RemoteSubscriptionID != "sub_conflict" {
+		t.Errorf("PlannedChange.RemoteSubscriptionID = %q, want sub_conflict", result.PlannedChange.RemoteSubscriptionID)
+	}
+	if len(result.PlannedChange.ConflictFields) != 1 || result.PlannedChange.ConflictFields[0].Name != "include_resource_data" {
+		t.Errorf("PlannedChange.ConflictFields = %+v, want one entry naming include_resource_data", result.PlannedChange.ConflictFields)
+	}
+	if result.RemoteBefore == nil || result.RemoteBefore.RemoteSubscriptionID != "sub_conflict" {
+		t.Errorf("RemoteBefore = %+v, want the conflicting subscription row", result.RemoteBefore)
+	}
+
+	if fake.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write, even for a plan a real run would reject", fake.createCalls)
+	}
+}
+
+func TestDryRun_Suspended_EndToEndViaFakeService_ReportsInformationallyNoCreateCall(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	fake := &fakeCreateAPI{listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
+		suspendedDetail("sub_susp", "authority_revoked"),
+	}, false, ""), nil)}
+
+	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsUser, false)
+	if err != nil {
+		t.Fatalf("reconcileExisting: unexpected error: %v", err)
+	}
+	if plan.Action != planActionSuspended {
+		t.Fatalf("Action = %q, want %q", plan.Action, planActionSuspended)
+	}
+	result := buildDryRunResult(resolved, core.AsUser, plan)
+
+	if result.PlannedChange.Action != planActionSuspended {
+		t.Errorf("PlannedChange.Action = %q, want %q", result.PlannedChange.Action, planActionSuspended)
+	}
+	if result.PlannedChange.RemoteSubscriptionID != "sub_susp" {
+		t.Errorf("PlannedChange.RemoteSubscriptionID = %q, want sub_susp", result.PlannedChange.RemoteSubscriptionID)
+	}
+	if result.RemoteBefore == nil || result.RemoteBefore.RemoteSubscriptionID != "sub_susp" {
+		t.Errorf("RemoteBefore = %+v, want the suspended subscription row", result.RemoteBefore)
+	}
+	if result.RemoteBefore.Remote.SuspensionReason != "authority_revoked" {
+		t.Errorf("RemoteBefore.Remote.SuspensionReason = %q, want authority_revoked", result.RemoteBefore.Remote.SuspensionReason)
+	}
+
+	if fake.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write, even for a plan a real run would reject", fake.createCalls)
 	}
 }
 
