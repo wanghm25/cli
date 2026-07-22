@@ -241,118 +241,50 @@ func errIncludeResourceDataGated() error {
 }
 
 // ---- remote reconciliation (spec §3.3/§4.2) ----
+//
+// The reconcile classification itself — the state table, authority
+// matching, and the ReconcilePlan shape — moved to
+// internal/event/reconcile.go (Task 15a), EXPORTED, so it can be shared
+// with the refined `event consume` startup chain's PlanRemoteSubscription
+// stage (Task 15b) instead of staying package-private here. The
+// aliases/thin wrapper below keep this package's own names
+// (reconcilePlan/planAction*/reconcileExisting) so create_test.go and this
+// file's own createOrReuseSubscription/outcomeFromPlan/buildDryRunResult
+// below are unchanged — only the underlying implementation moved.
 
 // createSubscriptionAPI is the subset of *eventlib.SubscriptionClient this
 // command calls: List (to reconcile against the unique key event_type +
 // target_resource + authority before ever writing) and Create. It is the
 // test seam — see listSubscriptionsAPI (list.go) for the rationale; tests
 // substitute a fake implementing just these two methods, so every branch
-// below is exercised without a real *lark.Client or network call.
+// below is exercised without a real *lark.Client or network call. It is
+// structurally identical to eventlib.SubscriptionCreateAPI (defined
+// alongside the reconcile logic this now calls into) — kept as its own
+// declaration here, rather than an alias, so this file's exported-to-tests
+// shape doesn't change.
 type createSubscriptionAPI interface {
 	List(ctx context.Context, req *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error)
 	Create(ctx context.Context, req *larkeventv1.CreateSubscriptionReq) (*larkeventv1.CreateSubscriptionResp, error)
 }
 
-// reconcilePlan is the outcome of reconciling a create request against
-// remote state (spec §3.3/§4.2's state table), computed identically for
-// --dry-run and a real run — only what happens AFTER the plan differs (spec
-// §3.4). Action is one of "create" (no blocking match; proceed to Create),
-// "reuse" (an active, payload_options-compatible match exists; return it
-// idempotently), "conflict" (an active but differently-configured match
-// exists), or "suspended" (a suspended match exists; do not overwrite it).
-//
-// A matched "expired" or "deleted"/invisible remote entry, or no match at
-// all, all resolve to Action "create": expired and deleted subscriptions are
-// inert (spec §3.3 explicitly withholds Renew/auto-Reactivate from expired,
-// but nothing blocks a fresh Create the way an active or suspended entry
-// does), so they are treated the same as "not found" rather than as a
-// separate blocking state.
-type reconcilePlan struct {
-	Action         string
-	Existing       *larkeventv1.SubscriptionDetail
-	ConflictFields []errs.InvalidParam
-}
+// reconcilePlan is a local alias for eventlib.ReconcilePlan — see the block
+// doc comment above.
+type reconcilePlan = eventlib.ReconcilePlan
 
 const (
-	planActionCreate    = "create"
-	planActionReuse     = "reuse"
-	planActionConflict  = "conflict"
-	planActionSuspended = "suspended"
+	planActionCreate    = eventlib.PlanActionCreate
+	planActionReuse     = eventlib.PlanActionReuse
+	planActionConflict  = eventlib.PlanActionConflict
+	planActionSuspended = eventlib.PlanActionSuspended
 )
 
-// reconcileExisting is the read-only half of §3.3/§4.2: it lists remote
-// Subscriptions matching event_type + target_resource, narrows to the one
-// (if any) whose authority matches the effective identity, and classifies
-// it per the state table. It never writes — safe to call from --dry-run.
-//
-// Authority matching is by type only ("user" vs "app"), not by open_id: the
-// SubscriptionClient always calls List using the effective identity's own
-// token (WithUserAccessToken for user, the app's own tenant token for bot —
-// internal/event/subscription_client.go's identityOptions), so the server
-// itself already scopes a List response to that caller's own authority; a
-// second, redundant open_id comparison would need an extra call (e.g.
-// resolving "my own open_id") this task does not otherwise need.
+// reconcileExisting forwards to eventlib.ReconcileExisting — see the block
+// doc comment above for why this thin wrapper exists instead of every call
+// site here naming eventlib.ReconcileExisting directly. See
+// eventlib.ReconcileExisting's own doc comment for the full state-table and
+// authority-matching rationale (unchanged by the move).
 func reconcileExisting(ctx context.Context, svc createSubscriptionAPI, eventType, targetResource string, identity core.Identity, requestedIncludeResourceData bool) (*reconcilePlan, error) {
-	req := larkeventv1.NewListSubscriptionReqBuilder().
-		EventType(eventType).
-		TargetResource(targetResource).
-		Build()
-	resp, err := svc.List(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	var match *larkeventv1.SubscriptionDetail
-	if resp != nil && resp.Data != nil {
-		for _, item := range resp.Data.Items {
-			if item != nil && authorityMatchesIdentity(item.Authority, identity) {
-				match = item
-				break
-			}
-		}
-	}
-	if match == nil {
-		return &reconcilePlan{Action: planActionCreate}, nil
-	}
-
-	switch strVal(match.State) {
-	case "active":
-		var existingIncluded bool
-		if match.PayloadOptions != nil {
-			existingIncluded = boolVal(match.PayloadOptions.IncludeResourceData)
-		}
-		if existingIncluded == requestedIncludeResourceData {
-			return &reconcilePlan{Action: planActionReuse, Existing: match}, nil
-		}
-		return &reconcilePlan{
-			Action:   planActionConflict,
-			Existing: match,
-			ConflictFields: []errs.InvalidParam{{
-				Name:   "include_resource_data",
-				Reason: fmt.Sprintf("existing subscription has include_resource_data=%t, this request has include_resource_data=%t", existingIncluded, requestedIncludeResourceData),
-			}},
-		}, nil
-	case "suspended":
-		return &reconcilePlan{Action: planActionSuspended, Existing: match}, nil
-	default:
-		// "expired", "deleted", "", or any other/unknown state: inert: treat
-		// like not-found (spec §3.3).
-		return &reconcilePlan{Action: planActionCreate}, nil
-	}
-}
-
-// authorityMatchesIdentity reports whether a, an already-observed remote
-// Authority, plausibly belongs to the given effective identity's own
-// authority domain — see reconcileExisting's doc comment for why type-only
-// matching is sufficient here.
-func authorityMatchesIdentity(a *larkeventv1.Authority, identity core.Identity) bool {
-	if a == nil || a.Type == nil {
-		return false
-	}
-	if identity.IsBot() {
-		return *a.Type == "app"
-	}
-	return *a.Type == "user"
+	return eventlib.ReconcileExisting(ctx, svc, eventType, targetResource, identity, requestedIncludeResourceData)
 }
 
 // createOutcome is the result of a completed (non-dry-run) create request:
