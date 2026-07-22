@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -146,8 +147,21 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 				return nil, nil, fmt.Errorf("resolve current profile identity for hello: %w", err)
 			}
 
+			// scopeUserOpenID mirrors buildHelloV2's own bot-drops-UserOpenID
+			// rule (review Fix 2, Minor #3): a bot consumer's ConsumerScopeID
+			// must be user-independent, matching what actually goes out on
+			// the wire — otherwise it would vary with whoever happens to be
+			// logged in on this host, fragmenting app-level fan-out for a
+			// scope id that is supposed to be stable per (base key,
+			// materialized key, authority type, app). User identity
+			// behavior is unchanged: its scope id still includes the real
+			// user_open_id.
+			scopeUserOpenID := userOpenID
+			if opts.Identity.IsBot() {
+				scopeUserOpenID = ""
+			}
 			consumerScopeID := computeConsumerScopeID(resolved.Definition.Key, resolved.MaterializedKey,
-				authorityTypeFor(opts.Identity), appID, userOpenID)
+				authorityTypeFor(opts.Identity), appID, scopeUserOpenID)
 
 			hello := buildHelloV2(resolved, opts.Identity, localSubscriptionID, profile, userOpenID, remoteSubscriptionID, consumerScopeID)
 			return doHelloV2(conn, hello)
@@ -240,11 +254,13 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 	// ---- 6. HelloV2 ----
 	ack, br, err := deps.hello(ctx, conn, remoteSubscriptionID)
 	if err != nil {
-		return errs.NewInternalError(errs.SubtypeUnknown,
-			"event bus handshake failed: %s", err).WithCause(err)
+		// Same rationale as the startBus-fail branch above: Apply already
+		// succeeded, so this must carry the same recovery Hint (review Fix
+		// 3), not a generic unactionable message.
+		return errApplyOkHelloFailed(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, err)
 	}
 	if rejErr := rejectionError(ack, resolved.MaterializedKey); rejErr != nil {
-		return rejErr
+		return applyOkRejectedError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, rejErr)
 	}
 
 	consumeOpts := Options{
@@ -356,6 +372,23 @@ func refinedConflictError(resolved event.ResolvedEventKey, identity core.Identit
 		WithHint("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before consuming", id, identity, id)
 }
 
+// applyOkRecoveryHint builds the recovery guidance shared by EVERY
+// post-Apply failure (review Fix 3): once Apply has succeeded, a remote
+// write may have just happened, and refined cleanup is nil (spec §4.2) — no
+// later failure in this chain (local bus won't start, HelloV2
+// transport/decode error, or the bus rejecting the handshake) may ever
+// delete it. All three must therefore surface the SAME actionable
+// remote_subscription_id / created_by_this_attempt / next_action triple so
+// retrying is understood to safely reconcile/reuse the existing remote
+// subscription rather than risk creating a duplicate. Extracted so the three
+// call sites (errApplyOkStartBusFailed, errApplyOkHelloFailed,
+// applyOkRejectedError) construct byte-identical wording instead of each
+// maintaining its own copy.
+func applyOkRecoveryHint(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool) string {
+	return fmt.Sprintf("remote_subscription_id=%s created_by_this_attempt=%t next_action=retry `lark-cli event consume %s --as %s` (the remote subscription was left as-is; retrying will reconcile/reuse it, not create a duplicate)",
+		remoteSubscriptionID, createdByThisAttempt, resolved.MaterializedKey, identity)
+}
+
 // errApplyOkStartBusFailed implements the design note's explicit
 // apply-succeeded-but-bus-failed contract: typed InternalError, Hint carries
 // remote_subscription_id + created_by_this_attempt + next_action. This never
@@ -368,8 +401,42 @@ func errApplyOkStartBusFailed(resolved event.ResolvedEventKey, identity core.Ide
 	return errs.NewInternalError(errs.SubtypeUnknown,
 		"remote subscription is ready but the local event bus failed to start: %s", cause).
 		WithCause(cause).
-		WithHint("remote_subscription_id=%s created_by_this_attempt=%t next_action=retry `lark-cli event consume %s --as %s` (the remote subscription was left as-is; retrying will reconcile/reuse it, not create a duplicate)",
-			remoteSubscriptionID, createdByThisAttempt, resolved.MaterializedKey, identity)
+		WithHint(applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+}
+
+// errApplyOkHelloFailed is errApplyOkStartBusFailed's HelloV2 counterpart
+// (review Fix 3, Minor #2): a transport/decode error during the HelloV2
+// handshake, AFTER Apply already succeeded and the bus already started, must
+// be exactly as actionable — same typed InternalError shape, same recovery
+// Hint — as a startBus failure. Before this fix, this path returned a
+// generic InternalError with no Hint at all, even though it leaves the exact
+// same remote-subscription-behind situation.
+func errApplyOkHelloFailed(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool, cause error) error {
+	return errs.NewInternalError(errs.SubtypeUnknown,
+		"remote subscription is ready but the event bus handshake failed: %s", cause).
+		WithCause(cause).
+		WithHint(applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+}
+
+// applyOkRejectedError is errApplyOkStartBusFailed's bus-rejection
+// counterpart (review Fix 3, Minor #2): rejectionError (consume.go, shared
+// with the legacy Run path) already returns a typed failed_precondition
+// naming the single-consumer conflict — that guidance stays useful and is
+// deliberately left in Message untouched. What it lacks, and what this adds,
+// is the SAME remote_subscription_id/created_by_this_attempt/next_action
+// recovery Hint every other post-Apply failure in this chain carries — Apply
+// already succeeded here too, so it is exactly as important to know the
+// remote subscription was left as-is. Appended (never replacing) the
+// original Hint so neither piece of guidance is lost. rejectionError only
+// ever returns nil or a *errs.ValidationError (see its own doc comment); the
+// errors.As failing is not a reachable case today, but falls back to
+// returning rejErr unchanged rather than panicking if that ever changes.
+func applyOkRejectedError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool, rejErr error) error {
+	var ve *errs.ValidationError
+	if !errors.As(rejErr, &ve) {
+		return rejErr
+	}
+	return ve.WithHint("%s; %s", ve.Hint, applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
 }
 
 // writeRefinedDryRunPreview reports the plan on stderr — stdout is reserved

@@ -692,6 +692,117 @@ func TestRunRefinedChain_ApplyOkStartBusFails_InternalErrorWithHint_NoDelete(t *
 	// reach a remote delete call.
 }
 
+// TestRunRefinedChain_ApplyOkHelloFails_InternalErrorWithHint_NoDelete is
+// review Fix 3 (Minor #2): a HelloV2 transport/decode error AFTER Apply
+// already succeeded must carry the SAME remote_subscription_id /
+// created_by_this_attempt / next_action recovery Hint as
+// TestRunRefinedChain_ApplyOkStartBusFails_InternalErrorWithHint_NoDelete's
+// startBus-fail case -- both leave a remote subscription behind (no-delete
+// correctly holds), so both must be equally actionable for retry/reuse.
+// Before the fix, this path returned a generic InternalError with no Hint
+// at all.
+func TestRunRefinedChain_ApplyOkHelloFails_InternalErrorWithHint_NoDelete(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		},
+		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+			return "sub_new_456", true, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) {
+			return client, nil
+		},
+		hello: func(context.Context, net.Conn, string) (*protocol.HelloAck, *bufio.Reader, error) {
+			return nil, nil, errors.New("handshake reset")
+		},
+	}
+	opts := RefinedOptions{ErrOut: io.Discard, Out: io.Discard, Identity: core.AsUser}
+
+	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
+	if err == nil {
+		t.Fatal("expected an error when hello fails after a successful apply")
+	}
+	var ie *errs.InternalError
+	if !errors.As(err, &ie) {
+		t.Fatalf("expected *errs.InternalError, got %T: %v", err, err)
+	}
+	if !strings.Contains(ie.Hint, "remote_subscription_id=sub_new_456") {
+		t.Errorf("Hint missing remote_subscription_id, got: %q", ie.Hint)
+	}
+	if !strings.Contains(ie.Hint, "created_by_this_attempt=true") {
+		t.Errorf("Hint missing created_by_this_attempt, got: %q", ie.Hint)
+	}
+	if !strings.Contains(ie.Hint, "next_action") {
+		t.Errorf("Hint missing next_action guidance, got: %q", ie.Hint)
+	}
+}
+
+// TestRunRefinedChain_ApplyOkHelloRejected_HintCarriesRecoveryInfo is review
+// Fix 3's bus-rejection counterpart: a rejected hello_ack (e.g.
+// SingleConsumer already running) AFTER Apply already succeeded must ALSO
+// carry the recovery Hint, on top of (not instead of) rejectionError's own
+// pre-existing single-consumer guidance -- both pieces of information are
+// useful, and neither call site (legacy Run vs refined) should lose what it
+// already had.
+func TestRunRefinedChain_ApplyOkHelloRejected_HintCarriesRecoveryInfo(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		},
+		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+			return "sub_new_789", true, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) {
+			return client, nil
+		},
+		hello: func(context.Context, net.Conn, string) (*protocol.HelloAck, *bufio.Reader, error) {
+			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, Rejected: true, RejectReason: "another consumer (pid 9) is already running"}, bufio.NewReader(client), nil
+		},
+	}
+	opts := RefinedOptions{ErrOut: io.Discard, Out: io.Discard, Identity: core.AsBot}
+
+	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
+	if err == nil {
+		t.Fatal("expected an error when the bus rejects the hello handshake")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if !strings.Contains(ve.Hint, "remote_subscription_id=sub_new_789") {
+		t.Errorf("Hint missing remote_subscription_id, got: %q", ve.Hint)
+	}
+	if !strings.Contains(ve.Hint, "created_by_this_attempt=true") {
+		t.Errorf("Hint missing created_by_this_attempt, got: %q", ve.Hint)
+	}
+	if !strings.Contains(ve.Hint, "next_action") {
+		t.Errorf("Hint missing next_action guidance, got: %q", ve.Hint)
+	}
+	// The original single-consumer guidance (rejectionError's own Hint --
+	// the reject reason itself, e.g. "already running", lives in
+	// ve.Error()/Message, not Hint) must survive alongside the appended
+	// recovery hint, not be clobbered by it.
+	if !strings.Contains(ve.Hint, "allows only one consumer") {
+		t.Errorf("Hint dropped the original reject guidance, got: %q", ve.Hint)
+	}
+	if !strings.Contains(ve.Error(), "already running") {
+		t.Errorf("Error() dropped the reject reason, got: %q", ve.Error())
+	}
+}
+
 func TestRunRefinedChain_Suspended_NonDryRun_AppliesReactivateNotError(t *testing.T) {
 	// Suspended proceeds to Apply (which Reactivates) instead of failing --
 	// distinct from Conflict, which always fails before Apply.
@@ -801,5 +912,92 @@ func TestProdRefinedDeps_HelloClosure_ResolvesRealCurrentIdentity(t *testing.T) 
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("bus side never received the Hello frame")
+	}
+}
+
+// TestProdRefinedDeps_HelloClosure_BotIdentity_ConsumerScopeIDIndependentOfUserOpenID
+// is review Fix 2 (Minor #3): prodRefinedDeps's hello closure must feed
+// computeConsumerScopeID an EMPTY user_open_id for a bot identity, matching
+// what buildHelloV2 itself puts on the wire (it drops UserOpenID for a bot —
+// TestBuildHelloV2_BotIdentity_NeverCarriesUserOpenID above). Before the fix,
+// the closure passed resolveCurrentProfileIdentity()'s real userOpenID
+// straight into computeConsumerScopeID regardless of identity, so a bot
+// consumer's scope id varied with whoever happened to be logged in on this
+// host (nondeterministic, fragments app-level fan-out). Proven here by
+// resolving the SAME bot Hello twice against two configs that differ ONLY in
+// user_open_id and asserting the resulting ConsumerScopeID is identical, and
+// that it equals computeConsumerScopeID fed "" — never the real id.
+func TestProdRefinedDeps_HelloClosure_BotIdentity_ConsumerScopeIDIndependentOfUserOpenID(t *testing.T) {
+	resolved := refinedFixture()
+
+	runOnce := func(t *testing.T, configJSON string) string {
+		t.Helper()
+		dir := t.TempDir()
+		t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(configJSON), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		opts := RefinedOptions{Identity: core.AsBot}
+		deps := prodRefinedDeps(failDialTransport{}, "cli_hello_test", "test-profile", "", resolved, opts)
+
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+
+		recvCh := make(chan *protocol.Hello, 1)
+		go func() {
+			br := bufio.NewReader(server)
+			line, err := protocol.ReadFrame(br)
+			if err != nil {
+				return
+			}
+			msg, err := protocol.Decode(bytes.TrimRight(line, "\n"))
+			if err != nil {
+				return
+			}
+			if h, ok := msg.(*protocol.Hello); ok {
+				recvCh <- h
+			}
+			_ = protocol.Encode(server, protocol.NewHelloAck("test-bus", true))
+		}()
+
+		if _, _, err := deps.hello(context.Background(), client, "sub_remote_prod"); err != nil {
+			t.Fatalf("hello closure: unexpected error: %v", err)
+		}
+
+		var scopeID string
+		select {
+		case got := <-recvCh:
+			if got.UserOpenID != "" {
+				t.Errorf("bot Hello must never carry UserOpenID, got %q", got.UserOpenID)
+			}
+			scopeID = got.ConsumerScopeID
+		case <-time.After(2 * time.Second):
+			t.Fatal("bus side never received the Hello frame")
+		}
+		return scopeID
+	}
+
+	scopeA := runOnce(t, `{
+		"currentApp": "test-profile",
+		"apps": [
+			{"name": "test-profile", "appId": "cli_hello_test", "users": [{"userOpenId": "ou_AAAA"}]}
+		]
+	}`)
+	scopeB := runOnce(t, `{
+		"currentApp": "test-profile",
+		"apps": [
+			{"name": "test-profile", "appId": "cli_hello_test", "users": [{"userOpenId": "ou_BBBB"}]}
+		]
+	}`)
+
+	if scopeA != scopeB {
+		t.Errorf("bot ConsumerScopeID must be independent of user_open_id: %q (ou_AAAA) vs %q (ou_BBBB)", scopeA, scopeB)
+	}
+
+	want := computeConsumerScopeID(resolved.Definition.Key, resolved.MaterializedKey, "app", "cli_hello_test", "")
+	if scopeA != want {
+		t.Errorf("bot ConsumerScopeID = %q, want %q (computed with empty user_open_id, matching buildHelloV2's bot-drops-UserOpenID rule)", scopeA, want)
 	}
 }

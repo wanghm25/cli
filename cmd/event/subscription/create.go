@@ -7,8 +7,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"slices"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -192,29 +190,18 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 }
 
 // checkTemplateAuthTypes enforces design spec §2.8's second, stricter
-// identity tier for a refined EventKey with a matched KeyTemplate: even when
-// the resolved identity is one the whole base key accepts (checked by the
-// caller against resolved.Definition.AuthTypes), the SPECIFIC matched
-// template may accept a narrower set (e.g. "owner/me" is user-only even
-// though its base key im.message.created_v1 allows user+bot). Empty
-// Template.AuthTypes means "no additional restriction" (mirrors
-// KeyDefinition.AuthTypes' own "empty = no identity required" convention).
-// Violated -> typed failed_precondition (never a silent identity switch —
-// AGENTS.md "no silent downgrade"), naming the allowed identities so the
-// caller can retry explicitly with --as.
+// identity tier for a refined EventKey with a matched KeyTemplate — see
+// eventlib.CheckTemplateAuthTypes's own doc comment for the full
+// rationale/state (empty = no restriction, violated = typed
+// failed_precondition naming the allowed identities). The check itself
+// moved to internal/event (review fix, Task 15b) so it is shared,
+// byte-identical, with the refined `event consume` startup chain
+// (cmd/event/consume.go's runRefinedConsume), which needs the exact same
+// tier-2 gate before its own remote write. This thin wrapper keeps this
+// package's own name (create_test.go calls it directly) — behavior is
+// unchanged, only the implementation moved.
 func checkTemplateAuthTypes(identity core.Identity, resolved eventlib.ResolvedEventKey) error {
-	allowed := resolved.Template.AuthTypes
-	if len(allowed) == 0 {
-		return nil
-	}
-	if slices.Contains(allowed, string(identity)) {
-		return nil
-	}
-	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
-		"EventKey template %s only supports identity: %s; resolved identity is %q",
-		resolved.Template.Template, strings.Join(allowed, ", "), identity).
-		WithParam("--as").
-		WithHint("retry with --as %s", strings.Join(allowed, " or "))
+	return eventlib.CheckTemplateAuthTypes(identity, resolved)
 }
 
 // errCreateRequiresRefinedKey rejects a syntactically valid, registered

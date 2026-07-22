@@ -282,6 +282,19 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 	if err != nil {
 		return err
 	}
+	// §2.8 tier 2 (write-safety, review fix): resolveIdentity only checked
+	// the BASE key's AuthTypes; the matched KeyTemplate can be narrower
+	// (e.g. the shipped im.message.created_v1/owner/me template is
+	// user-only even though its base key allows user+bot — see
+	// eventlib.CheckTemplateAuthTypes's own doc comment). This must run
+	// BEFORE any client/subClient construction below and before
+	// consume.RunRefined's Plan/Apply — a template-narrowed identity must
+	// never reach the ONLY remote write this chain performs. Mirrors
+	// cmd/event/subscription/create.go's own tier-2 check (same shared
+	// func), which guards the sibling write path.
+	if err := eventlib.CheckTemplateAuthTypes(identity, resolved); err != nil {
+		return err
+	}
 
 	outputDir := o.outputDir
 	if outputDir != "" {

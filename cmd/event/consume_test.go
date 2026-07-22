@@ -272,6 +272,64 @@ func TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOff
 	}
 }
 
+// TestRunConsume_OwnerMeTemplate_AsBot_RejectedByTemplateAuthTypesBeforePlanApply
+// is this task's REQUIRED write-safety case (review Fix 1): the shipped
+// catalog's im.message.created_v1/owner/me template declares
+// auth_types:["user"] (events/refined/refined_keys_mock.json) -- narrower
+// than the base key's ["user","bot"] -- so `--as bot` must be rejected with
+// the §2.8 typed error BEFORE the refined chain ever reaches
+// PlanRemoteSubscription/ApplyRemoteSubscriptionPlan. This Factory
+// (newRefinedConsumeTestFactory) registers zero HTTP stubs, so if the
+// rejection did NOT happen up front and the chain instead reached Plan's
+// real List call, the error would mention "/open-apis/event/v1/subscriptions"
+// (exactly as
+// TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOffline
+// demonstrates for the chat-id template) -- proving the apply seam was never
+// reached is therefore equivalent to proving that substring is absent.
+func TestRunConsume_OwnerMeTemplate_AsBot_RejectedByTemplateAuthTypesBeforePlanApply(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "im.message.created_v1/owner/me", "--as", "bot").Execute()
+
+	if err == nil {
+		t.Fatal("expected an error for --as bot on the user-only owner/me template, got nil")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if ve.Param != "--as" {
+		t.Errorf("Param = %q, want --as", ve.Param)
+	}
+	if strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
+		t.Errorf("template AuthTypes must reject BEFORE any Plan/Apply network call (apply seam must never be reached), got: %v", err)
+	}
+}
+
+// TestRunConsume_OwnerMeTemplate_AsUser_PassesTemplateCheck_ProceedsToRealChain
+// is Fix 1's non-regression counterpart: a user identity satisfies BOTH
+// AuthTypes tiers (base key AND the owner/me template) and so must still
+// proceed all the way into the real refined chain, exactly like
+// TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOffline's
+// chat-id case -- failing only once it reaches PlanRemoteSubscription's real
+// (stub-less) List call, never earlier.
+func TestRunConsume_OwnerMeTemplate_AsUser_PassesTemplateCheck_ProceedsToRealChain(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "im.message.created_v1/owner/me", "--as", "user").Execute()
+
+	if err == nil {
+		t.Fatal("expected an error (this Factory registers no HTTP stubs), got nil")
+	}
+	if _, ok := errs.ProblemOf(err); !ok {
+		t.Fatalf("expected a typed errs.* error even from a deep chain failure, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
+		t.Errorf("expected --as user on owner/me to reach PlanRemoteSubscription's real List call, got: %v", err)
+	}
+}
+
 // TestRunConsume_LegacyKeyWithSuffixRejected locks that a legacy EventKey
 // rejects any "/"-suffix (exact match only — legacy keys never enter the
 // refined split path, design spec §2.3 step 1) with a message distinct from
