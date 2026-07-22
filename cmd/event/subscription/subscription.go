@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -31,9 +32,9 @@ import (
 )
 
 // NewCmdSubscription builds the `event subscription` command group (spec
-// §3.1). Task 8 wired the read-only list/get pair; Task 9 adds create as a
-// sibling, without touching list/get. update/renew/reactivate/delete land in
-// later changes the same way.
+// §3.1). Task 8 wired the read-only list/get pair; Task 9 added create as a
+// sibling, without touching list/get; this change adds update/renew/
+// reactivate/delete the same way, without touching list/get/create.
 func NewCmdSubscription(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "subscription",
@@ -43,14 +44,22 @@ refined (per-resource) event delivery — as opposed to 'event consume', which
 starts a local process that consumes already-delivered events.
 
 Use 'list' / 'get <remote_subscription_id>' to inspect what is currently
-subscribed remotely, and 'create <refined EventKey>' to create (or
-idempotently reuse) one.`,
+subscribed remotely, 'create <refined EventKey>' to create (or idempotently
+reuse) one, 'update <remote_subscription_id>' to change its payload_options,
+'renew'/'reactivate' to extend its TTL or resume delivery, and
+'delete <remote_subscription_id>' to remove it. update/delete are high-risk
+writes on a shared remote resource and require --yes after a human confirms
+(spec §3.7); renew/reactivate do not.`,
 		SilenceUsage: true,
 	}
 
 	cmd.AddCommand(NewCmdList(f))
 	cmd.AddCommand(NewCmdGet(f))
 	cmd.AddCommand(NewCmdCreate(f))
+	cmd.AddCommand(NewCmdUpdate(f))
+	cmd.AddCommand(NewCmdRenew(f))
+	cmd.AddCommand(NewCmdReactivate(f))
+	cmd.AddCommand(NewCmdDelete(f))
 
 	return cmd
 }
@@ -276,4 +285,128 @@ func strVal(s *string) string {
 
 func boolVal(b *bool) bool {
 	return b != nil && *b
+}
+
+// ---- shared pieces for update/renew/reactivate/delete (spec §3.2.4-§3.2.7)
+//
+// Unlike create (which keys off a refined EventKey with no remote identity
+// yet, and so branches into create/reuse/conflict/suspended), these four
+// commands all key off an already-existing remote_subscription_id: their
+// --dry-run "parse/identity/scope preflight/remote read/impact analysis"
+// shape (spec §3.4) is therefore identical across all four, differing only
+// in the operation name, the planned_change.action string, and the
+// local_impact note text — so it is built and rendered once here rather
+// than four times. list/get/create keep their own bespoke shapes unchanged.
+
+// errEmptyRemoteSubscriptionID rejects an empty remote_subscription_id
+// before any identity/scope/network work — the shared counterpart of
+// get.go's runGet's own inlined identical check (kept as-is there per this
+// change's "do not disturb list/get/create" constraint; this helper exists
+// so update/renew/reactivate/delete do not each repeat it).
+func errEmptyRemoteSubscriptionID() error {
+	return errs.NewValidationError(errs.SubtypeInvalidArgument,
+		"remote_subscription_id must not be empty").
+		WithParam("remote_subscription_id").
+		WithHint("pass the remote_subscription_id from `lark-cli event subscription list --json`")
+}
+
+// mutationPreflight is the `preflight` sub-object shared by update/renew/
+// reactivate/delete's --dry-run JSON. Unlike create's createPreflight, these
+// commands carry no EventKey/KeyTemplate context (spec §2.8's last
+// paragraph: they resolve --as to a single identity with no per-template
+// AuthTypes check), so there is no MatchedTemplate field.
+type mutationPreflight struct {
+	Identity string `json:"identity"`
+	ScopesOK bool   `json:"scopes_ok"`
+}
+
+// mutationDryRunResult is the shared --dry-run JSON shape for update/renew/
+// reactivate/delete (spec §3.4: operation/dry_run/required_scopes/
+// preflight/remote_before/planned_change/local_impact/next_action). All
+// four always have a non-nil RemoteBefore by the time this is built: unlike
+// create's target (which may legitimately not exist yet), these commands
+// operate on an id the caller already believes exists, and the shared
+// getSubscription (get.go) helper that supplies RemoteBefore already
+// returns a typed error rather than a nil detail when the remote side
+// disagrees.
+type mutationDryRunResult struct {
+	Operation            string            `json:"operation"`
+	DryRun               bool              `json:"dry_run"`
+	RemoteSubscriptionID string            `json:"remote_subscription_id"`
+	RequiredScopes       []string          `json:"required_scopes"`
+	Preflight            mutationPreflight `json:"preflight"`
+	RemoteBefore         *subscriptionRow  `json:"remote_before"`
+	PlannedChange        plannedChange     `json:"planned_change"`
+	LocalImpact          localImpact       `json:"local_impact"`
+	NextAction           string            `json:"next_action"`
+}
+
+// buildMutationDryRunResult builds the shared --dry-run result. identity has
+// already passed the scope preflight by the time this is called, so
+// Preflight.ScopesOK is unconditionally true here — mirroring create.go's
+// buildDryRunResult's own ScopesOK comment. plannedAction is the
+// planned_change.action value (e.g. "update", or a blocked-state variant
+// such as "blocked_suspended" — spec §3.4 always reports the plan
+// informationally rather than erroring on remote business state; only the
+// preflight steps themselves are real dry-run failures, mirroring create's
+// own conflict/suspended dry-run handling).
+func buildMutationDryRunResult(operation, remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, plannedAction, impactNote, nextAction string) *mutationDryRunResult {
+	return &mutationDryRunResult{
+		Operation:            operation,
+		DryRun:               true,
+		RemoteSubscriptionID: remoteSubscriptionID,
+		RequiredScopes:       subscriptionMutationScopes,
+		Preflight: mutationPreflight{
+			Identity: string(identity),
+			ScopesOK: true,
+		},
+		RemoteBefore: before,
+		PlannedChange: plannedChange{
+			Action:               plannedAction,
+			RemoteSubscriptionID: remoteSubscriptionID,
+		},
+		LocalImpact: localImpact{
+			LocalConsumerAffected: false,
+			Note:                  impactNote,
+		},
+		NextAction: nextAction,
+	}
+}
+
+func writeMutationDryRunText(out io.Writer, result *mutationDryRunResult) {
+	fmt.Fprintf(out, "[dry-run] planned change: %s\n", result.PlannedChange.Action)
+	fmt.Fprintf(out, "Remote Subscription ID: %s\n", result.RemoteSubscriptionID)
+	if result.RemoteBefore != nil {
+		fmt.Fprintf(out, "Current remote state:    %s\n", result.RemoteBefore.Remote.State)
+	}
+	fmt.Fprintf(out, "Next: %s\n", result.NextAction)
+}
+
+// mutationResult is the shared non-dry-run success JSON shape for
+// update/renew/reactivate: each of those three SDK calls
+// (Patch/Renew/Reactivate) returns a fresh SubscriptionDetail to echo back.
+// delete has its own deleteResult in delete.go — DeleteSubscriptionResp
+// carries no Data/SubscriptionDetail at all (spec §0.4), so there is nothing
+// fresh to map here.
+type mutationResult struct {
+	Operation            string          `json:"operation"`
+	RemoteSubscriptionID string          `json:"remote_subscription_id"`
+	Subscription         subscriptionRow `json:"subscription"`
+	NextAction           string          `json:"next_action"`
+}
+
+func buildMutationResult(operation string, detail *larkeventv1.SubscriptionDetail, nextAction string) *mutationResult {
+	row := mapSubscriptionDetail(detail)
+	return &mutationResult{
+		Operation:            operation,
+		RemoteSubscriptionID: row.RemoteSubscriptionID,
+		Subscription:         row,
+		NextAction:           nextAction,
+	}
+}
+
+func writeMutationResultText(out io.Writer, verb string, result *mutationResult) {
+	fmt.Fprintf(out, "%s remote Subscription %s\n", verb, result.RemoteSubscriptionID)
+	fmt.Fprintf(out, "State: %s\n", result.Subscription.Remote.State)
+	fmt.Fprintf(out, "Next: %s\n", result.NextAction)
 }
