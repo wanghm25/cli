@@ -404,6 +404,112 @@ func TestIdentityGate_ResolveCurrent_FreshAcrossCalls(t *testing.T) {
 	}
 }
 
+// --- Task 18: bindConsumer seam (factored out of onConnReady) + memoization ---
+//
+// These exercise identityGate.bindConsumer DIRECTLY (not via onConnReady) --
+// exactly how subscriptionLifecycleAction (lifecycle.go) calls it when
+// reacting to activated_v1/a successful suspended_v1 Reactivate, independent
+// of any fresh WS ready/reconnect callback.
+
+// Before ANY onConnReady has ever fired, bindConsumer must fail gracefully
+// (no WS connection/bindUser to call yet) rather than panic on a nil
+// bindUser func, and must degrade ONLY the one consumer it was asked about.
+func TestIdentityGate_BindConsumer_BeforeAnyOnConnReady_DegradesGracefully(t *testing.T) {
+	h := NewHub()
+	c := newIdentityTestConn(t, 100, "", "user", "app1", "ou_alice")
+	h.RegisterAndIsFirst(c)
+
+	uat := &fakeUATResolver{uat: "uat-1"}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
+
+	if err := gate.bindConsumer(context.Background(), c); err == nil {
+		t.Fatal("bindConsumer before any onConnReady must return an error, got nil")
+	}
+	if got := c.DegradedReason(); got != "bind_failed: connection_not_ready" {
+		t.Errorf("DegradedReason() = %q, want %q", got, "bind_failed: connection_not_ready")
+	}
+	if c.BoundConnID() != "" {
+		t.Errorf("BoundConnID() = %q, want \"\" (never bound: no connection was ever ready)", c.BoundConnID())
+	}
+	if uat.callCount() != 0 {
+		t.Errorf("resolveUAT call count = %d, want 0 (must not mint a UAT with no connection to bind on)", uat.callCount())
+	}
+}
+
+// After onConnReady has fired at least once, bindConsumer(ctx, c) called
+// DIRECTLY (no fresh onConnReady) must reuse the MEMOIZED (connID, bindUser)
+// pair -- this is the seam Task 18's lifecycle action depends on.
+func TestIdentityGate_BindConsumer_ReusesMemoizedConnIDAndBindUser(t *testing.T) {
+	h := NewHub()
+	// A conn NOT yet registered when onConnReady first fires (mirrors a
+	// consumer that Hello's AFTER the WS connection is already ready) --
+	// onConnReady's own loop (over userConns() at call time) never touches
+	// it, so its later bindConsumer success can ONLY be explained by reusing
+	// the memoized pair, not by onConnReady's loop having bound it directly.
+	uat := &fakeUATResolver{uat: "uat-for-alice"}
+	fb := &fakeBindUser{}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
+
+	gate.onConnReady(context.Background(), "conn-1", fb.bind) // no user conns registered yet -- memoizes only
+
+	c := newIdentityTestConn(t, 100, "", "user", "app1", "ou_alice")
+	h.RegisterAndIsFirst(c)
+
+	if err := gate.bindConsumer(context.Background(), c); err != nil {
+		t.Fatalf("bindConsumer returned err: %v", err)
+	}
+	if got := c.BoundConnID(); got != "conn-1" {
+		t.Errorf("BoundConnID() = %q, want %q (memoized connID/bindUser from the earlier onConnReady)", got, "conn-1")
+	}
+	if fb.callCount() != 1 {
+		t.Errorf("bindUser call count = %d, want 1", fb.callCount())
+	}
+}
+
+// owner != current: bindConsumer must mark stale_identity and return an
+// error WITHOUT ever loading a UAT or calling bindUser -- the same §8 red
+// line onConnReady's own gate already enforced, now reused by bindConsumer.
+func TestIdentityGate_BindConsumer_OwnerMismatch_NoUATNoBind(t *testing.T) {
+	h := NewHub()
+	c := newIdentityTestConn(t, 100, "", "user", "app1", "ou_alice")
+	h.RegisterAndIsFirst(c)
+
+	uat := &fakeUATResolver{uat: "uat-for-someone"}
+	fb := &fakeBindUser{}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_bob"), uat.resolve, discardTestLogger())
+	gate.onConnReady(context.Background(), "conn-1", fb.bind) // memoize a real connID/bindUser
+
+	err := gate.bindConsumer(context.Background(), c)
+	if !errors.Is(err, errOwnerMismatch) {
+		t.Errorf("bindConsumer err = %v, want errOwnerMismatch", err)
+	}
+	if !c.StaleIdentity() {
+		t.Error("owner!=current must be marked stale_identity")
+	}
+	if c.BoundConnID() != "" {
+		t.Errorf("BoundConnID() = %q, want \"\" (must never bind a stale consumer)", c.BoundConnID())
+	}
+	if uat.callCount() != 0 {
+		t.Errorf("resolveUAT call count = %d, want 0 (must NEVER load a UAT for a mismatched/historical owner)", uat.callCount())
+	}
+	if fb.callCount() != 0 {
+		t.Errorf("bindUser call count = %d, want 0", fb.callCount())
+	}
+}
+
+// A nil *identityGate (a Bus that never called SetIdentityProviders) must
+// not panic -- lifecycle.go's subscriptionLifecycleAction only calls
+// bindConsumer once a conn is already known-eligible (which itself requires
+// a non-nil identityGate), but bindConsumer stays defensively nil-safe on
+// its own, mirroring onConnReady's identical guard.
+func TestIdentityGate_BindConsumer_NilGate_NoPanic(t *testing.T) {
+	var gate *identityGate
+	c := newIdentityTestConn(t, 1, "", "user", "app1", "ou_alice")
+	if err := gate.bindConsumer(context.Background(), c); err == nil {
+		t.Error("bindConsumer on a nil gate must return an error, got nil")
+	}
+}
+
 // Dedicated identity.go race coverage: onConnReady (bind gate, its own
 // goroutine in production via the WS callback) and Hub.Publish (delivery
 // gate, the source's emit goroutine) run concurrently against the SAME

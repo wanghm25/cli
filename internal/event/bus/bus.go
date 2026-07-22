@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	lark "github.com/larksuite/oapi-sdk-go/v3"
+
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/busdiscover"
@@ -55,10 +57,19 @@ type Bus struct {
 
 	// lifecycleExecutor is the bounded, in-memory subscription lifecycle
 	// executor (spec §5.1/§5.2) every FeishuSource's 6 typed lifecycle
-	// handlers feed into. Unlike identityGate, this has no external
-	// dependency to inject (Task 17's summary-only action needs only b's own
-	// Hub) — always constructed by NewBus, never nil.
+	// handlers feed into — always constructed by NewBus, never nil.
 	lifecycleExecutor *lifecycleExecutor
+
+	// lifecycleAction is the REAL per-event action (spec §5.3/§5.4/§5.5,
+	// Task 18) newLifecycleExecutor above was constructed with, kept as its
+	// own typed field (rather than only living inside lifecycleExecutor) so
+	// SetIdentityProviders/SetSubscriptionClient below can fill in its two
+	// optional dependencies AFTER construction — mirroring identityGate's
+	// own "nil until SetIdentityProviders" convention. Never nil itself:
+	// only its OWN identityGate/newSubClient fields start nil, which keeps
+	// it a strict superset of Task 17's summaryLifecycleAction (full summary
+	// recording, zero remote calls, zero panics) until wired.
+	lifecycleAction *subscriptionLifecycleAction
 
 	// pidHandle pins the alive.lock fd to the bus lifetime; OS releases on exit.
 	pidHandle *busdiscover.Handle
@@ -66,6 +77,7 @@ type Bus struct {
 
 func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logger) *Bus {
 	hub := NewHub()
+	action := newSubscriptionLifecycleAction(hub, logger)
 	return &Bus{
 		appID:     appID,
 		appSecret: appSecret,
@@ -77,7 +89,8 @@ func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logge
 		conns:     make(map[*Conn]struct{}),
 		// Buffered so shutdown and source-exit paths never drop the signal.
 		shutdownCh:        make(chan struct{}, 1),
-		lifecycleExecutor: newLifecycleExecutor(hub, summaryLifecycleAction(hub), logger),
+		lifecycleExecutor: newLifecycleExecutor(hub, action, logger),
+		lifecycleAction:   action,
 	}
 }
 
@@ -100,6 +113,33 @@ func (b *Bus) SetIdentityProviders(resolveUAT func(ctx context.Context, appID, u
 	}
 	b.identityGate = newIdentityGate(b.hub, resolveCurrentIdentity, resolveUAT, b.logger)
 	b.hub.SetCurrentResolver(resolveCurrentIdentity)
+	// Task 18: the real lifecycle action's owner==current gate (spec §8) and
+	// bindConsumer (activated/suspended-recovery) both need this SAME gate.
+	b.lifecycleAction.setIdentityGate(b.identityGate)
+}
+
+// SetSubscriptionClient injects the *lark.Client Task 18's real lifecycle
+// action (spec §5.3/§5.4) needs to issue the single Reactivate/Renew/Get
+// call each event allows. Mirrors SetIdentityProviders's own shape: nil is
+// tolerated (no-op, keeping the lifecycle action summary-only) and this is
+// safe to call any number of times before Run() only — NOT concurrently
+// with it, exactly like SetIdentityProviders.
+//
+// sdk is expected to already be bound to THIS bus's own (appID, appSecret)
+// pair (a bus is per-app, spec §4.4) — the SAME *lark.Client every
+// `event subscription` command builds via f.LarkClient() (cmd/event/bus.go
+// wires this). The per-call identity (bot, or a specific user's FRESH uat —
+// never a historical one, spec §8) is decided fresh for EVERY action by the
+// lifecycle action itself via eventlib.NewSubscriptionClient(sdk, as, uat)
+// (ref: cmd/event/consume.go:327) — never by constructing a second
+// *lark.Client.
+func (b *Bus) SetSubscriptionClient(sdk *lark.Client) {
+	if sdk == nil {
+		return
+	}
+	b.lifecycleAction.setNewSubscriptionClient(func(as core.Identity, uat string) (subscriptionActionClient, error) {
+		return event.NewSubscriptionClient(sdk, as, uat)
+	})
 }
 
 // Run binds the IPC socket, starts event sources, and blocks in the accept loop until shutdown.

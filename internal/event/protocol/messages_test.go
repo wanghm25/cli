@@ -360,6 +360,11 @@ func TestDecode_OldStatusResponse_BackwardCompat(t *testing.T) {
 		c.RemoteState != "" || c.RemoteSubscription != nil || c.LastLifecycleEvent != "" {
 		t.Errorf("Task 16 ConsumerInfo fields should be zero-valued decoding an old frame, got %+v", c)
 	}
+	// Task 18 (spec §5.5): same additive-field guarantee for the 4 action
+	// fields added on top of Task 16/17's shape.
+	if c.SuspensionReason != "" || c.LastAction != "" || c.LastActionError != "" || c.NextAction != "" {
+		t.Errorf("Task 18 ConsumerInfo action fields should be zero-valued decoding an old frame, got %+v", c)
+	}
 }
 
 // --- Task 16 additive ConsumerInfo fields (spec §4.6) ---
@@ -437,6 +442,69 @@ func TestConsumerInfo_V2FieldsOmittedWhenZero(t *testing.T) {
 	} {
 		if bytes.Contains(data, []byte(key)) {
 			t.Errorf("zero-valued Task 16 field leaked onto wire: %s in %s", key, data)
+		}
+	}
+}
+
+// --- Task 18 additive ConsumerInfo action fields (spec §5.5) ---------------
+//
+// Mirrors the Task 16 v2-additive-field test shape immediately above: (1) a
+// fully-populated ConsumerInfo round-trips through Encode/Decode inside a
+// StatusResponse, and (2) omitempty means a ConsumerInfo built the old way
+// (only pre-Task-18 fields set) marshals to exactly the old wire shape.
+
+func TestConsumerInfo_Task18ActionFieldsRoundTrip(t *testing.T) {
+	ci := ConsumerInfo{
+		PID:                  7,
+		EventKey:             "im.message.created_v1/chat-id/oc_xxx",
+		SubscriptionID:       "im.message.created_v1:chat-id:oc_xxx",
+		RefinedSubscription:  true,
+		RemoteSubscriptionID: "sub_abc123",
+		LastLifecycleEvent:   "event.subscription.suspended_v1",
+		RemoteState:          "suspended",
+		SuspensionReason:     "authority_revoked",
+		LastAction:           "reactivate",
+		LastActionError:      "missing_scopes",
+		NextAction:           "reactivate",
+	}
+	sr := NewStatusResponse(1, 10, 1, []ConsumerInfo{ci})
+
+	var buf bytes.Buffer
+	if err := Encode(&buf, sr); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	msg, err := Decode(bytes.TrimRight(buf.Bytes(), "\n"))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got, ok := msg.(*StatusResponse)
+	if !ok {
+		t.Fatalf("decoded type = %T, want *StatusResponse", msg)
+	}
+	if len(got.Consumers) != 1 {
+		t.Fatalf("Consumers len = %d, want 1", len(got.Consumers))
+	}
+	gc := got.Consumers[0]
+	if !reflect.DeepEqual(gc, ci) {
+		t.Errorf("ConsumerInfo roundtrip mismatch:\ngot:  %+v\nwant: %+v", gc, ci)
+	}
+}
+
+func TestConsumerInfo_Task18ActionFieldsOmittedWhenZero(t *testing.T) {
+	sr := NewStatusResponse(1, 10, 1, []ConsumerInfo{{
+		PID:            2,
+		EventKey:       "k",
+		SubscriptionID: "k:fp",
+	}})
+	data, err := json.Marshal(sr)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{
+		`"suspension_reason"`, `"last_action"`, `"last_action_error"`, `"next_action"`,
+	} {
+		if bytes.Contains(data, []byte(key)) {
+			t.Errorf("zero-valued Task 18 field leaked onto wire: %s in %s", key, data)
 		}
 	}
 }

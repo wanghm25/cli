@@ -8,6 +8,10 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	lark "github.com/larksuite/oapi-sdk-go/v3"
+
+	"github.com/larksuite/cli/internal/core"
 )
 
 // TestNewBus_ConstructsLifecycleExecutor locks bus.go's wiring: NewBus must
@@ -48,5 +52,84 @@ func TestNewBus_LifecycleExecutorWiredToOwnHub(t *testing.T) {
 	}
 	if got := c.LastLifecycleEvent(); got != "event.subscription.activated_v1" {
 		t.Errorf("LastLifecycleEvent() = %q, want %q (executor must be wired to b's own hub)", got, "event.subscription.activated_v1")
+	}
+}
+
+// --- Task 18: NewBus's default action + SetSubscriptionClient/SetIdentityProviders wiring ---
+
+// TestNewBus_DefaultLifecycleAction_IsSubscriptionLifecycleAction locks
+// Task 18's bus.go change: NewBus must construct the REAL action (not Task
+// 17's summaryLifecycleAction) so that once SetSubscriptionClient/
+// SetIdentityProviders are wired, Reactivate/Renew/Get/BindUser become
+// reachable without reconstructing anything.
+func TestNewBus_DefaultLifecycleAction_IsSubscriptionLifecycleAction(t *testing.T) {
+	b := NewBus("test-app", "test-secret", "", nil, discardTestLogger())
+	defer b.lifecycleExecutor.Cancel()
+
+	if b.lifecycleAction == nil {
+		t.Fatal("NewBus did not construct a lifecycleAction")
+	}
+	if b.lifecycleAction.identityGate != nil {
+		t.Error("a fresh Bus's lifecycleAction must start with identityGate unconfigured (nil)")
+	}
+	if b.lifecycleAction.newSubClient != nil {
+		t.Error("a fresh Bus's lifecycleAction must start with newSubClient unconfigured (nil)")
+	}
+}
+
+// TestBus_SetSubscriptionClient_WiresFactory locks the new injection seam:
+// after SetSubscriptionClient(sdk), the lifecycle action's newSubClient
+// factory must be non-nil and able to build a working client for a bot
+// identity (which needs no uat) WITHOUT ever making a network call itself —
+// eventlib.NewSubscriptionClient's own construction is purely local
+// (identityOptions), matching NewSubscriptionClient's own doc.
+func TestBus_SetSubscriptionClient_WiresFactory(t *testing.T) {
+	b := NewBus("test-app", "test-secret", "", nil, discardTestLogger())
+	defer b.lifecycleExecutor.Cancel()
+
+	sdk := lark.NewClient("test-app", "test-secret")
+	b.SetSubscriptionClient(sdk)
+
+	if b.lifecycleAction.newSubClient == nil {
+		t.Fatal("SetSubscriptionClient did not wire newSubClient")
+	}
+	client, err := b.lifecycleAction.newSubClient(core.AsBot, "")
+	if err != nil {
+		t.Fatalf("newSubClient(AsBot, \"\") returned err: %v", err)
+	}
+	if client == nil {
+		t.Fatal("newSubClient(AsBot, \"\") returned a nil client")
+	}
+}
+
+// TestBus_SetSubscriptionClient_Nil_NoOp mirrors SetIdentityProviders(nil)'s
+// own no-op convention.
+func TestBus_SetSubscriptionClient_Nil_NoOp(t *testing.T) {
+	b := NewBus("test-app", "test-secret", "", nil, discardTestLogger())
+	defer b.lifecycleExecutor.Cancel()
+
+	b.SetSubscriptionClient(nil)
+	if b.lifecycleAction.newSubClient != nil {
+		t.Error("SetSubscriptionClient(nil) must be a no-op")
+	}
+}
+
+// TestBus_SetIdentityProviders_WiresLifecycleActionsIdentityGate locks that
+// Task 18's lifecycleAction shares the SAME identityGate SetIdentityProviders
+// already constructs for the delivery/bind gates — not a second, independent
+// one.
+func TestBus_SetIdentityProviders_WiresLifecycleActionsIdentityGate(t *testing.T) {
+	b := NewBus("test-app", "test-secret", "", nil, discardTestLogger())
+	defer b.lifecycleExecutor.Cancel()
+
+	b.SetIdentityProviders(func(ctx context.Context, appID, userOpenID string) (string, error) {
+		return "uat", nil
+	})
+
+	if b.lifecycleAction.identityGate == nil {
+		t.Fatal("SetIdentityProviders did not wire the lifecycle action's identityGate")
+	}
+	if b.lifecycleAction.identityGate != b.identityGate {
+		t.Error("lifecycleAction.identityGate must be the SAME instance as b.identityGate, not a second one")
 	}
 }

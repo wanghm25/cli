@@ -235,10 +235,14 @@ type ConsumerInfo struct {
 	// RemoteState is a short summary of this consumer's remote Subscription
 	// state. Two independent producers, neither the bus's live Publish path:
 	// (a) status.go's weak, optional remote supplement (spec §4.6) sets it
-	// from a live SubscriptionClient.Get when every precondition holds —
-	// this is the only producer as of Task 16; (b) a future Task 18 will
-	// additionally have the bus itself remember the last lifecycle event it
-	// received for this subscription. Empty until either producer runs.
+	// from a live SubscriptionClient.Get when every precondition holds — the
+	// only producer as of Task 16; (b) since Task 17, the bus itself ALSO
+	// remembers the last subscription lifecycle meta-event it received for
+	// this consumer's remote Subscription (internal/event/bus/lifecycle.go's
+	// executor, via Conn.SetLifecycleSummary/Hub.Consumers()) — Task 18
+	// extends producer (b) to additionally take the real per-event action
+	// (spec §5.3/§5.4) rather than only recording a summary. Empty until
+	// either producer runs.
 	RemoteState string `json:"remote_state,omitempty"`
 
 	// RemoteSubscription carries the raw remote Subscription snapshot from
@@ -251,11 +255,44 @@ type ConsumerInfo struct {
 
 	// LastLifecycleEvent records the most recent typed lifecycle event
 	// (Activated/Updated/Suspended/ExpirationReminder/Expired/Deleted, spec
-	// §5.1) the bus observed for this consumer's remote Subscription. Added
-	// now so the wire shape is stable; POPULATED by Task 18 — always "" until
-	// then, which is fine/additive (this field's own zero value is
-	// indistinguishable from "no lifecycle event yet").
+	// §5.1) the bus observed for this consumer's remote Subscription.
+	// POPULATED since Task 17 (Hub.Consumers(), from Conn.LastLifecycleEvent()
+	// — the lifecycle executor's action writes it on every processed event);
+	// "" only means "no lifecycle event observed yet for this consumer", not
+	// "not implemented".
 	LastLifecycleEvent string `json:"last_lifecycle_event,omitempty"`
+
+	// --- lifecycle ACTION fields (spec §5.5, Task 18). All optional/
+	// omitempty so a pre-Task-18 consumer entry (only the fields above set)
+	// marshals to exactly the old wire shape. Populated by Hub.Consumers()
+	// from the identically-named Conn getters (internal/event/bus/conn.go),
+	// which internal/event/bus/lifecycle.go's subscriptionLifecycleAction
+	// writes to as it processes each lifecycle event — see that type's own
+	// doc for exactly when each field changes.
+
+	// SuspensionReason is the most recent suspended_v1's suspension.code,
+	// carried verbatim (spec §5.4: an open string, never a closed enum) —
+	// "" once cleared by a later activated_v1, or if never suspended.
+	SuspensionReason string `json:"suspension_reason,omitempty"`
+
+	// LastAction is the most recent remote SubscriptionClient call
+	// subscriptionLifecycleAction attempted for this consumer: "reactivate" /
+	// "renew" / "get" (spec §5.2/§5.3's "at most one such call per event, no
+	// retry"). "" means no such call has been attempted yet.
+	LastAction string `json:"last_action,omitempty"`
+
+	// LastActionError is LastAction's classified failure reason ("" =
+	// succeeded, or LastAction itself is ""). Reuses typed error
+	// classification (errs.Problem's Category/Subtype, with permission
+	// failures normalized to "missing_scopes") rather than a new private
+	// error code (spec §5.5).
+	LastActionError string `json:"last_action_error,omitempty"`
+
+	// NextAction is a short, stable hint for what an operator/AI should do
+	// next while this consumer is degraded (spec §5.5: the recovery command
+	// is uniformly "reactivate", never "reactive"/"resume"). "" means no
+	// outstanding recommendation.
+	NextAction string `json:"next_action,omitempty"`
 }
 
 // RemoteSubscriptionInfo is the CLI-facing snapshot of one remote

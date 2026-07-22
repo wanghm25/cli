@@ -70,16 +70,41 @@ type Conn struct {
 
 	// --- lifecycle summary state (spec §5.1/§5.5, Task 17) -----------------
 	// lastLifecycleEvent/lastLifecycleEventID/remoteState summarize the most
-	// recent subscription lifecycle meta-event LifecycleExecutor's
-	// summary-only action (internal/event/bus/lifecycle.go) observed for this
-	// consumer's remote Subscription. Guarded by the SAME identityMu as the
-	// rest of this block: written by the executor's worker goroutines, read
-	// by Hub.Consumers() (a future status query). Action-related fields
-	// (suspensionReason/lastAction/lastActionError/nextAction, spec §5.5) are
-	// Task 18 — not added here.
+	// recent subscription lifecycle meta-event the lifecycle executor's
+	// action (internal/event/bus/lifecycle.go) observed for this consumer's
+	// remote Subscription. Guarded by the SAME identityMu as the rest of this
+	// block: written by the executor's worker goroutines, read by
+	// Hub.Consumers() (the `event status` surface).
 	lastLifecycleEvent   string
 	lastLifecycleEventID string
 	remoteState          string
+
+	// --- lifecycle ACTION state (spec §5.3/§5.4/§5.5, Task 18) --------------
+	// suspensionReason/lastAction/lastActionError/nextAction record the real
+	// per-event action subscriptionLifecycleAction (lifecycle.go) took (or,
+	// per the spec §8 red line, deliberately did NOT take) for this
+	// consumer's remote Subscription. Same identityMu, same writers/readers
+	// as the summary fields just above.
+	//
+	//   - suspensionReason: body.suspension.code carried VERBATIM from the
+	//     most recent suspended_v1 (spec §5.4: an open string, never a closed
+	//     enum) — cleared to "" by a later activated_v1 (spec §5.3).
+	//   - lastAction/lastActionError: which ONE remote SubscriptionClient
+	//     call (spec §5.2/§5.3: "reactivate"/"renew"/"get" — at most one per
+	//     event, never a retry) subscriptionLifecycleAction last attempted
+	//     for this consumer, and its classified failure reason ("" on
+	//     success, or no action attempted yet). lastActionError reuses typed
+	//     error classification (errs.Problem's Category/Subtype) rather than
+	//     inventing a new private error code (spec §5.5) — see
+	//     classifyLifecycleActionError.
+	//   - nextAction: a short, stable hint for what an operator/AI should do
+	//     next while this consumer is degraded (e.g. nextActionReactivate —
+	//     spec §5.5: "恢复命令统一 reactivate", never "reactive"/"resume").
+	//     "" means no outstanding recommendation.
+	suspensionReason string
+	lastAction       string
+	lastActionError  string
+	nextAction       string
 
 	onClose         func(*Conn)
 	checkLastForKey func(scope string) bool
@@ -176,13 +201,16 @@ func (c *Conn) BoundConnID() string {
 }
 
 // SetBoundConnID records a successful BindUser for connID and clears any
-// prior stale/degraded state — a fresh successful bind supersedes both.
+// prior stale/degraded state — a fresh successful bind supersedes all three
+// (spec §5.4/§5.5: Task 18 added nextAction to what a fresh bind supersedes,
+// alongside the staleIdentity/degradedReason Task 14 already cleared here).
 func (c *Conn) SetBoundConnID(connID string) {
 	c.identityMu.Lock()
 	defer c.identityMu.Unlock()
 	c.boundConnID = connID
 	c.staleIdentity = false
 	c.degradedReason = ""
+	c.nextAction = ""
 }
 
 // StaleIdentity reports whether this consumer's owner last mismatched the
@@ -262,6 +290,85 @@ func (c *Conn) SetLifecycleSummary(eventType, eventID, state string) {
 	if state != "" {
 		c.remoteState = state
 	}
+}
+
+// SuspensionReason returns the most recent suspended_v1's suspension.code,
+// carried verbatim ("" = never suspended, or cleared by a later
+// activated_v1 — spec §5.3/§5.4).
+func (c *Conn) SuspensionReason() string {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	return c.suspensionReason
+}
+
+// SetSuspensionReason records body.suspension.code VERBATIM (spec §5.4: an
+// open string, CLI never builds a closed enum for it) — pass "" to clear
+// (activated_v1's hit path does this, spec §5.3).
+func (c *Conn) SetSuspensionReason(reason string) {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	c.suspensionReason = reason
+}
+
+// LastAction returns the most recent remote SubscriptionClient call
+// subscriptionLifecycleAction attempted for this consumer ("reactivate" /
+// "renew" / "get"; "" = none attempted yet).
+func (c *Conn) LastAction() string {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	return c.lastAction
+}
+
+// SetLastAction records which action was attempted.
+func (c *Conn) SetLastAction(action string) {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	c.lastAction = action
+}
+
+// LastActionError returns LastAction's classified failure reason ("" =
+// succeeded, or no action attempted yet).
+func (c *Conn) LastActionError() string {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	return c.lastActionError
+}
+
+// SetLastActionError records LastAction's classified outcome ("" = success).
+func (c *Conn) SetLastActionError(reason string) {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	c.lastActionError = reason
+}
+
+// NextAction returns the current recommended recovery step ("" = none).
+func (c *Conn) NextAction() string {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	return c.nextAction
+}
+
+// SetNextAction records the current recommended recovery step ("" = none
+// outstanding). Spec §5.5: the recovery command is uniformly "reactivate"
+// (never "reactive"/"resume") wherever that's what's being recommended.
+func (c *Conn) SetNextAction(action string) {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	c.nextAction = action
+}
+
+// clearActionDegraded clears BOTH degradedReason and nextAction together —
+// used whenever a lifecycle action's outcome means "fully healthy again"
+// (spec §5.4: a bare successful Reactivate for a bot, or a successful
+// Reactivate+bindConsumer pair for a user; likewise a successful Renew).
+// Deliberately does NOT touch suspensionReason/lastAction/lastActionError —
+// those are historical record-keeping, not "is this consumer currently
+// degraded" state.
+func (c *Conn) clearActionDegraded() {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	c.degradedReason = ""
+	c.nextAction = ""
 }
 
 func (c *Conn) SendCh() chan interface{} { return c.sendCh }

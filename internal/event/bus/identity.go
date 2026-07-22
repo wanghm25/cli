@@ -5,8 +5,10 @@ package bus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/larksuite/cli/internal/core"
 )
@@ -64,6 +66,21 @@ type identityGate struct {
 	resolveCurrent func() (currentIdentity, error)
 	resolveUAT     func(ctx context.Context, appID, userOpenID string) (string, error)
 	logger         *log.Logger
+
+	// connMu guards connID/bindUser below: the LATEST values FeishuSource's
+	// ready closure passed to onConnReady (spec §4.4), memoized (Task 18) so
+	// bindConsumer can be invoked independently of a fresh WS ready/reconnect
+	// callback — specifically, by subscriptionLifecycleAction
+	// (internal/event/bus/lifecycle.go) reacting to an activated_v1/
+	// suspended_v1 event, which has no connID/bindUser of its own to pass
+	// in. onConnReady itself still writes these on EVERY invocation (never
+	// once) — source/feishu.go's ready closure deliberately keeps NOT
+	// memoizing on ITS side (cli.Connection().ConnectionID/cli.BindUser are
+	// read fresh from the live *larkws.Client every time); this is the ONE
+	// place downstream that now remembers the latest pair.
+	connMu   sync.Mutex
+	connID   string
+	bindUser func(context.Context, string) error
 }
 
 func newIdentityGate(
@@ -81,64 +98,103 @@ func (g *identityGate) logf(format string, args ...interface{}) {
 	}
 }
 
+// errOwnerMismatch/errConnectionNotReady are bindConsumer's own sentinel
+// errors — callers only need "did this fail" (Conn.SetStaleIdentity/
+// SetDegraded already recorded WHY), but a plain non-nil error is still
+// clearer at call sites than a bare bool.
+var (
+	errOwnerMismatch      = errors.New("identity gate: owner does not match current identity")
+	errConnectionNotReady = errors.New("identity gate: no WS connection ready yet to bind on")
+)
+
 // onConnReady is FeishuSource.OnConnReady's implementation: invoked from the
 // WS client's OnReady (first usable connection of a run) and OnReconnected
 // (every successful reconnect — connID rotates each dial, so a stale
-// binding from before is never assumed valid) callbacks.
-//
-// For every registered USER consumer (bot consumers are invisible here —
-// Hub.userConns already filters them out, spec §4.4: bot consumers are
-// NEVER identity-gated or BindUser'd):
-//   - owner == current (resolved FRESH right now, never cached) and not yet
-//     bound on this exact connID -> resolveUAT(current) then bindUser; a
-//     per-consumer failure (either resolveUAT or bindUser) degrades ONLY
-//     that consumer (Conn.SetDegraded) — every other consumer is untouched.
-//   - owner == current and ALREADY bound on this connID -> no-op (no
-//     duplicate Bind).
-//   - owner != current -> Conn.SetStaleIdentity(); NEVER bound, NEVER loads
-//     a UAT for that (historical) owner, NEVER touches the remote
-//     connection for it.
-//
-// A resolveCurrent failure degrades every user consumer (fail-closed) and
-// returns without touching the WS — it must never crash/kill the
-// connection just because config.json was transiently unreadable.
+// binding from before is never assumed valid) callbacks. It memoizes
+// (connID, bindUser) for bindConsumer's later, independent use (Task 18)
+// and then runs bindConsumer for every registered USER consumer (bot
+// consumers are invisible here — Hub.userConns already filters them out,
+// spec §4.4: bot consumers are NEVER identity-gated or BindUser'd). Each
+// consumer's outcome (bound / stale / degraded) is entirely bindConsumer's
+// concern — a single consumer's failure never affects any other (spec
+// §4.4), and a resolveCurrent failure degrades only the consumers actually
+// evaluated rather than crashing/killing the WS connection.
 func (g *identityGate) onConnReady(ctx context.Context, connID string, bindUser func(context.Context, string) error) {
 	if g == nil || g.hub == nil {
 		return
 	}
-	conns := g.hub.userConns()
-	if len(conns) == 0 {
-		return
+	g.connMu.Lock()
+	g.connID = connID
+	g.bindUser = bindUser
+	g.connMu.Unlock()
+
+	for _, c := range g.hub.userConns() {
+		_ = g.bindConsumer(ctx, c)
+	}
+}
+
+// bindConsumer performs the per-consumer bind sequence (spec §4.4): owner==
+// current check -> resolveUAT -> bindUser -> SetBoundConnID. Factored out of
+// onConnReady's own loop body (Task 18) so a lifecycle action — e.g.
+// subscriptionLifecycleAction reacting to activated_v1 (resume running) or a
+// successful suspended_v1 Reactivate (spec §5.3/§5.4) — can (re)bind ONE
+// specific consumer independently of a fresh WS ready/reconnect event, using
+// the LATEST (connID, bindUser) onConnReady last memoized.
+//
+// Every failure mode degrades/marks ONLY c, exactly like onConnReady's own
+// original loop did, and returns a non-nil error so a caller can tell
+// success from failure without re-deriving it from Conn state:
+//   - resolveCurrent fails -> SetDegraded(reasonCurrentIdentityUnresolved).
+//   - owner != current -> SetStaleIdentity() — NEVER loads a UAT for that
+//     (historical) owner, NEVER binds (spec §8's red line, reused here).
+//   - already bound on the memoized connID -> no-op success (no duplicate
+//     Bind).
+//   - no WS connection has ever become ready (bindUser still nil) ->
+//     SetDegraded("bind_failed: connection_not_ready") rather than panic.
+//   - resolveUAT fails -> SetDegraded("bind_failed: uat_unavailable").
+//   - bindUser fails -> SetDegraded("bind_failed: bind_api_error").
+//   - success -> SetBoundConnID(connID) (which itself clears stale/degraded/
+//     nextAction — spec §5.4/§5.5).
+func (g *identityGate) bindConsumer(ctx context.Context, c *Conn) error {
+	if g == nil {
+		return errors.New("identity gate: not configured")
 	}
 
 	cur, err := g.resolveCurrent()
 	if err != nil {
-		g.logf("WARN: identity gate: resolveCurrent failed at connect time, degrading %d user consumer(s): %v", len(conns), err)
-		for _, c := range conns {
-			c.SetDegraded(reasonCurrentIdentityUnresolved)
-		}
-		return
+		g.logf("WARN: identity gate: resolveCurrent failed for pid=%d: %v", c.PID(), err)
+		c.SetDegraded(reasonCurrentIdentityUnresolved)
+		return err
+	}
+	if !ownerMatchesCurrent(c.OwnerAppID(), c.OwnerUserOpenID(), cur) {
+		c.SetStaleIdentity()
+		return errOwnerMismatch
 	}
 
-	for _, c := range conns {
-		if !ownerMatchesCurrent(c.OwnerAppID(), c.OwnerUserOpenID(), cur) {
-			c.SetStaleIdentity()
-			continue
-		}
-		if c.BoundConnID() == connID {
-			continue // same user already bound on this exact connection — no duplicate Bind
-		}
-		uat, err := g.resolveUAT(ctx, cur.appID, cur.userOpenID)
-		if err != nil {
-			g.logf("WARN: identity gate: UAT resolution failed for pid=%d: %v", c.PID(), err)
-			c.SetDegraded("bind_failed: uat_unavailable")
-			continue
-		}
-		if err := bindUser(ctx, uat); err != nil {
-			g.logf("WARN: identity gate: BindUser failed for pid=%d: %v", c.PID(), err)
-			c.SetDegraded("bind_failed: bind_api_error")
-			continue
-		}
-		c.SetBoundConnID(connID)
+	g.connMu.Lock()
+	connID, bindUser := g.connID, g.bindUser
+	g.connMu.Unlock()
+
+	if connID != "" && c.BoundConnID() == connID {
+		return nil // same user already bound on this exact connection — no duplicate Bind
 	}
+	if bindUser == nil {
+		g.logf("WARN: identity gate: no WS connection ready yet to bind pid=%d", c.PID())
+		c.SetDegraded("bind_failed: connection_not_ready")
+		return errConnectionNotReady
+	}
+
+	uat, err := g.resolveUAT(ctx, cur.appID, cur.userOpenID)
+	if err != nil {
+		g.logf("WARN: identity gate: UAT resolution failed for pid=%d: %v", c.PID(), err)
+		c.SetDegraded("bind_failed: uat_unavailable")
+		return err
+	}
+	if err := bindUser(ctx, uat); err != nil {
+		g.logf("WARN: identity gate: BindUser failed for pid=%d: %v", c.PID(), err)
+		c.SetDegraded("bind_failed: bind_api_error")
+		return err
+	}
+	c.SetBoundConnID(connID)
+	return nil
 }

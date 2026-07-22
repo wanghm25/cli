@@ -570,11 +570,18 @@ func (h *Hub) Consumers() []protocol.ConsumerInfo {
 			info.OwnerIdentity = c.OwnerIdentity()
 			info.StaleIdentity = c.StaleIdentity()
 			info.DegradedReason = c.DegradedReason()
-			// Task 17: populate the Task-16-added-but-unpopulated
-			// LastLifecycleEvent/RemoteState fields from the Conn getters
-			// LifecycleExecutor's summary action writes to (spec §5.1).
+			// Populate the summary fields (spec §5.1, Task 17) from the Conn
+			// getters the lifecycle executor's action writes to.
 			info.LastLifecycleEvent = c.LastLifecycleEvent()
 			info.RemoteState = c.RemoteState()
+			// Task 18: the real per-event action's own state (spec §5.5) —
+			// suspension.code verbatim, the last attempted OAPI action +
+			// its classified outcome, and the current recommended recovery
+			// step.
+			info.SuspensionReason = c.SuspensionReason()
+			info.LastAction = c.LastAction()
+			info.LastActionError = c.LastActionError()
+			info.NextAction = c.NextAction()
 		}
 		result = append(result, info)
 	}

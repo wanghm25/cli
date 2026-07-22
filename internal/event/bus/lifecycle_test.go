@@ -291,6 +291,12 @@ func TestLifecycleExecutor_QueueFull_MarksMatchedConsumerDegraded_NoBlock(t *tes
 	if got := c.DegradedReason(); got != reasonLifecycleExecutorFull {
 		t.Errorf("DegradedReason() = %q, want %q", got, reasonLifecycleExecutorFull)
 	}
+	// Task 18 review Minor 2: now that a next_action field exists, the
+	// full-queue path must ALSO set an explicit management next_action —
+	// not just the degraded reason.
+	if got := c.NextAction(); got != nextActionGet {
+		t.Errorf("NextAction() = %q, want %q (Task 18 Minor 2: an explicit management next_action on queue-full)", got, nextActionGet)
+	}
 }
 
 // TestLifecycleExecutor_Cancel_WaitsForInFlightRun_ButNotForcefully locks

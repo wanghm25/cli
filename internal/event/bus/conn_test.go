@@ -258,6 +258,22 @@ func TestConn_SetBoundConnID_ClearsStaleAndDegraded(t *testing.T) {
 	}
 }
 
+// Task 18: SetBoundConnID must ALSO clear nextAction — a fresh successful
+// bind supersedes all three (staleIdentity/degradedReason/nextAction).
+func TestConn_SetBoundConnID_ClearsNextAction(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	conn.SetNextAction(nextActionReactivate)
+
+	conn.SetBoundConnID("conn-42")
+
+	if got := conn.NextAction(); got != "" {
+		t.Errorf("NextAction() after SetBoundConnID = %q, want \"\" (cleared by a fresh successful bind)", got)
+	}
+}
+
 func TestConn_SetStaleIdentity(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
@@ -377,6 +393,146 @@ func TestConn_LifecycleSummaryState_ConcurrentAccessRace(t *testing.T) {
 				_ = conn.LastLifecycleEvent()
 				_ = conn.LastLifecycleEventID()
 				_ = conn.RemoteState()
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+// --- Task 18: lifecycle ACTION state (spec §5.3/§5.4/§5.5) ----------------
+
+func TestConn_ActionState_DefaultEmpty(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	if got := conn.SuspensionReason(); got != "" {
+		t.Errorf("SuspensionReason() on a fresh Conn = %q, want \"\"", got)
+	}
+	if got := conn.LastAction(); got != "" {
+		t.Errorf("LastAction() on a fresh Conn = %q, want \"\"", got)
+	}
+	if got := conn.LastActionError(); got != "" {
+		t.Errorf("LastActionError() on a fresh Conn = %q, want \"\"", got)
+	}
+	if got := conn.NextAction(); got != "" {
+		t.Errorf("NextAction() on a fresh Conn = %q, want \"\"", got)
+	}
+}
+
+func TestConn_SetSuspensionReason_RoundTripsVerbatim(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	// An UNRECOGNIZED, made-up code must round-trip unchanged (spec §5.4: an
+	// open string, never a closed enum -- no validation, no rejection).
+	conn.SetSuspensionReason("some_brand_new_future_code_the_cli_has_never_seen")
+	if got := conn.SuspensionReason(); got != "some_brand_new_future_code_the_cli_has_never_seen" {
+		t.Errorf("SuspensionReason() = %q, want verbatim passthrough", got)
+	}
+	conn.SetSuspensionReason("")
+	if got := conn.SuspensionReason(); got != "" {
+		t.Errorf("SuspensionReason() after clearing = %q, want \"\"", got)
+	}
+}
+
+func TestConn_SetLastAction_And_SetLastActionError_RoundTrip(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	conn.SetLastAction("reactivate")
+	conn.SetLastActionError("missing_scopes")
+	if got := conn.LastAction(); got != "reactivate" {
+		t.Errorf("LastAction() = %q, want %q", got, "reactivate")
+	}
+	if got := conn.LastActionError(); got != "missing_scopes" {
+		t.Errorf("LastActionError() = %q, want %q", got, "missing_scopes")
+	}
+	// A fresh attempt (even the same action name) must supersede a stale error.
+	conn.SetLastAction("reactivate")
+	conn.SetLastActionError("")
+	if got := conn.LastActionError(); got != "" {
+		t.Errorf("LastActionError() after a fresh successful attempt = %q, want \"\"", got)
+	}
+}
+
+func TestConn_SetNextAction_RoundTrips(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	conn.SetNextAction(nextActionReactivate)
+	if got := conn.NextAction(); got != nextActionReactivate {
+		t.Errorf("NextAction() = %q, want %q", got, nextActionReactivate)
+	}
+}
+
+// clearActionDegraded (used internally by subscriptionLifecycleAction) must
+// clear BOTH degradedReason and nextAction together, but must NEVER touch
+// suspensionReason/lastAction/lastActionError -- those are historical
+// record-keeping, not "is this consumer currently degraded" state.
+func TestConn_ClearActionDegraded_ClearsOnlyDegradedAndNextAction(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	conn.SetDegraded("remote_subscription_suspended")
+	conn.SetNextAction(nextActionReactivate)
+	conn.SetSuspensionReason("authority_revoked")
+	conn.SetLastAction("reactivate")
+	conn.SetLastActionError("some_error")
+
+	conn.clearActionDegraded()
+
+	if got := conn.DegradedReason(); got != "" {
+		t.Errorf("DegradedReason() = %q, want \"\"", got)
+	}
+	if got := conn.NextAction(); got != "" {
+		t.Errorf("NextAction() = %q, want \"\"", got)
+	}
+	if got := conn.SuspensionReason(); got != "authority_revoked" {
+		t.Errorf("SuspensionReason() = %q, want unchanged %q", got, "authority_revoked")
+	}
+	if got := conn.LastAction(); got != "reactivate" {
+		t.Errorf("LastAction() = %q, want unchanged %q", got, "reactivate")
+	}
+	if got := conn.LastActionError(); got != "some_error" {
+		t.Errorf("LastActionError() = %q, want unchanged %q", got, "some_error")
+	}
+}
+
+// TestConn_ActionState_ConcurrentAccessRace mirrors
+// TestConn_LifecycleSummaryState_ConcurrentAccessRace's rationale for Task
+// 18's action-state fields: written by the lifecycle executor's worker
+// goroutines (subscriptionLifecycleAction), read by a future status query
+// concurrently. Run with -race.
+func TestConn_ActionState_ConcurrentAccessRace(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	conn := NewConn(server, nil, "im.msg", []string{"im.msg"}, 1, "")
+
+	var wg sync.WaitGroup
+	const workers = 8
+	const iterations = 200
+	deadline := time.Now().Add(2 * time.Second)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < iterations && time.Now().Before(deadline); j++ {
+				conn.SetSuspensionReason("authority_revoked")
+				conn.SetLastAction("reactivate")
+				conn.SetLastActionError("")
+				conn.SetNextAction(nextActionReactivate)
+				conn.clearActionDegraded()
+				_ = conn.SuspensionReason()
+				_ = conn.LastAction()
+				_ = conn.LastActionError()
+				_ = conn.NextAction()
 			}
 		}(i)
 	}

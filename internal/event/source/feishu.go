@@ -117,7 +117,15 @@ func (s *FeishuSource) Start(ctx context.Context, eventTypes []string, emit func
 	// var cli up-front so the ready closure can capture it before NewClient
 	// returns (WithOnReady/WithOnReconnected only ever fire AFTER Start(),
 	// by which time cli is assigned) — cli.Connection().ConnectionID and
-	// cli.BindUser are read fresh on every invocation, never memoized here.
+	// cli.BindUser are read fresh on every invocation and passed straight
+	// through: THIS package/closure never memoizes them across calls. (The
+	// bus-side identityGate DOES memoize the latest (connID, bindUser) pair
+	// it receives via OnConnReady, Task 18 — so its own bindConsumer can
+	// (re)bind a specific consumer independently of a fresh ready/reconnect
+	// event, e.g. reacting to an activated_v1/suspended_v1 lifecycle event.
+	// That memoization lives entirely downstream of this closure, which
+	// keeps doing exactly what this comment always said: read fresh, pass
+	// through, remember nothing.)
 	var cli *larkws.Client
 	ready := func(ctx context.Context) {
 		if s.OnConnReady != nil {

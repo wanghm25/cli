@@ -69,6 +69,23 @@ func NewCmdBus(f *cmdutil.Factory) *cobra.Command {
 				return result.Token, nil
 			})
 
+			// Wires the *lark.Client Task 18's real lifecycle action needs
+			// for its single Reactivate/Renew/Get call per event (spec
+			// §5.3/§5.4). f.LarkClient() is the SAME primitive every other
+			// `event subscription`/`event consume` command builds its
+			// SubscriptionClient from (e.g. cmd/event/consume.go:319) --
+			// bound to this SAME cfg.AppID/AppSecret pair the bus itself
+			// was just constructed with (a bus is per-app). A failure here
+			// degrades to summary-only lifecycle handling (no Reactivate/
+			// Renew/Get ever attempted) rather than failing bus startup --
+			// the bus's core job (WS connect + local fan-out) must not
+			// depend on this optional remote-management capability.
+			if sdk, sdkErr := f.LarkClient(); sdkErr == nil {
+				b.SetSubscriptionClient(sdk)
+			} else {
+				logger.Printf("WARN: could not build a SubscriptionClient for lifecycle management (%v); lifecycle events will be summary-only", sdkErr)
+			}
+
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 

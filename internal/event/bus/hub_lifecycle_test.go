@@ -128,3 +128,60 @@ func TestHub_Consumers_LifecycleFieldsStayZero_WhenUnset(t *testing.T) {
 		t.Errorf("lifecycle fields not zero for a conn that never observed a lifecycle event: %+v", got)
 	}
 }
+
+// --- Task 18: action-state fields (spec §5.5) ------------------------------
+
+// TestHub_Consumers_PopulatesActionFields locks Task 18's extension of
+// Hub.Consumers(): ConsumerInfo.{SuspensionReason,LastAction,
+// LastActionError,NextAction} must be read off the matching *Conn, mirroring
+// how Task 17 already does this for LastLifecycleEvent/RemoteState.
+func TestHub_Consumers_PopulatesActionFields(t *testing.T) {
+	h := NewHub()
+	conn, _ := net.Pipe()
+	defer conn.Close()
+	c := NewConn(conn, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "")
+	c.SetRemoteSubscriptionID("sub-1")
+	c.SetSuspensionReason("authority_revoked")
+	c.SetLastAction("reactivate")
+	c.SetLastActionError("missing_scopes")
+	c.SetNextAction(nextActionReactivate)
+	h.RegisterAndIsFirst(c)
+
+	consumers := h.Consumers()
+	if len(consumers) != 1 {
+		t.Fatalf("got %d consumers, want 1", len(consumers))
+	}
+	got := consumers[0]
+	if got.SuspensionReason != "authority_revoked" {
+		t.Errorf("SuspensionReason = %q, want %q", got.SuspensionReason, "authority_revoked")
+	}
+	if got.LastAction != "reactivate" {
+		t.Errorf("LastAction = %q, want %q", got.LastAction, "reactivate")
+	}
+	if got.LastActionError != "missing_scopes" {
+		t.Errorf("LastActionError = %q, want %q", got.LastActionError, "missing_scopes")
+	}
+	if got.NextAction != nextActionReactivate {
+		t.Errorf("NextAction = %q, want %q", got.NextAction, nextActionReactivate)
+	}
+}
+
+// TestHub_Consumers_ActionFieldsStayZero_WhenUnset is the additive-output
+// regression counterpart: a Conn that never had a lifecycle action recorded
+// against it reports all four new fields at "".
+func TestHub_Consumers_ActionFieldsStayZero_WhenUnset(t *testing.T) {
+	h := NewHub()
+	conn, _ := net.Pipe()
+	defer conn.Close()
+	c := NewConn(conn, nil, "mail.x", []string{"mail.x"}, 1, "mail.x:alice")
+	h.RegisterAndIsFirst(c)
+
+	consumers := h.Consumers()
+	if len(consumers) != 1 {
+		t.Fatalf("got %d consumers, want 1", len(consumers))
+	}
+	got := consumers[0]
+	if got.SuspensionReason != "" || got.LastAction != "" || got.LastActionError != "" || got.NextAction != "" {
+		t.Errorf("action fields not zero for a conn with no recorded lifecycle action: %+v", got)
+	}
+}
