@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -125,5 +126,229 @@ func TestHelloAckRejected_RoundTrip(t *testing.T) {
 	}
 	if !got.Rejected || got.RejectReason != ack.RejectReason {
 		t.Errorf("roundtrip = %+v, want Rejected with reason", got)
+	}
+}
+
+// --- IPC protocol v2 additive fields (spec §4.2) ---
+//
+// These tests cover three things per frame: (1) a v2-populated frame
+// round-trips through Encode/Decode preserving every new field, (2) the
+// legacy `subscription_id` field's meaning (local parameter fingerprint) is
+// untouched by the new `remote_subscription_id` field, and (3) an OLD frame
+// (marshaled as if by a pre-v2 build, i.e. missing the new keys entirely)
+// still decodes cleanly with the new fields left at their zero value and the
+// old fields intact — this is the backward-compat contract §4.2 requires.
+
+func TestHello_V2FieldsRoundTrip(t *testing.T) {
+	h := &Hello{
+		Type:                 MsgTypeHello,
+		PID:                  123,
+		EventKey:             "im.message.created_v1/chat-id/oc_xxx",
+		EventTypes:           []string{"im.message.created_v1"},
+		Version:              "v1",
+		SubscriptionID:       "im.message.created_v1:chat-id:oc_xxx", // local fingerprint (frozen meaning)
+		ConsumerScopeID:      "scope-abc123",
+		RemoteSubscriptionID: "sub_123", // remote OpenAPI id — must NOT alias SubscriptionID
+		Identity:             "user",
+		Profile:              "work",
+		UserOpenID:           "ou_xxx",
+		Capabilities:         []string{"hello_v2"},
+	}
+	var buf bytes.Buffer
+	if err := Encode(&buf, h); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	msg, err := Decode(bytes.TrimRight(buf.Bytes(), "\n"))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got, ok := msg.(*Hello)
+	if !ok {
+		t.Fatalf("decoded type = %T, want *Hello", msg)
+	}
+	if got.SubscriptionID != h.SubscriptionID {
+		t.Errorf("SubscriptionID (local fingerprint) corrupted by roundtrip: got %q, want %q", got.SubscriptionID, h.SubscriptionID)
+	}
+	if got.RemoteSubscriptionID == got.SubscriptionID {
+		t.Errorf("RemoteSubscriptionID must be distinct from SubscriptionID, both = %q", got.SubscriptionID)
+	}
+	if got.ConsumerScopeID != h.ConsumerScopeID {
+		t.Errorf("ConsumerScopeID = %q, want %q", got.ConsumerScopeID, h.ConsumerScopeID)
+	}
+	if got.RemoteSubscriptionID != h.RemoteSubscriptionID {
+		t.Errorf("RemoteSubscriptionID = %q, want %q", got.RemoteSubscriptionID, h.RemoteSubscriptionID)
+	}
+	if got.Identity != h.Identity {
+		t.Errorf("Identity = %q, want %q", got.Identity, h.Identity)
+	}
+	if got.Profile != h.Profile {
+		t.Errorf("Profile = %q, want %q", got.Profile, h.Profile)
+	}
+	if got.UserOpenID != h.UserOpenID {
+		t.Errorf("UserOpenID = %q, want %q", got.UserOpenID, h.UserOpenID)
+	}
+	if !reflect.DeepEqual(got.Capabilities, h.Capabilities) {
+		t.Errorf("Capabilities = %v, want %v", got.Capabilities, h.Capabilities)
+	}
+}
+
+func TestEvent_V2FieldsRoundTrip(t *testing.T) {
+	e := &Event{
+		Type:                 MsgTypeEvent,
+		EventType:            "im.message.created_v1",
+		EventID:              "ev_1",
+		SourceTime:           "1234567890",
+		Seq:                  3,
+		Payload:              json.RawMessage(`{"a":1}`),
+		RemoteSubscriptionID: "sub_123",
+		TargetResource:       "im.message?chat_id=oc_xxx",
+		Authority:            "user:ou_xxx",
+		SubscriptionEventID:  "sub_evt_1",
+	}
+	var buf bytes.Buffer
+	if err := Encode(&buf, e); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	msg, err := Decode(bytes.TrimRight(buf.Bytes(), "\n"))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got, ok := msg.(*Event)
+	if !ok {
+		t.Fatalf("decoded type = %T, want *Event", msg)
+	}
+	if got.RemoteSubscriptionID != e.RemoteSubscriptionID {
+		t.Errorf("RemoteSubscriptionID = %q, want %q", got.RemoteSubscriptionID, e.RemoteSubscriptionID)
+	}
+	if got.TargetResource != e.TargetResource {
+		t.Errorf("TargetResource = %q, want %q", got.TargetResource, e.TargetResource)
+	}
+	if got.Authority != e.Authority {
+		t.Errorf("Authority = %q, want %q", got.Authority, e.Authority)
+	}
+	if got.SubscriptionEventID != e.SubscriptionEventID {
+		t.Errorf("SubscriptionEventID = %q, want %q", got.SubscriptionEventID, e.SubscriptionEventID)
+	}
+	// Pre-existing fields must survive untouched alongside the new ones.
+	if got.EventType != e.EventType || got.EventID != e.EventID || got.Seq != e.Seq {
+		t.Errorf("legacy Event fields corrupted: got %+v", got)
+	}
+}
+
+func TestStatusResponse_V2CapabilityFieldsRoundTrip(t *testing.T) {
+	sr := &StatusResponse{
+		Type:                 MsgTypeStatusResponse,
+		PID:                  1,
+		UptimeSec:            10,
+		ActiveConns:          2,
+		Consumers:            []ConsumerInfo{{PID: 2, EventKey: "im.message.created_v1", SubscriptionID: "fp"}},
+		ProtocolVersion:      "v2",
+		Capabilities:         []string{"refined_routing", "hello_v2"},
+		RegisteredEventTypes: []string{"im.message.created_v1", "im.message.receive_v1"},
+	}
+	var buf bytes.Buffer
+	if err := Encode(&buf, sr); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	msg, err := Decode(bytes.TrimRight(buf.Bytes(), "\n"))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got, ok := msg.(*StatusResponse)
+	if !ok {
+		t.Fatalf("decoded type = %T, want *StatusResponse", msg)
+	}
+	if got.ProtocolVersion != sr.ProtocolVersion {
+		t.Errorf("ProtocolVersion = %q, want %q", got.ProtocolVersion, sr.ProtocolVersion)
+	}
+	if !reflect.DeepEqual(got.Capabilities, sr.Capabilities) {
+		t.Errorf("Capabilities = %v, want %v", got.Capabilities, sr.Capabilities)
+	}
+	if !reflect.DeepEqual(got.RegisteredEventTypes, sr.RegisteredEventTypes) {
+		t.Errorf("RegisteredEventTypes = %v, want %v", got.RegisteredEventTypes, sr.RegisteredEventTypes)
+	}
+	if len(got.Consumers) != 1 || got.Consumers[0].SubscriptionID != "fp" {
+		t.Errorf("legacy Consumers field corrupted: %+v", got.Consumers)
+	}
+}
+
+// TestHello_V2FieldsOmittedWhenZero pins the `omitempty` contract: a Hello
+// built the old way (no v2 fields set) must marshal to exactly the old wire
+// shape, byte for byte indistinguishable from a pre-v2 build. This is what
+// lets a v1 bus/consumer on the other end ignore v2 entirely instead of
+// choking on unexpected keys.
+func TestHello_V2FieldsOmittedWhenZero(t *testing.T) {
+	h := NewHello(1, "im.message.receive_v1", []string{"im.message.receive_v1"}, "v1", "")
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{
+		`"consumer_scope_id"`, `"remote_subscription_id"`, `"identity"`,
+		`"profile"`, `"user_open_id"`, `"capabilities"`,
+	} {
+		if bytes.Contains(data, []byte(key)) {
+			t.Errorf("zero-valued v2 field leaked onto wire: %s in %s", key, data)
+		}
+	}
+}
+
+// TestDecode_OldHello_BackwardCompat feeds Decode a hand-written JSON line
+// shaped exactly like a message a pre-v2 build would have produced (no v2
+// keys at all) and checks it still decodes, with the new fields at zero
+// value and the old `subscription_id` — the local parameter fingerprint —
+// untouched.
+func TestDecode_OldHello_BackwardCompat(t *testing.T) {
+	old := `{"type":"hello","pid":55,"event_key":"im.message.receive_v1","event_types":["im.message.receive_v1"],"version":"v1","subscription_id":"im.message.receive_v1:legacy-fp"}`
+	msg, err := Decode([]byte(old))
+	if err != nil {
+		t.Fatalf("decode old hello frame: %v", err)
+	}
+	h, ok := msg.(*Hello)
+	if !ok {
+		t.Fatalf("decoded type = %T, want *Hello", msg)
+	}
+	if h.SubscriptionID != "im.message.receive_v1:legacy-fp" {
+		t.Errorf("old subscription_id (local fingerprint) lost: got %q", h.SubscriptionID)
+	}
+	if h.ConsumerScopeID != "" || h.RemoteSubscriptionID != "" || h.Identity != "" ||
+		h.Profile != "" || h.UserOpenID != "" || h.Capabilities != nil {
+		t.Errorf("v2 fields should be zero-valued decoding an old frame, got %+v", h)
+	}
+}
+
+func TestDecode_OldEvent_BackwardCompat(t *testing.T) {
+	old := `{"type":"event","event_type":"im.message.receive_v1","event_id":"e1","source_time":"111","seq":5,"payload":{"x":1}}`
+	msg, err := Decode([]byte(old))
+	if err != nil {
+		t.Fatalf("decode old event frame: %v", err)
+	}
+	e, ok := msg.(*Event)
+	if !ok {
+		t.Fatalf("decoded type = %T, want *Event", msg)
+	}
+	if e.EventType != "im.message.receive_v1" || e.EventID != "e1" || e.Seq != 5 {
+		t.Errorf("legacy Event fields not preserved: %+v", e)
+	}
+	if e.RemoteSubscriptionID != "" || e.TargetResource != "" || e.Authority != "" || e.SubscriptionEventID != "" {
+		t.Errorf("v2 fields should be zero-valued decoding an old frame, got %+v", e)
+	}
+}
+
+func TestDecode_OldStatusResponse_BackwardCompat(t *testing.T) {
+	old := `{"type":"status_response","pid":1,"uptime_sec":5,"active_conns":1,"consumers":[{"pid":2,"event_key":"k","subscription_id":"k:fp","received":1,"dropped":0}]}`
+	msg, err := Decode([]byte(old))
+	if err != nil {
+		t.Fatalf("decode old status_response frame: %v", err)
+	}
+	sr, ok := msg.(*StatusResponse)
+	if !ok {
+		t.Fatalf("decoded type = %T, want *StatusResponse", msg)
+	}
+	if len(sr.Consumers) != 1 || sr.Consumers[0].SubscriptionID != "k:fp" {
+		t.Errorf("legacy Consumers not preserved: %+v", sr.Consumers)
+	}
+	if sr.ProtocolVersion != "" || sr.Capabilities != nil || sr.RegisteredEventTypes != nil {
+		t.Errorf("v2 fields should be zero-valued decoding an old frame, got %+v", sr)
 	}
 }
