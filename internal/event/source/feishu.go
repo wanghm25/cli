@@ -28,6 +28,15 @@ type FeishuSource struct {
 	AppSecret string
 	Domain    string
 	Logger    *log.Logger
+
+	// OnConnReady is invoked on the WS client's OnReady (first usable
+	// connection of a run) and OnReconnected (every successful reconnect)
+	// callbacks with the fresh connection ID and a bindUser func bound to
+	// THIS client instance. A plain func type (not larkws.Client) so this
+	// package stays SDK-typed only here — the bus-side identity gate (which
+	// needs internal/core config resolution) stays out of this core-free
+	// package. nil is tolerated (no identity gating configured).
+	OnConnReady func(ctx context.Context, connID string, bindUser func(ctx context.Context, uat string) error)
 }
 
 func (s *FeishuSource) Name() string { return "feishu-websocket" }
@@ -50,10 +59,27 @@ func (s *FeishuSource) Start(ctx context.Context, eventTypes []string, emit func
 		opts = append(opts, larkws.WithLogger(&sdkLogger{l: s.Logger, notify: notify}))
 	}
 
+	// var cli up-front so the ready closure can capture it before NewClient
+	// returns (WithOnReady/WithOnReconnected only ever fire AFTER Start(),
+	// by which time cli is assigned) — cli.Connection().ConnectionID and
+	// cli.BindUser are read fresh on every invocation, never memoized here.
+	var cli *larkws.Client
+	ready := func(ctx context.Context) {
+		if s.OnConnReady != nil {
+			s.OnConnReady(ctx, cli.Connection().ConnectionID, cli.BindUser)
+		}
+	}
+	opts = append(opts,
+		larkws.WithOnReady(ready),
+		// Reconnect rotates connection_id, so any prior BindUser is no
+		// longer assumed valid — always re-run the same ready logic.
+		larkws.WithOnReconnected(func(ctx context.Context) { ready(ctx) }),
+	)
+
 	if notify != nil {
 		notify(protocol.SourceStateConnecting, "")
 	}
-	cli := larkws.NewClient(s.AppID, s.AppSecret, opts...)
+	cli = larkws.NewClient(s.AppID, s.AppSecret, opts...)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- cli.Start(ctx) }()

@@ -15,6 +15,7 @@ import (
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/credential"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/bus"
 	"github.com/larksuite/cli/internal/event/transport"
@@ -45,6 +46,28 @@ func NewCmdBus(f *cmdutil.Factory) *cobra.Command {
 
 			tr := transport.New()
 			b := bus.NewBus(cfg.AppID, cfg.AppSecret, domain, tr, logger)
+
+			// Wires the real-time identity gate + BindUser (spec §4.4).
+			// f.Credential.ResolveToken resolves a UAT via the SAME
+			// credential chain every other command uses (respects a
+			// configured extension credential provider, not just the
+			// built-in keychain-backed default) and is uncached for UAT —
+			// see internal/credential/default_provider.go's resolveUAT doc
+			// ("may be refreshed between calls"). userOpenID is accepted
+			// for parity with the identity gate's seam (and potential
+			// future use/diagnostics) but isn't threaded through:
+			// ResolveToken has no per-user-open-id parameter and instead
+			// re-resolves the active account itself via the same
+			// fresh-config-read path the gate's resolveCurrent just used,
+			// so the two can never disagree on which stored token gets
+			// fetched within one connect/reconnect action.
+			b.SetIdentityProviders(func(ctx context.Context, appID, userOpenID string) (string, error) {
+				result, err := f.Credential.ResolveToken(ctx, credential.NewTokenSpec(core.AsUser, appID))
+				if err != nil {
+					return "", err
+				}
+				return result.Token, nil
+			})
 
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()

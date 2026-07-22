@@ -317,6 +317,184 @@ func TestHandleHello_EmptyRemoteSubscriptionID_DefaultsToLegacy(t *testing.T) {
 	}
 }
 
+// --- Task 14: owner identity fixed at registration (spec §4.4) ---
+
+// TestHandleHello_PopulatesOwnerIdentityFromHelloFields: a Hello carrying
+// Identity/Profile/UserOpenID (populated client-side by the Task-15 HelloV2;
+// server-side reading is this task's concern) must flow into the registered
+// Conn's owner fields. owner_app_id is the BUS's own AppID — a bus is
+// per-app, and Hello carries no app_id field of its own.
+func TestHandleHello_PopulatesOwnerIdentityFromHelloFields(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	hub := NewHub()
+	b := &Bus{
+		appID:      "app_123",
+		hub:        hub,
+		logger:     logger,
+		conns:      make(map[*Conn]struct{}),
+		idleTimer:  time.NewTimer(30 * time.Second),
+		shutdownCh: make(chan struct{}, 1),
+	}
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	const pid = 6001
+	hello := &protocol.Hello{
+		PID:        pid,
+		EventKey:   "im.message.receive_v1",
+		EventTypes: []string{"im.message.receive_v1"},
+		Identity:   "user",
+		Profile:    "work",
+		UserOpenID: "ou_abc123",
+	}
+
+	br := bufio.NewReader(server)
+	done := make(chan struct{})
+	go func() {
+		b.handleHello(server, br, hello)
+		close(done)
+	}()
+
+	clientReader := bufio.NewReader(client)
+	if _, err := clientReader.ReadString('\n'); err != nil {
+		t.Fatalf("failed to read HelloAck: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleHello did not return within 3s")
+	}
+
+	sub, found := findSubscriberByPID(hub, pid)
+	if !found {
+		t.Fatal("registered conn for pid=6001 not found in hub")
+	}
+	if got := sub.OwnerAppID(); got != "app_123" {
+		t.Errorf("OwnerAppID() = %q, want %q (the BUS's own AppID)", got, "app_123")
+	}
+	if got := sub.OwnerUserOpenID(); got != "ou_abc123" {
+		t.Errorf("OwnerUserOpenID() = %q, want %q", got, "ou_abc123")
+	}
+	c, ok := sub.(*Conn)
+	if !ok {
+		t.Fatalf("registered subscriber is %T, want *Conn", sub)
+	}
+	if got := c.OwnerIdentity(); got != "user" {
+		t.Errorf("OwnerIdentity() = %q, want %q", got, "user")
+	}
+}
+
+// TestHandleHello_BotIdentity_OwnerUserOpenIDStaysEmpty: a bot Hello
+// (Identity=="bot") always carries UserOpenID=="" (protocol/messages.go's
+// documented contract) — the registered Conn's OwnerUserOpenID() must stay
+// "" so the identity gate's bot-bypass triggers (spec §4.4: bot consumers
+// are NEVER identity-gated or BindUser'd).
+func TestHandleHello_BotIdentity_OwnerUserOpenIDStaysEmpty(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	hub := NewHub()
+	b := &Bus{
+		appID:      "app_123",
+		hub:        hub,
+		logger:     logger,
+		conns:      make(map[*Conn]struct{}),
+		idleTimer:  time.NewTimer(30 * time.Second),
+		shutdownCh: make(chan struct{}, 1),
+	}
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	const pid = 6002
+	hello := &protocol.Hello{
+		PID:        pid,
+		EventKey:   "im.message.receive_v1",
+		EventTypes: []string{"im.message.receive_v1"},
+		Identity:   "bot",
+		// UserOpenID intentionally left unset, matching a real bot Hello.
+	}
+
+	br := bufio.NewReader(server)
+	done := make(chan struct{})
+	go func() {
+		b.handleHello(server, br, hello)
+		close(done)
+	}()
+
+	clientReader := bufio.NewReader(client)
+	if _, err := clientReader.ReadString('\n'); err != nil {
+		t.Fatalf("failed to read HelloAck: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleHello did not return within 3s")
+	}
+
+	sub, found := findSubscriberByPID(hub, pid)
+	if !found {
+		t.Fatal("registered conn for pid=6002 not found in hub")
+	}
+	if got := sub.OwnerUserOpenID(); got != "" {
+		t.Errorf("OwnerUserOpenID() for a bot Hello = %q, want \"\" (bot consumers are never identity-gated)", got)
+	}
+}
+
+// TestHandleHello_LegacyHello_OwnerFieldsDefaultEmpty: a v1 Hello (no
+// Identity/UserOpenID at all, pre-Task-15) must register a Conn whose owner
+// fields default to "" — indistinguishable from a bot for gating purposes,
+// which is the correct "not gated yet" behavior until Task 15 ships.
+func TestHandleHello_LegacyHello_OwnerFieldsDefaultEmpty(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	hub := NewHub()
+	b := &Bus{
+		appID:      "app_123",
+		hub:        hub,
+		logger:     logger,
+		conns:      make(map[*Conn]struct{}),
+		idleTimer:  time.NewTimer(30 * time.Second),
+		shutdownCh: make(chan struct{}, 1),
+	}
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	const pid = 6003
+	hello := &protocol.Hello{
+		PID:        pid,
+		EventKey:   "im.message.receive_v1",
+		EventTypes: []string{"im.message.receive_v1"},
+	}
+
+	br := bufio.NewReader(server)
+	done := make(chan struct{})
+	go func() {
+		b.handleHello(server, br, hello)
+		close(done)
+	}()
+
+	clientReader := bufio.NewReader(client)
+	if _, err := clientReader.ReadString('\n'); err != nil {
+		t.Fatalf("failed to read HelloAck: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleHello did not return within 3s")
+	}
+
+	sub, found := findSubscriberByPID(hub, pid)
+	if !found {
+		t.Fatal("registered conn for pid=6003 not found in hub")
+	}
+	if got := sub.OwnerUserOpenID(); got != "" {
+		t.Errorf("OwnerUserOpenID() for a legacy v1 Hello = %q, want \"\"", got)
+	}
+}
+
 // TestHandleHello_SingleConsumerRejectsSecond: a SingleConsumer EventKey accepts
 // the first consumer and rejects the second for the same SubscriptionID.
 func TestHandleHello_SingleConsumerRejectsSecond(t *testing.T) {

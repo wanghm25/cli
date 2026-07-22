@@ -47,6 +47,16 @@ type Subscriber interface {
 	// from SubscriptionID, which is the local per-resource fingerprint used
 	// for the registration/cleanup machinery above and is unrelated to this.
 	RemoteSubscriptionID() string
+	// OwnerAppID and OwnerUserOpenID are the owner identity fixed at this
+	// consumer's registration (spec §4.4): owner_app_id + owner_user_open_id
+	// is the ONLY comparison key against the freshly-resolved "current"
+	// identity — UAT is never compared. OwnerUserOpenID()=="" marks a bot
+	// consumer OR a legacy/pre-Task-15 registration (Hello.Identity/
+	// UserOpenID arrive "" until Task 15's client populates them); Hub.Publish's
+	// identity gate (and identity.go's bind gate) bypass these entirely —
+	// bot consumers are NEVER identity-gated or BindUser'd.
+	OwnerAppID() string
+	OwnerUserOpenID() string
 	SendCh() chan interface{}
 	PID() int
 	IncrementReceived()
@@ -84,6 +94,16 @@ type Hub struct {
 	// *event.DedupFilter is self-locking; do not add locking around them.
 	legacyDedup  *event.DedupFilter
 	refinedDedup *event.DedupFilter
+
+	// currentResolver is the identity gate's fresh-current-identity resolver
+	// (spec §4.4), wired by Bus.SetIdentityProviders via SetCurrentResolver.
+	// nil (the zero value — every pre-Task-14 NewHub()/NewBus() caller,
+	// including every existing test) means NO identity gating: every
+	// consumer is delivered to exactly as before this task. Guarded by mu
+	// (read together with the subscribers snapshot at the top of Publish)
+	// rather than a separate lock/atomic — it changes at most once in
+	// practice (bus construction, before Run starts accepting events).
+	currentResolver func() (currentIdentity, error)
 }
 
 func NewHub() *Hub {
@@ -98,6 +118,40 @@ func NewHub() *Hub {
 
 // SetLogger attaches a logger (nil tolerated).
 func (h *Hub) SetLogger(l *log.Logger) { h.logger.Store(l) }
+
+// SetCurrentResolver wires the identity gate's fresh-current-identity
+// resolver (spec §4.4) into Publish's delivery gate. nil disables gating
+// entirely (the NewHub() default) — this is how every pre-Task-14 caller
+// (and every test that never calls this) keeps exactly today's behavior.
+func (h *Hub) SetCurrentResolver(fn func() (currentIdentity, error)) {
+	h.mu.Lock()
+	h.currentResolver = fn
+	h.mu.Unlock()
+}
+
+// userConns returns every registered *Conn with a non-empty owner user
+// (OwnerUserOpenID() != "") — i.e. every USER consumer whose owner was
+// fixed at registration (spec §4.4). Bot/legacy consumers (OwnerUserOpenID()
+// == "") are excluded: they are never identity-gated or BindUser'd. Only
+// *Conn is inspected (not the bare Subscriber interface) because the
+// identity gate needs to mutate Conn-only state (BoundConnID/StaleIdentity/
+// DegradedReason) that intentionally isn't part of the Subscriber contract
+// every mock must satisfy — mirrors how findSubscriberByPID
+// (handle_hello_test.go) whitebox-iterates h.subscribers from within this
+// same package.
+func (h *Hub) userConns() []*Conn {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	var out []*Conn
+	for s := range h.subscribers {
+		c, ok := s.(*Conn)
+		if !ok || c.OwnerUserOpenID() == "" {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
 
 // UnregisterAndIsLast removes s and reports whether it was last for its SubscriptionID; stale unregisters are no-ops.
 func (h *Hub) UnregisterAndIsLast(s Subscriber) bool {
@@ -264,6 +318,9 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 			}
 		}
 	}
+	// Snapshotted alongside subscribers under the same RLock (spec §4.4):
+	// nil means no identity gating configured (every pre-Task-14 caller).
+	currentResolver := h.currentResolver
 	h.mu.RUnlock()
 
 	// Resolve source time once per Publish (not per subscriber) — same value
@@ -304,6 +361,16 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 		}
 	}
 
+	// Identity gate (spec §4.4) state, resolved AT MOST ONCE per Publish
+	// call — lazily, only when a matched subscriber is actually a USER
+	// consumer (OwnerUserOpenID() != ""); bot/legacy consumers never pay
+	// this cost and are never gated, regardless of currentResolver.
+	var (
+		identityResolved bool
+		identityCur      currentIdentity
+		identityErr      error
+	)
+
 	for _, m := range matches {
 		if m.refined {
 			if refinedDrop {
@@ -313,6 +380,31 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 			continue
 		}
 		s := m.sub
+
+		if currentResolver != nil && s.OwnerUserOpenID() != "" {
+			if !identityResolved {
+				identityCur, identityErr = currentResolver()
+				identityResolved = true
+			}
+			if identityErr != nil {
+				// Fail CLOSED: never deliver to a user consumer under an
+				// unresolved identity. A single unresolved lookup degrades
+				// every user consumer matched in THIS Publish call — bot
+				// consumers never reach this branch at all.
+				if c, ok := s.(*Conn); ok {
+					c.SetDegraded(reasonCurrentIdentityUnresolved)
+				}
+				continue
+			}
+			if !ownerMatchesCurrent(s.OwnerAppID(), s.OwnerUserOpenID(), identityCur) {
+				// owner != current: NO delivery, NO remote change, marked
+				// stale_identity. This is the core spec §4.4 invariant.
+				if c, ok := s.(*Conn); ok {
+					c.SetStaleIdentity()
+				}
+				continue
+			}
+		}
 
 		msg := protocol.NewEvent(
 			raw.EventType,

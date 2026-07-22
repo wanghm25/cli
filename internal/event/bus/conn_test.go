@@ -186,3 +186,145 @@ func TestConn_RemoteSubscriptionID_SetterRoundTrips(t *testing.T) {
 		t.Errorf("RemoteSubscriptionID() after SetRemoteSubscriptionID(%q) = %q, want %q", "sub_abc123", got, "sub_abc123")
 	}
 }
+
+// --- Task 14: owner identity + bind/stale/degraded state (spec §4.4) ---
+
+// A fresh Conn (the CLIENT hasn't sent Hello.Identity/UserOpenID yet — that's
+// Task 15 — or this is a bot) must default every owner field to "": the
+// identity gate reads OwnerUserOpenID()=="" as its bot/legacy bypass signal.
+func TestConn_OwnerIdentity_DefaultEmpty(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	if got := conn.OwnerIdentity(); got != "" {
+		t.Errorf("OwnerIdentity() on a fresh Conn = %q, want \"\"", got)
+	}
+	if got := conn.OwnerAppID(); got != "" {
+		t.Errorf("OwnerAppID() on a fresh Conn = %q, want \"\"", got)
+	}
+	if got := conn.OwnerUserOpenID(); got != "" {
+		t.Errorf("OwnerUserOpenID() on a fresh Conn = %q, want \"\" (legacy/bot default — never gated)", got)
+	}
+}
+
+func TestConn_SetOwnerIdentity_RoundTrips(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	conn.SetOwnerIdentity("user", "app_1", "ou_xyz")
+	if got := conn.OwnerIdentity(); got != "user" {
+		t.Errorf("OwnerIdentity() = %q, want %q", got, "user")
+	}
+	if got := conn.OwnerAppID(); got != "app_1" {
+		t.Errorf("OwnerAppID() = %q, want %q", got, "app_1")
+	}
+	if got := conn.OwnerUserOpenID(); got != "ou_xyz" {
+		t.Errorf("OwnerUserOpenID() = %q, want %q", got, "ou_xyz")
+	}
+}
+
+func TestConn_BoundConnID_DefaultEmpty(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	if got := conn.BoundConnID(); got != "" {
+		t.Errorf("BoundConnID() on a fresh Conn = %q, want \"\" (never bound)", got)
+	}
+}
+
+// SetBoundConnID marks a successful BindUser; a fresh success supersedes any
+// prior stale/degraded state (both are cleared).
+func TestConn_SetBoundConnID_ClearsStaleAndDegraded(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	conn.SetStaleIdentity()
+	conn.SetDegraded("bind_failed: test")
+
+	conn.SetBoundConnID("conn-42")
+
+	if got := conn.BoundConnID(); got != "conn-42" {
+		t.Errorf("BoundConnID() = %q, want %q", got, "conn-42")
+	}
+	if conn.StaleIdentity() {
+		t.Error("SetBoundConnID must clear staleIdentity — a fresh successful bind supersedes it")
+	}
+	if got := conn.DegradedReason(); got != "" {
+		t.Errorf("DegradedReason() after SetBoundConnID = %q, want \"\" (cleared by a fresh successful bind)", got)
+	}
+}
+
+func TestConn_SetStaleIdentity(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	if conn.StaleIdentity() {
+		t.Fatal("fresh Conn must not start stale_identity")
+	}
+	conn.SetStaleIdentity()
+	if !conn.StaleIdentity() {
+		t.Error("StaleIdentity() after SetStaleIdentity() = false, want true")
+	}
+}
+
+func TestConn_SetDegraded_RoundTrips(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	if got := conn.DegradedReason(); got != "" {
+		t.Errorf("DegradedReason() on a fresh Conn = %q, want \"\"", got)
+	}
+	conn.SetDegraded("bind_failed: uat_unavailable")
+	if got := conn.DegradedReason(); got != "bind_failed: uat_unavailable" {
+		t.Errorf("DegradedReason() = %q, want %q", got, "bind_failed: uat_unavailable")
+	}
+}
+
+// TestConn_IdentityGateState_ConcurrentAccessRace exercises every new
+// identity-gate mutator/getter concurrently: in production this state is
+// written from TWO independent goroutines (identity.go's onConnReady, driven
+// by the WS ready/reconnect callback, and Hub.Publish's per-event delivery
+// gate, driven by the source's emit goroutine) and read by a future status
+// command from yet another — hence its own dedicated mutex rather than the
+// zero-lock convention used for the write-once owner fields above. Run with
+// -race (mirrors hub_publish_race_test.go's style for the Hub side).
+func TestConn_IdentityGateState_ConcurrentAccessRace(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	conn := NewConn(server, nil, "im.msg", []string{"im.msg"}, 1, "")
+	conn.SetOwnerIdentity("user", "app1", "ou_alice")
+
+	var wg sync.WaitGroup
+	const workers = 8
+	const iterations = 200
+	deadline := time.Now().Add(2 * time.Second)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < iterations && time.Now().Before(deadline); j++ {
+				if i%2 == 0 {
+					conn.SetBoundConnID("conn-race")
+				} else {
+					conn.SetStaleIdentity()
+				}
+				conn.SetDegraded("bind_failed: test")
+				_ = conn.BoundConnID()
+				_ = conn.StaleIdentity()
+				_ = conn.DegradedReason()
+				_ = conn.OwnerAppID()
+				_ = conn.OwnerUserOpenID()
+				_ = conn.OwnerIdentity()
+			}
+		}(i)
+	}
+	wg.Wait()
+}

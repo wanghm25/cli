@@ -6,8 +6,10 @@ package bus
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -350,6 +352,179 @@ func TestHub_Publish_FanOutMultipleConsumersSameRemoteSubID(t *testing.T) {
 	}
 }
 
+// --- Task 14: real-time identity gate — delivery side (spec §4.4) ---
+//
+// Hub.Publish's identity gate is the SECOND of the two gate points (the
+// first, identity.go's onConnReady bind gate, is covered in identity_test.go):
+// it catches an owner/current mismatch on every single event fan-out, not
+// just at connect/reconnect time (e.g. a profile switch with no reconnect).
+
+// owner == current: delivered, never marked stale.
+func TestHub_Publish_IdentityGate_AllowsMatchingOwner(t *testing.T) {
+	h := NewHub()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	c := NewConn(server, nil, "im.msg", []string{"im.message.receive_v1"}, 1, "")
+	c.SetOwnerIdentity("user", "app1", "ou_alice")
+	h.RegisterAndIsFirst(c)
+	h.SetCurrentResolver(func() (currentIdentity, error) {
+		return currentIdentity{appID: "app1", userOpenID: "ou_alice"}, nil
+	})
+
+	h.Publish(&event.RawEvent{EventID: "evt-1", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
+
+	mustReceiveEvent(t, c.SendCh(), "owner==current must be delivered")
+	if c.StaleIdentity() {
+		t.Error("should not be marked stale_identity when owner matches current")
+	}
+}
+
+// owner != current: NOT delivered, marked stale_identity (spec §4.4's core invariant).
+func TestHub_Publish_IdentityGate_DeniesMismatchedOwner(t *testing.T) {
+	h := NewHub()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	c := NewConn(server, nil, "im.msg", []string{"im.message.receive_v1"}, 1, "")
+	c.SetOwnerIdentity("user", "app1", "ou_alice") // owner fixed at register
+	h.RegisterAndIsFirst(c)
+	h.SetCurrentResolver(func() (currentIdentity, error) {
+		return currentIdentity{appID: "app1", userOpenID: "ou_bob"}, nil // current is now a DIFFERENT user
+	})
+
+	h.Publish(&event.RawEvent{EventID: "evt-1", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
+
+	mustNotReceive(t, c.SendCh(), "owner!=current must NOT be delivered")
+	if !c.StaleIdentity() {
+		t.Error("should be marked stale_identity when owner mismatches current")
+	}
+}
+
+// nil currentResolver (the zero value from NewHub()) must mean NO gating —
+// every pre-Task-14 caller/test keeps exactly today's behavior.
+func TestHub_Publish_IdentityGate_NilResolverIsLegacyBehavior(t *testing.T) {
+	h := NewHub()
+	c := newOwnedTestConn("im.msg", []string{"im.message.receive_v1"}, "app1", "ou_alice")
+	h.RegisterAndIsFirst(c)
+
+	h.Publish(&event.RawEvent{EventID: "evt-1", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
+
+	mustReceiveEvent(t, c.sendCh, "nil currentResolver must mean NO gating (pre-Task-14/legacy behavior)")
+}
+
+// BOT consumers (OwnerUserOpenID()=="") are NEVER identity-gated (spec §4.4),
+// even when a currentResolver IS configured and would mismatch a user owner.
+func TestHub_Publish_IdentityGate_BotBypassesGate(t *testing.T) {
+	h := NewHub()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	c := NewConn(server, nil, "im.msg", []string{"im.message.receive_v1"}, 1, "")
+	c.SetOwnerIdentity("bot", "app1", "") // bot: identity fixed, but no owning user
+	h.RegisterAndIsFirst(c)
+	h.SetCurrentResolver(func() (currentIdentity, error) {
+		return currentIdentity{appID: "app1", userOpenID: "ou_alice"}, nil
+	})
+
+	h.Publish(&event.RawEvent{EventID: "evt-1", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
+
+	mustReceiveEvent(t, c.SendCh(), "bot consumer must ALWAYS be delivered — never identity-gated")
+	if c.StaleIdentity() {
+		t.Error("bot consumer must never be marked stale_identity")
+	}
+}
+
+// A resolveCurrent failure must fail CLOSED for user consumers (never
+// deliver under an unresolved identity) while leaving bot consumers
+// completely unaffected.
+func TestHub_Publish_IdentityGate_ResolveCurrentErrorFailsClosedForUsersOnly(t *testing.T) {
+	h := NewHub()
+	userServer, userClient := net.Pipe()
+	defer userServer.Close()
+	defer userClient.Close()
+	userConn := NewConn(userServer, nil, "im.msg", []string{"im.message.receive_v1"}, 1, "im.msg:user")
+	userConn.SetOwnerIdentity("user", "app1", "ou_alice")
+	h.RegisterAndIsFirst(userConn)
+
+	botServer, botClient := net.Pipe()
+	defer botServer.Close()
+	defer botClient.Close()
+	botConn := NewConn(botServer, nil, "im.msg", []string{"im.message.receive_v1"}, 2, "im.msg:bot")
+	botConn.SetOwnerIdentity("bot", "app1", "")
+	h.RegisterAndIsFirst(botConn)
+
+	h.SetCurrentResolver(func() (currentIdentity, error) {
+		return currentIdentity{}, errors.New("config.json unreadable")
+	})
+
+	h.Publish(&event.RawEvent{EventID: "evt-1", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
+
+	mustNotReceive(t, userConn.SendCh(), "user consumer must fail CLOSED when current identity cannot be resolved")
+	if got := userConn.DegradedReason(); got == "" {
+		t.Error("user consumer should be marked degraded when resolveCurrent errors")
+	}
+	mustReceiveEvent(t, botConn.SendCh(), "bot consumer must be unaffected by a resolveCurrent error")
+}
+
+// currentResolver must be resolved AT MOST ONCE per Publish call even when
+// multiple user consumers match — cheap by construction, not just by luck.
+func TestHub_Publish_IdentityGate_ResolvedOncePerPublishCall(t *testing.T) {
+	h := NewHub()
+	c1 := newOwnedTestConn("im.msg.one", []string{"im.message.receive_v1"}, "app1", "ou_alice")
+	c2 := newOwnedTestConn("im.msg.two", []string{"im.message.receive_v1"}, "app1", "ou_alice")
+	h.RegisterAndIsFirst(c1)
+	h.RegisterAndIsFirst(c2)
+
+	var calls int32
+	h.SetCurrentResolver(func() (currentIdentity, error) {
+		atomic.AddInt32(&calls, 1)
+		return currentIdentity{appID: "app1", userOpenID: "ou_alice"}, nil
+	})
+
+	h.Publish(&event.RawEvent{EventID: "evt-shared", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
+
+	mustReceiveEvent(t, c1.sendCh, "c1")
+	mustReceiveEvent(t, c2.sendCh, "c2")
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("currentResolver call count for one Publish matching 2 user consumers = %d, want 1 (memoized once per call)", got)
+	}
+}
+
+// SetCurrentResolver concurrently with Publish must not race on h.mu (both
+// already share it with subscribers/subCounts) — the identity gate's
+// resolver is set once at bus construction in production, but this proves
+// the guard holds even under concurrent (mis)use. Run with -race.
+func TestHub_SetCurrentResolver_ConcurrentWithPublish(t *testing.T) {
+	h := NewHub()
+	c := newOwnedTestConn("race.key", []string{"race.type"}, "app1", "ou_alice")
+	h.RegisterAndIsFirst(c)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			h.SetCurrentResolver(func() (currentIdentity, error) {
+				return currentIdentity{appID: "app1", userOpenID: "ou_alice"}, nil
+			})
+		}
+	}()
+
+	for i := 0; i < 500; i++ {
+		h.Publish(&event.RawEvent{EventID: strconv.Itoa(i), EventType: "race.type", Payload: json.RawMessage(`{}`)})
+	}
+	close(stop)
+	wg.Wait()
+}
+
 func TestHub_Unregister(t *testing.T) {
 	h := NewHub()
 	c := newTestConn("im", []string{"im.msg"})
@@ -481,6 +656,8 @@ type testConn struct {
 	pid                  int
 	received             atomic.Int64
 	remoteSubscriptionID string
+	ownerAppID           string
+	ownerUserOpenID      string
 }
 
 func newTestConn(eventKey string, eventTypes []string) *testConn {
@@ -501,6 +678,17 @@ func newRefinedTestConn(eventKey string, eventTypes []string, remoteSubscription
 	return c
 }
 
+// newOwnedTestConn builds a mock subscriber with its owner identity fixed
+// (spec §4.4): a non-empty ownerUserOpenID marks it a "user" consumer for
+// Hub.Publish's identity gate — mirrors newRefinedTestConn's pattern for
+// RemoteSubscriptionID. The newTestConn default ("") reads as bot/legacy.
+func newOwnedTestConn(eventKey string, eventTypes []string, ownerAppID, ownerUserOpenID string) *testConn {
+	c := newTestConn(eventKey, eventTypes)
+	c.ownerAppID = ownerAppID
+	c.ownerUserOpenID = ownerUserOpenID
+	return c
+}
+
 func (c *testConn) EventKey() string { return c.eventKey }
 
 // SubscriptionID falls back to EventKey for test mocks that don't set a separate subscription ID.
@@ -510,10 +698,16 @@ func (c *testConn) EventTypes() []string   { return c.eventTypes }
 // RemoteSubscriptionID: "" (the zero value) means legacy — matches Subscriber's
 // documented contract. Tests opt into refined behavior via newRefinedTestConn.
 func (c *testConn) RemoteSubscriptionID() string { return c.remoteSubscriptionID }
-func (c *testConn) SendCh() chan interface{}     { return c.sendCh }
-func (c *testConn) PID() int                     { return c.pid }
-func (c *testConn) IncrementReceived()           { c.received.Add(1) }
-func (c *testConn) Received() int64              { return c.received.Load() }
+
+// OwnerAppID/OwnerUserOpenID: "" (the zero value) means bot/legacy — matches
+// Subscriber's documented contract. Tests opt into a "user" owner via
+// newOwnedTestConn.
+func (c *testConn) OwnerAppID() string       { return c.ownerAppID }
+func (c *testConn) OwnerUserOpenID() string  { return c.ownerUserOpenID }
+func (c *testConn) SendCh() chan interface{} { return c.sendCh }
+func (c *testConn) PID() int                 { return c.pid }
+func (c *testConn) IncrementReceived()       { c.received.Add(1) }
+func (c *testConn) Received() int64          { return c.received.Load() }
 
 func (c *testConn) DroppedCount() int64 { return 0 }
 

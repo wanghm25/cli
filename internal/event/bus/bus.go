@@ -46,6 +46,13 @@ type Bus struct {
 	idleTimer  *time.Timer
 	shutdownCh chan struct{}
 
+	// identityGate implements spec §4.4's owner/current identity gate +
+	// BindUser wiring; nil (the default from NewBus) means no identity
+	// gating configured — every existing NewBus(...) caller (tests, and any
+	// _bus invocation that predates SetIdentityProviders) keeps exactly
+	// today's behavior. Call SetIdentityProviders before Run() to enable it.
+	identityGate *identityGate
+
 	// pidHandle pins the alive.lock fd to the bus lifetime; OS releases on exit.
 	pidHandle *busdiscover.Handle
 }
@@ -63,6 +70,27 @@ func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logge
 		// Buffered so shutdown and source-exit paths never drop the signal.
 		shutdownCh: make(chan struct{}, 1),
 	}
+}
+
+// SetIdentityProviders enables the real-time identity gate + BindUser (spec
+// §4.4). resolveUAT mints a UAT for exactly the (appID, userOpenID) pair the
+// gate resolved as CURRENT — the daemon entrypoint (cmd/event/bus.go) wires
+// this to the credential chain (f.Credential), which this package cannot
+// reach directly without importing internal/credential. Fresh-current
+// resolution itself (LoadMultiAppConfig -> CurrentAppConfig("") ->
+// Users[0], spec §4.4) is always resolveCurrentIdentity (identity.go) —
+// package bus already imports internal/core, so there is no reason for a
+// caller outside this package to ever need to override it.
+//
+// nil disables gating entirely (the default) — call before Run() (single-
+// goroutine setup, same convention as the rest of Bus's construction; not
+// safe to call concurrently with Run()).
+func (b *Bus) SetIdentityProviders(resolveUAT func(ctx context.Context, appID, userOpenID string) (string, error)) {
+	if resolveUAT == nil {
+		return
+	}
+	b.identityGate = newIdentityGate(b.hub, resolveCurrentIdentity, resolveUAT, b.logger)
+	b.hub.SetCurrentResolver(resolveCurrentIdentity)
 }
 
 // Run binds the IPC socket, starts event sources, and blocks in the accept loop until shutdown.
@@ -157,12 +185,16 @@ func shutdownConns(b *Bus) {
 func (b *Bus) startSources(ctx context.Context) {
 	sources := source.All()
 	if len(sources) == 0 {
-		sources = []source.Source{&source.FeishuSource{
+		fs := &source.FeishuSource{
 			AppID:     b.appID,
 			AppSecret: b.appSecret,
 			Domain:    b.domain,
 			Logger:    b.logger,
-		}}
+		}
+		if b.identityGate != nil {
+			fs.OnConnReady = b.identityGate.onConnReady
+		}
+		sources = []source.Source{fs}
 	}
 	eventTypes := subscribedEventTypes()
 	b.hub.SetLogger(b.logger)
@@ -273,6 +305,12 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 	// fallback-to-EventKey: an absent remote_subscription_id must stay empty,
 	// never be repurposed from another field.
 	bc.SetRemoteSubscriptionID(hello.RemoteSubscriptionID)
+	// Owner identity fixed at registration (spec §4.4): read from the Task-11
+	// Hello fields (populated client-side by Task 15's HelloV2 — "" until
+	// then, which is the correct "not gated yet" behavior). owner_app_id is
+	// the BUS's own AppID: a bus is per-app, so Hello carries no separate
+	// app_id field to read instead.
+	bc.SetOwnerIdentity(hello.Identity, b.appID, hello.UserOpenID)
 	bc.SetLogger(b.logger)
 
 	// SingleConsumer EventKeys allow only one consumer per SubscriptionID: reject extras at handshake.

@@ -129,13 +129,18 @@ func (s *alwaysFailSubscriber) EventTypes() []string   { return s.eventTypes }
 // RemoteSubscriptionID: always legacy ("") — this mock only exercises the
 // PushDropOldest-failure/bookkeeping path, unrelated to refined routing.
 func (s *alwaysFailSubscriber) RemoteSubscriptionID() string { return "" }
-func (s *alwaysFailSubscriber) SendCh() chan interface{}     { return s.sendCh }
-func (s *alwaysFailSubscriber) PID() int                     { return 0 }
-func (s *alwaysFailSubscriber) IncrementReceived()           { s.received.Add(1) }
-func (s *alwaysFailSubscriber) Received() int64              { return s.received.Load() }
-func (s *alwaysFailSubscriber) DroppedCount() int64          { return s.dropped.Load() }
-func (s *alwaysFailSubscriber) IncrementDropped()            { s.dropped.Add(1) }
-func (s *alwaysFailSubscriber) NextSeq() uint64              { return 0 }
+
+// OwnerAppID/OwnerUserOpenID: always "" (bot/legacy) — this mock is
+// unrelated to identity gating (spec §4.4).
+func (s *alwaysFailSubscriber) OwnerAppID() string       { return "" }
+func (s *alwaysFailSubscriber) OwnerUserOpenID() string  { return "" }
+func (s *alwaysFailSubscriber) SendCh() chan interface{} { return s.sendCh }
+func (s *alwaysFailSubscriber) PID() int                 { return 0 }
+func (s *alwaysFailSubscriber) IncrementReceived()       { s.received.Add(1) }
+func (s *alwaysFailSubscriber) Received() int64          { return s.received.Load() }
+func (s *alwaysFailSubscriber) DroppedCount() int64      { return s.dropped.Load() }
+func (s *alwaysFailSubscriber) IncrementDropped()        { s.dropped.Add(1) }
+func (s *alwaysFailSubscriber) NextSeq() uint64          { return 0 }
 func (s *alwaysFailSubscriber) TrySend(msg interface{}) bool {
 	select {
 	case s.sendCh <- msg:
@@ -176,13 +181,18 @@ func (s *raceSubscriber) EventTypes() []string   { return s.eventTypes }
 // RemoteSubscriptionID: always legacy ("") — this mock exercises Publish's
 // concurrency/bookkeeping accuracy under load, unrelated to refined routing.
 func (s *raceSubscriber) RemoteSubscriptionID() string { return "" }
-func (s *raceSubscriber) SendCh() chan interface{}     { return s.sendCh }
-func (s *raceSubscriber) PID() int                     { return s.pid }
-func (s *raceSubscriber) IncrementReceived()           { s.received.Add(1) }
-func (s *raceSubscriber) Received() int64              { return s.received.Load() }
-func (s *raceSubscriber) DroppedCount() int64          { return s.dropped.Load() }
-func (s *raceSubscriber) IncrementDropped()            { s.dropped.Add(1) }
-func (s *raceSubscriber) NextSeq() uint64              { return 0 }
+
+// OwnerAppID/OwnerUserOpenID: always "" (bot/legacy) — this mock is
+// unrelated to identity gating (spec §4.4).
+func (s *raceSubscriber) OwnerAppID() string       { return "" }
+func (s *raceSubscriber) OwnerUserOpenID() string  { return "" }
+func (s *raceSubscriber) SendCh() chan interface{} { return s.sendCh }
+func (s *raceSubscriber) PID() int                 { return s.pid }
+func (s *raceSubscriber) IncrementReceived()       { s.received.Add(1) }
+func (s *raceSubscriber) Received() int64          { return s.received.Load() }
+func (s *raceSubscriber) DroppedCount() int64      { return s.dropped.Load() }
+func (s *raceSubscriber) IncrementDropped()        { s.dropped.Add(1) }
+func (s *raceSubscriber) NextSeq() uint64          { return 0 }
 
 func (s *raceSubscriber) TrySend(msg interface{}) bool {
 	s.sendMu.Lock()
