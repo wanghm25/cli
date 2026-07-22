@@ -351,4 +351,91 @@ func TestDecode_OldStatusResponse_BackwardCompat(t *testing.T) {
 	if sr.ProtocolVersion != "" || sr.Capabilities != nil || sr.RegisteredEventTypes != nil {
 		t.Errorf("v2 fields should be zero-valued decoding an old frame, got %+v", sr)
 	}
+	// Task 16 (spec §4.6): the old consumer entry above carries none of the
+	// refined-status fields at all — every one of them must decode
+	// zero-valued, exactly like the StatusResponse-level v2 fields above.
+	c := sr.Consumers[0]
+	if c.RefinedSubscription || c.RemoteSubscriptionID != "" || c.OwnerIdentity != "" ||
+		c.OwnerAppID != "" || c.OwnerUserOpenID != "" || c.StaleIdentity || c.DegradedReason != "" ||
+		c.RemoteState != "" || c.RemoteSubscription != nil || c.LastLifecycleEvent != "" {
+		t.Errorf("Task 16 ConsumerInfo fields should be zero-valued decoding an old frame, got %+v", c)
+	}
+}
+
+// --- Task 16 additive ConsumerInfo fields (spec §4.6) ---
+//
+// Mirrors the v2-additive-field test shape already established above for
+// Hello/Event/StatusResponse: (1) a fully-populated ConsumerInfo round-trips
+// through Encode/Decode inside a StatusResponse, and (2) omitempty means a
+// ConsumerInfo built the old way (only the pre-Task-16 fields set) marshals
+// to exactly the old wire shape, byte for byte indistinguishable from a
+// pre-Task-16 build.
+
+func TestConsumerInfo_V2FieldsRoundTrip(t *testing.T) {
+	ci := ConsumerInfo{
+		PID:                  7,
+		EventKey:             "im.message.created_v1/chat-id/oc_xxx",
+		SubscriptionID:       "im.message.created_v1:chat-id:oc_xxx",
+		Received:             42,
+		Dropped:              1,
+		RefinedSubscription:  true,
+		RemoteSubscriptionID: "sub_abc123",
+		OwnerIdentity:        "user",
+		OwnerAppID:           "cli_app123",
+		OwnerUserOpenID:      "ou_xxx",
+		StaleIdentity:        true,
+		DegradedReason:       "bind_failed: uat_unavailable",
+		RemoteState:          "enabled",
+		RemoteSubscription: &RemoteSubscriptionInfo{
+			State:               "enabled",
+			ExpireTime:          1732000000,
+			IncludeResourceData: true,
+		},
+		LastLifecycleEvent: "subscription.activated",
+	}
+	sr := NewStatusResponse(1, 10, 1, []ConsumerInfo{ci})
+
+	var buf bytes.Buffer
+	if err := Encode(&buf, sr); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	msg, err := Decode(bytes.TrimRight(buf.Bytes(), "\n"))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got, ok := msg.(*StatusResponse)
+	if !ok {
+		t.Fatalf("decoded type = %T, want *StatusResponse", msg)
+	}
+	if len(got.Consumers) != 1 {
+		t.Fatalf("Consumers len = %d, want 1", len(got.Consumers))
+	}
+	gc := got.Consumers[0]
+	if !reflect.DeepEqual(gc, ci) {
+		t.Errorf("ConsumerInfo roundtrip mismatch:\ngot:  %+v\nwant: %+v", gc, ci)
+	}
+}
+
+func TestConsumerInfo_V2FieldsOmittedWhenZero(t *testing.T) {
+	sr := NewStatusResponse(1, 10, 1, []ConsumerInfo{{
+		PID:            2,
+		EventKey:       "k",
+		SubscriptionID: "k:fp",
+		Received:       1,
+		Dropped:        0,
+	}})
+	data, err := json.Marshal(sr)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{
+		`"refined_subscription"`, `"remote_subscription_id"`, `"owner_identity"`,
+		`"owner_app_id"`, `"owner_user_open_id"`, `"stale_identity"`,
+		`"degraded_reason"`, `"remote_state"`, `"remote_subscription"`,
+		`"last_lifecycle_event"`,
+	} {
+		if bytes.Contains(data, []byte(key)) {
+			t.Errorf("zero-valued Task 16 field leaked onto wire: %s in %s", key, data)
+		}
+	}
 }

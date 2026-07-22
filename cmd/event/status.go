@@ -4,6 +4,7 @@
 package event
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sort"
@@ -13,7 +14,12 @@ import (
 
 	"github.com/spf13/cobra"
 
+	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
+
+	"github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/core"
+	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/busctl"
 	"github.com/larksuite/cli/internal/event/busdiscover"
 	"github.com/larksuite/cli/internal/event/protocol"
@@ -32,7 +38,7 @@ func NewCmdStatus(f *cmdutil.Factory) *cobra.Command {
 		Short: "Show event bus daemon status for all discovered apps",
 		Long:  "Connect to each bus daemon under the config-dir/events/ tree and show PID, uptime, and active consumers. Use --current for only the current profile's app. Use --json for machine-readable output. Use --fail-on-orphan to exit 2 when any orphan bus is detected (for health checks).",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runStatus(f, current, asJSON, failOnOrphan)
+			return runStatus(cmd, f, current, asJSON, failOnOrphan)
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit status as JSON (for AI / scripts)")
@@ -69,6 +75,22 @@ type appStatus struct {
 	UptimeSec int
 	Active    int
 	Consumers []protocol.ConsumerInfo
+
+	// --- Task 16 additive: local current_profile_match support (spec §4.6) ---
+	//
+	// CurrentIdentityKnown/CurrentAppID/CurrentUserOpenID carry the FRESHLY
+	// resolved current identity (core.LoadMultiAppConfig, never
+	// Factory.Config()'s cache — mirrors internal/event/bus/identity.go's
+	// resolveCurrentIdentity so status's notion of "current" tracks exactly
+	// what the bus-side delivery gate itself would use right now) used by
+	// consumerProfileMatch below. Populated by annotateCurrentIdentity ONLY
+	// on the one appStatus row whose AppID matches the current profile's
+	// AppID (runStatus's cfg.AppID) — every other (foreign, merely scanned)
+	// appStatus is left at its zero value, so a match is never attempted for
+	// an app that isn't "current" at all.
+	CurrentIdentityKnown bool
+	CurrentAppID         string
+	CurrentUserOpenID    string
 }
 
 type busQuerier interface {
@@ -106,7 +128,7 @@ func (q *transportQuerier) QueryBusStatus(appID string) (*protocol.StatusRespons
 	return busctl.QueryStatus(q.tr, appID)
 }
 
-func runStatus(f *cmdutil.Factory, current, asJSON, failOnOrphan bool) error {
+func runStatus(cmd *cobra.Command, f *cmdutil.Factory, current, asJSON, failOnOrphan bool) error {
 	cfg, err := f.Config()
 	if err != nil {
 		return err
@@ -141,6 +163,26 @@ func runStatus(f *cmdutil.Factory, current, asJSON, failOnOrphan bool) error {
 		&transportQuerier{tr: tr},
 		time.Now(),
 	)
+
+	// --- Task 16 additive (spec §4.6), strictly read-only ---
+	//
+	// Local current_profile_match: always available, no scope, no network —
+	// stamp the freshly-resolved current identity onto the one appStatus row
+	// that is actually "current" (cfg.AppID) so writeStatusText/
+	// writeStatusJSON can compute each refined consumer's
+	// owner-vs-current match. Every other (foreign, merely scanned) app is
+	// untouched.
+	cur, curOK := loadCurrentIdentityForMatch()
+	annotateCurrentIdentity(statuses, cfg.AppID, cur, curOK)
+
+	// Remote supplement: WEAK, optional, current-app-only (see
+	// resolveRemoteSupplementGetter's doc for the full precondition chain).
+	// Any failed precondition silently keeps every consumer local-only —
+	// this must never turn a plain `event status` into a hard failure.
+	ctx := cmd.Context()
+	applyRefinedSupplement(ctx, statuses, cfg.AppID, func() refinedSubscriptionGetter {
+		return resolveRemoteSupplementGetter(ctx, cmd, f, cfg.AppID, cur.userOpenID, time.Now())
+	})
 
 	if asJSON {
 		if err := writeStatusJSON(f.IOStreams.Out, statuses); err != nil {
@@ -212,6 +254,249 @@ func deriveStatuses(seedAppIDs []string, sc busdiscover.Scanner, q busQuerier, n
 	return result
 }
 
+// --- Task 16 additive: local current_profile_match (spec §4.6) -------------
+
+// currentIdentityForMatch is the CLI-side "current" identity used to compute
+// each refined consumer's current_profile_match. Mirrors
+// internal/event/bus/identity.go's currentIdentity concept, kept as an
+// independent (unexported) type here rather than importing the bus package
+// just for two strings — cmd/event has no other reason to depend on
+// internal/event/bus.
+type currentIdentityForMatch struct {
+	appID      string
+	userOpenID string
+}
+
+// loadCurrentIdentityForMatch resolves the current identity FRESH from disk
+// (core.LoadMultiAppConfig → CurrentAppConfig("") → Users[0]) — never
+// Factory.Config()'s cache — exactly mirroring
+// internal/event/bus/identity.go's resolveCurrentIdentity, so what `event
+// status` displays as "matching" tracks exactly what the bus's own live
+// delivery gate would do right now (spec §4.4/§4.6). ok=false (unreadable
+// config, no current app, or no logged-in user under it) means "nothing
+// resolvable to compare against" — callers must treat this as
+// not-applicable, never as a synthetic mismatch.
+func loadCurrentIdentityForMatch() (currentIdentityForMatch, bool) {
+	multi, err := core.LoadMultiAppConfig()
+	if err != nil {
+		return currentIdentityForMatch{}, false
+	}
+	app := multi.CurrentAppConfig("")
+	if app == nil || len(app.Users) == 0 {
+		return currentIdentityForMatch{}, false
+	}
+	return currentIdentityForMatch{appID: app.AppId, userOpenID: app.Users[0].UserOpenId}, true
+}
+
+// annotateCurrentIdentity stamps cur/curOK onto the one appStatus row whose
+// AppID equals curAppID (runStatus's cfg.AppID) — every other (foreign,
+// merely scanned) appStatus is left at its zero value, so
+// consumerProfileMatch below never attempts a match for an app that isn't
+// "current" at all.
+func annotateCurrentIdentity(statuses []appStatus, curAppID string, cur currentIdentityForMatch, curOK bool) {
+	for i := range statuses {
+		if statuses[i].AppID != curAppID {
+			continue
+		}
+		statuses[i].CurrentIdentityKnown = curOK
+		statuses[i].CurrentAppID = cur.appID
+		statuses[i].CurrentUserOpenID = cur.userOpenID
+	}
+}
+
+// consumerProfileMatch reports current_profile_match (spec §4.6) for one
+// consumer against s's current identity (see appStatus's Current* field doc
+// and loadCurrentIdentityForMatch). applicable=false — NEVER treated as a
+// mismatch — when either side has nothing to compare: the consumer has no
+// owner user at all (OwnerUserOpenID=="", i.e. a bot or legacy/pre-Task-15
+// registration — OwnerAppID alone is populated for every consumer on a
+// Phase-C bus and is deliberately never used as a standalone comparison
+// key), or s isn't the current app / has no resolvable current identity.
+func consumerProfileMatch(s appStatus, c protocol.ConsumerInfo) (match, applicable bool) {
+	if !s.CurrentIdentityKnown || c.OwnerUserOpenID == "" {
+		return false, false
+	}
+	return c.OwnerAppID == s.CurrentAppID && c.OwnerUserOpenID == s.CurrentUserOpenID, true
+}
+
+// refinedNextAction returns the read-only advisory action to display next to
+// a real owner/current mismatch (applicable && !match); "" otherwise (either
+// not applicable, or matching — nothing to advise). Never describes the
+// consumer as dead/inactive (spec §4.6 + Task-14 review Minor #1: no
+// liveness signal exists, a live consumer can still carry a stale flag).
+func refinedNextAction(match, applicable bool) string {
+	if !applicable || match {
+		return ""
+	}
+	return "read-only: owner identity no longer matches the current profile; switch back to the owning profile to resume delivery, or leave as-is (no action taken, nothing was changed)"
+}
+
+// --- Task 16 additive: weak remote supplement (spec §4.6) -------------------
+
+// refinedSubscriptionGetter narrows *eventlib.SubscriptionClient to the one
+// call the remote supplement needs — mirrors
+// cmd/event/subscription/get.go's getSubscriptionAPI test seam, so tests
+// substitute a fake with no *lark.Client or network call involved.
+type refinedSubscriptionGetter interface {
+	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
+}
+
+// requiredRemoteSupplementScopes is the single scope status's weak remote
+// read depends on (spec §4.6). Kept as an independent literal rather than
+// importing cmd/event/subscription's unexported subscriptionReadScopes
+// (mirrors that package's own get.go scopeRemediationHint comment about the
+// identical asymmetry).
+var requiredRemoteSupplementScopes = []string{"event:subscription:read"}
+
+// getStoredToken indirects auth.GetStoredToken (mirrors
+// internal/credential/credential_provider.go's identical seam) purely so
+// tests can substitute a token without touching the real OS keychain;
+// production never reassigns it.
+var getStoredToken = auth.GetStoredToken
+
+// remoteSupplementUAT resolves the user access token to bind into
+// NewSubscriptionClient for the remote supplement WITHOUT ever refreshing it
+// (spec §4.6: "不触发 token refresh"). stored must come from getStoredToken (a
+// pure disk/keychain read, never network) — this function itself makes no
+// calls at all, it only inspects the fields it was handed, which is also the
+// no-refresh proof: there is no code path here that could refresh anything.
+// ok=false for any failed precondition (nil/expired stored token, or a
+// missing scope) — callers must fall back to local-only silently, never
+// surface an error (this is an observe gate, not a typed failure).
+func remoteSupplementUAT(stored *auth.StoredUAToken, nowMillis int64) (uat string, ok bool) {
+	if stored == nil || stored.ExpiresAt <= nowMillis {
+		return "", false
+	}
+	if missing := auth.MissingScopes(stored.Scope, requiredRemoteSupplementScopes); len(missing) > 0 {
+		return "", false
+	}
+	return stored.AccessToken, true
+}
+
+// resolveRemoteSupplementGetter performs the Factory-touching half of the
+// remote-supplement gate (spec §4.6): it is the ONE call site where `event
+// status` resolves its own identity (f.ResolveAs/CheckStrictMode/
+// CheckIdentity — the pattern cmd/event/subscription/subscription.go's
+// resolveEffectiveIdentity uses, minus a --as flag: status defines none, so
+// flagAs is always core.AsAuto and f.ResolveAs auto-detects exactly as if
+// --as had never been passed at all).
+//
+// core.AsUser is the only branch with a local stored-token/scope precheck:
+// auth.GetStoredToken is a USER token store keyed by appID+userOpenID —
+// bot/tenant tokens have no equivalent local record in this CLI
+// (cmd/event/subscription/subscription.go's own resolveUATAndCheckScopes
+// comment notes the identical asymmetry). core.AsBot skips straight to
+// constructing the client with no token option (NewSubscriptionClient
+// ignores uat for bot identity) — any real bot permission failure is caught
+// later by Get's own error classification, exactly like `event subscription
+// get --as bot` already behaves.
+//
+// Returns nil — NEVER an error — for any failed precondition: unresolvable/
+// disallowed identity, no valid unrefreshed token, missing scope, or no SDK
+// client available.
+func resolveRemoteSupplementGetter(ctx context.Context, cmd *cobra.Command, f *cmdutil.Factory, appID, curUserOpenID string, now time.Time) refinedSubscriptionGetter {
+	as := f.ResolveAs(ctx, cmd, core.AsAuto)
+	if err := f.CheckStrictMode(ctx, as); err != nil {
+		return nil
+	}
+	if err := f.CheckIdentity(as, []string{"user", "bot"}); err != nil {
+		return nil
+	}
+
+	var uat string
+	if as == core.AsUser {
+		stored := getStoredToken(appID, curUserOpenID)
+		resolvedUAT, ok := remoteSupplementUAT(stored, now.UnixMilli())
+		if !ok {
+			return nil
+		}
+		uat = resolvedUAT
+	}
+
+	sdk, err := f.LarkClient()
+	if err != nil || sdk == nil {
+		return nil
+	}
+	client, err := eventlib.NewSubscriptionClient(sdk, as, uat)
+	if err != nil {
+		return nil
+	}
+	return client
+}
+
+// hasRefinedConsumer reports whether any consumer in the slice is refined
+// (RemoteSubscriptionID != "") — used to skip the remote-supplement gate
+// entirely (no Factory/identity/keychain work at all) when there is nothing
+// to supplement.
+func hasRefinedConsumer(consumers []protocol.ConsumerInfo) bool {
+	for _, c := range consumers {
+		if c.RemoteSubscriptionID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// applyRefinedSupplement is the pure(ish) orchestration for status's weak
+// remote read (spec §4.6): for the ONE appStatus matching curAppID that has
+// at least one refined consumer, it calls resolveGetter (assumed ALREADY
+// gated by every Factory-dependent precondition) AT MOST ONCE and, if
+// non-nil, fills that appStatus's refined consumers via
+// supplementRefinedConsumers. Injecting resolveGetter (rather than a
+// Factory/cmd) keeps this orchestration itself unit-testable with a canned
+// getter-or-nil — no Factory/keychain/network involved.
+func applyRefinedSupplement(ctx context.Context, statuses []appStatus, curAppID string, resolveGetter func() refinedSubscriptionGetter) {
+	for i := range statuses {
+		s := &statuses[i]
+		if s.AppID != curAppID || !hasRefinedConsumer(s.Consumers) {
+			continue
+		}
+		if getter := resolveGetter(); getter != nil {
+			supplementRefinedConsumers(ctx, getter, s.Consumers)
+		}
+		return // only one appStatus can ever match curAppID
+	}
+}
+
+// supplementRefinedConsumers fills RemoteSubscription/RemoteState on every
+// refined consumer (RemoteSubscriptionID != "") in consumers by calling
+// getter.Get once per remote_subscription_id (spec §4.6). getter is assumed
+// ALREADY gated by every precondition — this function performs no gating,
+// only the read + mapping, so a fake getter exercises it with no Factory/
+// cmd/keychain/network involved. A nil getter, a Get error, or an
+// empty/malformed response for one consumer degrades ONLY that consumer to
+// local-only (spec: unreachable -> local-only, no fail) — it never aborts
+// the rest of the loop and never returns an error itself.
+func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionGetter, consumers []protocol.ConsumerInfo) {
+	if getter == nil {
+		return
+	}
+	for i := range consumers {
+		c := &consumers[i]
+		if c.RemoteSubscriptionID == "" {
+			continue
+		}
+		req := larkeventv1.NewGetSubscriptionReqBuilder().SubscriptionId(c.RemoteSubscriptionID).Build()
+		resp, err := getter.Get(ctx, req)
+		if err != nil || resp == nil || resp.Data == nil || resp.Data.Subscription == nil {
+			continue // unreachable/error -> local-only for this ONE consumer
+		}
+		d := resp.Data.Subscription
+		info := &protocol.RemoteSubscriptionInfo{}
+		if d.State != nil {
+			info.State = *d.State
+		}
+		if d.ExpireTime != nil {
+			info.ExpireTime = int64(*d.ExpireTime)
+		}
+		if d.PayloadOptions != nil && d.PayloadOptions.IncludeResourceData != nil {
+			info.IncludeResourceData = *d.PayloadOptions.IncludeResourceData
+		}
+		c.RemoteSubscription = info
+		c.RemoteState = info.State
+	}
+}
+
 // humanizeDuration formats d as a coarse "N unit ago" string.
 func humanizeDuration(d time.Duration) string {
 	s := int(d.Seconds())
@@ -227,6 +512,50 @@ func humanizeDuration(d time.Duration) string {
 		return fmt.Sprintf("%dh ago", h)
 	}
 	return fmt.Sprintf("%dd ago", h/24)
+}
+
+// writeRefinedSubLine prints the additive, indented sub-line(s) under one
+// refined consumer's table row (spec §4.6). Legacy (non-refined) consumers
+// get no output at all here — their row stays exactly as it was before this
+// change. stale_identity/degraded_reason are shown as advisory/informational
+// only (spec §4.6 + Task-14 review Minor #1): this NEVER labels the consumer
+// as dead/inactive, and next_action is read-only (no action is ever taken by
+// this command).
+func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
+	if !c.RefinedSubscription {
+		return
+	}
+	parts := []string{fmt.Sprintf("remote_subscription_id=%s", c.RemoteSubscriptionID)}
+	if c.OwnerIdentity != "" || c.OwnerAppID != "" || c.OwnerUserOpenID != "" {
+		parts = append(parts, fmt.Sprintf("owner=%s app=%s user=%s",
+			orDash(c.OwnerIdentity), orDash(c.OwnerAppID), orDash(c.OwnerUserOpenID)))
+	}
+	match, applicable := consumerProfileMatch(s, c)
+	if applicable {
+		parts = append(parts, fmt.Sprintf("current_profile_match=%t", match))
+	}
+	if c.RemoteState != "" {
+		parts = append(parts, fmt.Sprintf("remote_state=%s", c.RemoteState))
+	}
+	fmt.Fprintf(out, "      %s\n", strings.Join(parts, "  "))
+
+	if c.StaleIdentity {
+		fmt.Fprintln(out, "      advisory: stale_identity (owner identity does not match the current profile; informational only — the consumer may still be actively receiving events)")
+		if action := refinedNextAction(match, applicable); action != "" {
+			fmt.Fprintf(out, "      next_action: %s\n", action)
+		}
+	}
+	if c.DegradedReason != "" {
+		fmt.Fprintf(out, "      advisory: degraded (%s) — informational only\n", c.DegradedReason)
+	}
+}
+
+// orDash renders "" as "-" for compact sub-line display.
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func writeStatusText(out io.Writer, statuses []appStatus) {
@@ -263,9 +592,10 @@ func writeStatusText(out io.Writer, statuses []appStatus) {
 				fmt.Fprintln(out)
 				fmt.Fprint(out, "  ")
 				printTableRow(out, widths, headers, colGap)
-				for _, row := range rows {
+				for ci, row := range rows {
 					fmt.Fprint(out, "  ")
 					printTableRow(out, widths, row, colGap)
+					writeRefinedSubLine(out, s, s.Consumers[ci])
 				}
 			}
 		case stateOrphan:
@@ -283,20 +613,48 @@ func writeStatusText(out io.Writer, statuses []appStatus) {
 	}
 }
 
+// consumerView is writeStatusJSON's per-consumer wire shape: it embeds
+// protocol.ConsumerInfo directly (Go struct embedding flattens its JSON keys
+// to the top level, so every current and future ConsumerInfo field flows
+// through with ZERO per-field mapping code here) and adds exactly the two
+// values that CANNOT live on ConsumerInfo because the bus does not know the
+// querying profile (spec §4.6): current_profile_match and next_action, both
+// computed locally by consumerProfileMatch/refinedNextAction. Pointer
+// CurrentProfileMatch (not bool) so "not applicable" (nil -> omitted) is
+// distinguishable from a real "false" mismatch.
+type consumerView struct {
+	protocol.ConsumerInfo
+	CurrentProfileMatch *bool  `json:"current_profile_match,omitempty"`
+	NextAction          string `json:"next_action,omitempty"`
+}
+
 func writeStatusJSON(w io.Writer, statuses []appStatus) error {
 	type jsonStatus struct {
-		AppID           string                  `json:"app_id"`
-		Status          string                  `json:"status"`
-		Running         bool                    `json:"running"` // backward compat
-		PID             int                     `json:"pid,omitempty"`
-		UptimeSec       int                     `json:"uptime_sec,omitempty"`
-		Active          int                     `json:"active_consumers,omitempty"`
-		Consumers       []protocol.ConsumerInfo `json:"consumers,omitempty"`
-		Issue           string                  `json:"issue,omitempty"`
-		SuggestedAction string                  `json:"suggested_action,omitempty"`
+		AppID           string         `json:"app_id"`
+		Status          string         `json:"status"`
+		Running         bool           `json:"running"` // backward compat
+		PID             int            `json:"pid,omitempty"`
+		UptimeSec       int            `json:"uptime_sec,omitempty"`
+		Active          int            `json:"active_consumers,omitempty"`
+		Consumers       []consumerView `json:"consumers,omitempty"`
+		Issue           string         `json:"issue,omitempty"`
+		SuggestedAction string         `json:"suggested_action,omitempty"`
 	}
 	payload := make([]jsonStatus, 0, len(statuses))
 	for _, s := range statuses {
+		var consumers []consumerView
+		if len(s.Consumers) > 0 {
+			consumers = make([]consumerView, 0, len(s.Consumers))
+			for _, c := range s.Consumers {
+				cv := consumerView{ConsumerInfo: c}
+				if match, applicable := consumerProfileMatch(s, c); applicable {
+					m := match
+					cv.CurrentProfileMatch = &m
+					cv.NextAction = refinedNextAction(match, applicable)
+				}
+				consumers = append(consumers, cv)
+			}
+		}
 		js := jsonStatus{
 			AppID:     s.AppID,
 			Status:    s.State.String(),
@@ -304,7 +662,7 @@ func writeStatusJSON(w io.Writer, statuses []appStatus) error {
 			PID:       s.PID,
 			UptimeSec: s.UptimeSec,
 			Active:    s.Active,
-			Consumers: s.Consumers,
+			Consumers: consumers,
 		}
 		if s.State == stateOrphan {
 			if s.PID == 0 {

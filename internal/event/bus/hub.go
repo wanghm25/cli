@@ -510,18 +510,42 @@ func (h *Hub) BroadcastSourceStatus(source, state, detail string) {
 }
 
 // Consumers returns info about all connected consumers.
+//
+// Refined-status fields (spec §4.6, Task 16): RemoteSubscriptionID/
+// OwnerAppID/OwnerUserOpenID are already on the Subscriber interface, so
+// they're read directly for every subscriber, refined or not — OwnerAppID in
+// particular is populated for EVERY consumer registered against a Phase-C
+// bus (it is just that bus's own AppID, spec §4.4), not only refined ones.
+// OwnerIdentity/StaleIdentity/DegradedReason are *Conn-only state (not part
+// of Subscriber — see Conn's own doc comment on identityMu), so they need
+// the same s.(*Conn) type-assert the Publish delivery gate already uses
+// (hub.go's Publish, "if c, ok := s.(*Conn); ok"): this keeps the Subscriber
+// interface untouched (no mock churn) while still surfacing them for every
+// real registration, which is always a *Conn in production. A non-*Conn
+// Subscriber (test fakes only) simply leaves those three fields at zero.
 func (h *Hub) Consumers() []protocol.ConsumerInfo {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	result := make([]protocol.ConsumerInfo, 0, len(h.subscribers))
 	for s := range h.subscribers {
-		result = append(result, protocol.ConsumerInfo{
-			PID:            s.PID(),
-			EventKey:       s.EventKey(),
-			SubscriptionID: s.SubscriptionID(),
-			Received:       s.Received(),
-			Dropped:        s.DroppedCount(),
-		})
+		remoteSubID := s.RemoteSubscriptionID()
+		info := protocol.ConsumerInfo{
+			PID:                  s.PID(),
+			EventKey:             s.EventKey(),
+			SubscriptionID:       s.SubscriptionID(),
+			Received:             s.Received(),
+			Dropped:              s.DroppedCount(),
+			RefinedSubscription:  remoteSubID != "",
+			RemoteSubscriptionID: remoteSubID,
+			OwnerAppID:           s.OwnerAppID(),
+			OwnerUserOpenID:      s.OwnerUserOpenID(),
+		}
+		if c, ok := s.(*Conn); ok {
+			info.OwnerIdentity = c.OwnerIdentity()
+			info.StaleIdentity = c.StaleIdentity()
+			info.DegradedReason = c.DegradedReason()
+		}
+		result = append(result, info)
 	}
 	return result
 }

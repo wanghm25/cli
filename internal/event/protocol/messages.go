@@ -185,6 +185,91 @@ type ConsumerInfo struct {
 	SubscriptionID string `json:"subscription_id,omitempty"`
 	Received       int64  `json:"received"`
 	Dropped        int64  `json:"dropped"`
+
+	// --- refined-status additive fields (spec §4.6). All optional/omitempty
+	// so a pre-Task-16 consumer entry (only the fields above set) marshals
+	// to exactly the old wire shape — this is what
+	// TestDecode_OldStatusResponse_BackwardCompat pins. `event status`
+	// (cmd/event/status.go) is the sole consumer of these; Hub.Consumers()
+	// (internal/event/bus/hub.go) is the sole producer for the bus-known
+	// subset — see each field's own comment for exactly which side sets it.
+
+	// RefinedSubscription is true when this consumer is bound to a remote
+	// Subscription (RemoteSubscriptionID != ""), i.e. routed by spec §4.3's
+	// dual-index matrix rather than by EventTypes() alone. A legacy consumer
+	// is always false here.
+	RefinedSubscription bool `json:"refined_subscription,omitempty"`
+
+	// RemoteSubscriptionID is the same id as Hello.RemoteSubscriptionID /
+	// Event.RemoteSubscriptionID above (the OpenAPI Subscription primary
+	// key) — "" for a legacy consumer.
+	RemoteSubscriptionID string `json:"remote_subscription_id,omitempty"`
+
+	// OwnerIdentity/OwnerAppID/OwnerUserOpenID are the owner identity fixed
+	// at this consumer's registration (spec §4.4, Hello.Identity/Profile/
+	// UserOpenID + the bus's own AppID) — owner_app_id + owner_user_open_id
+	// is the ONLY authoritative comparison key against a freshly-resolved
+	// "current" identity; UAT is never part of this. OwnerAppID is set for
+	// EVERY consumer (bot, user, or legacy/pre-Task-15) once registered
+	// against a Phase-C bus — it is simply that bus's own AppID, so its
+	// presence alone is not a "refined" or "user" signal. OwnerUserOpenID
+	//=="" is the discriminator for "bot or legacy/pre-Task-15 registration"
+	// (mirrors Subscriber.OwnerUserOpenID's own doc): only a non-empty
+	// OwnerUserOpenID makes current_profile_match (computed by status.go,
+	// NOT stored here — the bus does not know the querying profile)
+	// meaningful at all.
+	OwnerIdentity   string `json:"owner_identity,omitempty"`
+	OwnerAppID      string `json:"owner_app_id,omitempty"`
+	OwnerUserOpenID string `json:"owner_user_open_id,omitempty"`
+
+	// StaleIdentity/DegradedReason mirror Conn's identical-named accessors
+	// (internal/event/bus/conn.go) as of the last bus-side identity-gate
+	// evaluation. ADVISORY ONLY: no liveness signal exists and status is a
+	// single-shot query, so a live, actively-receiving consumer can still
+	// carry a stale flag from an earlier profile switch that was never
+	// cleared (Task-14 review Minor #1) — a display MUST NOT treat these as
+	// "this consumer is dead", only as informational.
+	StaleIdentity  bool   `json:"stale_identity,omitempty"`
+	DegradedReason string `json:"degraded_reason,omitempty"`
+
+	// RemoteState is a short summary of this consumer's remote Subscription
+	// state. Two independent producers, neither the bus's live Publish path:
+	// (a) status.go's weak, optional remote supplement (spec §4.6) sets it
+	// from a live SubscriptionClient.Get when every precondition holds —
+	// this is the only producer as of Task 16; (b) a future Task 18 will
+	// additionally have the bus itself remember the last lifecycle event it
+	// received for this subscription. Empty until either producer runs.
+	RemoteState string `json:"remote_state,omitempty"`
+
+	// RemoteSubscription carries the raw remote Subscription snapshot from
+	// status.go's remote supplement (spec §4.6) — nil unless that weak read
+	// actually ran and succeeded for this consumer (current app + resolvable
+	// identity + valid unrefreshed token + held event:subscription:read
+	// scope); a nil value always means "local-only for this consumer", never
+	// "fetched and empty".
+	RemoteSubscription *RemoteSubscriptionInfo `json:"remote_subscription,omitempty"`
+
+	// LastLifecycleEvent records the most recent typed lifecycle event
+	// (Activated/Updated/Suspended/ExpirationReminder/Expired/Deleted, spec
+	// §5.1) the bus observed for this consumer's remote Subscription. Added
+	// now so the wire shape is stable; POPULATED by Task 18 — always "" until
+	// then, which is fine/additive (this field's own zero value is
+	// indistinguishable from "no lifecycle event yet").
+	LastLifecycleEvent string `json:"last_lifecycle_event,omitempty"`
+}
+
+// RemoteSubscriptionInfo is the CLI-facing snapshot of one remote
+// Subscription's live state (spec §4.6's `remote_subscription{state,
+// expire_time,include_resource_data}`), as returned by status.go's weak
+// remote supplement (internal/event/subscription_client.go's
+// SubscriptionClient.Get). Deliberately minimal — only the three fields spec
+// §4.6 names — rather than reusing cmd/event/subscription's own richer
+// subscriptionRow/remoteState shapes, which live in a sibling CLI package
+// this SDK-independent protocol package must not import.
+type RemoteSubscriptionInfo struct {
+	State               string `json:"state,omitempty"`
+	ExpireTime          int64  `json:"expire_time,omitempty"` // unix seconds; 0 = unknown
+	IncludeResourceData bool   `json:"include_resource_data"`
 }
 
 type StatusResponse struct {
