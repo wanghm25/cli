@@ -209,6 +209,29 @@ func newRefinedConsumeTestFactory(t *testing.T) *cmdutil.Factory {
 	return f
 }
 
+// newStrictBotOnlyRefinedConsumeTestFactory mirrors newRefinedConsumeTestFactory
+// but additionally configures a bot-only strict-mode account
+// (SupportedIdentities:2, bitflag 1=user/2=bot — internal/core/config.go) —
+// the same setup cmd/event/subscription/subscription_test.go's
+// TestResolveEffectiveIdentity_StrictModeRejectsCrossIdentity uses to lock
+// f.CheckStrictMode's rejection of a cross-identity --as for the sibling
+// `event subscription` write commands. Reused here to lock the equivalent
+// fix on runRefinedConsume's own write path (review finding I1).
+func newStrictBotOnlyRefinedConsumeTestFactory(t *testing.T) *cmdutil.Factory {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
+	if err := os.WriteFile(filepath.Join(dir, "events"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{
+		AppID: "cli_consume_test", AppSecret: "secret", Brand: core.BrandFeishu,
+		SupportedIdentities: 2, // bot only
+	})
+	return f
+}
+
 // newConsumeCmd wires cmd.Execute()'s own error/usage banner to io.Discard —
 // the returned error (what every test below asserts on) is unaffected;
 // this only keeps `go test -v` output free of cobra's usage dump for
@@ -327,6 +350,86 @@ func TestRunConsume_OwnerMeTemplate_AsUser_PassesTemplateCheck_ProceedsToRealCha
 	}
 	if !strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
 		t.Errorf("expected --as user on owner/me to reach PlanRemoteSubscription's real List call, got: %v", err)
+	}
+}
+
+// ---- runRefinedConsume strict-mode write-safety (review finding I1) ----
+//
+// resolveIdentity (shared by both the legacy and refined branches) calls
+// f.ResolveAs + f.CheckIdentity but never f.CheckStrictMode. Every sibling
+// --as write command DOES gate strict mode right after ResolveAs —
+// cmd/event/subscription/subscription.go's resolveEffectiveIdentity (whose
+// own fix is locked by TestResolveEffectiveIdentity_StrictModeRejectsCrossIdentity
+// in cmd/event/subscription/subscription_test.go), cmd/api/api.go's apiRun,
+// cmd/service/service.go's serviceMethodRun, and cmd/whoami/whoami.go's
+// whoamiRun. Because Factory.ResolveAs deliberately preserves an explicit
+// --as through strict mode (see its own doc comment: "so CheckStrictMode can
+// reject incompatible requests"), omitting CheckStrictMode lets an explicit
+// --as of the disallowed type slip through whenever it also happens to
+// satisfy the EventKey's/template's own AuthTypes whitelist — and on a
+// refined key that reaches PlanRemoteSubscription/ApplyRemoteSubscriptionPlan,
+// this means a remote create/reuse/reactivate of a Subscription under the
+// wrong authority. The fix adds f.CheckStrictMode right after
+// resolveIdentity returns in runRefinedConsume, before CheckTemplateAuthTypes
+// or any client/subClient construction — i.e. before any remote write.
+
+// TestRunRefinedConsume_StrictModeBotOnly_AsUser_RejectedBeforePlanApply is
+// this task's REQUIRED write-safety case: im.message.created_v1's chat-id
+// template declares auth_types:["user","bot"] at BOTH the base-key and
+// template tier (events/refined/refined_keys_mock.json), so --as user
+// otherwise passes both of resolveIdentity's CheckIdentity and
+// runRefinedConsume's own CheckTemplateAuthTypes on a bot-only strict-mode
+// account — f.CheckStrictMode is the only gate that can catch it. This
+// Factory (newStrictBotOnlyRefinedConsumeTestFactory) registers zero HTTP
+// stubs, so if the rejection did NOT happen up front, the chain would
+// instead reach PlanRemoteSubscription's real List call and fail with
+// "/open-apis/event/v1/subscriptions" in the error (exactly as
+// TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOffline
+// demonstrates) — proving the write seam (Plan/Apply/RunRefined) was never
+// reached is therefore equivalent to proving that substring is absent.
+func TestRunRefinedConsume_StrictModeBotOnly_AsUser_RejectedBeforePlanApply(t *testing.T) {
+	f := newStrictBotOnlyRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a", "--as", "user").Execute()
+
+	if err == nil {
+		t.Fatal("expected an error for --as user under strict mode bot, got nil")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeInvalidArgument {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeInvalidArgument)
+	}
+	if !strings.Contains(err.Error(), "strict mode") {
+		t.Errorf("expected the strict-mode error wording (f.CheckStrictMode), got: %v", err)
+	}
+	if strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
+		t.Errorf("strict-mode check must reject BEFORE any Plan/Apply network call (write seam must never be reached), got: %v", err)
+	}
+}
+
+// TestRunRefinedConsume_StrictModeBotOnly_AsBot_PassesStrictModeCheck_ProceedsToRealChain
+// is the non-regression counterpart: --as bot matches the bot-only
+// strict-mode account, so it must pass f.CheckStrictMode (as well as both
+// AuthTypes tiers) and proceed all the way into the real refined chain,
+// exactly like
+// TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOffline
+// — failing only once it reaches PlanRemoteSubscription's real (stub-less)
+// List call, never earlier. This locks that the new check does not
+// misfire on an ALLOWED identity, even when strict mode is active.
+func TestRunRefinedConsume_StrictModeBotOnly_AsBot_PassesStrictModeCheck_ProceedsToRealChain(t *testing.T) {
+	f := newStrictBotOnlyRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a", "--as", "bot").Execute()
+
+	if err == nil {
+		t.Fatal("expected an error (this Factory registers no HTTP stubs), got nil")
+	}
+	if _, ok := errs.ProblemOf(err); !ok {
+		t.Fatalf("expected a typed errs.* error even from a deep chain failure, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
+		t.Errorf("expected --as bot on a bot-only strict-mode account to reach PlanRemoteSubscription's real List call, got: %v", err)
 	}
 }
 

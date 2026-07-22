@@ -403,6 +403,29 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 	if err != nil {
 		return err
 	}
+	// §2.8 tier 1.5 (write-safety, review finding I1): resolveIdentity calls
+	// f.ResolveAs + f.CheckIdentity but never f.CheckStrictMode, unlike every
+	// sibling --as write command — cmd/event/subscription/subscription.go's
+	// resolveEffectiveIdentity (same signature/pattern mirrored here
+	// verbatim), cmd/api/api.go's apiRun, cmd/service/service.go's
+	// serviceMethodRun, and cmd/whoami/whoami.go's whoamiRun all call
+	// CheckStrictMode right after ResolveAs, before any further identity
+	// check. Factory.ResolveAs deliberately preserves an explicit --as
+	// through strict mode specifically so the caller can reject it here
+	// (internal/cmdutil/factory.go's own comment on that branch) — skipping
+	// this call would let an explicit --as of the disallowed type reach
+	// PlanRemoteSubscription/ApplyRemoteSubscriptionPlan (the ONLY remote
+	// write this chain performs) whenever a credential of that type still
+	// happened to be resolvable, silently bypassing the administrator's
+	// configured identity policy. Deliberately NOT added inside
+	// resolveIdentity itself: that function is shared with the legacy
+	// (non-refined) consume.Run path, which must stay byte-identical — this
+	// call is local to runRefinedConsume so only the refined write path
+	// gains the gate. Must run BEFORE CheckTemplateAuthTypes and before any
+	// client/subClient construction below.
+	if err := f.CheckStrictMode(cmd.Context(), identity); err != nil {
+		return err
+	}
 	// §2.8 tier 2 (write-safety, review fix): resolveIdentity only checked
 	// the BASE key's AuthTypes; the matched KeyTemplate can be narrower
 	// (e.g. the shipped im.message.created_v1/owner/me template is
