@@ -178,6 +178,37 @@ func TestProbeBusEligibility_HealthyLocalBus_NoError(t *testing.T) {
 	}
 }
 
+func TestProbeBusEligibility_HealthyLocalBusAlreadyOnline_RemoteCheckNotAppliedToItsOwnConnection(t *testing.T) {
+	// The realistic steady state once ANY bus for this app is already up:
+	// that bus's own WebSocket connection makes the remote API's
+	// online_instance_cnt >= 1. A SECOND (or third...) refined consumer
+	// attaching to that SAME already-healthy local bus must not be
+	// rejected just because the remote API reports the bus's own
+	// connection back to it. EnsureBus's own existing logic (startup.go)
+	// already establishes this exact condition — it calls
+	// CheckRemoteConnections ONLY inside the "local bus not found" branch
+	// (see its "local bus not found; checking remote connections..." log
+	// line), never when probeAndDialBus already succeeded — so Probe must
+	// mirror that same condition, not just the same underlying call.
+	healthyResp := protocol.NewStatusResponse(4242, 10, 1, nil)
+	healthyResp.ProtocolVersion = protocol.ProtocolVersionV2
+	healthyResp.Capabilities = []string{protocol.CapabilityRefinedRouting, protocol.CapabilityHelloV2}
+	tr := fakeStatusBusTransport{resp: healthyResp}
+	apiClient := &testutil.StubAPIClient{Body: `{"code":0,"data":{"online_instance_cnt":1}}`}
+
+	err := ProbeBusEligibility(context.Background(), tr, "cli_probe_test", apiClient, io.Discard)
+	if err != nil {
+		t.Errorf("a healthy already-running local bus must not be rejected merely because the remote API reports ITS OWN connection back; got: %v", err)
+	}
+	// The remote check is inapplicable once a local bus already answered —
+	// asserting zero calls proves Probe did not even attempt it (not just
+	// that it tolerated the result), consistent with EnsureBus's own
+	// "checking remote connections" log firing only in the no-local-bus branch.
+	if apiClient.Calls != 0 {
+		t.Errorf("expected the remote connection check to be skipped once a local bus already answered, got %d call(s)", apiClient.Calls)
+	}
+}
+
 func TestProbeBusEligibility_LocalBusMissingOneCapabilityMarker_FailedPrecondition(t *testing.T) {
 	// ProtocolVersion present but the capability list is incomplete (e.g. a
 	// mid-rollout partial build) must still fail closed -- absence of a
