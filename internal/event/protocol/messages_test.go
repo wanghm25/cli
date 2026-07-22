@@ -390,6 +390,7 @@ func TestConsumerInfo_V2FieldsRoundTrip(t *testing.T) {
 			State:               "enabled",
 			ExpireTime:          1732000000,
 			IncludeResourceData: true,
+			SuspensionCode:      "", // not suspended; exercised separately below
 		},
 		LastLifecycleEvent: "subscription.activated",
 	}
@@ -437,5 +438,86 @@ func TestConsumerInfo_V2FieldsOmittedWhenZero(t *testing.T) {
 		if bytes.Contains(data, []byte(key)) {
 			t.Errorf("zero-valued Task 16 field leaked onto wire: %s in %s", key, data)
 		}
+	}
+}
+
+// --- Task 16 review fix wave: RemoteSubscriptionInfo refinements -----------
+//
+// Fix A support: SuspensionCode carries the remote Subscription's
+// suspension code verbatim (SDK service/event/v1/model.go's Suspension.Code
+// doc: "仅 state=suspended 时返回") so status.go's remoteDegradedAdvisory can
+// include it in a "suspended" advisory without re-fetching or guessing
+// anything — this package only carries the value, it does not interpret it.
+// Fix B: IncludeResourceData gains `,omitempty` for consistency with its two
+// siblings (State, ExpireTime) — harmless either way since the enclosing
+// RemoteSubscription pointer is already omitempty, but kept consistent.
+
+func TestRemoteSubscriptionInfo_SuspensionCode_RoundTripAndOmitempty(t *testing.T) {
+	ci := ConsumerInfo{
+		RemoteState: "suspended",
+		RemoteSubscription: &RemoteSubscriptionInfo{
+			State:          "suspended",
+			SuspensionCode: "app_ticket_expired",
+		},
+	}
+	data, err := json.Marshal(ci)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(data, []byte(`"suspension_code":"app_ticket_expired"`)) {
+		t.Errorf("suspension_code missing from marshaled output: %s", data)
+	}
+	var got ConsumerInfo
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.RemoteSubscription == nil || got.RemoteSubscription.SuspensionCode != "app_ticket_expired" {
+		t.Errorf("SuspensionCode roundtrip failed: %+v", got.RemoteSubscription)
+	}
+
+	// Omitted when empty (e.g. a healthy state, or a suspended state whose
+	// response happened not to include a Suspension object at all).
+	healthy := ConsumerInfo{
+		RemoteState:        "enabled",
+		RemoteSubscription: &RemoteSubscriptionInfo{State: "enabled"},
+	}
+	data2, err := json.Marshal(healthy)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(data2, []byte(`"suspension_code"`)) {
+		t.Errorf("suspension_code should be omitted when empty: %s", data2)
+	}
+}
+
+// TestRemoteSubscriptionInfo_IncludeResourceData_OmittedWhenFalse locks Fix
+// B: IncludeResourceData now matches its siblings (State/ExpireTime) in
+// being omitempty, so a remote_subscription snapshot with
+// include_resource_data=false (a real, meaningful value, distinct from
+// "unknown") drops the key entirely rather than writing `false` onto the
+// wire.
+func TestRemoteSubscriptionInfo_IncludeResourceData_OmittedWhenFalse(t *testing.T) {
+	ci := ConsumerInfo{
+		RemoteState:        "enabled",
+		RemoteSubscription: &RemoteSubscriptionInfo{State: "enabled", IncludeResourceData: false},
+	}
+	data, err := json.Marshal(ci)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(data, []byte(`"include_resource_data"`)) {
+		t.Errorf("include_resource_data should be omitted when false: %s", data)
+	}
+
+	ciTrue := ConsumerInfo{
+		RemoteState:        "enabled",
+		RemoteSubscription: &RemoteSubscriptionInfo{State: "enabled", IncludeResourceData: true},
+	}
+	dataTrue, err := json.Marshal(ciTrue)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(dataTrue, []byte(`"include_resource_data":true`)) {
+		t.Errorf("include_resource_data should be present (true) when set: %s", dataTrue)
 	}
 }

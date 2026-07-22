@@ -553,3 +553,321 @@ func TestResolveRemoteSupplementGetter_LarkClientError_ReturnsNil(t *testing.T) 
 		t.Errorf("expected nil getter when f.LarkClient() errors, got %v", getter)
 	}
 }
+
+// --- Task 16 review fix wave ------------------------------------------------
+//
+// Fix A (§4.6:321 partial-compliance): a KNOWN degraded remote_state
+// ("suspended"/"expired") gets a derived, display-only advisory appended
+// alongside any pre-existing bus-side degraded_reason/stale_identity
+// advisory; any OTHER (open-vocabulary / healthy, e.g. "active"/"enabled")
+// remote_state gets none — no guessing. Fix C (style): the stale_identity
+// advisory is phrased as an earlier-snapshot note, never a current-mismatch
+// assertion, when the FRESHLY-computed current_profile_match is true.
+
+// okGetSubscriptionRespSuspended mirrors okGetSubscriptionResp above but
+// additionally sets Suspension.Code, for exercising supplementRefinedConsumers'
+// verbatim SuspensionCode capture (Fix A support). suspensionCode=="" omits
+// the Suspension object entirely (a suspended response with no suspension
+// details, which must still produce a suspended advisory with no code).
+func okGetSubscriptionRespSuspended(suspensionCode string) *larkeventv1.GetSubscriptionResp {
+	state := "suspended"
+	resp := &larkeventv1.GetSubscriptionResp{
+		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
+		Data: &larkeventv1.GetSubscriptionRespData{
+			Subscription: &larkeventv1.SubscriptionDetail{
+				State: &state,
+			},
+		},
+	}
+	if suspensionCode != "" {
+		resp.Data.Subscription.Suspension = &larkeventv1.Suspension{Code: &suspensionCode}
+	}
+	return resp
+}
+
+// --- remoteDegradedAdvisory: pure function, no ctx/getter/bus involved at
+// all (the strongest possible proof that Fix A introduces no remote call and
+// no bus/Conn write: the function signature has nothing capable of either).
+
+func TestRemoteDegradedAdvisory_Suspended_IncludesCodeWhenPresent(t *testing.T) {
+	c := protocol.ConsumerInfo{
+		RemoteState:        "suspended",
+		RemoteSubscription: &protocol.RemoteSubscriptionInfo{State: "suspended", SuspensionCode: "app_ticket_expired"},
+	}
+	got := remoteDegradedAdvisory(c)
+	if !strings.Contains(got, "suspended") || !strings.Contains(got, "app_ticket_expired") {
+		t.Errorf("remoteDegradedAdvisory = %q, want it to mention suspended and the code verbatim", got)
+	}
+}
+
+func TestRemoteDegradedAdvisory_Suspended_NoCodeStillAdvises(t *testing.T) {
+	c := protocol.ConsumerInfo{RemoteState: "suspended"}
+	got := remoteDegradedAdvisory(c)
+	if got == "" || !strings.Contains(got, "suspended") {
+		t.Errorf("remoteDegradedAdvisory = %q, want a non-empty suspended advisory even with no captured code", got)
+	}
+}
+
+func TestRemoteDegradedAdvisory_Expired(t *testing.T) {
+	c := protocol.ConsumerInfo{RemoteState: "expired"}
+	got := remoteDegradedAdvisory(c)
+	if got == "" || !strings.Contains(got, "expired") {
+		t.Errorf("remoteDegradedAdvisory = %q, want a non-empty expired advisory", got)
+	}
+}
+
+// TestRemoteDegradedAdvisory_UnknownOrHealthyState_ReturnsEmpty is the core
+// "do not guess the open vocabulary" guard: any state other than the two
+// grounded values — including a healthy value like "active"/"enabled" —
+// must NOT synthesize a degraded advisory.
+func TestRemoteDegradedAdvisory_UnknownOrHealthyState_ReturnsEmpty(t *testing.T) {
+	for _, state := range []string{"active", "enabled", "some_future_state", ""} {
+		c := protocol.ConsumerInfo{RemoteState: state}
+		if got := remoteDegradedAdvisory(c); got != "" {
+			t.Errorf("remoteDegradedAdvisory(remote_state=%q) = %q, want empty (no guessing)", state, got)
+		}
+	}
+}
+
+// --- writeStatusText: text-output integration ------------------------------
+
+func TestWriteStatusText_RemoteStateSuspended_ShowsDegradedAdvisory(t *testing.T) {
+	var buf bytes.Buffer
+	c := refinedConsumer()
+	c.RemoteState = "suspended"
+	c.RemoteSubscription = &protocol.RemoteSubscriptionInfo{State: "suspended", SuspensionCode: "app_ticket_expired"}
+	statuses := []appStatus{{
+		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
+		Consumers: []protocol.ConsumerInfo{c},
+	}}
+	writeStatusText(&buf, statuses)
+	out := buf.String()
+	for _, want := range []string{"remote_state=suspended", "suspended", "app_ticket_expired", "advisory"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q; full output:\n%s", want, out)
+		}
+	}
+}
+
+func TestWriteStatusText_RemoteStateExpired_ShowsDegradedAdvisory(t *testing.T) {
+	var buf bytes.Buffer
+	c := refinedConsumer()
+	c.RemoteState = "expired"
+	statuses := []appStatus{{
+		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
+		Consumers: []protocol.ConsumerInfo{c},
+	}}
+	writeStatusText(&buf, statuses)
+	out := buf.String()
+	for _, want := range []string{"remote_state=expired", "expired", "advisory"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q; full output:\n%s", want, out)
+		}
+	}
+}
+
+// TestWriteStatusText_RemoteStateUnknownHealthy_NoDegradedAdvisory locks the
+// "do not guess" contract at the display-integration level: an
+// unknown/healthy remote_state still shows remote_state= verbatim but adds
+// no synthesized "remote subscription ..." advisory line.
+func TestWriteStatusText_RemoteStateUnknownHealthy_NoDegradedAdvisory(t *testing.T) {
+	var buf bytes.Buffer
+	c := refinedConsumer()
+	c.RemoteState = "active"
+	statuses := []appStatus{{
+		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
+		Consumers: []protocol.ConsumerInfo{c},
+	}}
+	writeStatusText(&buf, statuses)
+	out := buf.String()
+	if !strings.Contains(out, "remote_state=active") {
+		t.Errorf("output missing remote_state=active; full output:\n%s", out)
+	}
+	if strings.Contains(out, "remote subscription") {
+		t.Errorf("must not synthesize a degraded advisory for an unknown/healthy remote_state; full output:\n%s", out)
+	}
+}
+
+// TestWriteStatusText_RemoteDegradedAdvisory_AppendsAlongsideDegradedReason is
+// the "APPEND, do not clobber" guard: a pre-existing bus-side degraded_reason
+// advisory must still be shown in full alongside the new remote-derived one
+// — neither replaces the other.
+func TestWriteStatusText_RemoteDegradedAdvisory_AppendsAlongsideDegradedReason(t *testing.T) {
+	var buf bytes.Buffer
+	c := refinedConsumer()
+	c.DegradedReason = "bind_failed: uat_unavailable"
+	c.RemoteState = "suspended"
+	statuses := []appStatus{{
+		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
+		Consumers: []protocol.ConsumerInfo{c},
+	}}
+	writeStatusText(&buf, statuses)
+	out := buf.String()
+	for _, want := range []string{"bind_failed: uat_unavailable", "suspended"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q (both advisories must coexist); full output:\n%s", want, out)
+		}
+	}
+	if strings.Count(out, "advisory") < 2 {
+		t.Errorf("expected at least 2 advisory lines (bus-side degraded_reason + remote-derived), got output:\n%s", out)
+	}
+}
+
+// --- writeStatusJSON: --json equivalents -----------------------------------
+
+func consumerJSONFromStatuses(t *testing.T, statuses []appStatus) map[string]interface{} {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := writeStatusJSON(&buf, statuses); err != nil {
+		t.Fatalf("writeStatusJSON: %v", err)
+	}
+	var payload struct {
+		Apps []struct {
+			Consumers []map[string]interface{} `json:"consumers"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal: %v\nraw: %s", err, buf.String())
+	}
+	if len(payload.Apps) != 1 || len(payload.Apps[0].Consumers) != 1 {
+		t.Fatalf("unexpected shape: %+v", payload)
+	}
+	return payload.Apps[0].Consumers[0]
+}
+
+func TestWriteStatusJSON_RemoteStateSuspended_IncludesDegradedAdvisory(t *testing.T) {
+	c := refinedConsumer()
+	c.RemoteState = "suspended"
+	c.RemoteSubscription = &protocol.RemoteSubscriptionInfo{State: "suspended", SuspensionCode: "app_ticket_expired"}
+	statuses := []appStatus{{AppID: "cli_a", State: stateRunning, Consumers: []protocol.ConsumerInfo{c}}}
+
+	cv := consumerJSONFromStatuses(t, statuses)
+	advisory, _ := cv["remote_degraded_advisory"].(string)
+	if advisory == "" || !strings.Contains(advisory, "suspended") || !strings.Contains(advisory, "app_ticket_expired") {
+		t.Errorf("remote_degraded_advisory = %v, want a suspended advisory including the code", cv["remote_degraded_advisory"])
+	}
+}
+
+func TestWriteStatusJSON_RemoteStateUnknownHealthy_OmitsDegradedAdvisoryKey(t *testing.T) {
+	c := refinedConsumer()
+	c.RemoteState = "enabled"
+	statuses := []appStatus{{AppID: "cli_a", State: stateRunning, Consumers: []protocol.ConsumerInfo{c}}}
+
+	cv := consumerJSONFromStatuses(t, statuses)
+	if _, present := cv["remote_degraded_advisory"]; present {
+		t.Errorf("remote_degraded_advisory must be omitted for an unknown/healthy remote_state, got %v", cv["remote_degraded_advisory"])
+	}
+	if cv["remote_state"] != "enabled" {
+		t.Errorf("remote_state = %v, want enabled (still shown verbatim)", cv["remote_state"])
+	}
+}
+
+func TestWriteStatusJSON_RemoteDegradedAdvisory_AppendsAlongsideDegradedReason(t *testing.T) {
+	c := refinedConsumer()
+	c.DegradedReason = "bind_failed: uat_unavailable"
+	c.RemoteState = "expired"
+	statuses := []appStatus{{AppID: "cli_a", State: stateRunning, Consumers: []protocol.ConsumerInfo{c}}}
+
+	cv := consumerJSONFromStatuses(t, statuses)
+	if cv["degraded_reason"] != "bind_failed: uat_unavailable" {
+		t.Errorf("degraded_reason = %v, want it preserved untouched", cv["degraded_reason"])
+	}
+	advisory, _ := cv["remote_degraded_advisory"].(string)
+	if advisory == "" || !strings.Contains(advisory, "expired") {
+		t.Errorf("remote_degraded_advisory = %v, want a non-empty expired advisory", cv["remote_degraded_advisory"])
+	}
+}
+
+func TestWriteStatusJSON_LegacyConsumer_OmitsRemoteDegradedAdvisoryKey(t *testing.T) {
+	statuses := []appStatus{{
+		AppID: "cli_a", State: stateRunning,
+		Consumers: []protocol.ConsumerInfo{{PID: 1, EventKey: "mail.x", Received: 1}},
+	}}
+	cv := consumerJSONFromStatuses(t, statuses)
+	if _, present := cv["remote_degraded_advisory"]; present {
+		t.Errorf("remote_degraded_advisory must be omitted for a legacy consumer, got %v", cv["remote_degraded_advisory"])
+	}
+}
+
+// --- supplementRefinedConsumers: SuspensionCode capture, still exactly ONE
+// Get call (no extra remote call introduced by Fix A) ----------------------
+
+func TestSupplementRefinedConsumers_CapturesSuspensionCodeVerbatim(t *testing.T) {
+	consumers := []protocol.ConsumerInfo{refinedConsumer()}
+	getter := &fakeRefinedGetter{resp: okGetSubscriptionRespSuspended("app_ticket_expired")}
+
+	supplementRefinedConsumers(context.Background(), getter, consumers)
+
+	if consumers[0].RemoteSubscription == nil || consumers[0].RemoteSubscription.SuspensionCode != "app_ticket_expired" {
+		t.Errorf("SuspensionCode not captured verbatim: %+v", consumers[0].RemoteSubscription)
+	}
+	if getter.calls != 1 {
+		t.Errorf("Get called %d times, want exactly 1 (no extra remote call introduced)", getter.calls)
+	}
+}
+
+// --- Fix C: staleIdentityAdvisory -------------------------------------------
+
+func TestStaleIdentityAdvisory_FreshMatchTrue_EarlierSnapshotWording(t *testing.T) {
+	got := staleIdentityAdvisory(true, true)
+	if strings.Contains(got, "does not match the current profile") {
+		t.Errorf("staleIdentityAdvisory(match=true) must not assert a current mismatch: %q", got)
+	}
+	if !strings.Contains(strings.ToLower(got), "earlier") {
+		t.Errorf("staleIdentityAdvisory(match=true) = %q, want it framed as an earlier-snapshot advisory", got)
+	}
+	lower := strings.ToLower(got)
+	if strings.Contains(lower, "dead") || strings.Contains(lower, "inactive") {
+		t.Errorf("must never describe the consumer as dead/inactive: %q", got)
+	}
+}
+
+func TestStaleIdentityAdvisory_FreshMismatch_KeepsExistingWording(t *testing.T) {
+	got := staleIdentityAdvisory(false, true)
+	if !strings.Contains(got, "does not match the current profile") {
+		t.Errorf("staleIdentityAdvisory(match=false, applicable=true) = %q, want the existing current-mismatch wording preserved", got)
+	}
+}
+
+func TestStaleIdentityAdvisory_NotApplicable_NeverAssertsCurrentMismatch(t *testing.T) {
+	got := staleIdentityAdvisory(false, false)
+	if strings.Contains(got, "does not match the current profile") {
+		t.Errorf("staleIdentityAdvisory(applicable=false) must not assert an unverified current mismatch: %q", got)
+	}
+}
+
+// TestWriteStatusText_StaleIdentityWithFreshMatch_NoContradictoryMismatchLine
+// is the exact review scenario: current_profile_match=true (FRESH) but
+// StaleIdentity is still set (an earlier evaluation's leftover flag, Task-14
+// review Minor #1). The two lines must never contradict each other, and the
+// consumer must never be described as dead/inactive.
+func TestWriteStatusText_StaleIdentityWithFreshMatch_NoContradictoryMismatchLine(t *testing.T) {
+	var buf bytes.Buffer
+	c := refinedConsumer()
+	c.StaleIdentity = true
+	statuses := []appStatus{{
+		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
+		CurrentIdentityKnown: true, CurrentAppID: "cli_a", CurrentUserOpenID: "ou_1", // matches refinedConsumer()'s owner
+		Consumers: []protocol.ConsumerInfo{c},
+	}}
+	writeStatusText(&buf, statuses)
+	out := buf.String()
+
+	if !strings.Contains(out, "current_profile_match=true") {
+		t.Errorf("output missing current_profile_match=true; full output:\n%s", out)
+	}
+	if strings.Contains(out, "does not match the current profile") {
+		t.Errorf("current_profile_match=true must never be followed by a current-mismatch assertion; full output:\n%s", out)
+	}
+	if !strings.Contains(strings.ToLower(out), "earlier") {
+		t.Errorf("expected the stale flag framed as an earlier-snapshot advisory; full output:\n%s", out)
+	}
+	lower := strings.ToLower(out)
+	if strings.Contains(lower, "dead") || strings.Contains(lower, "inactive") {
+		t.Errorf("must never describe the consumer as dead/inactive; full output:\n%s", out)
+	}
+	// next_action must NOT be suggested when the fresh check says it matches.
+	if strings.Contains(out, "next_action") {
+		t.Errorf("no next_action expected when current_profile_match=true; full output:\n%s", out)
+	}
+}

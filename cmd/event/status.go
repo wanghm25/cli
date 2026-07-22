@@ -331,6 +331,31 @@ func refinedNextAction(match, applicable bool) string {
 	return "read-only: owner identity no longer matches the current profile; switch back to the owning profile to resume delivery, or leave as-is (no action taken, nothing was changed)"
 }
 
+// staleIdentityAdvisory renders the stale_identity flag's advisory text
+// (Task 16 review Fix C). The FRESHLY-computed match/applicable (spec §4.6,
+// consumerProfileMatch above) is authoritative for "does it currently
+// match" — the bus-side StaleIdentity flag, by contrast, is only ever set,
+// never cleared except on rebind (Task-14 review Minor #1), so a live
+// consumer that currently matches can still carry a stale flag left over
+// from an earlier evaluation. Presenting that leftover flag next to a fresh
+// "current_profile_match=true" as if it were a CURRENT mismatch would be
+// two textually-contradictory adjacent lines. So: only a CONFIRMED fresh
+// mismatch (applicable && !match) is phrased as a current mismatch; every
+// other case — a fresh match, or no fresh comparison available at all for
+// this app/consumer — is phrased as an earlier-snapshot advisory instead,
+// never asserting a current mismatch it cannot verify. Never describes the
+// consumer as dead/inactive (spec §4.6 + Task-14 review Minor #1:
+// advisory-only — no liveness signal exists).
+func staleIdentityAdvisory(match, applicable bool) string {
+	if applicable && !match {
+		return "stale_identity (owner identity does not match the current profile; informational only — the consumer may still be actively receiving events)"
+	}
+	if applicable && match {
+		return "stale_identity (a stale_identity flag was set by an earlier evaluation; the consumer currently matches the active profile) — informational only"
+	}
+	return "stale_identity (a stale_identity flag was set by an earlier evaluation; current match status could not be freshly confirmed for this app) — informational only"
+}
+
 // --- Task 16 additive: weak remote supplement (spec §4.6) -------------------
 
 // refinedSubscriptionGetter narrows *eventlib.SubscriptionClient to the one
@@ -492,8 +517,57 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 		if d.PayloadOptions != nil && d.PayloadOptions.IncludeResourceData != nil {
 			info.IncludeResourceData = *d.PayloadOptions.IncludeResourceData
 		}
+		if d.Suspension != nil && d.Suspension.Code != nil {
+			// Captured verbatim from the response already fetched above —
+			// NOT a new remote call. Feeds the Task 16 review Fix A degraded
+			// advisory (remoteDegradedAdvisory below); this function itself
+			// does no interpretation, only mapping.
+			info.SuspensionCode = *d.Suspension.Code
+		}
 		c.RemoteSubscription = info
 		c.RemoteState = info.State
+	}
+}
+
+// --- Task 16 review Fix A (§4.6:321 partial-compliance) ---------------------
+//
+// remoteDegradedAdvisory derives a read-only degraded advisory from c's
+// ALREADY-fetched remote-supplement result (c.RemoteState/
+// c.RemoteSubscription, filled by supplementRefinedConsumers above — spec
+// §4.6). Spec §4.6:321 asks the remote supplement to "据此刷新本地
+// degraded/错误状态" (refresh local degraded/error state accordingly), which
+// Task 16 itself deliberately did NOT implement because the remote state
+// string is an open vocabulary with no closed enum in this SDK — guessing at
+// "which states count as unhealthy" would risk fabricating incorrect logic
+// (see this task's own design-note/report history). This function is
+// grounded to EXACTLY the two values that ARE documented outside that open
+// vocabulary:
+//   - "suspended": SDK service/event/v1/model.go's Suspension field doc
+//     ("仅 state=suspended 时返回") and already used as a string-equality
+//     check in shipped code (cmd/event/subscription/update.go's
+//     applyUpdate/errUpdateSuspended).
+//   - "expired": the well-known subscription expiry lifecycle state.
+//
+// Any OTHER remote_state — including a healthy value like "active"/
+// "enabled", or any other string this open vocabulary might produce in the
+// future — returns "" (no derived advisory; the raw remote_state is still
+// displayed verbatim by the caller, unaffected). DISPLAY-ONLY: reads fields
+// already populated by an earlier, already-gated fetch (or, per
+// RemoteState's own doc, a future Task 18 lifecycle push); this function
+// itself makes no call, no bus/Conn write, nothing — its signature (a single
+// value parameter, no ctx/getter/bus reference) makes that structurally
+// impossible.
+func remoteDegradedAdvisory(c protocol.ConsumerInfo) string {
+	switch c.RemoteState {
+	case "suspended":
+		if c.RemoteSubscription != nil && c.RemoteSubscription.SuspensionCode != "" {
+			return fmt.Sprintf("remote subscription suspended (suspension_code=%s)", c.RemoteSubscription.SuspensionCode)
+		}
+		return "remote subscription suspended"
+	case "expired":
+		return "remote subscription expired"
+	default:
+		return ""
 	}
 }
 
@@ -540,13 +614,19 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 	fmt.Fprintf(out, "      %s\n", strings.Join(parts, "  "))
 
 	if c.StaleIdentity {
-		fmt.Fprintln(out, "      advisory: stale_identity (owner identity does not match the current profile; informational only — the consumer may still be actively receiving events)")
+		fmt.Fprintf(out, "      advisory: %s\n", staleIdentityAdvisory(match, applicable))
 		if action := refinedNextAction(match, applicable); action != "" {
 			fmt.Fprintf(out, "      next_action: %s\n", action)
 		}
 	}
 	if c.DegradedReason != "" {
 		fmt.Fprintf(out, "      advisory: degraded (%s) — informational only\n", c.DegradedReason)
+	}
+	// Task 16 review Fix A: APPEND (never clobber) a degraded advisory
+	// derived from the remote-supplement result, alongside whichever of the
+	// two advisories above may already be printed.
+	if advisory := remoteDegradedAdvisory(c); advisory != "" {
+		fmt.Fprintf(out, "      advisory: %s — informational only (remote-supplement, read-only)\n", advisory)
 	}
 }
 
@@ -616,16 +696,25 @@ func writeStatusText(out io.Writer, statuses []appStatus) {
 // consumerView is writeStatusJSON's per-consumer wire shape: it embeds
 // protocol.ConsumerInfo directly (Go struct embedding flattens its JSON keys
 // to the top level, so every current and future ConsumerInfo field flows
-// through with ZERO per-field mapping code here) and adds exactly the two
-// values that CANNOT live on ConsumerInfo because the bus does not know the
-// querying profile (spec §4.6): current_profile_match and next_action, both
-// computed locally by consumerProfileMatch/refinedNextAction. Pointer
+// through with ZERO per-field mapping code here) and adds three values that
+// are DERIVED/computed rather than raw bus data, so they don't belong on
+// ConsumerInfo itself: current_profile_match/next_action (spec §4.6) —
+// computed locally by consumerProfileMatch/refinedNextAction because the bus
+// does not know the querying profile — and remote_degraded_advisory (Task 16
+// review Fix A), computed locally by remoteDegradedAdvisory from the
+// consumer's own already-fetched remote_state/remote_subscription (spec
+// §4.6:321's "refresh local degraded/error state", scoped to the two known
+// remote states this SDK documents outside an open vocabulary). Pointer
 // CurrentProfileMatch (not bool) so "not applicable" (nil -> omitted) is
-// distinguishable from a real "false" mismatch.
+// distinguishable from a real "false" mismatch. remote_degraded_advisory is
+// deliberately a SEPARATE key from the bus-side degraded_reason (embedded
+// verbatim from ConsumerInfo) — additive/appended, never a replacement or a
+// clobber of that pre-existing advisory.
 type consumerView struct {
 	protocol.ConsumerInfo
-	CurrentProfileMatch *bool  `json:"current_profile_match,omitempty"`
-	NextAction          string `json:"next_action,omitempty"`
+	CurrentProfileMatch    *bool  `json:"current_profile_match,omitempty"`
+	NextAction             string `json:"next_action,omitempty"`
+	RemoteDegradedAdvisory string `json:"remote_degraded_advisory,omitempty"`
 }
 
 func writeStatusJSON(w io.Writer, statuses []appStatus) error {
@@ -652,6 +741,7 @@ func writeStatusJSON(w io.Writer, statuses []appStatus) error {
 					cv.CurrentProfileMatch = &m
 					cv.NextAction = refinedNextAction(match, applicable)
 				}
+				cv.RemoteDegradedAdvisory = remoteDegradedAdvisory(c)
 				consumers = append(consumers, cv)
 			}
 		}

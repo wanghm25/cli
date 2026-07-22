@@ -263,13 +263,26 @@ type ConsumerInfo struct {
 // expire_time,include_resource_data}`), as returned by status.go's weak
 // remote supplement (internal/event/subscription_client.go's
 // SubscriptionClient.Get). Deliberately minimal — only the three fields spec
-// §4.6 names — rather than reusing cmd/event/subscription's own richer
-// subscriptionRow/remoteState shapes, which live in a sibling CLI package
-// this SDK-independent protocol package must not import.
+// §4.6 names, plus SuspensionCode (added by the Task 16 review Fix A: the
+// one extra piece of the ALREADY-fetched response needed to surface a
+// grounded degraded advisory verbatim, with no new remote call) — rather
+// than reusing cmd/event/subscription's own richer subscriptionRow/
+// remoteState shapes, which live in a sibling CLI package this
+// SDK-independent protocol package must not import.
 type RemoteSubscriptionInfo struct {
 	State               string `json:"state,omitempty"`
 	ExpireTime          int64  `json:"expire_time,omitempty"` // unix seconds; 0 = unknown
-	IncludeResourceData bool   `json:"include_resource_data"`
+	IncludeResourceData bool   `json:"include_resource_data,omitempty"`
+
+	// SuspensionCode is the remote Subscription's suspension code (SDK
+	// service/event/v1/model.go's Suspension.Code), carried verbatim from
+	// status.go's remote supplement. Meaningful ONLY when State=="suspended"
+	// (the SDK's own doc: "仅 state=suspended 时返回" — "returned only when
+	// state=suspended"); "" for every other state, including a suspended
+	// state whose response happened to omit the Suspension object. This
+	// package does not interpret the code, it only carries it — status.go's
+	// remoteDegradedAdvisory is the sole consumer.
+	SuspensionCode string `json:"suspension_code,omitempty"`
 }
 
 type StatusResponse struct {
