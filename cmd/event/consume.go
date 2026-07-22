@@ -37,6 +37,7 @@ type consumeCmdOpts struct {
 
 	maxEvents int
 	timeout   time.Duration
+	dryRun    bool
 }
 
 func NewCmdConsume(f *cmdutil.Factory) *cobra.Command {
@@ -71,6 +72,8 @@ Use 'event schema <EventKey>' for parameter details.`,
 	_ = cmd.RegisterFlagCompletionFunc("as", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return []string{"user", "bot", "auto"}, cobra.ShellCompDirectiveNoFileComp
 	})
+	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
+		"Preview the refined-subscription remote-write plan (probe + plan only) without applying it, starting the bus, or writing anything remote. No-op for legacy (non-refined) EventKeys, which never write remote state at all.")
 	cmdutil.SetRisk(cmd, "read")
 
 	return cmd
@@ -103,11 +106,14 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		return err
 	}
 	if resolved.IsRefined {
-		// R1 passed (this is a materialized refined key), but the refined
-		// consume runtime — bus/IPC/BindUser wiring, design spec §4 — is
-		// Phase C and does not exist yet. Never start the bus or perform a
-		// remote write for it.
-		return errRefinedConsumeRuntimeUnavailable(resolved.MaterializedKey)
+		// R1 passed (this is a materialized refined key): drive the refined
+		// startup chain (design spec §4.1/§4.2/§4.9) — ProbeBusEligibility
+		// (read-only) -> PlanRemoteSubscription (List/Get) -> [--dry-run
+		// exits here] -> ApplyRemoteSubscriptionPlan (the ONLY remote write)
+		// -> StartOrConnectBus -> HelloV2. The legacy branch below
+		// (keyDef/identity resolution through consume.Run) is UNTOUCHED and
+		// never reached for a refined key.
+		return runRefinedConsume(cmd, f, cfg, paramMap, resolved, o)
 	}
 	keyDef := resolved.Definition
 
@@ -258,14 +264,128 @@ func eventKeyBaseRegistered(eventKey string) bool {
 	return ok
 }
 
-// errRefinedConsumeRuntimeUnavailable rejects a successfully-resolved
-// refined EventKey at the consume entry: R1 already passed (ResolveEventKey
-// returned no error), but the refined consume runtime — bus/IPC/BindUser
-// wiring, design spec §4 — is Phase C and is not built yet.
-func errRefinedConsumeRuntimeUnavailable(materializedKey string) error {
-	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
-		"refined consume runtime not yet available for EventKey %s", materializedKey).
-		WithHint("refined consume runtime not yet available; use `lark-cli event subscription` to manage the remote subscription (coming in a later change)")
+// runRefinedConsume is cmd/event/consume.go's fork-seam target for a
+// materialized refined EventKey (design spec §4). Unlike the legacy branch,
+// none of the preflight below has run yet at this point in runConsume (the
+// IsRefined check happens before keyDef/identity resolution) — so this
+// resolves the minimal additional values consume.RunRefined needs (identity,
+// an identity-bound SubscriptionClient, the local API client, domain, signal
+// handling) and drives the refined startup chain: ProbeBusEligibility ->
+// PlanRemoteSubscription -> [--dry-run exit] -> ApplyRemoteSubscriptionPlan
+// (the ONLY remote write) -> StartOrConnectBus -> HelloV2 (design note "TASK
+// 15b"). It deliberately mirrors, rather than shares code with, the legacy
+// preflight further down runConsume — the legacy branch must stay
+// byte-identical, and refined's own console-precheck/scopes preflight is out
+// of this task's scope (design note's stage list does not include it).
+func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConfig, paramMap map[string]string, resolved eventlib.ResolvedEventKey, o consumeCmdOpts) error {
+	identity, err := resolveIdentity(cmd, f, resolved.Definition)
+	if err != nil {
+		return err
+	}
+
+	outputDir := o.outputDir
+	if outputDir != "" {
+		safePath, err := sanitizeOutputDir(outputDir)
+		if err != nil {
+			return err
+		}
+		outputDir = safePath
+	}
+
+	domain := core.ResolveEndpoints(cfg.Brand).Open
+
+	apiClient, err := f.NewAPIClient()
+	if err != nil {
+		return err
+	}
+	runtime := &consumeRuntime{client: apiClient, accessIdentity: identity}
+	// botRuntime pins AsBot: /open-apis/event/v1/connection is app-level,
+	// same rationale as the legacy botRuntime a few lines below in runConsume.
+	botRuntime := &consumeRuntime{client: apiClient, accessIdentity: core.AsBot}
+
+	sdk, err := f.LarkClient()
+	if err != nil {
+		return err
+	}
+	uat, err := resolveIdentityUAT(cmd.Context(), f, cfg.AppID, identity)
+	if err != nil {
+		return err
+	}
+	subClient, err := eventlib.NewSubscriptionClient(sdk, identity, uat)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			if !o.quiet && f.IOStreams.IsTerminal {
+				fmt.Fprintln(f.IOStreams.ErrOut, "\nShutting down...")
+			}
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	errOut := f.IOStreams.ErrOut
+	if o.quiet {
+		errOut = io.Discard
+	}
+	// Non-TTY unbounded consumers use stdin EOF as shutdown, same as legacy.
+	if shouldWatchStdinEOF(f.IOStreams.IsTerminal, o.maxEvents, o.timeout) {
+		watchStdinEOF(os.Stdin, cancel, errOut)
+	}
+
+	return consume.RunRefined(ctx, transport.New(), cfg.AppID, cfg.ProfileName, domain, resolved, consume.RefinedOptions{
+		Params:          paramMap,
+		JQExpr:          o.jqExpr,
+		Quiet:           o.quiet,
+		OutputDir:       outputDir,
+		Runtime:         runtime,
+		Out:             f.IOStreams.Out,
+		ErrOut:          errOut,
+		RemoteAPIClient: botRuntime,
+		MaxEvents:       o.maxEvents,
+		Timeout:         o.timeout,
+		IsTTY:           f.IOStreams.IsTerminal,
+		DryRun:          o.dryRun,
+		Identity:        identity,
+		SubClient:       subClient,
+	})
+}
+
+// resolveIdentityUAT resolves the user access token SubscriptionClient needs
+// when identity is core.AsUser; for core.AsBot it returns "" without any
+// call at all — eventlib.NewSubscriptionClient ignores uat for a bot
+// identity (the SDK mints/caches its own tenant access token), mirroring
+// resolveTenantToken's error handling for the equivalent bot-token lookup.
+func resolveIdentityUAT(ctx context.Context, f *cmdutil.Factory, appID string, identity core.Identity) (string, error) {
+	if identity != core.AsUser {
+		return "", nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := f.Credential.ResolveToken(ctx, credential.NewTokenSpec(core.AsUser, appID))
+	if err != nil {
+		if _, ok := errs.ProblemOf(err); ok {
+			return "", err
+		}
+		return "", errs.NewAuthenticationError(errs.SubtypeTokenMissing,
+			"resolve user access token: %s", err).WithCause(err)
+	}
+	if result == nil || result.Token == "" {
+		return "", errs.NewAuthenticationError(errs.SubtypeTokenMissing,
+			"no user access token available for app %s", appID).
+			WithHint("run `lark-cli auth login` to authorize as user")
+	}
+	return result.Token, nil
 }
 
 // resolveIdentity resolves the session identity and enforces keyDef.AuthTypes as a whitelist.

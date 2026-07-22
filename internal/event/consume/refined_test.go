@@ -1,0 +1,774 @@
+// Copyright (c) 2026 Lark Technologies Pte. Ltd.
+// SPDX-License-Identifier: MIT
+
+package consume
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
+
+	"github.com/larksuite/cli/errs"
+	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/protocol"
+	"github.com/larksuite/cli/internal/event/testutil"
+)
+
+// ---- fixtures ----
+
+// refinedFixture builds a self-contained event.ResolvedEventKey (as
+// cmd/event/consume.go's fork seam would hand RunRefined after
+// eventlib.ResolveEventKey succeeds) without touching the global KeyDefinition
+// registry — every test in this file constructs its own Definition, so there
+// is no RegisterKey/UnregisterKeyForTest cleanup dance to get wrong.
+func refinedFixture() event.ResolvedEventKey {
+	def := &event.KeyDefinition{
+		Key:                 "im.message.created_v1",
+		EventType:           "im.message.created_v1",
+		RefinedSubscription: true,
+		ResourceType:        "im.message",
+		Process: func(_ context.Context, _ event.APIClient, raw *event.RawEvent, _ map[string]string) (json.RawMessage, error) {
+			return raw.Payload, nil
+		},
+	}
+	return event.ResolvedEventKey{
+		Definition:      def,
+		IsRefined:       true,
+		MaterializedKey: "im.message.created_v1/chat-id/oc_aaa",
+		SelectorKey:     "chat_id",
+		SelectorValue:   "oc_aaa",
+		TargetResource:  "im.message?chat_id=oc_aaa",
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+// ---- fakeStatusBusTransport: a minimal local "bus" that only answers status_query ----
+
+// fakeStatusBusTransport plays a local bus that answers exactly one
+// status_query with a canned StatusResponse, over a net.Pipe (no real
+// socket/listener needed) — enough for busctl.QueryStatus's single
+// dial-encode-read-decode round trip.
+type fakeStatusBusTransport struct {
+	resp *protocol.StatusResponse
+}
+
+func (f fakeStatusBusTransport) Listen(string) (net.Listener, error) {
+	return nil, errors.New("fakeStatusBusTransport: Listen not supported")
+}
+
+func (f fakeStatusBusTransport) Dial(string) (net.Conn, error) {
+	client, server := net.Pipe()
+	go func() {
+		defer server.Close()
+		br := bufio.NewReader(server)
+		line, err := protocol.ReadFrame(br)
+		if err != nil {
+			return
+		}
+		if _, err := protocol.Decode(bytes.TrimRight(line, "\n")); err != nil {
+			return
+		}
+		_ = protocol.Encode(server, f.resp)
+	}()
+	return client, nil
+}
+
+func (f fakeStatusBusTransport) Address(string) string { return "fake-status-bus-addr" }
+func (f fakeStatusBusTransport) Cleanup(string)        {}
+
+// ---- ProbeBusEligibility: stage (a) remote-connection guard ----
+
+func TestProbeBusEligibility_RemoteConnectionBusy_FailedPrecondition_NoWrite(t *testing.T) {
+	apiClient := &testutil.StubAPIClient{Body: `{"code":0,"msg":"ok","data":{"online_instance_cnt":2}}`}
+
+	err := ProbeBusEligibility(context.Background(), failDialTransport{}, "cli_probe_test", apiClient, io.Discard)
+	if err == nil {
+		t.Fatal("expected failed_precondition when a remote connection is already online, got nil")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if !strings.Contains(ve.Hint, "probe_bus_eligibility") {
+		t.Errorf("Hint should name the probe stage, got: %q", ve.Hint)
+	}
+	if !strings.Contains(ve.Hint, "online_instance_cnt=2") {
+		t.Errorf("Hint should carry the observed count, got: %q", ve.Hint)
+	}
+	// Probe is read-only: exactly the connection-check GET, nothing else.
+	if apiClient.Calls != 1 {
+		t.Errorf("expected exactly 1 API call (read-only connection check), got %d", apiClient.Calls)
+	}
+	if apiClient.GotMethod != "GET" || apiClient.GotPath != "/open-apis/event/v1/connection" {
+		t.Errorf("unexpected call: %s %s (probe must never write)", apiClient.GotMethod, apiClient.GotPath)
+	}
+}
+
+func TestProbeBusEligibility_RemoteConnectionCheckErrors_FailsOpenMirroringEnsureBus(t *testing.T) {
+	// EnsureBus's own existing CheckRemoteConnections handling treats a
+	// transport/decode failure as inconclusive (log + proceed), not fatal —
+	// Probe reuses that exact call, so it must mirror that fail-open
+	// behavior for THIS specific failure mode (as opposed to a confirmed
+	// online_instance_cnt>0, which fails closed above).
+	apiClient := &testutil.StubAPIClient{Body: `not json at all`}
+	err := ProbeBusEligibility(context.Background(), failDialTransport{}, "cli_probe_test", apiClient, io.Discard)
+	if err != nil {
+		t.Errorf("expected the probe to fail OPEN on an inconclusive remote check, got error: %v", err)
+	}
+}
+
+// ---- ProbeBusEligibility: stage (b) local-bus capability guard ----
+
+func TestProbeBusEligibility_NoLocalBus_NoError(t *testing.T) {
+	// No bus reachable at all -- fine, a fresh one gets forked later with
+	// full v2 capabilities (StartOrConnectBus, a later stage).
+	if err := ProbeBusEligibility(context.Background(), failDialTransport{}, "cli_probe_test", nil, io.Discard); err != nil {
+		t.Errorf("expected no error when no local bus is running yet, got: %v", err)
+	}
+}
+
+func TestProbeBusEligibility_OldLocalBus_MissingCapabilities_FailedPrecondition_PromptsEventStop(t *testing.T) {
+	// An old (pre-refined) bus never sets ProtocolVersion/Capabilities at
+	// all -- their ABSENCE is the incompatibility signal (see
+	// protocol.StatusResponse's own doc comment), not a version mismatch.
+	oldBusResp := protocol.NewStatusResponse(4242, 10, 1, nil)
+	tr := fakeStatusBusTransport{resp: oldBusResp}
+
+	err := ProbeBusEligibility(context.Background(), tr, "cli_probe_test", nil, io.Discard)
+	if err == nil {
+		t.Fatal("expected failed_precondition for an old (pre-v2) local bus, got nil")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if !strings.Contains(ve.Hint, "event stop") {
+		t.Errorf("Hint should fail closed and prompt `event stop`, got: %q", ve.Hint)
+	}
+}
+
+func TestProbeBusEligibility_HealthyLocalBus_NoError(t *testing.T) {
+	healthyResp := protocol.NewStatusResponse(4242, 10, 1, nil)
+	healthyResp.ProtocolVersion = protocol.ProtocolVersionV2
+	healthyResp.Capabilities = []string{protocol.CapabilityRefinedRouting, protocol.CapabilityHelloV2}
+	tr := fakeStatusBusTransport{resp: healthyResp}
+
+	if err := ProbeBusEligibility(context.Background(), tr, "cli_probe_test", nil, io.Discard); err != nil {
+		t.Errorf("expected no error for a bus advertising full v2 capabilities, got: %v", err)
+	}
+}
+
+func TestProbeBusEligibility_LocalBusMissingOneCapabilityMarker_FailedPrecondition(t *testing.T) {
+	// ProtocolVersion present but the capability list is incomplete (e.g. a
+	// mid-rollout partial build) must still fail closed -- absence of a
+	// value, not just of the whole field, is what disqualifies it.
+	partialResp := protocol.NewStatusResponse(4242, 10, 1, nil)
+	partialResp.ProtocolVersion = protocol.ProtocolVersionV2
+	partialResp.Capabilities = []string{protocol.CapabilityRefinedRouting} // missing hello_v2
+	tr := fakeStatusBusTransport{resp: partialResp}
+
+	err := ProbeBusEligibility(context.Background(), tr, "cli_probe_test", nil, io.Discard)
+	if err == nil {
+		t.Fatal("expected failed_precondition when a required capability marker is missing")
+	}
+}
+
+// ---- computeConsumerScopeID / buildHelloV2 (pure, no network) ----
+
+func TestComputeConsumerScopeID_DeterministicAndSensitiveToEachInput(t *testing.T) {
+	base := computeConsumerScopeID("im.message.created_v1", "im.message.created_v1/chat-id/oc_aaa", "user", "cli_app", "ou_123")
+	same := computeConsumerScopeID("im.message.created_v1", "im.message.created_v1/chat-id/oc_aaa", "user", "cli_app", "ou_123")
+	if base != same {
+		t.Error("computeConsumerScopeID must be deterministic for identical inputs")
+	}
+	if base == "" {
+		t.Error("computeConsumerScopeID must not be empty")
+	}
+
+	variants := map[string]string{
+		"materialized_key": computeConsumerScopeID("im.message.created_v1", "im.message.created_v1/chat-id/oc_BBB", "user", "cli_app", "ou_123"),
+		"authority_type":   computeConsumerScopeID("im.message.created_v1", "im.message.created_v1/chat-id/oc_aaa", "app", "cli_app", "ou_123"),
+		"app_id":           computeConsumerScopeID("im.message.created_v1", "im.message.created_v1/chat-id/oc_aaa", "user", "cli_other", "ou_123"),
+		"user_open_id":     computeConsumerScopeID("im.message.created_v1", "im.message.created_v1/chat-id/oc_aaa", "user", "cli_app", "ou_999"),
+	}
+	for field, v := range variants {
+		if v == base {
+			t.Errorf("changing %s produced the same scope id as base; inputs must be distinguishable", field)
+		}
+	}
+}
+
+func TestAuthorityTypeFor_MapsIdentityToRemoteAuthorityVocabulary(t *testing.T) {
+	if got := authorityTypeFor(core.AsBot); got != "app" {
+		t.Errorf("authorityTypeFor(bot) = %q, want %q", got, "app")
+	}
+	if got := authorityTypeFor(core.AsUser); got != "user" {
+		t.Errorf("authorityTypeFor(user) = %q, want %q", got, "user")
+	}
+}
+
+func TestBuildHelloV2_PopulatesV2Fields(t *testing.T) {
+	resolved := refinedFixture()
+	h := buildHelloV2(resolved, core.AsUser, "local-sub-id", "my-profile", "ou_user_1", "sub_remote_1", "scope-hash-1")
+
+	if h.Type != protocol.MsgTypeHello {
+		t.Errorf("Type = %q, want %q", h.Type, protocol.MsgTypeHello)
+	}
+	if h.Version != "v1" {
+		t.Errorf(`Version = %q, want frozen "v1" (v2-ness is signaled via Capabilities, never a Version bump)`, h.Version)
+	}
+	if h.EventKey != resolved.MaterializedKey {
+		t.Errorf("EventKey = %q, want the filled template instance %q", h.EventKey, resolved.MaterializedKey)
+	}
+	if len(h.EventTypes) != 1 || h.EventTypes[0] != resolved.Definition.EventType {
+		t.Errorf("EventTypes = %v, want [%q]", h.EventTypes, resolved.Definition.EventType)
+	}
+	if h.SubscriptionID != "local-sub-id" {
+		t.Errorf("SubscriptionID = %q, want the LOCAL fingerprint (frozen meaning, never repurposed)", h.SubscriptionID)
+	}
+	if h.Identity != "user" {
+		t.Errorf("Identity = %q, want %q", h.Identity, "user")
+	}
+	if h.Profile != "my-profile" {
+		t.Errorf("Profile = %q, want %q", h.Profile, "my-profile")
+	}
+	if h.UserOpenID != "ou_user_1" {
+		t.Errorf("UserOpenID = %q, want %q", h.UserOpenID, "ou_user_1")
+	}
+	if h.RemoteSubscriptionID != "sub_remote_1" {
+		t.Errorf("RemoteSubscriptionID = %q, want %q (distinct id space from SubscriptionID)", h.RemoteSubscriptionID, "sub_remote_1")
+	}
+	if h.ConsumerScopeID != "scope-hash-1" {
+		t.Errorf("ConsumerScopeID = %q, want %q", h.ConsumerScopeID, "scope-hash-1")
+	}
+	var foundHelloV2 bool
+	for _, c := range h.Capabilities {
+		if c == protocol.CapabilityHelloV2 {
+			foundHelloV2 = true
+		}
+	}
+	if !foundHelloV2 {
+		t.Errorf("Capabilities = %v, want it to include %q", h.Capabilities, protocol.CapabilityHelloV2)
+	}
+}
+
+func TestBuildHelloV2_BotIdentity_NeverCarriesUserOpenID(t *testing.T) {
+	resolved := refinedFixture()
+	h := buildHelloV2(resolved, core.AsBot, "local-sub-id", "my-profile", "ou_should_be_dropped", "sub_remote_1", "scope-hash-1")
+	if h.Identity != "bot" {
+		t.Errorf("Identity = %q, want %q", h.Identity, "bot")
+	}
+	if h.UserOpenID != "" {
+		t.Errorf("UserOpenID = %q, want empty for a bot identity", h.UserOpenID)
+	}
+}
+
+// ---- doHelloV2: v2 Hello survives the actual wire round trip ----
+
+func TestDoHelloV2_SendsPopulatedHelloAndReadsAck(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	recvCh := make(chan *protocol.Hello, 1)
+	go func() {
+		br := bufio.NewReader(server)
+		line, err := protocol.ReadFrame(br)
+		if err != nil {
+			return
+		}
+		msg, err := protocol.Decode(bytes.TrimRight(line, "\n"))
+		if err != nil {
+			return
+		}
+		if h, ok := msg.(*protocol.Hello); ok {
+			recvCh <- h
+		}
+		_ = protocol.Encode(server, protocol.NewHelloAck("test-bus-v", true))
+	}()
+
+	resolved := refinedFixture()
+	hello := buildHelloV2(resolved, core.AsUser, "local-sub", "profile-x", "ou_1", "sub_remote", "scope-1")
+
+	ack, _, err := doHelloV2(client, hello)
+	if err != nil {
+		t.Fatalf("doHelloV2: unexpected error: %v", err)
+	}
+	if ack == nil || !ack.FirstForKey {
+		t.Fatalf("expected a FirstForKey ack, got %+v", ack)
+	}
+
+	select {
+	case got := <-recvCh:
+		if got.RemoteSubscriptionID != "sub_remote" || got.ConsumerScopeID != "scope-1" || got.Identity != "user" {
+			t.Errorf("bus received a Hello without its v2 fields intact: %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("bus side never received the Hello frame")
+	}
+}
+
+// ---- applyRemoteSubscriptionPlan: the ONLY remote write ----
+
+type fakeApplyAPI struct {
+	listResp *larkeventv1.ListSubscriptionResp
+	listErr  error
+
+	createResp *larkeventv1.CreateSubscriptionResp
+	createErr  error
+
+	reactivateResp *larkeventv1.ReactivateSubscriptionResp
+	reactivateErr  error
+
+	listCalls       int
+	createCalls     int
+	reactivateCalls int
+}
+
+func (f *fakeApplyAPI) List(context.Context, *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
+	f.listCalls++
+	return f.listResp, f.listErr
+}
+
+func (f *fakeApplyAPI) Create(context.Context, *larkeventv1.CreateSubscriptionReq) (*larkeventv1.CreateSubscriptionResp, error) {
+	f.createCalls++
+	return f.createResp, f.createErr
+}
+
+func (f *fakeApplyAPI) Reactivate(context.Context, *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error) {
+	f.reactivateCalls++
+	return f.reactivateResp, f.reactivateErr
+}
+
+func TestApplyRemoteSubscriptionPlan_Create_CallsCreateExactlyOnce(t *testing.T) {
+	fake := &fakeApplyAPI{createResp: &larkeventv1.CreateSubscriptionResp{
+		Data: &larkeventv1.CreateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_new")}},
+	}}
+	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "sub_new" || !created {
+		t.Errorf("got id=%q created=%v, want sub_new/true", id, created)
+	}
+	if fake.createCalls != 1 || fake.reactivateCalls != 0 {
+		t.Errorf("createCalls=%d reactivateCalls=%d, want 1/0", fake.createCalls, fake.reactivateCalls)
+	}
+}
+
+func TestApplyRemoteSubscriptionPlan_Reuse_NeverWrites(t *testing.T) {
+	fake := &fakeApplyAPI{}
+	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_existing")}
+	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionReuse, Existing: existing})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "sub_existing" || created {
+		t.Errorf("got id=%q created=%v, want sub_existing/false", id, created)
+	}
+	if fake.createCalls != 0 || fake.reactivateCalls != 0 {
+		t.Errorf("reuse must never call Create/Reactivate; got create=%d reactivate=%d", fake.createCalls, fake.reactivateCalls)
+	}
+}
+
+func TestApplyRemoteSubscriptionPlan_Suspended_CallsReactivateNotCreate(t *testing.T) {
+	fake := &fakeApplyAPI{reactivateResp: &larkeventv1.ReactivateSubscriptionResp{
+		Data: &larkeventv1.ReactivateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_susp")}},
+	}}
+	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_susp")}
+	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionSuspended, Existing: existing})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "sub_susp" || created {
+		t.Errorf("got id=%q created=%v, want sub_susp/false (reactivation is not \"created by this attempt\")", id, created)
+	}
+	if fake.reactivateCalls != 1 || fake.createCalls != 0 {
+		t.Errorf("suspended must call Reactivate exactly once, never Create; got create=%d reactivate=%d", fake.createCalls, fake.reactivateCalls)
+	}
+}
+
+// ---- runRefinedChain: strict order + dry-run + conflict + apply-ok/startBus-fail ----
+
+// orderRecorder is a tiny, mutex-guarded call-order recorder shared by the
+// refinedDeps fakes below -- mirrors cmd/event/subscription/create_test.go's
+// fakeCreateAPI call-recording pattern, generalized to all 5 stages.
+type orderRecorder struct {
+	mu    sync.Mutex
+	order []string
+}
+
+func (r *orderRecorder) record(stage string) {
+	r.mu.Lock()
+	r.order = append(r.order, stage)
+	r.mu.Unlock()
+}
+
+func (r *orderRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.order...)
+}
+
+func TestRunRefinedChain_StrictOrder_ProbePlanApplyStartBusHello(t *testing.T) {
+	rec := &orderRecorder{}
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	events := []*protocol.Event{
+		protocol.NewEvent("im.message.created_v1", "e1", "", 1, json.RawMessage(`{"ok":true}`)),
+	}
+	go busSide(t, server, events, true)
+
+	deps := refinedDeps{
+		probe: func(context.Context) error {
+			rec.record("probe")
+			return nil
+		},
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			rec.record("plan")
+			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		},
+		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+			rec.record("apply")
+			return "sub_new", true, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) {
+			rec.record("startBus")
+			return client, nil
+		},
+		hello: func(_ context.Context, conn net.Conn, remoteSubscriptionID string) (*protocol.HelloAck, *bufio.Reader, error) {
+			rec.record("hello")
+			if remoteSubscriptionID != "sub_new" {
+				t.Errorf("hello received remoteSubscriptionID=%q, want %q (apply's output)", remoteSubscriptionID, "sub_new")
+			}
+			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true}, bufio.NewReader(conn), nil
+		},
+	}
+
+	resolved := refinedFixture()
+	opts := RefinedOptions{
+		Quiet:     true,
+		ErrOut:    io.Discard,
+		Out:       io.Discard,
+		MaxEvents: 1,
+		Identity:  core.AsBot,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := runRefinedChain(ctx, resolved, opts, deps); err != nil {
+		t.Fatalf("runRefinedChain: unexpected error: %v", err)
+	}
+
+	got := rec.snapshot()
+	want := []string{"probe", "plan", "apply", "startBus", "hello"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("call order = %v, want %v", got, want)
+	}
+}
+
+func TestRunRefinedChain_DryRun_OnlyProbeAndPlanRun_NoApplyNoBusNoWrite(t *testing.T) {
+	rec := &orderRecorder{}
+	deps := refinedDeps{
+		probe: func(context.Context) error {
+			rec.record("probe")
+			return nil
+		},
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			rec.record("plan")
+			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		},
+		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+			rec.record("apply")
+			t.Error("apply must never run under --dry-run")
+			return "should-not-happen", true, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) {
+			rec.record("startBus")
+			t.Error("startBus must never run under --dry-run")
+			return nil, errors.New("must not be called")
+		},
+		hello: func(context.Context, net.Conn, string) (*protocol.HelloAck, *bufio.Reader, error) {
+			rec.record("hello")
+			t.Error("hello must never run under --dry-run")
+			return nil, nil, errors.New("must not be called")
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	opts := RefinedOptions{DryRun: true, Out: &stdout, ErrOut: &stderr, Identity: core.AsUser}
+	resolved := refinedFixture()
+
+	if err := runRefinedChain(context.Background(), resolved, opts, deps); err != nil {
+		t.Fatalf("dry-run: unexpected error: %v", err)
+	}
+
+	got := rec.snapshot()
+	want := []string{"probe", "plan"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("dry-run call order = %v, want ONLY %v", got, want)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("dry-run must never write to stdout (business-event NDJSON channel is reserved); got: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "dry-run") || !strings.Contains(stderr.String(), resolved.MaterializedKey) {
+		t.Errorf("dry-run should describe the plan (mentioning the materialized key) on stderr; got: %q", stderr.String())
+	}
+}
+
+func TestRunRefinedChain_DryRun_EvenOnConflictingPlan_ReportsInformationallyNoError(t *testing.T) {
+	// Mirrors event.subscription create --dry-run's own precedent (spec
+	// §3.4): dry-run ALWAYS reports the plan informationally, even
+	// conflict/suspended -- only preflight itself can fail a dry-run. Only a
+	// REAL (non-dry-run) run turns a conflict into a typed error.
+	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_conflict")}
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			return event.ReconcilePlan{Action: event.PlanActionConflict, Existing: existing}, nil
+		},
+		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+			t.Fatal("apply must not run under dry-run")
+			return "", false, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) {
+			t.Fatal("startBus must not run under dry-run")
+			return nil, nil
+		},
+		hello: func(context.Context, net.Conn, string) (*protocol.HelloAck, *bufio.Reader, error) {
+			t.Fatal("hello must not run under dry-run")
+			return nil, nil, nil
+		},
+	}
+	var stderr bytes.Buffer
+	opts := RefinedOptions{DryRun: true, Out: io.Discard, ErrOut: &stderr, Identity: core.AsUser}
+
+	if err := runRefinedChain(context.Background(), refinedFixture(), opts, deps); err != nil {
+		t.Fatalf("dry-run must report a conflicting plan informationally, not error: %v", err)
+	}
+}
+
+func TestRunRefinedChain_PlanConflict_NonDryRun_ReturnsTypedErrorBeforeApply(t *testing.T) {
+	var applyCalled, startBusCalled, helloCalled bool
+	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_conflict")}
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			return event.ReconcilePlan{
+				Action:         event.PlanActionConflict,
+				Existing:       existing,
+				ConflictFields: []errs.InvalidParam{{Name: "include_resource_data", Reason: "mismatch"}},
+			}, nil
+		},
+		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+			applyCalled = true
+			return "", false, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) { startBusCalled = true; return nil, nil },
+		hello: func(context.Context, net.Conn, string) (*protocol.HelloAck, *bufio.Reader, error) {
+			helloCalled = true
+			return nil, nil, nil
+		},
+	}
+	opts := RefinedOptions{ErrOut: io.Discard, Out: io.Discard, Identity: core.AsUser}
+
+	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
+	if err == nil {
+		t.Fatal("expected a typed conflict error on a real (non-dry-run) run")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if len(ve.Params) == 0 {
+		t.Error("expected ConflictFields to be carried through as Params")
+	}
+	if applyCalled || startBusCalled || helloCalled {
+		t.Error("a conflict must short-circuit before apply/startBus/hello")
+	}
+}
+
+func TestRunRefinedChain_ApplyOkStartBusFails_InternalErrorWithHint_NoDelete(t *testing.T) {
+	var helloCalled bool
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		},
+		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+			return "sub_new_123", true, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) {
+			return nil, errors.New("dial refused")
+		},
+		hello: func(context.Context, net.Conn, string) (*protocol.HelloAck, *bufio.Reader, error) {
+			helloCalled = true
+			return nil, nil, nil
+		},
+	}
+	opts := RefinedOptions{ErrOut: io.Discard, Out: io.Discard, Identity: core.AsBot}
+
+	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
+	if err == nil {
+		t.Fatal("expected an error when startBus fails after a successful apply")
+	}
+	var ie *errs.InternalError
+	if !errors.As(err, &ie) {
+		t.Fatalf("expected *errs.InternalError, got %T: %v", err, err)
+	}
+	if !strings.Contains(ie.Hint, "remote_subscription_id=sub_new_123") {
+		t.Errorf("Hint missing remote_subscription_id, got: %q", ie.Hint)
+	}
+	if !strings.Contains(ie.Hint, "created_by_this_attempt=true") {
+		t.Errorf("Hint missing created_by_this_attempt, got: %q", ie.Hint)
+	}
+	if !strings.Contains(ie.Hint, "next_action") {
+		t.Errorf("Hint missing next_action guidance, got: %q", ie.Hint)
+	}
+	if helloCalled {
+		t.Error("hello must not be called when startBus fails")
+	}
+	// Structural guarantee, not just a runtime assertion: refinedDeps has no
+	// delete/cleanup seam at all, and subscriptionApplyAPI exposes no
+	// Delete method -- there is no code path by which this failure could
+	// reach a remote delete call.
+}
+
+func TestRunRefinedChain_Suspended_NonDryRun_AppliesReactivateNotError(t *testing.T) {
+	// Suspended proceeds to Apply (which Reactivates) instead of failing --
+	// distinct from Conflict, which always fails before Apply.
+	var appliedAction string
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	go busSide(t, server, nil, true)
+
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			return event.ReconcilePlan{Action: event.PlanActionSuspended, Existing: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_susp")}}, nil
+		},
+		apply: func(_ context.Context, plan event.ReconcilePlan) (string, bool, error) {
+			appliedAction = plan.Action
+			return "sub_susp", false, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) { return client, nil },
+		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
+			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true}, bufio.NewReader(conn), nil
+		},
+	}
+	opts := RefinedOptions{Quiet: true, ErrOut: io.Discard, Out: io.Discard, Identity: core.AsUser, Timeout: 500 * time.Millisecond}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := runRefinedChain(ctx, refinedFixture(), opts, deps); err != nil {
+		t.Fatalf("suspended plan should reach Apply/consume, not error: %v", err)
+	}
+	if appliedAction != event.PlanActionSuspended {
+		t.Errorf("apply saw action %q, want %q", appliedAction, event.PlanActionSuspended)
+	}
+}
+
+// ---- prodRefinedDeps: the real production wiring behind RunRefined ----
+
+// TestProdRefinedDeps_HelloClosure_ResolvesRealCurrentIdentity exercises the
+// ONE piece of prodRefinedDeps's wiring that runRefinedChain's fake-deps
+// tests above cannot reach: the hello closure's own
+// resolveCurrentProfileIdentity() call, which reads config.json fresh
+// (mirroring internal/event/bus/identity.go's resolveCurrentIdentity — see
+// buildHelloV2's own doc comment for why that mirroring matters). Sandboxed
+// via LARKSUITE_CLI_CONFIG_DIR, same pattern as
+// cmd/event/consume_test.go's newRefinedConsumeTestFactory — never touches
+// the real host config.
+func TestProdRefinedDeps_HelloClosure_ResolvesRealCurrentIdentity(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
+	configJSON := `{
+		"currentApp": "test-profile",
+		"apps": [
+			{"name": "test-profile", "appId": "cli_hello_test", "users": [{"userOpenId": "ou_hello_1"}]}
+		]
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(configJSON), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved := refinedFixture()
+	opts := RefinedOptions{Identity: core.AsUser}
+	deps := prodRefinedDeps(failDialTransport{}, "cli_hello_test", "test-profile", "", resolved, opts)
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	recvCh := make(chan *protocol.Hello, 1)
+	go func() {
+		br := bufio.NewReader(server)
+		line, err := protocol.ReadFrame(br)
+		if err != nil {
+			return
+		}
+		msg, err := protocol.Decode(bytes.TrimRight(line, "\n"))
+		if err != nil {
+			return
+		}
+		if h, ok := msg.(*protocol.Hello); ok {
+			recvCh <- h
+		}
+		_ = protocol.Encode(server, protocol.NewHelloAck("test-bus", true))
+	}()
+
+	ack, _, err := deps.hello(context.Background(), client, "sub_remote_prod")
+	if err != nil {
+		t.Fatalf("hello closure: unexpected error: %v", err)
+	}
+	if ack == nil || !ack.FirstForKey {
+		t.Fatalf("expected a FirstForKey ack, got %+v", ack)
+	}
+
+	select {
+	case got := <-recvCh:
+		if got.Profile != "test-profile" {
+			t.Errorf("Profile = %q, want %q (resolved from the sandboxed config.json)", got.Profile, "test-profile")
+		}
+		if got.UserOpenID != "ou_hello_1" {
+			t.Errorf("UserOpenID = %q, want %q", got.UserOpenID, "ou_hello_1")
+		}
+		if got.RemoteSubscriptionID != "sub_remote_prod" {
+			t.Errorf("RemoteSubscriptionID = %q, want %q", got.RemoteSubscriptionID, "sub_remote_prod")
+		}
+		wantScope := computeConsumerScopeID(resolved.Definition.Key, resolved.MaterializedKey, "user", "cli_hello_test", "ou_hello_1")
+		if got.ConsumerScopeID != wantScope {
+			t.Errorf("ConsumerScopeID = %q, want %q (must match computeConsumerScopeID fed the same real-resolved inputs)", got.ConsumerScopeID, wantScope)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("bus side never received the Hello frame")
+	}
+}

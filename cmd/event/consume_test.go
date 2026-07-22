@@ -236,31 +236,39 @@ func TestRunConsume_BareRefinedBaseKeyRejected(t *testing.T) {
 	}
 }
 
-// TestRunConsume_RefinedMaterializedKey_RuntimeNotYetAvailable locks that a
-// fully materialized refined EventKey (R1 satisfied — ResolveEventKey
-// returns no error) is rejected with failed_precondition, not silently
-// consumed and not routed into the real bus: the refined consume runtime
-// (bus/IPC/BindUser wiring, design spec §4) is Phase C and does not exist
-// yet. Must never start the bus or make a remote write.
-func TestRunConsume_RefinedMaterializedKey_RuntimeNotYetAvailable(t *testing.T) {
+// TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOffline
+// is Task 15b's counterpart to the removed
+// TestRunConsume_RefinedMaterializedKey_RuntimeNotYetAvailable: a fully
+// materialized refined EventKey (R1 satisfied) is no longer rejected by a
+// hardcoded "not yet available" stub — the fork seam now routes it into the
+// real consume.RunRefined chain (ProbeBusEligibility -> PlanRemoteSubscription
+// -> ...; internal/event/consume/refined_test.go covers that chain's own
+// ordering/dry-run/error-contract behavior directly, with injected fakes).
+//
+// This Factory (newRefinedConsumeTestFactory) registers no httpmock stubs at
+// all, so the chain's first REAL network call — PlanRemoteSubscription's
+// List, reached only after identity resolution and
+// apiClient/SubscriptionClient construction succeeded and
+// ProbeBusEligibility passed — fails deterministically and offline with a
+// typed error. That failure is the useful assertion here: it proves the
+// fork seam reaches all the way into the real chain (not a stub) while
+// never forking a bus or reaching Apply (the only remote write) — both
+// later stages than Plan, never reached in this run.
+func TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOffline(t *testing.T) {
 	f := newRefinedConsumeTestFactory(t)
 	err := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a").Execute()
 
 	if err == nil {
-		t.Fatal("expected an error, got nil")
+		t.Fatal("expected an error (this test's Factory registers no HTTP stubs), got nil")
 	}
-	var ve *errs.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	if _, ok := errs.ProblemOf(err); !ok {
+		t.Fatalf("expected a typed errs.* error even from a deep chain failure, got %T: %v", err, err)
 	}
-	if ve.Subtype != errs.SubtypeFailedPrecondition {
-		t.Errorf("subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
-	}
-	if !strings.Contains(ve.Message, "not yet available") && !strings.Contains(ve.Hint, "not yet available") {
-		t.Errorf("message/hint should say the refined runtime is not yet available; message=%q hint=%q", ve.Message, ve.Hint)
-	}
-	if !strings.Contains(ve.Hint, "event subscription") {
-		t.Errorf("Hint = %q, want it to point at `event subscription`", ve.Hint)
+	// Reached PlanRemoteSubscription's real List call — proof the fork seam
+	// no longer returns a hardcoded stub error, and proof it failed before
+	// ever reaching a write (Apply) or forking a bus (StartOrConnectBus).
+	if !strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
+		t.Errorf("expected the failure to come from PlanRemoteSubscription's List call, got: %v", err)
 	}
 }
 

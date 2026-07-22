@@ -20,6 +20,21 @@ const helloAckTimeout = 5 * time.Second // symmetric with bus-side hello read de
 // buffered with the ack in one TCP segment aren't dropped.
 func doHello(conn net.Conn, eventKey string, eventTypes []string, subscriptionID string) (*protocol.HelloAck, *bufio.Reader, error) {
 	hello := protocol.NewHello(os.Getpid(), eventKey, eventTypes, "v1", subscriptionID)
+	return sendHello(conn, hello)
+}
+
+// doHelloV2 sends an already-populated v2 Hello (refined consume's HelloV2
+// stage, design spec §4.2/§4.3 — see refined.go's buildHelloV2) and awaits
+// its ack. Shares sendHello's wire implementation with doHello so both
+// frame/deadline/decode exactly once, instead of two independently
+// maintained copies of the same protocol dance.
+func doHelloV2(conn net.Conn, hello *protocol.Hello) (*protocol.HelloAck, *bufio.Reader, error) {
+	return sendHello(conn, hello)
+}
+
+// sendHello is doHello/doHelloV2's shared wire implementation: encode hello,
+// read the single hello_ack frame under helloAckTimeout, decode it.
+func sendHello(conn net.Conn, hello *protocol.Hello) (*protocol.HelloAck, *bufio.Reader, error) {
 	if err := protocol.EncodeWithDeadline(conn, hello, protocol.WriteTimeout); err != nil {
 		return nil, nil, err
 	}
