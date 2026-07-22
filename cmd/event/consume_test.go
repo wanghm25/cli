@@ -377,6 +377,150 @@ func TestRunConsume_UnknownEventKeyContractPreserved(t *testing.T) {
 	}
 }
 
+// ---- --include-resource-data gap-fill (design spec §4.7:325/328/330, §9:403) ----
+//
+// Task 19 shipped `event consume` with NO --include-resource-data flag at
+// all: internal/event/consume/refined.go hardcodes IncludeResourceData(false)
+// for its own remote write, so passing --include-resource-data on the CLI
+// produced a generic cobra "unknown flag" error instead of a typed
+// rejection ("无声降级即 bug" — the caller must get an explicit, typed
+// explanation of the deferral, not a parse error indistinguishable from a
+// typo). The tests below lock the gap-fill: the flag now exists, defaults
+// to false (no behavior change), and true is rejected with a typed error
+// BEFORE any side effect — reusing the exact same
+// resource_data_encryption_deferred wording `event subscription
+// create`/`update` already use for their own E-gate (see
+// cmd/event/subscription/create.go's errIncludeResourceDataGated) when the
+// key is refined, and a distinct typed invalid_argument when the key is
+// ordinary (the flag has no remote-Subscription concept to apply to there).
+
+// TestNewCmdConsume_HasIncludeResourceDataFlag is the cheapest possible
+// regression guard for the underlying bug this gap-fill closes: before this
+// change, cmd.Flags().Lookup("include-resource-data") was nil and cobra
+// itself rejected the flag pre-RunE with an untyped "unknown flag" error,
+// never reaching any of runConsume's own typed-error paths.
+func TestNewCmdConsume_HasIncludeResourceDataFlag(t *testing.T) {
+	f := &cmdutil.Factory{}
+	cmd := NewCmdConsume(f)
+	if cmd.Flags().Lookup("include-resource-data") == nil {
+		t.Error("NewCmdConsume missing --include-resource-data flag")
+	}
+}
+
+// TestRunConsume_RefinedKey_IncludeResourceDataTrue_TypedFailedPreconditionBeforeAnyWrite
+// proves --include-resource-data=true against a materialized REFINED
+// EventKey is rejected with the SAME typed failed_precondition (Param
+// --include-resource-data, Hint naming reason resource_data_encryption_deferred)
+// that `event subscription create`/`update` already return for their own
+// E-gate — and that the rejection happens BEFORE runRefinedConsume ever
+// runs: this Factory (newRefinedConsumeTestFactory) registers zero HTTP
+// stubs, so if the gate were checked any later than "right after
+// resolved.IsRefined is known" (e.g. after ProbeBusEligibility or
+// PlanRemoteSubscription's real List call), the error would instead surface
+// "/open-apis/event/v1/subscriptions" — exactly the substring
+// TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOffline
+// uses to prove the opposite (that the chain DOES reach Plan) for the
+// flag-omitted case below.
+func TestRunConsume_RefinedKey_IncludeResourceDataTrue_TypedFailedPreconditionBeforeAnyWrite(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a", "--include-resource-data=true").Execute()
+
+	if err == nil {
+		t.Fatal("expected a typed failed_precondition, got nil")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if ve.Param != "--include-resource-data" {
+		t.Errorf("Param = %q, want --include-resource-data", ve.Param)
+	}
+	if !strings.Contains(ve.Hint, "resource_data_encryption_deferred") {
+		t.Errorf("Hint = %q, want it to name reason resource_data_encryption_deferred", ve.Hint)
+	}
+	if strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
+		t.Errorf("--include-resource-data=true on a refined key must be rejected BEFORE any Plan/Apply network call, got: %v", err)
+	}
+}
+
+// TestRunConsume_RefinedKey_IncludeResourceDataFalse_PassesGate_NonRegression
+// mirrors cmd/event/subscription/create_test.go's
+// TestRunCreate_IncludeResourceDataFalse_PassesEGate: explicitly passing
+// --include-resource-data=false (not just omitting it) must never trip the
+// new gate — the refined chain proceeds all the way to
+// PlanRemoteSubscription's real List call exactly as it did before this
+// gap-fill.
+func TestRunConsume_RefinedKey_IncludeResourceDataFalse_PassesGate_NonRegression(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a", "--include-resource-data=false").Execute()
+
+	if err == nil {
+		t.Fatal("expected an error (this Factory registers no HTTP stubs), got nil")
+	}
+	var ve *errs.ValidationError
+	if errors.As(err, &ve) && ve.Subtype == errs.SubtypeFailedPrecondition && ve.Param == "--include-resource-data" {
+		t.Fatalf("--include-resource-data=false must not trip the gate, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
+		t.Errorf("--include-resource-data=false must still proceed to PlanRemoteSubscription's real List call, got: %v", err)
+	}
+}
+
+// TestRunConsume_OrdinaryKey_IncludeResourceDataTrue_TypedInvalidArgument
+// locks design spec §4.7:330 ("对普通 Key 传 --include-resource-data 应
+// typed 拒绝——本期取 typed invalid_argument"): the flag only ever controls a
+// refined key's remote Subscription (see `event subscription
+// create/update --include-resource-data`); passing true against an
+// ORDINARY (legacy) EventKey is a caller mistake, not a not-yet-supported
+// capability, so it is a DIFFERENT typed subtype (invalid_argument) than
+// the refined case's failed_precondition above — and it must fire before
+// ANY side effect, not just before a refined-only remote call: this test
+// passes no --as at all even though im.message.receive_v1 requires --as
+// bot (events/im/register.go), proving the gate runs before identity
+// resolution too.
+func TestRunConsume_OrdinaryKey_IncludeResourceDataTrue_TypedInvalidArgument(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "im.message.receive_v1", "--include-resource-data=true").Execute()
+
+	ve := assertInvalidArgumentParam(t, err, "--include-resource-data")
+	if !strings.Contains(ve.Message, "im.message.receive_v1") {
+		t.Errorf("Message = %q, want it to name the rejected EventKey", ve.Message)
+	}
+	if strings.Contains(err.Error(), "resource_data_encryption_deferred") {
+		t.Errorf("an ordinary key's rejection must not claim the encryption-deferred reason (that gate is refined-key-only), got: %v", err)
+	}
+}
+
+// TestRunConsume_OrdinaryKey_NoIncludeResourceDataFlag_UnaffectedNonRegression
+// proves plain `event consume im.message.receive_v1 --as bot` (the flag
+// never passed at all — the pre-gap-fill baseline) still behaves exactly
+// as before: it must proceed past the new gate, past identity resolution,
+// all the way down into consume.Run -> EnsureBus -> forkBus, which fails
+// deterministically (and fast — no real network, no real bus, no real
+// fork survives) against newRefinedConsumeTestFactory's blocked
+// LARKSUITE_CLI_CONFIG_DIR/events safety net. A typed InternalError from
+// that unrelated, much-later failure point — never an
+// --include-resource-data validation error — is proof the gate did not
+// misfire on the default (flag-omitted) path.
+func TestRunConsume_OrdinaryKey_NoIncludeResourceDataFlag_UnaffectedNonRegression(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	err := newConsumeCmd(f, "im.message.receive_v1", "--as", "bot").Execute()
+
+	if err == nil {
+		t.Fatal("expected an error (blocked bus-fork path / no HTTP stubs in this Factory), got nil")
+	}
+	var ve *errs.ValidationError
+	if errors.As(err, &ve) && ve.Param == "--include-resource-data" {
+		t.Fatalf("omitting --include-resource-data must not trip the new gate, got: %v", err)
+	}
+	if _, ok := errs.ProblemOf(err); !ok {
+		t.Fatalf("expected a typed errs.* error even from the unrelated bus-fork failure, got %T: %v", err, err)
+	}
+}
+
 func TestSanitizeOutputDir(t *testing.T) {
 	cases := []struct {
 		name       string

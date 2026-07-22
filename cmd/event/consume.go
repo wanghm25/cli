@@ -38,6 +38,17 @@ type consumeCmdOpts struct {
 	maxEvents int
 	timeout   time.Duration
 	dryRun    bool
+
+	// includeResourceData is the gap-fill flag (design spec §4.7:325/328/330,
+	// §9:403): default false is a no-op (unchanged behavior — a refined
+	// consume's remote Subscription is still created/reused with resource
+	// data disabled). true is gated: typed failed_precondition on a refined
+	// key (reason resource_data_encryption_deferred, matching `event
+	// subscription create`/`update`'s own E-gate wording verbatim), typed
+	// invalid_argument on an ordinary key (the flag has no remote-Subscription
+	// concept to apply to there). See runConsume's gate, checked immediately
+	// after resolved.IsRefined is known and before any side effect.
+	includeResourceData bool
 }
 
 func NewCmdConsume(f *cmdutil.Factory) *cobra.Command {
@@ -90,10 +101,20 @@ as pure observe — run with --dry-run first to preview the plan with zero
 writes. Unlike a legacy key, exiting a refined consumer never deletes the
 remote Subscription (there is no cleanup hook): it is TTL-persistent and
 reused by the next matching consume/create — delete it explicitly via
-'event subscription delete' if you no longer want it to exist. This command
-has no --include-resource-data flag: a refined consume's remote Subscription
-is always created/reused with resource data disabled, consistent with this
-phase's encryption-deferred gate (see 'event subscription create --help').`,
+'event subscription delete' if you no longer want it to exist.
+
+INCLUDE-RESOURCE-DATA: --include-resource-data (default false) mirrors the
+same-named flag on 'event subscription create'/'update'. false (the
+default) is a no-op: a refined consume's remote Subscription is still
+created/reused with resource data disabled, exactly as before. Passing
+--include-resource-data=true on a refined key is gated in this phase — typed
+failed_precondition, reason resource_data_encryption_deferred
+(resource-data delivery and decryption, including user-subscription
+encrypt_key generation, is not yet supported; it will ship with the
+encryption module — see 'event subscription create --help'). Passing
+--include-resource-data=true on an ORDINARY (non-refined) key is always
+rejected as typed invalid_argument instead: the flag only ever controls a
+refined key's remote Subscription, so it can never silently no-op there.`,
 		Example: `  lark-cli event consume im.message.receive_v1 --as bot                        # legacy key: unlimited stream
   lark-cli event schema im.message.created_v1 --json                            # refined key: find its templates first
   lark-cli event consume im.message.created_v1/chat-id/oc_xxx --dry-run --as bot  # preview the refined plan, zero writes
@@ -116,6 +137,8 @@ phase's encryption-deferred gate (see 'event subscription create --help').`,
 	})
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the refined-subscription remote-write plan (probe + plan only) without applying it, starting the bus, or writing anything remote. No-op for legacy (non-refined) EventKeys, which never write remote state at all.")
+	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
+		"Include resource data in a refined key's remote Subscription (mirrors 'event subscription create/update'). false (the default) is a no-op. true is gated pending the encryption module on a refined key (typed failed_precondition, reason resource_data_encryption_deferred, see design spec §9) and always rejected as invalid_argument on an ordinary (non-refined) key.")
 	cmdutil.SetRisk(cmd, "read")
 
 	return cmd
@@ -148,6 +171,15 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		return err
 	}
 	if resolved.IsRefined {
+		// §4.7/§9 E-gate: checked BEFORE runRefinedConsume (i.e. before
+		// ProbeBusEligibility/PlanRemoteSubscription/ApplyRemoteSubscriptionPlan
+		// — none of which have run yet at this point) so a gated request
+		// never causes any network activity, bus fork, or remote write.
+		// Placed alongside the identity/template-auth checks that similarly
+		// gate runRefinedConsume's entry (see its own tier-1/tier-2 comments).
+		if o.includeResourceData {
+			return errIncludeResourceDataGatedRefined()
+		}
 		// R1 passed (this is a materialized refined key): drive the refined
 		// startup chain (design spec §4.1/§4.2/§4.9) — ProbeBusEligibility
 		// (read-only) -> PlanRemoteSubscription (List/Get) -> [--dry-run
@@ -158,6 +190,14 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		return runRefinedConsume(cmd, f, cfg, paramMap, resolved, o)
 	}
 	keyDef := resolved.Definition
+
+	// §4.7:330 E-gate: --include-resource-data has no remote-Subscription
+	// concept to apply to on an ordinary (legacy) EventKey — reject before
+	// identity resolution or any other side effect, mirroring the refined
+	// branch's own before-side-effect placement above.
+	if o.includeResourceData {
+		return errIncludeResourceDataNotApplicable(eventKey)
+	}
 
 	identity, err := resolveIdentity(cmd, f, keyDef)
 	if err != nil {
@@ -285,6 +325,45 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		return err
 	}
 	return nil
+}
+
+// errIncludeResourceDataGatedRefined implements design spec §4.7/§9's
+// --include-resource-data E-gate for `event consume` on a REFINED EventKey.
+// Message/Hint are a deliberate byte-identical copy of
+// cmd/event/subscription/create.go's errIncludeResourceDataGated (reused
+// unchanged by update.go too) — same reason string
+// (resource_data_encryption_deferred) — so "gated pending the encryption
+// module" means exactly the same thing whether the rejection comes from
+// `event consume`, `event subscription create`, or `event subscription
+// update`. It cannot reference that function directly (unexported, and a
+// different package: cmd/event/subscription vs cmd/event) — this is a
+// deliberate verbatim copy rather than an export, per this task's own
+// instruction to reuse the wording verbatim without widening subscription's
+// exported surface. Only ever called BEFORE runRefinedConsume (see its call
+// site in runConsume), so a gated request never causes any network
+// activity, bus fork, or remote write.
+func errIncludeResourceDataGatedRefined() error {
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"--include-resource-data=true is not yet supported").
+		WithParam("--include-resource-data").
+		WithHint("resource-data delivery and decryption (including user-subscription encrypt_key generation) is not yet supported (reason: resource_data_encryption_deferred); it will ship with the encryption module. Retry with --include-resource-data=false (the default).")
+}
+
+// errIncludeResourceDataNotApplicable implements design spec §4.7:330's
+// typed rejection: --include-resource-data only ever controls a
+// refined-subscription EventKey's remote Subscription (see `event
+// subscription create/update --include-resource-data`) — an ordinary
+// (legacy) EventKey has no remote Subscription resource at all, so passing
+// the flag against one is a caller mistake, not a not-yet-supported
+// capability. Subtype is invalid_argument (contrast
+// errIncludeResourceDataGatedRefined's failed_precondition above): this is
+// never going to become valid once the encryption module ships, unlike the
+// refined case's temporary gate.
+func errIncludeResourceDataNotApplicable(eventKey string) error {
+	return errs.NewValidationError(errs.SubtypeInvalidArgument,
+		"--include-resource-data does not apply to EventKey %q: it is not a refined-subscription key, and --include-resource-data only controls a refined key's remote Subscription", eventKey).
+		WithParam("--include-resource-data").
+		WithHint("drop --include-resource-data for this EventKey, or pass a materialized refined EventKey instead if you need resource-data control (see `lark-cli event schema %s --json` key_templates)", eventKey)
 }
 
 // eventKeyBaseRegistered reports whether eventKey itself, or the segment
