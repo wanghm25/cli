@@ -31,9 +31,9 @@ import (
 )
 
 // NewCmdSubscription builds the `event subscription` command group (spec
-// §3.1). This change (Task 8) wires the read-only list/get pair;
-// create/update/renew/reactivate/delete land in later changes as siblings
-// registered here, without touching list/get.
+// §3.1). Task 8 wired the read-only list/get pair; Task 9 adds create as a
+// sibling, without touching list/get. update/renew/reactivate/delete land in
+// later changes the same way.
 func NewCmdSubscription(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "subscription",
@@ -43,12 +43,14 @@ refined (per-resource) event delivery — as opposed to 'event consume', which
 starts a local process that consumes already-delivered events.
 
 Use 'list' / 'get <remote_subscription_id>' to inspect what is currently
-subscribed remotely.`,
+subscribed remotely, and 'create <refined EventKey>' to create (or
+idempotently reuse) one.`,
 		SilenceUsage: true,
 	}
 
 	cmd.AddCommand(NewCmdList(f))
 	cmd.AddCommand(NewCmdGet(f))
+	cmd.AddCommand(NewCmdCreate(f))
 
 	return cmd
 }
