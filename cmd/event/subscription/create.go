@@ -242,21 +242,6 @@ func errCreateRequiresRefinedKey(eventKeyArg string) error {
 		WithHint("run `lark-cli event schema %s --json` to check whether this key supports refined subscriptions and, if so, see key_templates[].example for a key to pass here", eventKeyArg)
 }
 
-// errIncludeResourceDataGated implements the §9 E-gate. Task E2 removes
-// create's OWN use of this (create now un-gates --include-resource-data=true
-// and implements real encrypted-create instead — see createRequiredScopes/
-// reconcileExisting/createOrReuseSubscription below), but the function
-// itself must stay defined here: update.go (cmd/event/subscription/update.go)
-// still calls it to gate its own --include-resource-data=true — rejecting an
-// in-place include_resource_data/encryption switch is task E3's job (out of
-// this task's scope guard, which forbids touching update.go), not this one's.
-func errIncludeResourceDataGated() error {
-	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
-		"--include-resource-data=true is not yet supported").
-		WithParam("--include-resource-data").
-		WithHint("resource-data delivery and decryption (including user-subscription encrypt_key generation) is not yet supported (reason: resource_data_encryption_deferred); it will ship with the encryption module. Retry with --include-resource-data=false (the default).")
-}
-
 // createRequiredScopes returns the scopes create's preflight
 // (resolveUATAndCheckScopes) must check for this request: the usual
 // subscriptionMutationScopes, plus event:encrypt_key:read when

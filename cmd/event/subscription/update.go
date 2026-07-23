@@ -78,8 +78,11 @@ reactivate <remote_subscription_id>' first) and to report impact for
 --dry-run.
 
 ALLOWED VALUES: --include-resource-data true|false (required — no default is
-silently applied); true is gated in this phase (typed failed_precondition,
-reason resource_data_encryption_deferred).
+silently applied). --include-resource-data=true is refused: encryption is set
+only at create time and cannot be added, changed, or removed by update (spec
+§4.7), so switching include_resource_data / encryption on an existing
+Subscription is not supported here — a typed failed_precondition guides you to
+delete + recreate (after a human confirms) instead.
 
 OUTPUT: {operation, remote_subscription_id, subscription{...}, next_action}.
 
@@ -100,7 +103,7 @@ confirmed. Use --dry-run to preview the plan without changing anything.`,
 	}
 
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
-		"New value for whether to include resource data in delivered events (required: pass explicitly; true is gated pending the encryption module, see design spec §9)")
+		"New value for whether to include resource data in delivered events (required: pass explicitly). true is refused: encryption is set only at create time (spec §4.7), so switching include_resource_data / encryption on an existing subscription is not supported via update — delete + recreate (after a human confirms) instead.")
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the plan (identity/scope preflight + remote read + impact analysis) without updating anything")
 	cmd.Flags().BoolVar(&o.yes, "yes", false, "Confirm this high-risk write (required unless --dry-run); only pass this after a human has confirmed")
@@ -121,11 +124,13 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 			WithParam("--include-resource-data").
 			WithHint("retry with --include-resource-data=true or --include-resource-data=false")
 	}
-	// §9 E-gate: a pure local check, independent of identity/scope/remote
-	// state, so a gated request never causes any network activity at all —
-	// mirrors create.go's identical ordering rationale.
+	// Task E3 (spec §4.7 "轮换、删除与缓存失效"): the CLI refuses to switch
+	// include_resource_data / encryption ON via update. This is a pure local
+	// check, independent of identity/scope/remote state, so a rejected request
+	// never causes any network activity at all — same ordering rationale as
+	// the §9 E-gate it replaced.
 	if o.includeResourceData {
-		return errIncludeResourceDataGated()
+		return errUpdateCannotSwitchEncryption(remoteSubscriptionID)
 	}
 
 	ctx := cmd.Context()
@@ -227,6 +232,29 @@ func doPatchSubscription(ctx context.Context, svc updateSubscriptionAPI, remoteS
 			"subscription update reported success but returned no subscription data")
 	}
 	return detail, nil
+}
+
+// errUpdateCannotSwitchEncryption implements task E3 / design spec §4.7's
+// "轮换、删除与缓存失效": the CLI refuses to switch include_resource_data or
+// encryption on an existing remote Subscription via update. `encrypt` is a
+// Create-only field (Patch carries no encrypt), so update could never add an
+// encrypt_key to accompany a newly-enabled include_resource_data=true — and
+// the CLI will not leave a Subscription in an inconsistent state (resource
+// data toggled while its key can be neither added nor removed). Enabling
+// resource-data/encryption, or rotating a key, is therefore only ever done by
+// deleting the Subscription and creating a new one (or creating a separate new
+// Subscription), after a human confirms.
+//
+// This replaces the former §9 E-deferred gate: it is a permanent
+// by-design rejection, not a "not yet supported / retry later" defer, so it
+// deliberately drops the old resource_data_encryption_deferred reason. Like
+// that gate it is a pure local check (no identity/scope/remote read), so a
+// rejected request never touches the network.
+func errUpdateCannotSwitchEncryption(remoteSubscriptionID string) error {
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"cannot change include_resource_data or encryption on an existing subscription via update").
+		WithParam("--include-resource-data").
+		WithHint("encryption is set only when a subscription is created and can never be added, changed, or removed afterward (spec §4.7); to switch include_resource_data or enable/rotate encryption a human must confirm, then delete this subscription and create a new one (or create a separate new subscription) — e.g. `lark-cli event subscription delete %s` then `lark-cli event subscription create <refined-event-key> --include-resource-data=true`", remoteSubscriptionID)
 }
 
 // errUpdateSuspended implements spec §3.2.4's suspended guard: Patch is

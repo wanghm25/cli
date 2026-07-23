@@ -321,7 +321,16 @@ func TestRunUpdate_MissingIncludeResourceDataFlag_ReturnsInvalidArgument(t *test
 	}
 }
 
-func TestRunUpdate_IncludeResourceDataTrue_ReturnsEGateFailedPrecondition(t *testing.T) {
+// TestRunUpdate_IncludeResourceDataTrue_RejectsSwitchWithDeleteRecreateGuidance
+// locks task E3: switching include_resource_data / encryption ON via update is
+// refused (encryption is Create-only, spec §4.7). This replaces the old
+// E-deferred gate (reason resource_data_encryption_deferred) — now that the
+// encryption module ships, the rejection is permanent-by-design, not a
+// temporary defer, and guides the caller to delete + recreate (human confirm)
+// rather than to "retry later". Like the gate it replaced, it is a pure local
+// check that fires before any identity/scope/remote work, so a rejected
+// request never touches the network (f carries no config here).
+func TestRunUpdate_IncludeResourceDataTrue_RejectsSwitchWithDeleteRecreateGuidance(t *testing.T) {
 	f := &cmdutil.Factory{}
 	cmd := NewCmdUpdate(f)
 	cmd.SetOut(io.Discard)
@@ -339,8 +348,26 @@ func TestRunUpdate_IncludeResourceDataTrue_ReturnsEGateFailedPrecondition(t *tes
 	if ve.Param != "--include-resource-data" {
 		t.Errorf("Param = %q, want --include-resource-data", ve.Param)
 	}
-	if !strings.Contains(ve.Hint, "resource_data_encryption_deferred") {
-		t.Errorf("Hint = %q, want it to name reason resource_data_encryption_deferred", ve.Hint)
+	// New guidance: cannot change include_resource_data / encryption in place.
+	msg := ve.Error()
+	for _, want := range []string{"include_resource_data", "encryption"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("Error() = %q, want it to mention %q", msg, want)
+		}
+	}
+	// delete + recreate, after a human confirms.
+	for _, want := range []string{"delete", "create", "confirm"} {
+		if !strings.Contains(ve.Hint, want) {
+			t.Errorf("Hint = %q, want it to guide the caller to %q", ve.Hint, want)
+		}
+	}
+	if !strings.Contains(ve.Hint, "sub_1") {
+		t.Errorf("Hint = %q, want it to name remote_subscription_id sub_1", ve.Hint)
+	}
+	// The old E-deferred reason must be gone: this is no longer a "not yet
+	// supported / retry later" defer.
+	if strings.Contains(msg, "resource_data_encryption_deferred") || strings.Contains(ve.Hint, "resource_data_encryption_deferred") {
+		t.Errorf("error must no longer mention resource_data_encryption_deferred (E-deferred gate retired); got msg=%q hint=%q", msg, ve.Hint)
 	}
 }
 
