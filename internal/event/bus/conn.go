@@ -85,7 +85,7 @@ type Conn struct {
 	// --- lifecycle summary state ---
 	// lastLifecycleEvent/lastLifecycleEventID/remoteState summarize the most
 	// recent subscription lifecycle meta-event the lifecycle executor's
-	// action (internal/event/bus/lifecycle.go) observed for this consumer's
+	// action (internal/event/bus/lifecycle) observed for this consumer's
 	// remote Subscription. Guarded by the SAME identityMu as the rest of this
 	// block: written by the executor's worker goroutines, read by
 	// Hub.Consumers() (the `event status` surface).
@@ -95,10 +95,10 @@ type Conn struct {
 
 	// --- lifecycle ACTION state ---
 	// suspensionReason/lastAction/lastActionError/nextAction record the real
-	// per-event action subscriptionLifecycleAction (lifecycle.go) took (or,
-	// per the security red line, deliberately did NOT take) for this
-	// consumer's remote Subscription. Same identityMu, same writers/readers
-	// as the summary fields just above.
+	// per-event action lifecycle.SubscriptionAction took (or, per the security
+	// red line, deliberately did NOT take) for this consumer's remote
+	// Subscription. Same identityMu, same writers/readers as the summary
+	// fields just above.
 	//
 	//   - suspensionReason: body.suspension.code carried VERBATIM from the
 	//     most recent suspended_v1 (an open string, never a closed
@@ -411,14 +411,14 @@ func (c *Conn) SetNextAction(action string) {
 	c.nextAction = action
 }
 
-// clearActionDegraded clears BOTH degradedReason and nextAction together —
+// ClearActionDegraded clears BOTH degradedReason and nextAction together —
 // used whenever a lifecycle action's outcome means "fully healthy again"
 // (a bare successful Reactivate for a bot, or a successful
 // Reactivate+bindConsumer pair for a user; likewise a successful Renew).
 // Deliberately does NOT touch suspensionReason/lastAction/lastActionError —
 // those are historical record-keeping, not "is this consumer currently
 // degraded" state.
-func (c *Conn) clearActionDegraded() {
+func (c *Conn) ClearActionDegraded() {
 	c.identityMu.Lock()
 	defer c.identityMu.Unlock()
 	c.degradedReason = ""

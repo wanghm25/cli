@@ -12,6 +12,7 @@ import (
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 )
 
 // TestNewBus_ConstructsLifecycleExecutor locks bus.go's wiring: NewBus must
@@ -42,7 +43,7 @@ func TestNewBus_LifecycleExecutorWiredToOwnHub(t *testing.T) {
 	c.SetRemoteSubscriptionID("sub-1")
 	b.hub.RegisterAndIsFirst(c)
 
-	b.lifecycleExecutor.Submit(context.Background(), LifecycleEvent{
+	b.lifecycleExecutor.Submit(context.Background(), lifecycle.LifecycleEvent{
 		EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
 	})
 
@@ -69,10 +70,10 @@ func TestNewBus_DefaultLifecycleAction_IsSubscriptionLifecycleAction(t *testing.
 	if b.lifecycleAction == nil {
 		t.Fatal("NewBus did not construct a lifecycleAction")
 	}
-	if b.lifecycleAction.identityGate != nil {
+	if b.lifecycleAction.IdentityGate() != nil {
 		t.Error("a fresh Bus's lifecycleAction must start with identityGate unconfigured (nil)")
 	}
-	if b.lifecycleAction.newSubClient != nil {
+	if b.lifecycleAction.NewSubscriptionClientFunc() != nil {
 		t.Error("a fresh Bus's lifecycleAction must start with newSubClient unconfigured (nil)")
 	}
 }
@@ -90,10 +91,10 @@ func TestBus_SetSubscriptionClient_WiresFactory(t *testing.T) {
 	sdk := lark.NewClient("test-app", "test-secret")
 	b.SetSubscriptionClient(sdk)
 
-	if b.lifecycleAction.newSubClient == nil {
+	if b.lifecycleAction.NewSubscriptionClientFunc() == nil {
 		t.Fatal("SetSubscriptionClient did not wire newSubClient")
 	}
-	client, err := b.lifecycleAction.newSubClient(core.AsBot, "")
+	client, err := b.lifecycleAction.NewSubscriptionClientFunc()(core.AsBot, "")
 	if err != nil {
 		t.Fatalf("newSubClient(AsBot, \"\") returned err: %v", err)
 	}
@@ -109,7 +110,7 @@ func TestBus_SetSubscriptionClient_Nil_NoOp(t *testing.T) {
 	defer b.lifecycleExecutor.Cancel()
 
 	b.SetSubscriptionClient(nil)
-	if b.lifecycleAction.newSubClient != nil {
+	if b.lifecycleAction.NewSubscriptionClientFunc() != nil {
 		t.Error("SetSubscriptionClient(nil) must be a no-op")
 	}
 }
@@ -126,10 +127,10 @@ func TestBus_SetIdentityProviders_WiresLifecycleActionsIdentityGate(t *testing.T
 		return "uat", nil
 	})
 
-	if b.lifecycleAction.identityGate == nil {
+	if b.lifecycleAction.IdentityGate() == nil {
 		t.Fatal("SetIdentityProviders did not wire the lifecycle action's identityGate")
 	}
-	if b.lifecycleAction.identityGate != b.identityGate {
+	if b.lifecycleAction.IdentityGate() != b.identityGate {
 		t.Error("lifecycleAction.identityGate must be the SAME instance as b.identityGate, not a second one")
 	}
 }

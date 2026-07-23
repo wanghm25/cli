@@ -7,6 +7,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
@@ -18,10 +19,10 @@ func TestSubscriptionLifecycleAction_Deleted_RemovesEncryptKey(t *testing.T) {
 	hub.RegisterAndIsFirst(c)
 
 	var removed []string
-	action := newSubscriptionLifecycleAction(hub, discardTestLogger())
-	action.setEncryptKeyRemover(func(subID string) { removed = append(removed, subID) })
+	action := lifecycle.NewSubscriptionAction(hub.lifecycleRegistry(), discardTestLogger())
+	action.SetEncryptKeyRemover(func(subID string) { removed = append(removed, subID) })
 
-	le := LifecycleEvent{EventType: lifecycleEventTypeDeleted, EventID: "evt-del", RemoteSubscriptionID: "sub-del"}
+	le := lifecycle.LifecycleEvent{EventType: lifecycle.LifecycleEventTypeDeleted, EventID: "evt-del", RemoteSubscriptionID: "sub-del"}
 	if err := action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -29,15 +30,15 @@ func TestSubscriptionLifecycleAction_Deleted_RemovesEncryptKey(t *testing.T) {
 		t.Errorf("encrypt-key remover called with %v, want [sub-del]", removed)
 	}
 	// The existing deleted_v1 behavior is preserved.
-	if c.DegradedReason() != reasonRemoteSubscriptionDeleted {
-		t.Errorf("DegradedReason = %q, want %q", c.DegradedReason(), reasonRemoteSubscriptionDeleted)
+	if c.DegradedReason() != lifecycle.ReasonRemoteSubscriptionDeleted {
+		t.Errorf("DegradedReason = %q, want %q", c.DegradedReason(), lifecycle.ReasonRemoteSubscriptionDeleted)
 	}
 }
 
 func TestSubscriptionLifecycleAction_Deleted_NilRemover_NoPanic(t *testing.T) {
 	hub := NewHub()
-	action := newSubscriptionLifecycleAction(hub, discardTestLogger()) // no remover wired
-	le := LifecycleEvent{EventType: lifecycleEventTypeDeleted, EventID: "evt", RemoteSubscriptionID: "sub-1"}
+	action := lifecycle.NewSubscriptionAction(hub.lifecycleRegistry(), discardTestLogger()) // no remover wired
+	le := lifecycle.LifecycleEvent{EventType: lifecycle.LifecycleEventTypeDeleted, EventID: "evt", RemoteSubscriptionID: "sub-1"}
 	if err := action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle with nil remover must not fail: %v", err)
 	}
@@ -53,7 +54,7 @@ func TestNewBus_WiresEncryptKeyRemover_DeletedReleasesKey(t *testing.T) {
 	if _, ok := b.encryptKeyProvider.static.EncryptKey(context.Background(), "sub-gone"); !ok {
 		t.Fatal("precondition: key should be cached")
 	}
-	le := LifecycleEvent{EventType: lifecycleEventTypeDeleted, EventID: "evt", RemoteSubscriptionID: "sub-gone"}
+	le := lifecycle.LifecycleEvent{EventType: lifecycle.LifecycleEventTypeDeleted, EventID: "evt", RemoteSubscriptionID: "sub-gone"}
 	if err := b.lifecycleAction.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}

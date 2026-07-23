@@ -14,13 +14,14 @@ import (
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 )
 
 // --- Task 18: subscriptionLifecycleAction (spec §5.3/§5.4/§5.5/§8) ---------
 //
 // These tests exercise subscriptionLifecycleAction.Handle directly (the real
 // lifecycleAction bus.go wires into newLifecycleExecutor in place of Task
-// 17's summaryLifecycleAction) against a fake subscriptionActionClient and a
+// 17's summaryLifecycleAction) against a fake lifecycle.SubscriptionClient and a
 // real identityGate (itself wired to fake resolveCurrent/resolveUAT/bindUser
 // funcs, exactly like identity_test.go) -- no *lark.Client, no network, no
 // disk/keychain.
@@ -123,7 +124,7 @@ func newLifecycleDispatchTestConn(t *testing.T, pid int, remoteSubID, ownerIdent
 // wires together, so each test can reach into whichever it needs to assert
 // on (the fake client's call counts, the fake bindUser's call count, ...).
 type testActionDeps struct {
-	action *subscriptionLifecycleAction
+	action *lifecycle.SubscriptionAction
 	gate   *identityGate
 	client *fakeSubscriptionActionClient
 	bind   *fakeBindUser
@@ -155,9 +156,9 @@ func newTestAction(t *testing.T, hub *Hub, resolveCurrent func() (currentIdentit
 	}
 
 	client := &fakeSubscriptionActionClient{}
-	action := newSubscriptionLifecycleAction(hub, discardTestLogger())
-	action.setIdentityGate(gate)
-	action.setNewSubscriptionClient(func(_ core.Identity, _ string) (subscriptionActionClient, error) {
+	action := lifecycle.NewSubscriptionAction(hub.lifecycleRegistry(), discardTestLogger())
+	action.SetIdentityGate(gate)
+	action.SetNewSubscriptionClient(func(_ core.Identity, _ string) (lifecycle.SubscriptionClient, error) {
 		return client, nil
 	})
 
@@ -175,7 +176,7 @@ func TestSubscriptionLifecycleAction_Suspended_HitCurrentOwnerUser_SingleReactiv
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
 
-	le := LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -215,7 +216,7 @@ func TestSubscriptionLifecycleAction_Suspended_Bot_SingleReactivate_NoBindNeeded
 	// call configured at all (spec §5.4: "bot 只需 Reactivate 成功").
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), false)
 
-	le := LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -242,7 +243,7 @@ func TestSubscriptionLifecycleAction_Suspended_OwnerMismatch_NoReactivateNoBindU
 	// current is a DIFFERENT user than the owner fixed at registration.
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_bob"), true)
 
-	le := LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -276,7 +277,7 @@ func TestSubscriptionLifecycleAction_Suspended_Miss_NoConsumer_NoRemoteCall(t *t
 	hub := NewHub() // nothing registered -- a miss
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 
-	le := LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-missing", State: "suspended", SuspensionCode: "authority_revoked"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-missing", State: "suspended", SuspensionCode: "authority_revoked"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -299,7 +300,7 @@ func TestSubscriptionLifecycleAction_Suspended_UnknownCode_DefaultBranch_GetOnce
 	hub.RegisterAndIsFirst(c)
 	deps.client.getResp = buildGetResp("suspended", "some_future_unrecognized_code")
 
-	le := LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "some_future_unrecognized_code"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "some_future_unrecognized_code"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -328,7 +329,7 @@ func TestSubscriptionLifecycleAction_Suspended_ReactivateFails_Degraded_NextActi
 	hub.RegisterAndIsFirst(c)
 	deps.client.reactivateErr = errors.New("upstream: 500")
 
-	le := LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
 	if err := deps.action.Handle(context.Background(), le); err == nil {
 		t.Fatal("Handle should surface the Reactivate failure")
 	}
@@ -336,8 +337,8 @@ func TestSubscriptionLifecycleAction_Suspended_ReactivateFails_Degraded_NextActi
 	if got := c.DegradedReason(); got == "" {
 		t.Error("DegradedReason() empty after a Reactivate failure")
 	}
-	if got := c.NextAction(); got != nextActionReactivate {
-		t.Errorf("NextAction() = %q, want %q", got, nextActionReactivate)
+	if got := c.NextAction(); got != lifecycle.NextActionReactivate {
+		t.Errorf("NextAction() = %q, want %q", got, lifecycle.NextActionReactivate)
 	}
 	if got := c.LastAction(); got != "reactivate" {
 		t.Errorf("LastAction() = %q, want %q", got, "reactivate")
@@ -361,14 +362,14 @@ func TestSubscriptionLifecycleAction_Suspended_ReactivateSucceeds_BindFails_NotR
 	gate.onConnReady(context.Background(), "conn-1", fb.bind) // memoize only -- no conns registered yet
 
 	client := &fakeSubscriptionActionClient{}
-	action := newSubscriptionLifecycleAction(hub, discardTestLogger())
-	action.setIdentityGate(gate)
-	action.setNewSubscriptionClient(func(_ core.Identity, _ string) (subscriptionActionClient, error) { return client, nil })
+	action := lifecycle.NewSubscriptionAction(hub.lifecycleRegistry(), discardTestLogger())
+	action.SetIdentityGate(gate)
+	action.SetNewSubscriptionClient(func(_ core.Identity, _ string) (lifecycle.SubscriptionClient, error) { return client, nil })
 
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
 
-	le := LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
 	if err := action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v (want nil -- Reactivate itself succeeded, only bind failed)", err)
 	}
@@ -385,8 +386,8 @@ func TestSubscriptionLifecycleAction_Suspended_ReactivateSucceeds_BindFails_NotR
 	if got := c.DegradedReason(); got == "" {
 		t.Error("DegradedReason() empty -- a failed bind after a successful Reactivate must still be degraded (spec §5.4: NOT running)")
 	}
-	if got := c.NextAction(); got != nextActionRebind {
-		t.Errorf("NextAction() = %q, want %q", got, nextActionRebind)
+	if got := c.NextAction(); got != lifecycle.NextActionRebind {
+		t.Errorf("NextAction() = %q, want %q", got, lifecycle.NextActionRebind)
 	}
 }
 
@@ -401,7 +402,7 @@ func TestSubscriptionLifecycleAction_ExpirationReminder_Hit_SingleRenew_Success(
 	hub.RegisterAndIsFirst(c)
 	c.SetDegraded("stale_marker_from_before")
 
-	le := LifecycleEvent{EventType: "event.subscription.expiration_reminder_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", ExpireTime: 123}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.expiration_reminder_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", ExpireTime: 123}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -425,7 +426,7 @@ func TestSubscriptionLifecycleAction_ExpirationReminder_RenewFails_Degraded_Next
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), false)
 	deps.client.renewErr = errors.New("upstream: 500")
 
-	le := LifecycleEvent{EventType: "event.subscription.expiration_reminder_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.expiration_reminder_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1"}
 	if err := deps.action.Handle(context.Background(), le); err == nil {
 		t.Fatal("Handle should surface the Renew failure")
 	}
@@ -433,11 +434,11 @@ func TestSubscriptionLifecycleAction_ExpirationReminder_RenewFails_Degraded_Next
 	// reported as "remote_subscription_expired" (that reason is reserved for
 	// the actual expired_v1 event/reconcile outcome) -- a renew failure only
 	// means the subscription is at risk of expiring soon, a distinct fact.
-	if got := c.DegradedReason(); got != reasonRemoteSubscriptionExpiringSoon {
-		t.Errorf("DegradedReason() = %q, want %q", got, reasonRemoteSubscriptionExpiringSoon)
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpiringSoon {
+		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionExpiringSoon)
 	}
-	if got := c.NextAction(); got != nextActionRenew {
-		t.Errorf("NextAction() = %q, want %q", got, nextActionRenew)
+	if got := c.NextAction(); got != lifecycle.NextActionRenew {
+		t.Errorf("NextAction() = %q, want %q", got, lifecycle.NextActionRenew)
 	}
 }
 
@@ -447,7 +448,7 @@ func TestSubscriptionLifecycleAction_ExpirationReminder_OwnerMismatch_NoRenew(t 
 	hub.RegisterAndIsFirst(c)
 
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_bob"), true)
-	le := LifecycleEvent{EventType: "event.subscription.expiration_reminder_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.expiration_reminder_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -462,7 +463,7 @@ func TestSubscriptionLifecycleAction_ExpirationReminder_OwnerMismatch_NoRenew(t 
 func TestSubscriptionLifecycleAction_ExpirationReminder_Miss_NoRenew(t *testing.T) {
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
-	le := LifecycleEvent{EventType: "event.subscription.expiration_reminder_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-missing"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.expiration_reminder_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-missing"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -480,16 +481,16 @@ func TestSubscriptionLifecycleAction_Expired_Hit_Degraded_NoRemoteCallAtAll(t *t
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
-	le := LifecycleEvent{EventType: "event.subscription.expired_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "expired"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.expired_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "expired"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
 
-	if got := c.DegradedReason(); got != reasonRemoteSubscriptionExpired {
-		t.Errorf("DegradedReason() = %q, want %q", got, reasonRemoteSubscriptionExpired)
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpired {
+		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionExpired)
 	}
-	if got := c.NextAction(); got != nextActionRebuild {
-		t.Errorf("NextAction() = %q, want %q", got, nextActionRebuild)
+	if got := c.NextAction(); got != lifecycle.NextActionRebuild {
+		t.Errorf("NextAction() = %q, want %q", got, lifecycle.NextActionRebuild)
 	}
 	if deps.client.reactivateCount() != 0 || deps.client.renewCount() != 0 || deps.client.getCount() != 0 {
 		t.Errorf("expired must NEVER call Reactivate/Renew/Get: reactivate=%d renew=%d get=%d",
@@ -508,12 +509,12 @@ func TestSubscriptionLifecycleAction_Expired_OwnerMismatch_StillMarkedLocally_No
 	hub.RegisterAndIsFirst(c)
 
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_bob"), true)
-	le := LifecycleEvent{EventType: "event.subscription.expired_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "expired"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.expired_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "expired"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != reasonRemoteSubscriptionExpired {
-		t.Errorf("DegradedReason() = %q, want %q", got, reasonRemoteSubscriptionExpired)
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpired {
+		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionExpired)
 	}
 	if deps.client.reactivateCount() != 0 || deps.client.renewCount() != 0 {
 		t.Error("expired must never issue a remote call regardless of owner match")
@@ -530,16 +531,16 @@ func TestSubscriptionLifecycleAction_Deleted_Hit_Degraded_NoRebuild(t *testing.T
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
-	le := LifecycleEvent{EventType: "event.subscription.deleted_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.deleted_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
 
-	if got := c.DegradedReason(); got != reasonRemoteSubscriptionDeleted {
-		t.Errorf("DegradedReason() = %q, want %q", got, reasonRemoteSubscriptionDeleted)
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionDeleted {
+		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionDeleted)
 	}
-	if got := c.NextAction(); got != nextActionRebuild {
-		t.Errorf("NextAction() = %q, want %q", got, nextActionRebuild)
+	if got := c.NextAction(); got != lifecycle.NextActionRebuild {
+		t.Errorf("NextAction() = %q, want %q", got, lifecycle.NextActionRebuild)
 	}
 	if got := c.RemoteState(); got != "deleted" {
 		t.Errorf("RemoteState() = %q, want %q (deleted_v1's body carries no state -- synthesized, spec §5.3 \"删 active 快照\")", got, "deleted")
@@ -553,7 +554,7 @@ func TestSubscriptionLifecycleAction_Tombstone_BlocksLateActivatedAfterDeletedMi
 	hub := NewHub() // no consumer registered yet when "deleted" arrives -- a miss
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 
-	deleted := LifecycleEvent{EventType: "event.subscription.deleted_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1"}
+	deleted := lifecycle.LifecycleEvent{EventType: "event.subscription.deleted_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1"}
 	if err := deps.action.Handle(context.Background(), deleted); err != nil {
 		t.Fatalf("Handle(deleted) returned err: %v", err)
 	}
@@ -565,7 +566,7 @@ func TestSubscriptionLifecycleAction_Tombstone_BlocksLateActivatedAfterDeletedMi
 	hub.RegisterAndIsFirst(c)
 	c.SetDegraded("pre_existing_marker") // proves the activated-success path never ran
 
-	activated := LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-2", RemoteSubscriptionID: "sub-1", State: "active"}
+	activated := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-2", RemoteSubscriptionID: "sub-1", State: "active"}
 	if err := deps.action.Handle(context.Background(), activated); err != nil {
 		t.Fatalf("Handle(activated) returned err: %v", err)
 	}
@@ -579,14 +580,14 @@ func TestSubscriptionLifecycleAction_Tombstone_BlocksLateActivatedAfterDeletedMi
 }
 
 func TestSubscriptionLifecycleAction_Tombstone_ExpiresAfterTTL_AllowsLateResurrection(t *testing.T) {
-	saved := tombstoneTTL
-	tombstoneTTL = 20 * time.Millisecond
-	defer func() { tombstoneTTL = saved }()
+	saved := lifecycle.TombstoneTTL
+	lifecycle.TombstoneTTL = 20 * time.Millisecond
+	defer func() { lifecycle.TombstoneTTL = saved }()
 
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 
-	deleted := LifecycleEvent{EventType: "event.subscription.deleted_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1"}
+	deleted := lifecycle.LifecycleEvent{EventType: "event.subscription.deleted_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1"}
 	if err := deps.action.Handle(context.Background(), deleted); err != nil {
 		t.Fatalf("Handle(deleted) returned err: %v", err)
 	}
@@ -595,7 +596,7 @@ func TestSubscriptionLifecycleAction_Tombstone_ExpiresAfterTTL_AllowsLateResurre
 
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "bot", "app1", "")
 	hub.RegisterAndIsFirst(c)
-	activated := LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-2", RemoteSubscriptionID: "sub-1", State: "active"}
+	activated := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-2", RemoteSubscriptionID: "sub-1", State: "active"}
 	if err := deps.action.Handle(context.Background(), activated); err != nil {
 		t.Fatalf("Handle(activated) returned err: %v", err)
 	}
@@ -621,7 +622,7 @@ func TestSubscriptionLifecycleAction_Updated_Compatible_Continue(t *testing.T) {
 	// include_resource_data) for this to classify compatible.
 	c.SetListenIntent("im.message?chat_id=oc_1", true)
 	hub.RegisterAndIsFirst(c)
-	le := LifecycleEvent{
+	le := lifecycle.LifecycleEvent{
 		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
 		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
 		IncludeResourceData: true, PayloadOptionsPresent: true,
@@ -648,7 +649,7 @@ func TestSubscriptionLifecycleAction_Updated_DifferingTargetResource_DegradedCon
 	c.SetListenIntent("im.message?chat_id=oc_1", true)
 	hub.RegisterAndIsFirst(c)
 
-	le := LifecycleEvent{
+	le := lifecycle.LifecycleEvent{
 		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
 		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_DIFFERENT",
 		IncludeResourceData: true, PayloadOptionsPresent: true,
@@ -656,8 +657,8 @@ func TestSubscriptionLifecycleAction_Updated_DifferingTargetResource_DegradedCon
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != reasonRemoteSubscriptionConflict {
-		t.Errorf("DegradedReason() = %q, want %q (target_resource changed remotely)", got, reasonRemoteSubscriptionConflict)
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q (target_resource changed remotely)", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 	if deps.client.getCount() != 0 {
 		t.Errorf("Get call count = %d, want 0 (a clear target_resource mismatch needs no reconcile)", deps.client.getCount())
@@ -674,7 +675,7 @@ func TestSubscriptionLifecycleAction_Updated_DifferingIncludeResourceData_Degrad
 	c.SetListenIntent("im.message?chat_id=oc_1", true) // this consumer's own ENCRYPTED intent
 	hub.RegisterAndIsFirst(c)
 
-	le := LifecycleEvent{
+	le := lifecycle.LifecycleEvent{
 		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
 		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
 		IncludeResourceData: false, PayloadOptionsPresent: true, // remote flipped to plaintext
@@ -682,8 +683,8 @@ func TestSubscriptionLifecycleAction_Updated_DifferingIncludeResourceData_Degrad
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != reasonRemoteSubscriptionConflict {
-		t.Errorf("DegradedReason() = %q, want %q (include_resource_data changed remotely)", got, reasonRemoteSubscriptionConflict)
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q (include_resource_data changed remotely)", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 	if deps.client.getCount() != 0 {
 		t.Errorf("Get call count = %d, want 0 (a clear include_resource_data mismatch needs no reconcile)", deps.client.getCount())
@@ -702,7 +703,7 @@ func TestSubscriptionLifecycleAction_Updated_MissingPayloadOptions_SingleGetReco
 	hub.RegisterAndIsFirst(c)
 	deps.client.getResp = buildGetResp("active", "")
 
-	le := LifecycleEvent{
+	le := lifecycle.LifecycleEvent{
 		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
 		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
 		// PayloadOptionsPresent deliberately left false: the after snapshot
@@ -724,12 +725,12 @@ func TestSubscriptionLifecycleAction_Updated_Incompatible_DegradedConflict(t *te
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
-	le := LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: "app"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: "app"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != reasonRemoteSubscriptionConflict {
-		t.Errorf("DegradedReason() = %q, want %q", got, reasonRemoteSubscriptionConflict)
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 	if deps.client.getCount() != 0 {
 		t.Errorf("Get call count = %d, want 0 (a clear incompatibility needs no reconcile)", deps.client.getCount())
@@ -743,7 +744,7 @@ func TestSubscriptionLifecycleAction_Updated_UnclearAuthority_SingleGetReconcile
 	hub.RegisterAndIsFirst(c)
 	deps.client.getResp = buildGetResp("active", "")
 
-	le := LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -761,7 +762,7 @@ func TestSubscriptionLifecycleAction_Updated_UnclearAuthority_SingleGetReconcile
 func TestSubscriptionLifecycleAction_Updated_Miss_NoRemoteCall(t *testing.T) {
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
-	le := LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-missing", State: "active"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-missing", State: "active"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -776,7 +777,7 @@ func TestSubscriptionLifecycleAction_Updated_OwnerMismatch_NoGet(t *testing.T) {
 	hub.RegisterAndIsFirst(c)
 
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_bob"), true)
-	le := LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -800,10 +801,10 @@ func TestSubscriptionLifecycleAction_Activated_User_ClearsSuspension_NeverBinds(
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
 	c.SetSuspensionReason("authority_revoked")
-	c.SetDegraded(reasonRemoteSubscriptionSuspended)
-	c.SetNextAction(nextActionReactivate)
+	c.SetDegraded(lifecycle.ReasonRemoteSubscriptionSuspended)
+	c.SetNextAction(lifecycle.NextActionReactivate)
 
-	le := LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -835,7 +836,7 @@ func TestSubscriptionLifecycleAction_Activated_User_BindWired_StillZeroBinds(t *
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
 
-	le := LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -851,10 +852,10 @@ func TestSubscriptionLifecycleAction_Activated_Bot_ClearsWithoutBind(t *testing.
 	hub := NewHub()
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "bot", "app1", "")
 	hub.RegisterAndIsFirst(c)
-	c.SetDegraded(reasonRemoteSubscriptionSuspended)
+	c.SetDegraded(lifecycle.ReasonRemoteSubscriptionSuspended)
 
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), false) // no bindUser wired at all
-	le := LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -872,7 +873,7 @@ func TestSubscriptionLifecycleAction_Activated_OwnerMismatch_NoBindConsumerCall(
 	hub.RegisterAndIsFirst(c)
 
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_bob"), true)
-	le := LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -887,7 +888,7 @@ func TestSubscriptionLifecycleAction_Activated_OwnerMismatch_NoBindConsumerCall(
 func TestSubscriptionLifecycleAction_Activated_Miss_NoOp(t *testing.T) {
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
-	le := LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-missing", State: "active"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-missing", State: "active"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -908,11 +909,11 @@ func TestSubscriptionLifecycleAction_AlwaysRecordsSummary(t *testing.T) {
 
 	// Owner mismatch AND no subscription client configured at all -- proves
 	// the summary write is unconditional, independent of every gate.
-	action := newSubscriptionLifecycleAction(hub, discardTestLogger())
+	action := lifecycle.NewSubscriptionAction(hub.lifecycleRegistry(), discardTestLogger())
 	gate := newIdentityGate(hub, staticCurrent("app1", "ou_bob"), (&fakeUATResolver{}).resolve, discardTestLogger())
-	action.setIdentityGate(gate)
+	action.SetIdentityGate(gate)
 
-	le := LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
 	if err := action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -935,9 +936,9 @@ func TestSubscriptionLifecycleAction_NoSubscriptionClientConfigured_NoPanic_Summ
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "bot", "app1", "")
 	hub.RegisterAndIsFirst(c)
 
-	action := newSubscriptionLifecycleAction(hub, discardTestLogger()) // no identityGate, no subClient at all
+	action := lifecycle.NewSubscriptionAction(hub.lifecycleRegistry(), discardTestLogger()) // no identityGate, no subClient at all
 
-	le := LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "authority_revoked"}
 	if err := action.Handle(context.Background(), le); err == nil {
 		t.Log("Handle returned nil even with no subscription client configured -- acceptable as long as no panic and no crash")
 	}

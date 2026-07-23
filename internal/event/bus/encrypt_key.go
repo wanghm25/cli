@@ -37,7 +37,7 @@ const defaultEncryptKeyFetchTimeout = 5 * time.Second
 // lists/creates/patches). *event.SubscriptionClient satisfies it structurally,
 // so bus.go's SetSubscriptionClient passes one straight through; tests
 // substitute a fake with no *lark.Client or network call — the same test-seam
-// idiom as subscriptionActionClient (lifecycle.go).
+// idiom as lifecycle.SubscriptionClient.
 type encryptKeyClient interface {
 	GetEncryptKey(ctx context.Context, req *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error)
 }

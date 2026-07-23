@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 )
 
 // --- test helpers -----------------------------------------------------------
@@ -35,17 +37,17 @@ func (g *testGate) release() { g.once.Do(func() { close(g.ch) }) }
 // gate (or ctx.Done(), whichever first) until released.
 type recordingAction struct {
 	mu    sync.Mutex
-	calls []LifecycleEvent
+	calls []lifecycle.LifecycleEvent
 
-	started chan LifecycleEvent // buffered; one send per Handle call (best-effort, generously sized)
-	gate    <-chan struct{}     // nil = never blocks
+	started chan lifecycle.LifecycleEvent // buffered; one send per Handle call (best-effort, generously sized)
+	gate    <-chan struct{}               // nil = never blocks
 }
 
 func newRecordingAction() *recordingAction {
-	return &recordingAction{started: make(chan LifecycleEvent, 256)}
+	return &recordingAction{started: make(chan lifecycle.LifecycleEvent, 256)}
 }
 
-func (r *recordingAction) Handle(ctx context.Context, le LifecycleEvent) error {
+func (r *recordingAction) Handle(ctx context.Context, le lifecycle.LifecycleEvent) error {
 	r.mu.Lock()
 	r.calls = append(r.calls, le)
 	r.mu.Unlock()
@@ -71,19 +73,19 @@ func (r *recordingAction) callCount() int {
 	return len(r.calls)
 }
 
-func (r *recordingAction) allCalls() []LifecycleEvent {
+func (r *recordingAction) allCalls() []lifecycle.LifecycleEvent {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]LifecycleEvent, len(r.calls))
+	out := make([]lifecycle.LifecycleEvent, len(r.calls))
 	copy(out, r.calls)
 	return out
 }
 
-func (r *recordingAction) lastCall() (LifecycleEvent, bool) {
+func (r *recordingAction) lastCall() (lifecycle.LifecycleEvent, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.calls) == 0 {
-		return LifecycleEvent{}, false
+		return lifecycle.LifecycleEvent{}, false
 	}
 	return r.calls[len(r.calls)-1], true
 }
@@ -117,11 +119,11 @@ func newConnWithRemoteSub(t *testing.T, pid int, remoteSubID string) *Conn {
 func TestLifecycleExecutor_Submit_MissingEventIDOrRemoteSubID_Dropped(t *testing.T) {
 	hub := NewHub()
 	action := newRecordingAction()
-	exec := newLifecycleExecutor(hub, action, discardTestLogger())
+	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), action, discardTestLogger())
 	defer exec.Cancel()
 
-	exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "", RemoteSubscriptionID: "sub-1"})
-	exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "evt-1", RemoteSubscriptionID: ""})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "", RemoteSubscriptionID: "sub-1"})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-1", RemoteSubscriptionID: ""})
 
 	time.Sleep(50 * time.Millisecond)
 	if got := action.callCount(); got != 0 {
@@ -132,10 +134,10 @@ func TestLifecycleExecutor_Submit_MissingEventIDOrRemoteSubID_Dropped(t *testing
 func TestLifecycleExecutor_Submit_Valid_RunsAction(t *testing.T) {
 	hub := NewHub()
 	action := newRecordingAction()
-	exec := newLifecycleExecutor(hub, action, discardTestLogger())
+	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), action, discardTestLogger())
 	defer exec.Cancel()
 
-	le := LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
 	exec.Submit(context.Background(), le)
 	waitForCalls(t, action, 1)
 
@@ -152,10 +154,10 @@ func TestLifecycleExecutor_Submit_Valid_RunsAction(t *testing.T) {
 func TestLifecycleExecutor_Dedup_SameRemoteSubIDAndEventID_RunsOnce(t *testing.T) {
 	hub := NewHub()
 	action := newRecordingAction()
-	exec := newLifecycleExecutor(hub, action, discardTestLogger())
+	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), action, discardTestLogger())
 	defer exec.Cancel()
 
-	le := LifecycleEvent{EventType: "t", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
+	le := lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
 	exec.Submit(context.Background(), le)
 	exec.Submit(context.Background(), le)
 	exec.Submit(context.Background(), le)
@@ -174,11 +176,11 @@ func TestLifecycleExecutor_Dedup_SameRemoteSubIDAndEventID_RunsOnce(t *testing.T
 func TestLifecycleExecutor_Dedup_DifferentRemoteSubID_BothRun(t *testing.T) {
 	hub := NewHub()
 	action := newRecordingAction()
-	exec := newLifecycleExecutor(hub, action, discardTestLogger())
+	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), action, discardTestLogger())
 	defer exec.Cancel()
 
-	exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "evt-shared", RemoteSubscriptionID: "sub-A"})
-	exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "evt-shared", RemoteSubscriptionID: "sub-B"})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-shared", RemoteSubscriptionID: "sub-A"})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-shared", RemoteSubscriptionID: "sub-B"})
 
 	waitForCalls(t, action, 2)
 	time.Sleep(50 * time.Millisecond)
@@ -197,19 +199,19 @@ func TestLifecycleExecutor_InFlightMerge_SameRemoteSubscriptionID(t *testing.T) 
 	action := newRecordingAction()
 	g := newTestGate()
 	action.gate = g.ch
-	exec := newLifecycleExecutor(hub, action, discardTestLogger())
+	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), action, discardTestLogger())
 	defer func() { g.release(); exec.Cancel() }()
 
-	first := LifecycleEvent{EventType: "t", EventID: "evt-1", RemoteSubscriptionID: "sub-merge", State: "active"}
+	first := lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-1", RemoteSubscriptionID: "sub-merge", State: "active"}
 	exec.Submit(context.Background(), first)
 	waitForCalls(t, action, 1) // first Handle call is now blocked on the gate
 
 	for i := 2; i <= 5; i++ {
-		exec.Submit(context.Background(), LifecycleEvent{
+		exec.Submit(context.Background(), lifecycle.LifecycleEvent{
 			EventType: "t", EventID: fmt.Sprintf("evt-%d", i), RemoteSubscriptionID: "sub-merge", State: "active",
 		})
 	}
-	last := LifecycleEvent{EventType: "t", EventID: "evt-last", RemoteSubscriptionID: "sub-merge", State: "suspended"}
+	last := lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-last", RemoteSubscriptionID: "sub-merge", State: "suspended"}
 	exec.Submit(context.Background(), last)
 
 	g.release() // let the first (blocked) run finish
@@ -231,11 +233,11 @@ func TestLifecycleExecutor_InFlightMerge_SameRemoteSubscriptionID(t *testing.T) 
 func TestLifecycleExecutor_InFlightMerge_DifferentRemoteSubID_BothRunIndependently(t *testing.T) {
 	hub := NewHub()
 	action := newRecordingAction()
-	exec := newLifecycleExecutor(hub, action, discardTestLogger())
+	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), action, discardTestLogger())
 	defer exec.Cancel()
 
-	exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "evt-a", RemoteSubscriptionID: "sub-a"})
-	exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "evt-b", RemoteSubscriptionID: "sub-b"})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-a", RemoteSubscriptionID: "sub-a"})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-b", RemoteSubscriptionID: "sub-b"})
 
 	waitForCalls(t, action, 2)
 	time.Sleep(50 * time.Millisecond)
@@ -247,28 +249,28 @@ func TestLifecycleExecutor_InFlightMerge_DifferentRemoteSubID_BothRunIndependent
 // TestLifecycleExecutor_QueueFull_MarksMatchedConsumerDegraded_NoBlock locks
 // spec §5.2: capacity is a small, tested code constant (worker=2, slots=32);
 // once truly full, Submit must NOT block, and the matched consumer(s) for the
-// dropped event must be marked degraded with the reasonLifecycleExecutorFull
+// dropped event must be marked degraded with the lifecycle.ReasonExecutorFull
 // classification.
 func TestLifecycleExecutor_QueueFull_MarksMatchedConsumerDegraded_NoBlock(t *testing.T) {
 	hub := NewHub()
 	action := newRecordingAction()
 	g := newTestGate()
 	action.gate = g.ch
-	exec := newLifecycleExecutor(hub, action, discardTestLogger())
+	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), action, discardTestLogger())
 	defer func() { g.release(); exec.Cancel() }()
 
 	// Occupy BOTH workers on distinct keys so neither can drain the queue.
-	for i := 0; i < lifecycleExecutorWorkers; i++ {
-		exec.Submit(context.Background(), LifecycleEvent{
+	for i := 0; i < lifecycle.ExecutorWorkers; i++ {
+		exec.Submit(context.Background(), lifecycle.LifecycleEvent{
 			EventType: "t", EventID: fmt.Sprintf("worker-evt-%d", i), RemoteSubscriptionID: fmt.Sprintf("sub-worker-%d", i),
 		})
 	}
-	waitForCalls(t, action, lifecycleExecutorWorkers)
+	waitForCalls(t, action, lifecycle.ExecutorWorkers)
 
 	// Fill the bounded queue to capacity with DISTINCT keys (a repeated key
 	// would merge instead of consuming a new slot).
-	for i := 0; i < lifecycleExecutorSlots; i++ {
-		exec.Submit(context.Background(), LifecycleEvent{
+	for i := 0; i < lifecycle.ExecutorSlots; i++ {
+		exec.Submit(context.Background(), lifecycle.LifecycleEvent{
 			EventType: "t", EventID: fmt.Sprintf("queued-evt-%d", i), RemoteSubscriptionID: fmt.Sprintf("sub-queued-%d", i),
 		})
 	}
@@ -278,7 +280,7 @@ func TestLifecycleExecutor_QueueFull_MarksMatchedConsumerDegraded_NoBlock(t *tes
 
 	overflowDone := make(chan struct{})
 	go func() {
-		exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "overflow-evt", RemoteSubscriptionID: "sub-overflow"})
+		exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "overflow-evt", RemoteSubscriptionID: "sub-overflow"})
 		close(overflowDone)
 	}()
 
@@ -288,14 +290,14 @@ func TestLifecycleExecutor_QueueFull_MarksMatchedConsumerDegraded_NoBlock(t *tes
 		t.Fatal("Submit blocked on a full executor -- spec §5.2 requires it never block")
 	}
 
-	if got := c.DegradedReason(); got != reasonLifecycleExecutorFull {
-		t.Errorf("DegradedReason() = %q, want %q", got, reasonLifecycleExecutorFull)
+	if got := c.DegradedReason(); got != lifecycle.ReasonExecutorFull {
+		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonExecutorFull)
 	}
 	// Task 18 review Minor 2: now that a next_action field exists, the
 	// full-queue path must ALSO set an explicit management next_action —
 	// not just the degraded reason.
-	if got := c.NextAction(); got != nextActionGet {
-		t.Errorf("NextAction() = %q, want %q (Task 18 Minor 2: an explicit management next_action on queue-full)", got, nextActionGet)
+	if got := c.NextAction(); got != lifecycle.NextActionGet {
+		t.Errorf("NextAction() = %q, want %q (Task 18 Minor 2: an explicit management next_action on queue-full)", got, lifecycle.NextActionGet)
 	}
 }
 
@@ -307,9 +309,9 @@ func TestLifecycleExecutor_Cancel_WaitsForInFlightRun(t *testing.T) {
 	action := newRecordingAction()
 	g := newTestGate()
 	action.gate = g.ch
-	exec := newLifecycleExecutor(hub, action, discardTestLogger())
+	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), action, discardTestLogger())
 
-	exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "evt-1", RemoteSubscriptionID: "sub-1"})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-1", RemoteSubscriptionID: "sub-1"})
 	waitForCalls(t, action, 1) // now blocked in Handle
 
 	cancelDone := make(chan struct{})
@@ -343,19 +345,19 @@ func TestLifecycleExecutor_Cancel_DiscardsNotStartedWork(t *testing.T) {
 	action := newRecordingAction()
 	g := newTestGate()
 	action.gate = g.ch
-	exec := newLifecycleExecutor(hub, action, discardTestLogger())
+	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), action, discardTestLogger())
 	defer g.release()
 
-	for i := 0; i < lifecycleExecutorWorkers; i++ {
-		exec.Submit(context.Background(), LifecycleEvent{
+	for i := 0; i < lifecycle.ExecutorWorkers; i++ {
+		exec.Submit(context.Background(), lifecycle.LifecycleEvent{
 			EventType: "t", EventID: fmt.Sprintf("busy-%d", i), RemoteSubscriptionID: fmt.Sprintf("sub-busy-%d", i),
 		})
 	}
-	waitForCalls(t, action, lifecycleExecutorWorkers)
+	waitForCalls(t, action, lifecycle.ExecutorWorkers)
 
 	// A 3rd, DISTINCT key: both workers are occupied, so this can only ever
 	// sit in the queue, never start.
-	exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "never-started", RemoteSubscriptionID: "sub-never"})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "never-started", RemoteSubscriptionID: "sub-never"})
 	time.Sleep(20 * time.Millisecond) // let the (non-blocking) enqueue definitely land
 
 	cancelDone := make(chan struct{})
@@ -376,15 +378,15 @@ func TestLifecycleExecutor_Cancel_DiscardsNotStartedWork(t *testing.T) {
 		t.Fatal("Cancel did not return")
 	}
 
-	if got := action.callCount(); got != lifecycleExecutorWorkers {
-		t.Errorf("Handle called %d times, want %d (the never-started submission must be discarded, not run)", got, lifecycleExecutorWorkers)
+	if got := action.callCount(); got != lifecycle.ExecutorWorkers {
+		t.Errorf("Handle called %d times, want %d (the never-started submission must be discarded, not run)", got, lifecycle.ExecutorWorkers)
 	}
 
 	// Submit after Cancel must be a no-op.
-	exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "post-cancel", RemoteSubscriptionID: "sub-post"})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "post-cancel", RemoteSubscriptionID: "sub-post"})
 	time.Sleep(20 * time.Millisecond)
-	if got := action.callCount(); got != lifecycleExecutorWorkers {
-		t.Errorf("Handle called %d times after Cancel()+late Submit, want unchanged %d (Submit after Cancel must be a no-op)", got, lifecycleExecutorWorkers)
+	if got := action.callCount(); got != lifecycle.ExecutorWorkers {
+		t.Errorf("Handle called %d times after Cancel()+late Submit, want unchanged %d (Submit after Cancel must be a no-op)", got, lifecycle.ExecutorWorkers)
 	}
 }
 
@@ -393,9 +395,9 @@ func TestLifecycleExecutor_Cancel_DiscardsNotStartedWork(t *testing.T) {
 // treated as a failure (no retry, no re-queue) and must not wedge its
 // worker -- a later, independent submission still runs.
 func TestLifecycleExecutor_ActionTimeout_BoundedAndWorkerRecovers(t *testing.T) {
-	saved := lifecycleActionTimeout
-	lifecycleActionTimeout = 30 * time.Millisecond
-	defer func() { lifecycleActionTimeout = saved }()
+	saved := lifecycle.ActionTimeout
+	lifecycle.ActionTimeout = 30 * time.Millisecond
+	defer func() { lifecycle.ActionTimeout = saved }()
 
 	hub := NewHub()
 	var fastCalls atomic.Int64
@@ -403,7 +405,7 @@ func TestLifecycleExecutor_ActionTimeout_BoundedAndWorkerRecovers(t *testing.T) 
 	timedOut := make(chan struct{})
 	var once sync.Once
 
-	action := lifecycleActionFunc(func(ctx context.Context, le LifecycleEvent) error {
+	action := lifecycle.ActionFunc(func(ctx context.Context, le lifecycle.LifecycleEvent) error {
 		if le.EventID == "evt-slow" {
 			if _, ok := ctx.Deadline(); ok {
 				once.Do(func() { close(deadlineSeen) })
@@ -415,10 +417,10 @@ func TestLifecycleExecutor_ActionTimeout_BoundedAndWorkerRecovers(t *testing.T) 
 		fastCalls.Add(1)
 		return nil
 	})
-	exec := newLifecycleExecutor(hub, action, discardTestLogger())
+	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), action, discardTestLogger())
 	defer exec.Cancel()
 
-	exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "evt-slow", RemoteSubscriptionID: "sub-slow"})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-slow", RemoteSubscriptionID: "sub-slow"})
 
 	select {
 	case <-deadlineSeen:
@@ -433,7 +435,7 @@ func TestLifecycleExecutor_ActionTimeout_BoundedAndWorkerRecovers(t *testing.T) 
 	}
 
 	// A second, independent key must still run afterward.
-	exec.Submit(context.Background(), LifecycleEvent{EventType: "t", EventID: "evt-fast", RemoteSubscriptionID: "sub-fast"})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-fast", RemoteSubscriptionID: "sub-fast"})
 	deadline := time.Now().Add(2 * time.Second)
 	for fastCalls.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
@@ -450,8 +452,8 @@ func TestSummaryLifecycleAction_RecordsOnMatchedConsumer(t *testing.T) {
 	c := newConnWithRemoteSub(t, 1, "sub-1")
 	hub.RegisterAndIsFirst(c)
 
-	action := summaryLifecycleAction(hub)
-	le := LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-9", RemoteSubscriptionID: "sub-1", State: "suspended"}
+	action := lifecycle.SummaryAction(hub.lifecycleRegistry())
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-9", RemoteSubscriptionID: "sub-1", State: "suspended"}
 	if err := action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -469,8 +471,8 @@ func TestSummaryLifecycleAction_RecordsOnMatchedConsumer(t *testing.T) {
 
 func TestSummaryLifecycleAction_Miss_RecordsNothing_NoOAPI(t *testing.T) {
 	hub := NewHub() // no consumers registered at all -- a "miss"
-	action := summaryLifecycleAction(hub)
-	le := LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-9", RemoteSubscriptionID: "sub-missing", State: "suspended"}
+	action := lifecycle.SummaryAction(hub.lifecycleRegistry())
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-9", RemoteSubscriptionID: "sub-missing", State: "suspended"}
 	if err := action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v, want nil (a miss is not a failure)", err)
 	}
@@ -483,8 +485,8 @@ func TestSummaryLifecycleAction_MultipleMatchedConsumers_AllUpdated(t *testing.T
 	c2 := newConnWithRemoteSub(t, 2, "sub-shared")
 	hub.RegisterAndIsFirst(c2)
 
-	action := summaryLifecycleAction(hub)
-	le := LifecycleEvent{EventType: "event.subscription.expired_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-shared"}
+	action := lifecycle.SummaryAction(hub.lifecycleRegistry())
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.expired_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-shared"}
 	if err := action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}

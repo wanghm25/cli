@@ -21,6 +21,7 @@ import (
 
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 	"github.com/larksuite/cli/internal/event/busdiscover"
 	"github.com/larksuite/cli/internal/event/protocol"
 	"github.com/larksuite/cli/internal/event/source"
@@ -58,18 +59,18 @@ type Bus struct {
 	// lifecycleExecutor is the bounded, in-memory subscription lifecycle
 	// executor every FeishuSource's 6 typed lifecycle
 	// handlers feed into — always constructed by NewBus, never nil.
-	lifecycleExecutor *lifecycleExecutor
+	lifecycleExecutor *lifecycle.Executor
 
 	// lifecycleAction is the REAL per-event action
-	// newLifecycleExecutor above was constructed with, kept as its
+	// lifecycle.NewExecutor above was constructed with, kept as its
 	// own typed field (rather than only living inside lifecycleExecutor) so
 	// SetIdentityProviders/SetSubscriptionClient below can fill in its two
 	// optional dependencies AFTER construction — mirroring identityGate's
 	// own "nil until SetIdentityProviders" convention. Never nil itself:
-	// only its OWN identityGate/newSubClient fields start nil, which keeps
-	// it a strict superset of summaryLifecycleAction (full summary
+	// only its OWN identity-gate/subscription-client fields start nil, which
+	// keeps it a strict superset of lifecycle.SummaryAction (full summary
 	// recording, zero remote calls, zero panics) until wired.
-	lifecycleAction *subscriptionLifecycleAction
+	lifecycleAction *lifecycle.SubscriptionAction
 
 	// encryptKeyProvider manages per-subscription encrypt_keys. The SDK
 	// dispatcher is wired to its plain static cache
@@ -90,7 +91,8 @@ type Bus struct {
 
 func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logger) *Bus {
 	hub := NewHub()
-	action := newSubscriptionLifecycleAction(hub, logger)
+	reg := hub.lifecycleRegistry()
+	action := lifecycle.NewSubscriptionAction(reg, logger)
 	b := &Bus{
 		appID:     appID,
 		appSecret: appSecret,
@@ -102,15 +104,15 @@ func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logge
 		conns:     make(map[*Conn]struct{}),
 		// Buffered so shutdown and source-exit paths never drop the signal.
 		shutdownCh:         make(chan struct{}, 1),
-		lifecycleExecutor:  newLifecycleExecutor(hub, action, logger),
+		lifecycleExecutor:  lifecycle.NewExecutor(reg, action, logger),
 		lifecycleAction:    action,
 		encryptKeyProvider: newEncryptKeyProvider(),
 	}
 	// On deleted_v1 the lifecycle action releases the
 	// subscription's cached encrypt_key from the provider. Wired
 	// here (post-construction) since both the action and the provider exist by
-	// now — mirrors setIdentityGate/setNewSubscriptionClient's own convention.
-	b.lifecycleAction.setEncryptKeyRemover(b.encryptKeyProvider.Remove)
+	// now — mirrors SetIdentityGate/SetNewSubscriptionClient's own convention.
+	b.lifecycleAction.SetEncryptKeyRemover(b.encryptKeyProvider.Remove)
 	return b
 }
 
@@ -135,7 +137,7 @@ func (b *Bus) SetIdentityProviders(resolveUAT func(ctx context.Context, appID, u
 	b.hub.SetCurrentResolver(resolveCurrentIdentity)
 	// The real lifecycle action's owner==current gate and
 	// bindConsumer (activated/suspended-recovery) both need this SAME gate.
-	b.lifecycleAction.setIdentityGate(b.identityGate)
+	b.lifecycleAction.SetIdentityGate(b.identityGate)
 	// The encrypt-key provider reuses the SAME gate for a user
 	// subscription's owner==current check + fresh-UAT mint.
 	b.encryptKeyProvider.setIdentityGate(b.identityGate)
@@ -160,7 +162,7 @@ func (b *Bus) SetSubscriptionClient(sdk *lark.Client) {
 	if sdk == nil {
 		return
 	}
-	b.lifecycleAction.setNewSubscriptionClient(func(as core.Identity, uat string) (subscriptionActionClient, error) {
+	b.lifecycleAction.SetNewSubscriptionClient(func(as core.Identity, uat string) (lifecycle.SubscriptionClient, error) {
 		return event.NewSubscriptionClient(sdk, as, uat)
 	})
 	// The encrypt-key provider fetches keys via GetEncryptKey on

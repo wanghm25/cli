@@ -6,6 +6,8 @@ package bus
 import (
 	"net"
 	"testing"
+
+	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 )
 
 // TestHub_ConnsByRemoteSubscriptionID_MatchesAndFilters locks Task 17's
@@ -144,7 +146,7 @@ func TestHub_Consumers_PopulatesActionFields(t *testing.T) {
 	c.SetSuspensionReason("authority_revoked")
 	c.SetLastAction("reactivate")
 	c.SetLastActionError("missing_scopes")
-	c.SetNextAction(nextActionReactivate)
+	c.SetNextAction(lifecycle.NextActionReactivate)
 	h.RegisterAndIsFirst(c)
 
 	consumers := h.Consumers()
@@ -161,8 +163,8 @@ func TestHub_Consumers_PopulatesActionFields(t *testing.T) {
 	if got.LastActionError != "missing_scopes" {
 		t.Errorf("LastActionError = %q, want %q", got.LastActionError, "missing_scopes")
 	}
-	if got.NextAction != nextActionReactivate {
-		t.Errorf("NextAction = %q, want %q", got.NextAction, nextActionReactivate)
+	if got.NextAction != lifecycle.NextActionReactivate {
+		t.Errorf("NextAction = %q, want %q", got.NextAction, lifecycle.NextActionReactivate)
 	}
 }
 

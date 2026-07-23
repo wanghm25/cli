@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
@@ -292,7 +293,7 @@ func TestConn_SetBoundConnID_ClearsNextAction(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
-	conn.SetNextAction(nextActionReactivate)
+	conn.SetNextAction(lifecycle.NextActionReactivate)
 
 	conn.SetBoundConnID("conn-42")
 
@@ -490,13 +491,13 @@ func TestConn_SetNextAction_RoundTrips(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
-	conn.SetNextAction(nextActionReactivate)
-	if got := conn.NextAction(); got != nextActionReactivate {
-		t.Errorf("NextAction() = %q, want %q", got, nextActionReactivate)
+	conn.SetNextAction(lifecycle.NextActionReactivate)
+	if got := conn.NextAction(); got != lifecycle.NextActionReactivate {
+		t.Errorf("NextAction() = %q, want %q", got, lifecycle.NextActionReactivate)
 	}
 }
 
-// clearActionDegraded (used internally by subscriptionLifecycleAction) must
+// ClearActionDegraded (used internally by subscriptionLifecycleAction) must
 // clear BOTH degradedReason and nextAction together, but must NEVER touch
 // suspensionReason/lastAction/lastActionError -- those are historical
 // record-keeping, not "is this consumer currently degraded" state.
@@ -506,12 +507,12 @@ func TestConn_ClearActionDegraded_ClearsOnlyDegradedAndNextAction(t *testing.T) 
 	defer c2.Close()
 	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
 	conn.SetDegraded("remote_subscription_suspended")
-	conn.SetNextAction(nextActionReactivate)
+	conn.SetNextAction(lifecycle.NextActionReactivate)
 	conn.SetSuspensionReason("authority_revoked")
 	conn.SetLastAction("reactivate")
 	conn.SetLastActionError("some_error")
 
-	conn.clearActionDegraded()
+	conn.ClearActionDegraded()
 
 	if got := conn.DegradedReason(); got != "" {
 		t.Errorf("DegradedReason() = %q, want \"\"", got)
@@ -554,8 +555,8 @@ func TestConn_ActionState_ConcurrentAccessRace(t *testing.T) {
 				conn.SetSuspensionReason("authority_revoked")
 				conn.SetLastAction("reactivate")
 				conn.SetLastActionError("")
-				conn.SetNextAction(nextActionReactivate)
-				conn.clearActionDegraded()
+				conn.SetNextAction(lifecycle.NextActionReactivate)
+				conn.ClearActionDegraded()
 				_ = conn.SuspensionReason()
 				_ = conn.LastAction()
 				_ = conn.LastActionError()
