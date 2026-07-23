@@ -544,6 +544,57 @@ func TestSchemaJSON_LegacyKeyUnchanged(t *testing.T) {
 	}
 }
 
+// TestRunSchema_RefinedSubscription_Text pins the text (non-JSON) parity half:
+// a refined key surfaces the same disclosures the --json output carries
+// (resource type, conditional scopes, effective write risk, payload options,
+// dry-run, next action) in the human-readable output too.
+func TestRunSchema_RefinedSubscription_Text(t *testing.T) {
+	f, stdout, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "test"})
+
+	if err := runSchema(f, "im.message.created_v1", false); err != nil {
+		t.Fatalf("runSchema: %v", err)
+	}
+
+	out := stdout.String()
+	dryRun := "lark-cli event subscription create im.message.created_v1/chat-id/oc_9f3b1c2d8a --dry-run --json"
+	for _, want := range []string{
+		"Refined Subscription: yes",
+		"Resource Type: im.message",
+		"event:encrypt_key:read (when --include-resource-data set with --as user)",
+		"effective write",
+		"refined consume may create, reuse, reactivate, or bind remote resources",
+		"Payload Options: --include-resource-data",
+		"Dry Run: supported — " + dryRun,
+		"Next Action: run `" + dryRun + "` before consume",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("refined schema text missing %q; full output:\n%s", want, out)
+		}
+	}
+}
+
+// TestRunSchema_LegacyKey_Text_NoRefinedFields is the regression half: a legacy
+// (non-refined) key's text output must not gain any refined disclosures.
+func TestRunSchema_LegacyKey_Text_NoRefinedFields(t *testing.T) {
+	f, stdout, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "test"})
+
+	if err := runSchema(f, "im.message.receive_v1", false); err != nil {
+		t.Fatalf("runSchema: %v", err)
+	}
+
+	out := stdout.String()
+	for _, unwanted := range []string{
+		"Refined Subscription",
+		"Conditional Scopes",
+		"Dry Run",
+		"Next Action",
+	} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("legacy schema text unexpectedly contains %q; full output:\n%s", unwanted, out)
+		}
+	}
+}
+
 func TestRenderSpec_EmptySpecIsTypedInternalError(t *testing.T) {
 	_, err := renderSpec(&eventlib.SchemaSpec{})
 	if err == nil {

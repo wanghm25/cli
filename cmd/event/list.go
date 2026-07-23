@@ -99,6 +99,29 @@ func runList(f *cmdutil.Factory, asJSON bool) error {
 			printTableRow(out, widths, row, colGap)
 		}
 	}
+
+	// Refined-subscription keys manage a remote resource and carry extra setup
+	// (scopes) and write-level risk that legacy keys don't; surface the same
+	// signal the --json output carries so the text path is at parity. Only
+	// refined keys appear here, so legacy key output stays unchanged.
+	var refined []*eventlib.KeyDefinition
+	for _, def := range all {
+		if def.RefinedSubscription {
+			refined = append(refined, def)
+		}
+	}
+	if len(refined) > 0 {
+		fmt.Fprintf(out, "\nRefined subscriptions (manage a remote resource — run `event schema <key>` for setup/risk):\n")
+		for _, def := range refined {
+			resource := def.ResourceType
+			if resource == "" {
+				resource = "-"
+			}
+			fmt.Fprintf(out, "  %s  (resource: %s, dry-run supported)  →  run `lark-cli event schema %s --json` before consume\n",
+				def.Key, resource, def.Key)
+		}
+	}
+
 	// stderr keeps stdout pipe-clean for `event list | jq`.
 	fmt.Fprintln(f.IOStreams.ErrOut, "\nUse 'event schema <key>' for details.")
 	return nil

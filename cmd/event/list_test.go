@@ -239,3 +239,25 @@ func TestListJSON_LegacyKeyUnchanged(t *testing.T) {
 		}
 	}
 }
+
+// TestRunList_RefinedSubscription_Text pins the text (non-JSON) parity half of
+// `event list`: refined keys are surfaced with the same signal the --json
+// output carries (refined, resource type, dry-run, next action), while the
+// legacy table rows above are unchanged.
+func TestRunList_RefinedSubscription_Text(t *testing.T) {
+	f, stdout, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "test"})
+
+	if err := runList(f, false); err != nil {
+		t.Fatalf("runList: %v", err)
+	}
+
+	out := stdout.String()
+	for _, want := range []string{
+		"Refined subscriptions (manage a remote resource",
+		"im.message.created_v1  (resource: im.message, dry-run supported)  →  run `lark-cli event schema im.message.created_v1 --json` before consume",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("refined list text missing %q; full output:\n%s", want, out)
+		}
+	}
+}
