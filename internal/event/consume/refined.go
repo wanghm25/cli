@@ -40,6 +40,12 @@ import (
 type subscriptionApplyAPI interface {
 	event.SubscriptionCreateAPI
 	Reactivate(ctx context.Context, req *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error)
+	// EncryptKeyProber (task E5): PlanRemoteSubscription needs it as the
+	// WithEncryptKeyProber for the encryption conflict matrix (spec §4.7) when
+	// IncludeResourceData is true, and the pre-ready prewarm calls GetEncryptKey
+	// to confirm the subscription's key is retrievable before the consumer goes
+	// ready. *event.SubscriptionClient satisfies it (GetEncryptKey, task E1).
+	event.EncryptKeyProber
 }
 
 // RefinedOptions holds RunRefined's own parameters — deliberately separate
@@ -69,6 +75,14 @@ type RefinedOptions struct {
 	// no remote write (security-relevant invariant, spec §4.2).
 	DryRun bool
 
+	// IncludeResourceData (task E5, spec §4.7): true creates an ENCRYPTED
+	// remote Subscription — Plan reconciles against the encryption conflict
+	// matrix (WithEncryptKeyProber), Apply generates a fresh CSPRNG encrypt_key
+	// and submits it atomically with the Create, and a pre-ready prewarm
+	// confirms the key is retrievable before the consumer emits ready. false
+	// (the default) is the pre-E5 plaintext path, byte-for-byte unchanged.
+	IncludeResourceData bool
+
 	// Identity is the already-resolved --as identity (design spec §2.8 —
 	// resolved by the caller, e.g. cmd/event/consume.go's resolveIdentity;
 	// RunRefined never guesses or re-resolves it).
@@ -92,6 +106,14 @@ type refinedDeps struct {
 	apply    func(ctx context.Context, plan event.ReconcilePlan) (remoteSubscriptionID string, createdByThisAttempt bool, err error)
 	startBus func(ctx context.Context) (net.Conn, error)
 	hello    func(ctx context.Context, conn net.Conn, remoteSubscriptionID string) (*protocol.HelloAck, *bufio.Reader, error)
+	// prewarm (task E5) runs AFTER a successful HelloV2 registration and BEFORE
+	// the ready marker (spec §4.7): for an encrypted subscription it confirms
+	// the bus will be able to obtain the encrypt_key (by fetching it with the
+	// same authority the bus uses), so the consumer never goes ready when its
+	// events could not be decrypted. nil (or a no-op) for a plaintext
+	// subscription. A non-nil error means "do NOT ready" — runRefinedChain
+	// rolls back the local registration (the deferred conn.Close unregisters).
+	prewarm func(ctx context.Context, remoteSubscriptionID string) error
 }
 
 // RunRefined drives the refined-subscription `event consume` startup chain
@@ -120,14 +142,30 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 			return ProbeBusEligibility(ctx, tr, appID, opts.RemoteAPIClient, opts.ErrOut)
 		},
 		plan: func(ctx context.Context) (event.ReconcilePlan, error) {
-			plan, err := event.ReconcileExisting(ctx, opts.SubClient, eventType, targetResource, opts.Identity, false)
+			// Task E5: an encrypted request (IncludeResourceData=true) must
+			// reconcile against spec §4.7's encryption conflict matrix — supply
+			// the EncryptKeyProber so an active include_resource_data=true match
+			// is disambiguated (reuse vs conflict) exactly as `event
+			// subscription create` does. The plaintext path passes no option and
+			// is byte-for-byte unchanged.
+			var reconcileOpts []event.ReconcileOption
+			if opts.IncludeResourceData {
+				reconcileOpts = append(reconcileOpts, event.WithEncryptKeyProber(opts.SubClient))
+			}
+			plan, err := event.ReconcileExisting(ctx, opts.SubClient, eventType, targetResource, opts.Identity, opts.IncludeResourceData, reconcileOpts...)
 			if err != nil {
 				return event.ReconcilePlan{}, err
 			}
 			return *plan, nil
 		},
 		apply: func(ctx context.Context, plan event.ReconcilePlan) (string, bool, error) {
-			return applyRemoteSubscriptionPlan(ctx, opts.SubClient, eventType, targetResource, plan)
+			return applyRemoteSubscriptionPlan(ctx, opts.SubClient, eventType, targetResource, plan, opts.IncludeResourceData)
+		},
+		prewarm: func(ctx context.Context, remoteSubscriptionID string) error {
+			if !opts.IncludeResourceData {
+				return nil // plaintext subscription: nothing to decrypt, nothing to prewarm
+			}
+			return prewarmEncryptKey(ctx, opts.SubClient, remoteSubscriptionID)
 		},
 		startBus: func(ctx context.Context) (net.Conn, error) {
 			return EnsureBus(ctx, tr, appID, profileName, domain, opts.RemoteAPIClient, opts.ErrOut)
@@ -263,6 +301,19 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 		return applyOkRejectedError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, rejErr)
 	}
 
+	// ---- 6.5 Prewarm the encrypt_key BEFORE ready (task E5, spec §4.7) ----
+	// For an encrypted subscription, confirm the key is retrievable (so the bus
+	// can decrypt) before this consumer ever reports ready. A failure here must
+	// NOT ready the consumer: return a structured error. Rollback of the local
+	// registration is the deferred conn.Close() above — closing the IPC
+	// connection makes the bus unregister this consumer, so no half-registered
+	// consumer is left behind.
+	if deps.prewarm != nil {
+		if err := deps.prewarm(ctx, remoteSubscriptionID); err != nil {
+			return refinedPrewarmError(resolved, opts.Identity, remoteSubscriptionID, err)
+		}
+	}
+
 	consumeOpts := Options{
 		EventKey:  resolved.MaterializedKey,
 		Params:    opts.Params,
@@ -320,7 +371,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 // suspended handling), a no-op reuse of the existing id for an
 // already-active compatible match. Never called for PlanActionConflict —
 // runRefinedChain returns a typed error before Apply in that case.
-func applyRemoteSubscriptionPlan(ctx context.Context, svc subscriptionApplyAPI, eventType, targetResource string, plan event.ReconcilePlan) (remoteSubscriptionID string, createdByThisAttempt bool, err error) {
+func applyRemoteSubscriptionPlan(ctx context.Context, svc subscriptionApplyAPI, eventType, targetResource string, plan event.ReconcilePlan, includeResourceData bool) (remoteSubscriptionID string, createdByThisAttempt bool, err error) {
 	switch plan.Action {
 	case event.PlanActionReuse:
 		return strVal(plan.Existing.SubscriptionId), false, nil
@@ -337,11 +388,23 @@ func applyRemoteSubscriptionPlan(ctx context.Context, svc subscriptionApplyAPI, 
 		return id, false, nil
 
 	case event.PlanActionCreate:
-		body := larkeventv1.NewCreateSubscriptionReqBodyBuilder().
-			EventType(eventType).
-			TargetResource(targetResource).
-			PayloadOptions(larkeventv1.NewCreatePayloadOptionsBuilder().IncludeResourceData(false).Build()).
-			Build()
+		// Task E5 (spec §4.7): an encrypted request generates a fresh
+		// per-subscription encrypt_key via the OS CSPRNG and submits it
+		// ATOMICALLY in the same Create body as include_resource_data=true —
+		// fail-closed: a key-gen failure aborts the create, never falls back to
+		// a plaintext subscription. The key is used only to build this one body
+		// and is never logged, persisted, returned, or sent to the bus over IPC
+		// (the bus fetches its own copy via GetEncryptKey). The plaintext path
+		// (includeResourceData=false) generates no key — byte-for-byte the
+		// pre-E5 behavior.
+		var encryptKey string
+		if includeResourceData {
+			encryptKey, err = newEncryptKeyFunc()
+			if err != nil {
+				return "", false, err
+			}
+		}
+		body := buildRefinedCreateBody(eventType, targetResource, includeResourceData, encryptKey)
 		resp, err := svc.Create(ctx, larkeventv1.NewCreateSubscriptionReqBuilder().Body(body).Build())
 		if err != nil {
 			return "", false, err
@@ -356,6 +419,85 @@ func applyRemoteSubscriptionPlan(ctx context.Context, svc subscriptionApplyAPI, 
 		return "", false, errs.NewInternalError(errs.SubtypeUnknown,
 			"apply_remote_subscription_plan: unexpected reconcile plan action %q", plan.Action)
 	}
+}
+
+// newEncryptKeyFunc is indirected (mirroring cmd/event/subscription/create.go's
+// own var of the same name) so a test can spy that it is called EXACTLY once
+// for an encrypted create and NEVER for a plaintext create / reuse / suspended
+// / dry-run. Production code must never reassign it outside tests.
+var newEncryptKeyFunc = event.NewEncryptKey
+
+// buildRefinedCreateBody constructs the Create body, always setting
+// include_resource_data and (when non-empty) the encrypt_key on the SAME
+// CreatePayloadOptions within the SAME body value — spec §4.7's atomicity is
+// structural here, exactly like cmd/event/subscription/create.go's
+// buildCreateSubscriptionBody. Split out so a test can assert the atomicity
+// directly against a plain, inspectable body value.
+func buildRefinedCreateBody(eventType, targetResource string, includeResourceData bool, encryptKey string) *larkeventv1.CreateSubscriptionReqBody {
+	payloadOptions := larkeventv1.NewCreatePayloadOptionsBuilder().IncludeResourceData(includeResourceData)
+	if encryptKey != "" {
+		payloadOptions = payloadOptions.Encrypt(larkeventv1.NewPayloadOptionsEncryptBuilder().EncryptKey(encryptKey).Build())
+	}
+	return larkeventv1.NewCreateSubscriptionReqBodyBuilder().
+		EventType(eventType).
+		TargetResource(targetResource).
+		PayloadOptions(payloadOptions.Build()).
+		Build()
+}
+
+// errPrewarmNoKey is prewarmEncryptKey's sentinel for "GetEncryptKey succeeded
+// but returned no usable key" — a genuine (not transient) unavailability.
+var errPrewarmNoKey = errors.New("subscription encrypt_key is not retrievable") //nolint:forbidigo // sentinel, typed at call site
+
+// prewarmEncryptKey confirms the subscription's encrypt_key is retrievable with
+// this identity/scope (task E5, spec §4.7's "输出 ready 之前预热"). It fetches
+// via the SAME GetEncryptKey the bus-side provider uses, with the SAME
+// authority (opts.SubClient is bound to the resolved --as identity, whose
+// current profile HelloV2 already established as the owner) — so a success here
+// guarantees the bus's own first-event fetch will succeed too. It deliberately
+// never returns or logs the key value: it only checks non-empty, then discards
+// resp (spec §4.7 敏感信息红线).
+func prewarmEncryptKey(ctx context.Context, prober event.EncryptKeyProber, remoteSubscriptionID string) error {
+	req := larkeventv1.NewGetEncryptKeySubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()
+	resp, err := prober.GetEncryptKey(ctx, req)
+	if err != nil {
+		return err // already typed (WrapDoAPIError/classifyFailure); classified transient vs genuine by the caller
+	}
+	if resp == nil || resp.Data == nil || strVal(resp.Data.EncryptKey) == "" {
+		return errPrewarmNoKey
+	}
+	return nil
+}
+
+// refinedPrewarmError turns a prewarm failure into the structured error the
+// consumer exits with instead of going ready (task E5). A transient failure
+// (context cancel/deadline, or a typed network error) is returned UNCHANGED —
+// it is retryable and must never be relabeled as a decrypt conflict (the
+// E2-review lesson). A genuine failure becomes a failed_precondition classified
+// decrypt_key_unavailable, guiding the operator to fix scope/identity (or
+// delete+recreate) — the consumer was NOT started.
+func refinedPrewarmError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, cause error) error {
+	if isTransientPrewarmErr(cause) {
+		return cause
+	}
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"cannot start consuming %s: its subscription encrypt_key is not retrievable (decrypt_key_unavailable), so the event bus could not decrypt its events",
+		resolved.MaterializedKey).
+		WithParam("--include-resource-data").
+		WithHint("the consumer was NOT started (no half-registered consumer remains). Ensure identity %s holds scope `event:encrypt_key:read` and is the owner of remote_subscription_id=%s (switch --as/--profile if this identity is not the owner), then retry `lark-cli event consume %s --as %s`; or delete and recreate the subscription after human confirmation",
+			identity, remoteSubscriptionID, resolved.MaterializedKey, identity).
+		WithCause(cause)
+}
+
+// isTransientPrewarmErr reports whether a prewarm GetEncryptKey failure was a
+// retryable transient (context cancel/deadline, or a typed network error)
+// rather than a confirmed unavailability.
+func isTransientPrewarmErr(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne *errs.NetworkError
+	return errors.As(err, &ne)
 }
 
 // refinedConflictError mirrors cmd/event/subscription/create.go's own

@@ -488,14 +488,12 @@ func TestRunConsume_UnknownEventKeyContractPreserved(t *testing.T) {
 // produced a generic cobra "unknown flag" error instead of a typed
 // rejection ("无声降级即 bug" — the caller must get an explicit, typed
 // explanation of the deferral, not a parse error indistinguishable from a
-// typo). The tests below lock the gap-fill: the flag now exists, defaults
-// to false (no behavior change), and true is rejected with a typed error
-// BEFORE any side effect — reusing the exact same
-// resource_data_encryption_deferred wording `event subscription
-// create`/`update` already use for their own E-gate (see
-// cmd/event/subscription/create.go's errIncludeResourceDataGated) when the
-// key is refined, and a distinct typed invalid_argument when the key is
-// ordinary (the flag has no remote-Subscription concept to apply to there).
+// typo). The tests below lock the flag's behavior: it exists, defaults to
+// false (no behavior change), and true is SUPPORTED on a refined key (task
+// E5 — it creates an ENCRYPTED subscription; the former
+// resource_data_encryption_deferred E-gate is retired) while staying a typed
+// invalid_argument on an ordinary key (the flag has no remote-Subscription
+// concept to apply to there).
 
 // TestNewCmdConsume_HasIncludeResourceDataFlag is the cheapest possible
 // regression guard for the underlying bug this gap-fill closes: before this
@@ -510,42 +508,33 @@ func TestNewCmdConsume_HasIncludeResourceDataFlag(t *testing.T) {
 	}
 }
 
-// TestRunConsume_RefinedKey_IncludeResourceDataTrue_TypedFailedPreconditionBeforeAnyWrite
-// proves --include-resource-data=true against a materialized REFINED
-// EventKey is rejected with the SAME typed failed_precondition (Param
-// --include-resource-data, Hint naming reason resource_data_encryption_deferred)
-// that `event subscription create`/`update` already return for their own
-// E-gate — and that the rejection happens BEFORE runRefinedConsume ever
-// runs: this Factory (newRefinedConsumeTestFactory) registers zero HTTP
-// stubs, so if the gate were checked any later than "right after
-// resolved.IsRefined is known" (e.g. after ProbeBusEligibility or
-// PlanRemoteSubscription's real List call), the error would instead surface
-// "/open-apis/event/v1/subscriptions" — exactly the substring
-// TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOffline
-// uses to prove the opposite (that the chain DOES reach Plan) for the
-// flag-omitted case below.
-func TestRunConsume_RefinedKey_IncludeResourceDataTrue_TypedFailedPreconditionBeforeAnyWrite(t *testing.T) {
+// TestRunConsume_RefinedKey_IncludeResourceDataTrue_UnGated_ReachesPlan locks
+// task E5's un-gating: --include-resource-data=true against a materialized
+// REFINED EventKey is NO LONGER rejected by the former §9 E-gate
+// (resource_data_encryption_deferred). Instead it flows into the real refined
+// chain, which — with this Factory (newRefinedConsumeTestFactory) registering
+// zero HTTP stubs — reaches PlanRemoteSubscription's real List call and fails
+// there (surfacing "/open-apis/event/v1/subscriptions"), exactly like the
+// --include-resource-data=false non-regression case below.
+func TestRunConsume_RefinedKey_IncludeResourceDataTrue_UnGated_ReachesPlan(t *testing.T) {
 	f := newRefinedConsumeTestFactory(t)
 	err := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a", "--include-resource-data=true").Execute()
 
 	if err == nil {
-		t.Fatal("expected a typed failed_precondition, got nil")
+		t.Fatal("expected an error (this Factory registers no HTTP stubs), got nil")
 	}
+	// The E-gate is retired: true must no longer trip a failed_precondition on
+	// --include-resource-data, nor claim the resource_data_encryption_deferred reason.
 	var ve *errs.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	if errors.As(err, &ve) && ve.Subtype == errs.SubtypeFailedPrecondition && ve.Param == "--include-resource-data" {
+		t.Fatalf("--include-resource-data=true must no longer be gated, got: %v", err)
 	}
-	if ve.Subtype != errs.SubtypeFailedPrecondition {
-		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	if strings.Contains(err.Error(), "resource_data_encryption_deferred") {
+		t.Fatalf("the E-deferred gate must be retired, got: %v", err)
 	}
-	if ve.Param != "--include-resource-data" {
-		t.Errorf("Param = %q, want --include-resource-data", ve.Param)
-	}
-	if !strings.Contains(ve.Hint, "resource_data_encryption_deferred") {
-		t.Errorf("Hint = %q, want it to name reason resource_data_encryption_deferred", ve.Hint)
-	}
-	if strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
-		t.Errorf("--include-resource-data=true on a refined key must be rejected BEFORE any Plan/Apply network call, got: %v", err)
+	// It now drives the real refined chain, reaching PlanRemoteSubscription's List.
+	if !strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
+		t.Errorf("--include-resource-data=true must now reach PlanRemoteSubscription's real List call, got: %v", err)
 	}
 }
 

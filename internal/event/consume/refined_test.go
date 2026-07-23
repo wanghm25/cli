@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -371,9 +372,13 @@ type fakeApplyAPI struct {
 	reactivateResp *larkeventv1.ReactivateSubscriptionResp
 	reactivateErr  error
 
-	listCalls       int
-	createCalls     int
-	reactivateCalls int
+	getEncryptKeyResp *larkeventv1.GetEncryptKeySubscriptionResp
+	getEncryptKeyErr  error
+
+	listCalls          int
+	createCalls        int
+	reactivateCalls    int
+	getEncryptKeyCalls int
 }
 
 func (f *fakeApplyAPI) List(context.Context, *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
@@ -391,11 +396,16 @@ func (f *fakeApplyAPI) Reactivate(context.Context, *larkeventv1.ReactivateSubscr
 	return f.reactivateResp, f.reactivateErr
 }
 
+func (f *fakeApplyAPI) GetEncryptKey(_ context.Context, _ *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
+	f.getEncryptKeyCalls++
+	return f.getEncryptKeyResp, f.getEncryptKeyErr
+}
+
 func TestApplyRemoteSubscriptionPlan_Create_CallsCreateExactlyOnce(t *testing.T) {
 	fake := &fakeApplyAPI{createResp: &larkeventv1.CreateSubscriptionResp{
 		Data: &larkeventv1.CreateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_new")}},
 	}}
-	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate})
+	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -410,7 +420,7 @@ func TestApplyRemoteSubscriptionPlan_Create_CallsCreateExactlyOnce(t *testing.T)
 func TestApplyRemoteSubscriptionPlan_Reuse_NeverWrites(t *testing.T) {
 	fake := &fakeApplyAPI{}
 	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_existing")}
-	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionReuse, Existing: existing})
+	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionReuse, Existing: existing}, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -427,7 +437,7 @@ func TestApplyRemoteSubscriptionPlan_Suspended_CallsReactivateNotCreate(t *testi
 		Data: &larkeventv1.ReactivateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_susp")}},
 	}}
 	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_susp")}
-	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionSuspended, Existing: existing})
+	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionSuspended, Existing: existing}, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -436,6 +446,97 @@ func TestApplyRemoteSubscriptionPlan_Suspended_CallsReactivateNotCreate(t *testi
 	}
 	if fake.reactivateCalls != 1 || fake.createCalls != 0 {
 		t.Errorf("suspended must call Reactivate exactly once, never Create; got create=%d reactivate=%d", fake.createCalls, fake.reactivateCalls)
+	}
+}
+
+// ---- E5: encrypted create (key-gen atomicity + no-key-on-non-create) ----
+
+// TestApplyRemoteSubscriptionPlan_EncryptedCreate_GeneratesKeyExactlyOnce locks
+// that an encrypted create (includeResourceData=true) generates a fresh key via
+// newEncryptKeyFunc EXACTLY once and still creates the subscription. The key is
+// never returned by applyRemoteSubscriptionPlan (only the remote id is).
+func TestApplyRemoteSubscriptionPlan_EncryptedCreate_GeneratesKeyExactlyOnce(t *testing.T) {
+	var keyGenCalls int
+	restore := newEncryptKeyFunc
+	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return "GENERATED_KEY", nil }
+	defer func() { newEncryptKeyFunc = restore }()
+
+	fake := &fakeApplyAPI{createResp: &larkeventv1.CreateSubscriptionResp{
+		Data: &larkeventv1.CreateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_enc")}},
+	}}
+	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "sub_enc" || !created {
+		t.Errorf("got id=%q created=%v, want sub_enc/true", id, created)
+	}
+	if keyGenCalls != 1 {
+		t.Errorf("newEncryptKeyFunc called %d times, want exactly 1 for an encrypted create", keyGenCalls)
+	}
+	if fake.createCalls != 1 {
+		t.Errorf("createCalls=%d, want 1", fake.createCalls)
+	}
+}
+
+// TestApplyRemoteSubscriptionPlan_PlaintextAndReuse_NeverGenerateKey proves the
+// key is generated ONLY on an encrypted create — never for a plaintext create,
+// a reuse, or a suspended reactivate (spec §4.7 / task E5).
+func TestApplyRemoteSubscriptionPlan_PlaintextAndReuse_NeverGenerateKey(t *testing.T) {
+	var keyGenCalls int
+	restore := newEncryptKeyFunc
+	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return "SHOULD_NOT_HAPPEN", nil }
+	defer func() { newEncryptKeyFunc = restore }()
+
+	// plaintext create
+	fake := &fakeApplyAPI{createResp: &larkeventv1.CreateSubscriptionResp{
+		Data: &larkeventv1.CreateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_plain")}},
+	}}
+	if _, _, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, false); err != nil {
+		t.Fatalf("plaintext create: unexpected error: %v", err)
+	}
+	// reuse (even with includeResourceData=true: no create happens, no key)
+	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_reuse")}
+	if _, _, err := applyRemoteSubscriptionPlan(context.Background(), &fakeApplyAPI{}, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionReuse, Existing: existing}, true); err != nil {
+		t.Fatalf("reuse: unexpected error: %v", err)
+	}
+	if keyGenCalls != 0 {
+		t.Errorf("newEncryptKeyFunc called %d times, want 0 (no key for plaintext create or reuse)", keyGenCalls)
+	}
+}
+
+// TestApplyRemoteSubscriptionPlan_EncryptedCreate_KeyGenFailure_FailClosed:
+// a key-gen failure aborts the create — never a plaintext fallback (spec §4.7).
+func TestApplyRemoteSubscriptionPlan_EncryptedCreate_KeyGenFailure_FailClosed(t *testing.T) {
+	restore := newEncryptKeyFunc
+	newEncryptKeyFunc = func() (string, error) { return "", errors.New("csprng unavailable") }
+	defer func() { newEncryptKeyFunc = restore }()
+
+	fake := &fakeApplyAPI{}
+	_, _, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, true)
+	if err == nil {
+		t.Fatal("expected key-gen failure to abort the create, got nil")
+	}
+	if fake.createCalls != 0 {
+		t.Errorf("createCalls=%d, want 0: a key-gen failure must never fall back to a plaintext Create", fake.createCalls)
+	}
+}
+
+// TestBuildRefinedCreateBody_AtomicEncrypt proves the encrypt_key is set on the
+// SAME body as include_resource_data (spec §4.7 atomicity), and that a
+// plaintext body carries no encrypt block.
+func TestBuildRefinedCreateBody_AtomicEncrypt(t *testing.T) {
+	enc := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", true, "THE_KEY")
+	if enc.PayloadOptions == nil || enc.PayloadOptions.IncludeResourceData == nil || !*enc.PayloadOptions.IncludeResourceData {
+		t.Fatalf("encrypted body must set include_resource_data=true, got %+v", enc.PayloadOptions)
+	}
+	if enc.PayloadOptions.Encrypt == nil || enc.PayloadOptions.Encrypt.EncryptKey == nil || *enc.PayloadOptions.Encrypt.EncryptKey != "THE_KEY" {
+		t.Fatalf("encrypted body must carry the encrypt_key atomically, got %+v", enc.PayloadOptions.Encrypt)
+	}
+
+	plain := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "")
+	if plain.PayloadOptions == nil || plain.PayloadOptions.Encrypt != nil {
+		t.Fatalf("plaintext body must carry no encrypt block, got %+v", plain.PayloadOptions)
 	}
 }
 
@@ -835,6 +936,146 @@ func TestRunRefinedChain_Suspended_NonDryRun_AppliesReactivateNotError(t *testin
 	}
 	if appliedAction != event.PlanActionSuspended {
 		t.Errorf("apply saw action %q, want %q", appliedAction, event.PlanActionSuspended)
+	}
+}
+
+// ---- E5: prewarm-before-ready ----
+
+// closeRecorder wraps a net.Conn to observe whether Close was called (the
+// rollback signal for a prewarm failure).
+type closeRecorder struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (c *closeRecorder) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
+}
+
+// TestRunRefinedChain_Prewarm_RunsAfterHelloBeforeReady_Success proves the
+// prewarm step runs AFTER hello and BEFORE the consumer starts (spec §4.7
+// ordering), and that a successful prewarm lets the chain proceed normally.
+func TestRunRefinedChain_Prewarm_RunsAfterHelloBeforeReady_Success(t *testing.T) {
+	rec := &orderRecorder{}
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	events := []*protocol.Event{protocol.NewEvent("im.message.created_v1", "e1", "", 1, json.RawMessage(`{"ok":true}`))}
+	go busSide(t, server, events, true)
+
+	deps := refinedDeps{
+		probe: func(context.Context) error { rec.record("probe"); return nil },
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			rec.record("plan")
+			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		},
+		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+			rec.record("apply")
+			return "sub_enc", true, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) { rec.record("startBus"); return client, nil },
+		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
+			rec.record("hello")
+			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true}, bufio.NewReader(conn), nil
+		},
+		prewarm: func(_ context.Context, remoteSubscriptionID string) error {
+			rec.record("prewarm")
+			if remoteSubscriptionID != "sub_enc" {
+				t.Errorf("prewarm got remoteSubscriptionID=%q, want sub_enc (apply's output)", remoteSubscriptionID)
+			}
+			return nil
+		},
+	}
+	opts := RefinedOptions{Quiet: true, ErrOut: io.Discard, Out: io.Discard, MaxEvents: 1, Identity: core.AsUser, IncludeResourceData: true}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := runRefinedChain(ctx, refinedFixture(), opts, deps); err != nil {
+		t.Fatalf("runRefinedChain: unexpected error: %v", err)
+	}
+	got := strings.Join(rec.snapshot(), ",")
+	want := "probe,plan,apply,startBus,hello,prewarm"
+	if got != want {
+		t.Errorf("call order = %s, want %s (prewarm must run after hello, before consume)", got, want)
+	}
+}
+
+// TestRunRefinedChain_PrewarmFails_NotReady_RollsBack proves a prewarm failure
+// (a genuine key-unavailable): the consumer must NOT emit ready, must return a
+// typed decrypt_key_unavailable failed_precondition, and must roll back its
+// local registration (the deferred conn.Close unregisters it from the bus).
+func TestRunRefinedChain_PrewarmFails_NotReady_RollsBack(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	rc := &closeRecorder{Conn: client}
+
+	var stderr bytes.Buffer
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		},
+		apply:    func(context.Context, event.ReconcilePlan) (string, bool, error) { return "sub_enc", true, nil },
+		startBus: func(context.Context) (net.Conn, error) { return rc, nil },
+		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
+			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true}, bufio.NewReader(conn), nil
+		},
+		prewarm: func(context.Context, string) error { return errPrewarmNoKey },
+	}
+	// Quiet=false so the ready marker WOULD be written if the chain reached it.
+	opts := RefinedOptions{Quiet: false, ErrOut: &stderr, Out: io.Discard, Identity: core.AsUser, IncludeResourceData: true}
+
+	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
+	if err == nil {
+		t.Fatal("expected a prewarm failure error, got nil")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) || ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Fatalf("expected a failed_precondition, got %T: %v", err, err)
+	}
+	if !strings.Contains(ve.Error(), "decrypt_key_unavailable") {
+		t.Errorf("error must be classified decrypt_key_unavailable, got: %v", ve.Error())
+	}
+	if strings.Contains(stderr.String(), "ready") {
+		t.Errorf("consumer must NOT emit the ready marker on prewarm failure; stderr:\n%s", stderr.String())
+	}
+	if !rc.closed.Load() {
+		t.Errorf("prewarm failure must roll back local registration by closing the bus conn")
+	}
+}
+
+// TestRunRefinedChain_PrewarmTransientError_ReturnedUnchanged proves a
+// transient prewarm failure (network) is surfaced as its original retryable
+// error, NOT relabeled as a decrypt conflict (the E2-review lesson).
+func TestRunRefinedChain_PrewarmTransientError_ReturnedUnchanged(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	transient := errs.NewNetworkError(errs.SubtypeNetworkTimeout, "dial timeout")
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		},
+		apply:    func(context.Context, event.ReconcilePlan) (string, bool, error) { return "sub_enc", true, nil },
+		startBus: func(context.Context) (net.Conn, error) { return client, nil },
+		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
+			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true}, bufio.NewReader(conn), nil
+		},
+		prewarm: func(context.Context, string) error { return transient },
+	}
+	opts := RefinedOptions{Quiet: true, ErrOut: io.Discard, Out: io.Discard, Identity: core.AsUser, IncludeResourceData: true}
+
+	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
+	var ne *errs.NetworkError
+	if !errors.As(err, &ne) {
+		t.Fatalf("transient prewarm error must be surfaced as a NetworkError, got %T: %v", err, err)
+	}
+	var ve *errs.ValidationError
+	if errors.As(err, &ve) && strings.Contains(err.Error(), "decrypt_key_unavailable") {
+		t.Errorf("a transient prewarm error must NOT be relabeled decrypt_key_unavailable, got: %v", err)
 	}
 }
 
