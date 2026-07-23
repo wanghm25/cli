@@ -104,18 +104,39 @@ Two independent things can each be "stopped"; stopping one never stops the other
 
 To fully tear down a refined subscription: stop the local consumer **and** delete the remote subscription (either order) — neither one implies the other.
 
-## 8. The E-deferred boundary (encryption not yet shipped)
+## 8. Resource data & encryption (`--include-resource-data`)
 
-`--include-resource-data` defaults to `false`, and `false` is fully functional in this phase (no gating, nothing missing). Requesting `true` is gated everywhere it could be requested — `event subscription create --include-resource-data`, `event subscription update --include-resource-data`, and (on a refined EventKey) `event consume --include-resource-data`, all for **user and bot** identity alike — with a typed `failed_precondition` whose `Hint` names the reason `resource_data_encryption_deferred` (resource-data delivery and decryption, including user-subscription `encrypt_key` generation, is not yet supported; it ships with the encryption module). This is a hard typed rejection, never a silent downgrade or a best-effort attempt to deliver undecryptable payload data.
+`--include-resource-data` defaults to `false`; `false` delivers plaintext business events with no resource snapshot (unchanged behavior). Setting `true` creates an **encrypted** Subscription — there is no "plaintext resource_data" mode.
 
-`event consume` also exposes `--include-resource-data` (previously absent — passing it used to fail with a generic "unknown flag" error instead of a typed rejection). `false` (the default, whether passed explicitly or omitted) is a no-op: a refined consume's own remote-write step (create/reuse/reactivate) always requests `include_resource_data:false`, consistent with the gate above — every reachable remote Subscription in this phase has `include_resource_data:false`, so this never collides with an existing subscription's configuration. `--include-resource-data=true` is rejected before any Probe/Plan/Apply call, with a subtype that depends on the EventKey shape: a **refined** key gets the same typed `failed_precondition`/`resource_data_encryption_deferred` gate as `subscription create`/`update` above; an **ordinary** (non-refined) key gets a typed `invalid_argument` instead, since the flag has no remote Subscription to apply to there.
+**Mechanism.** A Subscription-level `encrypt_key` encrypts the *whole* `{schema, header, event}` push envelope, not just `resource_data`. The push body is `{encrypt_info (plaintext routing, carries subscription_id), encrypt (ciphertext)}`. Decryption happens transparently inside the **bus** process at the SDK EventDispatcher, *before* routing/handlers — consumers, `jq`, and NDJSON output only ever see plaintext. `--include-resource-data=true` is supported on `event subscription create` and (on a refined EventKey) `event consume`, for **user and bot** alike. It is refused on `event subscription update` (see rotation below), and stays a typed `invalid_argument` on an ordinary (non-refined) `event consume` key (there is no remote Subscription for the flag to apply to).
 
-There is also no `subscription get-encrypt-key`-style subcommand in this phase — the SDK's `GetEncryptKey` capability is out of scope until the encryption module ships.
+**Key creation & source.** The CLI never accepts `--encrypt-key`. On an encrypted create it generates a fresh, high-entropy per-subscription key with the OS CSPRNG in memory and submits it **atomically** in the same Create request as `include_resource_data=true` (fail-closed: a failed create never downgrades to a plaintext subscription). After success only the `remote_subscription_id` is kept; the key is never printed, logged, persisted, or returned. `--dry-run` generates no key at all.
+
+**Scope.** Fetching a key needs the dedicated scope `event:encrypt_key:read` — `event:subscription:read`/`write` do NOT imply it. `event schema <base> --json` discloses it under `conditional_scopes` (`event:encrypt_key:read` when `--include-resource-data` is set with `--as user`); `event subscription create --dry-run --json` lists it in `required_scopes` for an encrypted request.
+
+**Key lifecycle in the bus.** The front-end never hands the key to the bus (IPC never carries a key). The bus fetches its own copy via `GetEncryptKey(subscription_id)` using the owner-matching identity (a user Subscription uses the current gated user's UAT; owner≠current is never fetched, and a historical owner's UAT is never loaded), caches it in memory for the bus lifetime only (never on disk), and releases it on `deleted_v1`. A refined `consume` **prewarms** the key after Hello registration and before `ready`: if the key is not retrievable (missing scope, foreign/mismatched identity, or the subscription is gone), the consumer does **not** report `ready` — it returns a typed `decrypt_key_unavailable` `failed_precondition` (next_action: fix scope/identity or delete+recreate) and rolls back its registration, leaving no half-registered consumer. There is no user-facing `get-encrypt-key` command — key retrieval is entirely bus-internal.
+
+**Conflict matrix (encryption dimension), at create/consume reconcile:**
+
+| Local intent | Remote state | Action |
+|---|---|---|
+| no resource data | `include_resource_data=false` | reuse |
+| no resource data | plaintext OR encrypted resource data | conflict → human decision |
+| encrypted | `include_resource_data=false` | conflict → human decision |
+| encrypted | plaintext resource data | unsupported → human decision |
+| encrypted | encrypted + key retrievable | reuse |
+| encrypted | encrypted + key NOT retrievable | not ready → fix scope/identity |
+
+**Rotation / enable / disable = delete + recreate.** `encrypt` is Create-only: it can never be added, changed, or removed afterward. `event subscription update --include-resource-data=true` is therefore refused with a typed `failed_precondition` guiding you to delete + recreate (or create a separate new subscription) after human confirmation. There is no in-place rotate/update-key.
+
+**Observability.** `event status` shows, per encrypted consumer, `resource_data` (`decrypted`/`unavailable`), `decrypt_state` (`decrypted`/`decrypt_key_unavailable`/`decrypt_failed`), and `last_decrypt_error {class,count,time}` — advisory only. A single undecryptable event is dropped fail-closed and counted (never delivered as ciphertext, never on stdout); persistent failures mark the consumer `degraded`.
+
+**Redaction (hard red lines).** The `encrypt_key`, App Secret, UAT, refresh token, ciphertext envelope, and any decrypted temporary plaintext never appear in command args, stdin, stdout, stderr, `bus.log`, `status`, telemetry, or error envelopes/Hints. Errors carry at most `remote_subscription_id`, a failure stage, a classification, and a request/log ID. AES-CBC has no MAC, so "decrypt success" is not an integrity proof on its own — the CLI relies on the SDK envelope parse + `subscription_id` routing + local authority/resource cross-check, and never self-relaxes those.
 
 ## Gotchas
 
 - **Bare base key rejected (R1)**: `event consume im.message.created_v1` or `event subscription create im.message.created_v1` (no template segment) always fails `invalid_argument`, pointing at `event schema im.message.created_v1 --json`. Only a materialized key (e.g. a `key_templates[].example` value) works.
 - **A legacy key never accepts a path suffix**: `im.message.receive_v1/foo/bar` is not a refined-style path — legacy keys only ever match exactly.
 - **Selector value URL discipline**: a selector value is percent-decoded exactly once; an unescaped `/` inside it is rejected outright (it would silently change how the key is segmented) — percent-encode a literal `/` as `%2F`.
-- **`create`'s conflict is about `payload_options`, not caller intent**: two `create` calls for the same `event_type` + `target_resource` + identity but a different `--include-resource-data` collide as `failed_precondition`, never a silent overwrite.
+- **`create`'s conflict is about `payload_options`, not caller intent**: two `create` calls for the same `event_type` + `target_resource` + identity but a different `--include-resource-data` (including plaintext-vs-encrypted, or encrypted-but-key-not-retrievable) collide as `failed_precondition`, never a silent overwrite — see the encryption conflict matrix in §8.
 - **`event consume`'s risk is understated by its command name**: it is registered `read` at the framework level, but for a refined key it has `effective:"write"` remote side effects (see `event schema <base> --json`'s `risk` field) — prefer `--dry-run` first.

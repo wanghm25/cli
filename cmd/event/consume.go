@@ -329,13 +329,13 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 // errIncludeResourceDataNotApplicable implements design spec §4.7:330's
 // typed rejection: --include-resource-data only ever controls a
 // refined-subscription EventKey's remote Subscription (see `event
-// subscription create/update --include-resource-data`) — an ordinary
-// (legacy) EventKey has no remote Subscription resource at all, so passing
-// the flag against one is a caller mistake, not a not-yet-supported
-// capability. Subtype is invalid_argument (contrast
-// errIncludeResourceDataGatedRefined's failed_precondition above): this is
-// never going to become valid once the encryption module ships, unlike the
-// refined case's temporary gate.
+// subscription create --include-resource-data`) — an ordinary (legacy)
+// EventKey has no remote Subscription resource at all, so passing the flag
+// against one is a caller mistake. Subtype is invalid_argument: unlike a
+// refined key (where --include-resource-data=true is now SUPPORTED and creates
+// an encrypted subscription, task E5), an ordinary key can never have a remote
+// Subscription for the flag to apply to, so this rejection is permanent by
+// design — not a temporary gate.
 func errIncludeResourceDataNotApplicable(eventKey string) error {
 	return errs.NewValidationError(errs.SubtypeInvalidArgument,
 		"--include-resource-data does not apply to EventKey %q: it is not a refined-subscription key, and --include-resource-data only controls a refined key's remote Subscription", eventKey).
