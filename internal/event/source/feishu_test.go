@@ -364,6 +364,55 @@ func TestBuildDispatcher_NilEncryptKeyProvider_Unchanged(t *testing.T) {
 	}
 }
 
+// TestBuildDispatcher_KeyPresentButDecryptFails_FailClosed_NoEmit (task E6):
+// with a key present but the ciphertext undecryptable, the SDK dispatcher
+// fail-closes — Do returns an error and emit is NEVER called (no ciphertext is
+// ever delivered as a plaintext event).
+func TestBuildDispatcher_KeyPresentButDecryptFails_FailClosed_NoEmit(t *testing.T) {
+	// A key IS available for the subscription, but encryptedEnvelope's "encrypt"
+	// field is not valid ciphertext for it, so EventDecrypt fails.
+	prov := &recordingEncryptKeyProvider{key: "some-key", ok: true}
+	s := &FeishuSource{EncryptKeyProvider: prov}
+	var emitted int
+	d := s.buildDispatcher([]string{"im.message.receive_v1"}, func(*event.RawEvent) { emitted++ })
+
+	_, err := d.Do(context.Background(), []byte(encryptedEnvelope))
+	if err == nil {
+		t.Error("Do must return a fail-closed error when decryption fails")
+	}
+	if emitted != 0 {
+		t.Errorf("emit called %d times, want 0: an undecryptable envelope is never delivered", emitted)
+	}
+}
+
+// TestSdkLogger_DecryptFailure_ExtractsSubscriptionID (task E6): a fail-closed
+// decrypt-failure SDK Error line (the ws client wraps the dispatcher Do error)
+// fires OnDecryptFailure with the extracted subscription_id; unrelated error
+// lines never fire it. The callback only ever receives a subscription_id —
+// never a key/ciphertext/plaintext.
+func TestSdkLogger_DecryptFailure_ExtractsSubscriptionID(t *testing.T) {
+	var got []string
+	lg := &sdkLogger{onDecryptFailure: func(subID string) { got = append(got, subID) }}
+
+	// Exactly how ws/client.go wraps a dispatcher Do error for the WS path.
+	lg.Error(context.Background(), "handle message failed, message_type: event, message_id: m1, trace_id: t1, err: subscription event decryption failed (subscription_id=sub_abc123): illegal base64 data")
+	if len(got) != 1 || got[0] != "sub_abc123" {
+		t.Fatalf("OnDecryptFailure got %v, want [sub_abc123]", got)
+	}
+
+	got = nil
+	lg.Error(context.Background(), "handle message failed, message_type: event, err: some unrelated transport problem")
+	if len(got) != 0 {
+		t.Errorf("OnDecryptFailure fired on a non-decrypt error: %v", got)
+	}
+}
+
+// TestSdkLogger_DecryptFailure_NilCallback_NoPanic: detection is best-effort.
+func TestSdkLogger_DecryptFailure_NilCallback_NoPanic(t *testing.T) {
+	lg := &sdkLogger{} // no onDecryptFailure
+	lg.Error(context.Background(), "err: subscription event decryption failed (subscription_id=sub_x): boom")
+}
+
 // TestBuildDispatcher_OnLifecycleEventNil_NoPanic: a FeishuSource with no
 // lifecycle executor configured (OnLifecycleEvent left nil, matching
 // OnConnReady's own nil-tolerant contract) must not panic when a lifecycle

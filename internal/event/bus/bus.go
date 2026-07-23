@@ -90,7 +90,7 @@ type Bus struct {
 func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logger) *Bus {
 	hub := NewHub()
 	action := newSubscriptionLifecycleAction(hub, logger)
-	return &Bus{
+	b := &Bus{
 		appID:     appID,
 		appSecret: appSecret,
 		domain:    domain,
@@ -105,6 +105,12 @@ func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logge
 		lifecycleAction:    action,
 		encryptKeyProvider: newEncryptKeyProvider(hub, logger),
 	}
+	// Module E (task E6): on deleted_v1 the lifecycle action releases the
+	// subscription's cached encrypt_key from the provider (spec §4.7). Wired
+	// here (post-construction) since both the action and the provider exist by
+	// now — mirrors setIdentityGate/setNewSubscriptionClient's own convention.
+	b.lifecycleAction.setEncryptKeyRemover(b.encryptKeyProvider.Remove)
+	return b
 }
 
 // SetIdentityProviders enables the real-time identity gate + BindUser (spec
@@ -275,6 +281,11 @@ func (b *Bus) startSources(ctx context.Context) {
 		// reach it (the SDK only calls EncryptKey for envelopes carrying a
 		// top-level encrypt_info), so wiring it is a no-op for the plaintext path.
 		fs.EncryptKeyProvider = b.encryptKeyProvider
+		// Module E (E6): a fail-closed SDK decrypt failure surfaces via the SDK
+		// logger; the source extracts the subscription_id and calls this so the
+		// bus can count it + mark the matched consumer degraded (spec §4.7). The
+		// undecryptable event is already dropped by the SDK — never delivered.
+		fs.OnDecryptFailure = b.onDecryptFailure
 		sources = []source.Source{fs}
 	}
 	eventTypes := subscribedEventTypes()
@@ -489,6 +500,26 @@ func (b *Bus) handleStatusQuery(conn net.Conn) {
 	resp.Capabilities = []string{protocol.CapabilityRefinedRouting, protocol.CapabilityHelloV2}
 	resp.RegisteredEventTypes = b.hub.RegisteredEventTypes()
 	_ = protocol.EncodeWithDeadline(conn, resp, protocol.WriteTimeout)
+}
+
+// onDecryptFailure records a fail-closed SDK decryption failure for
+// subscriptionID (Module E, task E6, spec §4.7). The undecryptable event was
+// already dropped by the SDK dispatcher (it never reached a handler, emit, the
+// Hub, or stdout — no ciphertext is ever delivered); this only updates
+// observability: every matched consumer's decrypt-failure counter/state, and,
+// once failures persist, its degraded flag. The warning it logs to bus.log is
+// non-sensitive — subscription_id + a fixed classification only, never a key,
+// ciphertext, or decrypted plaintext (spec §4.7 敏感信息红线).
+func (b *Bus) onDecryptFailure(subscriptionID string) {
+	if subscriptionID == "" {
+		return
+	}
+	conns := b.hub.connsByRemoteSubscriptionID(subscriptionID)
+	for _, c := range conns {
+		c.RecordDecryptFailure()
+	}
+	b.logger.Printf("[decrypt] WARN: an event for subscription_id=%s could not be decrypted; dropped (fail-closed), matched_consumers=%d",
+		subscriptionID, len(conns))
 }
 
 // handleShutdown signals Run() to exit.

@@ -64,6 +64,16 @@ type FeishuSource struct {
 	// fallback) exactly as before Module E. The key never crosses back out of
 	// the SDK through this field.
 	EncryptKeyProvider larkevent.EncryptKeyProvider
+
+	// OnDecryptFailure is invoked (best-effort) when the SDK dispatcher
+	// fail-closes on an undecryptable subscription envelope (spec §4.7, Module
+	// E task E6). The undecryptable event is already dropped by the SDK — it
+	// never reaches emit/Hub/stdout; this is purely so the bus can count the
+	// failure and mark the matched consumer degraded. subscriptionID is parsed
+	// from the SDK's stable decrypt-failure log line (the SDK exposes no typed
+	// per-message error callback for the WS path); it never carries a key,
+	// ciphertext, or plaintext. nil is tolerated (no observability wired).
+	OnDecryptFailure func(subscriptionID string)
 }
 
 // LifecycleEvent is FeishuSource's normalized shape for one of the SDK's 6
@@ -121,9 +131,9 @@ func (s *FeishuSource) Start(ctx context.Context, eventTypes []string, emit func
 	if s.Domain != "" {
 		opts = append(opts, larkws.WithDomain(s.Domain))
 	}
-	if s.Logger != nil || notify != nil {
+	if s.Logger != nil || notify != nil || s.OnDecryptFailure != nil {
 		opts = append(opts, larkws.WithLogLevel(larkcore.LogLevelInfo))
-		opts = append(opts, larkws.WithLogger(&sdkLogger{l: s.Logger, notify: notify}))
+		opts = append(opts, larkws.WithLogger(&sdkLogger{l: s.Logger, notify: notify, onDecryptFailure: s.OnDecryptFailure}))
 	}
 
 	// var cli up-front so the ready closure can capture it before NewClient
@@ -489,7 +499,20 @@ func formatSubscriptionAuthority(authType, principalID string) string {
 type sdkLogger struct {
 	l      *log.Logger
 	notify StatusNotifier
+	// onDecryptFailure (Module E, task E6) is called with the subscription_id
+	// extracted from a fail-closed decrypt-failure SDK Error line. nil = not wired.
+	onDecryptFailure func(subscriptionID string)
 }
+
+// subscriptionDecryptFailureRe matches the SDK's stable whole-envelope
+// decrypt-failure error (event/dispatcher/dispatcher.go's
+// decryptSubscriptionEnvelope: "subscription event decryption failed
+// (subscription_id=%s): ...") and captures the subscription_id. This couples to
+// the pinned SDK's error string — the only surface the WS path exposes for a
+// per-message decrypt failure (Do returns the error; the ws client logs it via
+// this logger). The capture stops at ')' so it never swallows the ": <detail>"
+// tail (which carries no key, but also no useful routing info).
+var subscriptionDecryptFailureRe = regexp.MustCompile(`subscription event decryption failed \(subscription_id=([^)]*)\)`)
 
 func (a *sdkLogger) Debug(_ context.Context, _ ...interface{}) {}
 func (a *sdkLogger) Info(_ context.Context, args ...interface{}) {
@@ -511,8 +534,24 @@ func (a *sdkLogger) Error(_ context.Context, args ...interface{}) {
 	if a.l != nil {
 		a.l.Output(2, "[SDK ERROR] "+msg)
 	}
+	// Module E (task E6): a fail-closed subscription decrypt failure surfaces
+	// here (the WS client logs the dispatcher's Do error via this logger).
+	// Detect it and hand the subscription_id to the bus for counting/degrade.
+	a.tryDecryptFailure(msg)
 	// Errors usually manifest as disconnects; pass msg as detail.
 	a.tryNotify(msg, msg)
+}
+
+// tryDecryptFailure fires onDecryptFailure with the subscription_id parsed from
+// a fail-closed decrypt-failure SDK Error line (Module E, task E6). Best-effort:
+// no callback wired, or a line that is not a decrypt failure, is a no-op.
+func (a *sdkLogger) tryDecryptFailure(msg string) {
+	if a.onDecryptFailure == nil {
+		return
+	}
+	if m := subscriptionDecryptFailureRe.FindStringSubmatch(msg); len(m) == 2 {
+		a.onDecryptFailure(m[1])
+	}
 }
 
 var reconnectAttemptRe = regexp.MustCompile(`reconnect:?\s*(\d+)`)

@@ -118,6 +118,17 @@ type Conn struct {
 	// a short classification (spec §4.7 敏感信息红线).
 	decryptState string
 
+	// lastDecryptError* summarize the most recent SDK decrypt FAILURE observed
+	// for this consumer's subscription (task E6; surfaced by E7's status as
+	// last_decrypt_error {class,count,time}). decryptFailCount is the running
+	// total; once it reaches decryptFailDegradeThreshold the consumer is also
+	// marked degraded ("single fail → count; persistent fail → degraded", spec
+	// §4.7). class is a fixed token ("decrypt_failed"), never a raw SDK error —
+	// no padding/algorithm detail (no oracle, spec §4.7 红线).
+	decryptFailCount      int64
+	lastDecryptErrorClass string
+	lastDecryptErrorTime  time.Time
+
 	onClose         func(*Conn)
 	checkLastForKey func(scope string) bool
 	logger          *log.Logger
@@ -399,6 +410,55 @@ func (c *Conn) SetDecryptState(state string) {
 	c.identityMu.Lock()
 	defer c.identityMu.Unlock()
 	c.decryptState = state
+}
+
+// decryptFailDegradeThreshold is how many decrypt failures a consumer tolerates
+// before it is additionally marked degraded (spec §4.7: "single-event fail →
+// drop+count; persistent fail → degraded"). A small fixed value — this is
+// control-plane observability, not a tuned data path.
+const decryptFailDegradeThreshold = 3
+
+// RecordDecryptFailure records one fail-closed SDK decrypt failure for this
+// consumer (task E6). It increments the counter, stamps the last error
+// class/time, and sets decrypt_state=decrypt_failed; once failures persist
+// (>= decryptFailDegradeThreshold) it also marks the consumer degraded. It
+// records ONLY a fixed classification — never a key, ciphertext, decrypted
+// plaintext, or raw SDK error (spec §4.7 敏感信息红线). The undecryptable event
+// itself is dropped by the SDK before ever reaching delivery.
+func (c *Conn) RecordDecryptFailure() {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	c.decryptFailCount++
+	c.lastDecryptErrorClass = decryptStateFailed
+	c.lastDecryptErrorTime = time.Now()
+	c.decryptState = decryptStateFailed
+	if c.decryptFailCount >= decryptFailDegradeThreshold {
+		c.degradedReason = decryptStateFailed
+	}
+}
+
+// DecryptFailCount returns the running total of decrypt failures observed for
+// this consumer (0 = none).
+func (c *Conn) DecryptFailCount() int64 {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	return c.decryptFailCount
+}
+
+// LastDecryptErrorClass returns the most recent decrypt-failure classification
+// ("" = none yet). A fixed token, never a raw error.
+func (c *Conn) LastDecryptErrorClass() string {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	return c.lastDecryptErrorClass
+}
+
+// LastDecryptErrorTime returns when the most recent decrypt failure was
+// recorded (zero = none yet).
+func (c *Conn) LastDecryptErrorTime() time.Time {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	return c.lastDecryptErrorTime
 }
 
 func (c *Conn) SendCh() chan interface{} { return c.sendCh }

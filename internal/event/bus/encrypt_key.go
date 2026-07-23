@@ -22,6 +22,7 @@ import (
 const (
 	decryptStateDecrypted      = "decrypted"
 	decryptStateKeyUnavailable = "decrypt_key_unavailable"
+	decryptStateFailed         = "decrypt_failed" // key held but SDK decrypt/parse failed (task E6)
 )
 
 // encryptKeyProviderDefaults — internal control-plane housekeeping timings,

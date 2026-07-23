@@ -1,0 +1,112 @@
+// Copyright (c) 2026 Lark Technologies Pte. Ltd.
+// SPDX-License-Identifier: MIT
+
+package bus
+
+import (
+	"context"
+	"testing"
+)
+
+// ---- E6: encrypt_key removal on deleted_v1 ----
+
+func TestSubscriptionLifecycleAction_Deleted_RemovesEncryptKey(t *testing.T) {
+	hub := NewHub()
+	c := newConnWithRemoteSub(t, 1, "sub-del")
+	hub.RegisterAndIsFirst(c)
+
+	var removed []string
+	action := newSubscriptionLifecycleAction(hub, discardTestLogger())
+	action.setEncryptKeyRemover(func(subID string) { removed = append(removed, subID) })
+
+	le := LifecycleEvent{EventType: lifecycleEventTypeDeleted, EventID: "evt-del", RemoteSubscriptionID: "sub-del"}
+	if err := action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != "sub-del" {
+		t.Errorf("encrypt-key remover called with %v, want [sub-del]", removed)
+	}
+	// The existing deleted_v1 behavior is preserved.
+	if c.DegradedReason() != reasonRemoteSubscriptionDeleted {
+		t.Errorf("DegradedReason = %q, want %q", c.DegradedReason(), reasonRemoteSubscriptionDeleted)
+	}
+}
+
+func TestSubscriptionLifecycleAction_Deleted_NilRemover_NoPanic(t *testing.T) {
+	hub := NewHub()
+	action := newSubscriptionLifecycleAction(hub, discardTestLogger()) // no remover wired
+	le := LifecycleEvent{EventType: lifecycleEventTypeDeleted, EventID: "evt", RemoteSubscriptionID: "sub-1"}
+	if err := action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle with nil remover must not fail: %v", err)
+	}
+}
+
+// TestNewBus_WiresEncryptKeyRemover_DeletedReleasesKey proves the full wiring:
+// NewBus connects the lifecycle action's deleted_v1 path to the provider's
+// Remove, so a deleted_v1 evicts the cached key from the SDK provider.
+func TestNewBus_WiresEncryptKeyRemover_DeletedReleasesKey(t *testing.T) {
+	b := NewBus("test-app", "test-secret", "", nil, discardTestLogger())
+	// Seed a cached key, then confirm a deleted_v1 evicts it.
+	b.encryptKeyProvider.static.Set("sub-gone", "CACHED")
+	if _, ok := b.encryptKeyProvider.static.EncryptKey(context.Background(), "sub-gone"); !ok {
+		t.Fatal("precondition: key should be cached")
+	}
+	le := LifecycleEvent{EventType: lifecycleEventTypeDeleted, EventID: "evt", RemoteSubscriptionID: "sub-gone"}
+	if err := b.lifecycleAction.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if _, ok := b.encryptKeyProvider.static.EncryptKey(context.Background(), "sub-gone"); ok {
+		t.Errorf("deleted_v1 must evict the cached encrypt_key from the provider")
+	}
+}
+
+// ---- E6: decrypt-failure counting + degrade ----
+
+func TestConn_RecordDecryptFailure_CountsThenDegrades(t *testing.T) {
+	c := newConnWithRemoteSub(t, 1, "sub-1")
+
+	// Below the threshold: counted + decrypt_state set, but NOT yet degraded.
+	for i := int64(1); i < decryptFailDegradeThreshold; i++ {
+		c.RecordDecryptFailure()
+		if c.DecryptFailCount() != i {
+			t.Errorf("DecryptFailCount = %d, want %d", c.DecryptFailCount(), i)
+		}
+		if c.DecryptState() != decryptStateFailed {
+			t.Errorf("DecryptState = %q, want decrypt_failed", c.DecryptState())
+		}
+		if c.DegradedReason() != "" {
+			t.Errorf("consumer degraded too early at count=%d (single fails only count)", i)
+		}
+	}
+	// Crossing the threshold degrades it.
+	c.RecordDecryptFailure()
+	if c.DecryptFailCount() != decryptFailDegradeThreshold {
+		t.Errorf("DecryptFailCount = %d, want %d", c.DecryptFailCount(), decryptFailDegradeThreshold)
+	}
+	if c.DegradedReason() != decryptStateFailed {
+		t.Errorf("DegradedReason = %q, want decrypt_failed after persistent failures", c.DegradedReason())
+	}
+	if c.LastDecryptErrorClass() != decryptStateFailed {
+		t.Errorf("LastDecryptErrorClass = %q, want decrypt_failed", c.LastDecryptErrorClass())
+	}
+	if c.LastDecryptErrorTime().IsZero() {
+		t.Errorf("LastDecryptErrorTime must be stamped")
+	}
+}
+
+func TestBus_OnDecryptFailure_RecordsOnMatchedConsumers(t *testing.T) {
+	b := NewBus("test-app", "test-secret", "", nil, discardTestLogger())
+	c := newConnWithRemoteSub(t, 1, "sub-x")
+	b.hub.RegisterAndIsFirst(c)
+
+	b.onDecryptFailure("sub-x")
+	if c.DecryptFailCount() != 1 {
+		t.Errorf("DecryptFailCount = %d, want 1", c.DecryptFailCount())
+	}
+	if c.DecryptState() != decryptStateFailed {
+		t.Errorf("DecryptState = %q, want decrypt_failed", c.DecryptState())
+	}
+	// An unknown / empty subscription id is a harmless no-op (never panics).
+	b.onDecryptFailure("sub-unknown")
+	b.onDecryptFailure("")
+}

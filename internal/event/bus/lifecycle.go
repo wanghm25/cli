@@ -573,6 +573,15 @@ type subscriptionLifecycleAction struct {
 	identityGate *identityGate
 	newSubClient func(as core.Identity, uat string) (subscriptionActionClient, error)
 
+	// encryptKeyRemover releases a subscription's cached encrypt_key from the
+	// bus-side provider (Module E, task E6) when its remote Subscription is
+	// gone: on deleted_v1 (handleDeleted). nil until wired by bus.go's NewBus
+	// (b.encryptKeyProvider.Remove) — a bus with no provider configured (never,
+	// in production) simply skips the release. Releasing the key here is spec
+	// §4.7's "收到 deleted_v1 ... 执行 Remove(subscription_id)": the key must not
+	// outlive the subscription in memory.
+	encryptKeyRemover func(subID string)
+
 	tombstone *tombstoneStore
 }
 
@@ -589,6 +598,10 @@ func (a *subscriptionLifecycleAction) setIdentityGate(g *identityGate) { a.ident
 
 func (a *subscriptionLifecycleAction) setNewSubscriptionClient(fn func(as core.Identity, uat string) (subscriptionActionClient, error)) {
 	a.newSubClient = fn
+}
+
+func (a *subscriptionLifecycleAction) setEncryptKeyRemover(fn func(subID string)) {
+	a.encryptKeyRemover = fn
 }
 
 func (a *subscriptionLifecycleAction) logf(format string, args ...interface{}) {
@@ -906,6 +919,13 @@ func (a *subscriptionLifecycleAction) handleExpired(conns []*Conn) error {
 // activated_v1/updated_v1 for the same id cannot resurrect it.
 func (a *subscriptionLifecycleAction) handleDeleted(le LifecycleEvent, conns []*Conn) error {
 	a.tombstone.mark(le.RemoteSubscriptionID)
+	// Module E (task E6, spec §4.7): the subscription is gone — release its
+	// cached encrypt_key from the bus provider so the key does not outlive the
+	// subscription in memory. Best-effort, idempotent, and never fails the
+	// event: a nil remover (no provider wired) or an unknown id is a no-op.
+	if a.encryptKeyRemover != nil && le.RemoteSubscriptionID != "" {
+		a.encryptKeyRemover(le.RemoteSubscriptionID)
+	}
 	for _, c := range conns {
 		c.SetDegraded(reasonRemoteSubscriptionDeleted)
 		c.SetNextAction(nextActionRebuild)
