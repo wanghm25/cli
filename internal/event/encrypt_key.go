@@ -11,8 +11,7 @@ import (
 )
 
 // encryptKeyRandomBytes is the number of OS-CSPRNG bytes read to build one
-// fresh per-subscription encrypt_key (design spec §4.7 "密钥创建与来源";
-// task-E-design-note.md's task E2). The candidate SDK's EventDecrypt derives
+// fresh per-subscription encrypt_key. The candidate SDK's EventDecrypt derives
 // the actual AES-256 key via `sha256.Sum256([]byte(encrypt_key))` (verified
 // in the 4c77bba clone's event/event.go) — so encrypt_key itself has no
 // fixed platform format, only entropy matters, and the SDK never decodes it
@@ -24,7 +23,7 @@ const encryptKeyRandomBytes = 32
 
 // newEncryptKey generates one fresh, high-entropy per-subscription
 // encrypt_key using the OS CSPRNG (crypto/rand — never math/rand, and never
-// derived from any user/CLI-supplied input): spec §4.7 is explicit that the
+// derived from any user/CLI-supplied input): the
 // CLI does not accept `--encrypt-key`; a bare refined base key over resource
 // data cannot ship "bring your own key" and this whole module's fail-closed
 // posture depends on every encrypted Subscription's key being CLI-generated
@@ -39,7 +38,7 @@ const encryptKeyRandomBytes = 32
 // does not eliminate all traces, only the one buffer this function fully
 // controls).
 //
-// RED LINE (task-E-design-note.md's "RED LINES" + this task's own): the
+// SECURITY: the
 // caller must never log, persist, print, or return this value beyond the
 // single Create call it is injected into — see
 // cmd/event/subscription/create.go's doCreateSubscription (the sole

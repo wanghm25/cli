@@ -122,7 +122,7 @@ func TestTryNotify_NilNotifySafe(t *testing.T) {
 // event carries header.subscription{subscription_id,resource,authority{type,
 // principal_id},subscription_event_id} — buildRawHandler must normalize all
 // four into RawEvent, with a "user" authority rendering as "user:<open_id>"
-// (spec §4.3, matching cmd/event/subscription/subscription.go's formatAuthority
+// (matching cmd/event/subscription/subscription.go's formatAuthority
 // vocabulary).
 func TestRawHandlerSubscriptionEnvelope_UserAuthority(t *testing.T) {
 	s := &FeishuSource{}
@@ -246,7 +246,7 @@ func TestFormatSubscriptionAuthority(t *testing.T) {
 	}
 }
 
-// --- Task 17: subscription lifecycle handler registration (spec §5.1) -----
+// --- subscription lifecycle handler registration ---
 
 // lifecyclePayload synthesizes a raw WS push payload for one of the SDK's 6
 // subscription lifecycle meta-events, mirroring the SDK's own
@@ -264,8 +264,8 @@ func lifecyclePayload(eventType, eventBody string) []byte {
 	}`, eventType, eventBody))
 }
 
-// TestBuildDispatcher_RegistersAllSixLifecycleHandlers_NoPanic locks spec
-// §5.1: all 6 typed handlers must register without the SDK dispatcher's
+// TestBuildDispatcher_RegistersAllSixLifecycleHandlers_NoPanic locks that
+// all 6 typed handlers must register without the SDK dispatcher's
 // duplicate-registration panic, and each must reach OnLifecycleEvent.
 func TestBuildDispatcher_RegistersAllSixLifecycleHandlers_NoPanic(t *testing.T) {
 	s := &FeishuSource{}
@@ -305,7 +305,7 @@ func TestBuildDispatcher_RegistersAllSixLifecycleHandlers_NoPanic(t *testing.T) 
 }
 
 // recordingEncryptKeyProvider is a structural larkevent.EncryptKeyProvider that
-// records which subscription_ids it was asked for (Module E wiring tests).
+// records which subscription_ids it was asked for (decryption wiring tests).
 type recordingEncryptKeyProvider struct {
 	mu    sync.Mutex
 	asked []string
@@ -320,11 +320,11 @@ func (r *recordingEncryptKeyProvider) EncryptKey(_ context.Context, subID string
 	return r.key, r.ok
 }
 
-// encryptedEnvelope is a whole-envelope encrypted subscription push body (spec
-// §4.7): top-level plaintext encrypt_info (routing) + encrypt (ciphertext).
+// encryptedEnvelope is a whole-envelope encrypted subscription push body:
+// top-level plaintext encrypt_info (routing) + encrypt (ciphertext).
 const encryptedEnvelope = `{"encrypt_info":{"subscription":{"subscription_id":"sub_enc_1"}},"encrypt":"not-real-ciphertext"}`
 
-// TestBuildDispatcher_EncryptKeyProviderConsultedAndFailClosed proves task E4's
+// TestBuildDispatcher_EncryptKeyProviderConsultedAndFailClosed proves the
 // wiring: with an EncryptKeyProvider set, buildDispatcher calls
 // WithEncryptKeyProvider, so the SDK consults it (by subscription_id) for an
 // encrypted envelope. On a miss the envelope stays encrypted and fails the
@@ -352,7 +352,7 @@ func TestBuildDispatcher_EncryptKeyProviderConsultedAndFailClosed(t *testing.T) 
 
 // TestBuildDispatcher_NilEncryptKeyProvider_Unchanged proves the opt-in
 // contract: with no provider, WithEncryptKeyProvider is never called, so an
-// encrypted envelope is handled exactly as before Module E (parse-fails, no
+// encrypted envelope is handled exactly as before decryption support (parse-fails, no
 // emit) — and no provider is consulted because there is none.
 func TestBuildDispatcher_NilEncryptKeyProvider_Unchanged(t *testing.T) {
 	s := &FeishuSource{} // no EncryptKeyProvider
@@ -364,7 +364,7 @@ func TestBuildDispatcher_NilEncryptKeyProvider_Unchanged(t *testing.T) {
 	}
 }
 
-// TestBuildDispatcher_KeyPresentButDecryptFails_FailClosed_NoEmit (task E6):
+// TestBuildDispatcher_KeyPresentButDecryptFails_FailClosed_NoEmit:
 // with a key present but the ciphertext undecryptable, the SDK dispatcher
 // fail-closes — Do returns an error and emit is NEVER called (no ciphertext is
 // ever delivered as a plaintext event).
@@ -385,7 +385,7 @@ func TestBuildDispatcher_KeyPresentButDecryptFails_FailClosed_NoEmit(t *testing.
 	}
 }
 
-// TestSdkLogger_DecryptFailure_ExtractsSubscriptionID (task E6): a fail-closed
+// TestSdkLogger_DecryptFailure_ExtractsSubscriptionID: a fail-closed
 // decrypt-failure SDK Error line (the ws client wraps the dispatcher Do error)
 // fires OnDecryptFailure with the extracted subscription_id; unrelated error
 // lines never fire it. The callback only ever receives a subscription_id —
@@ -428,8 +428,8 @@ func TestBuildDispatcher_OnLifecycleEventNil_NoPanic(t *testing.T) {
 
 // TestBuildDispatcher_LifecycleEventNeverReachesEmit is the direct proof that
 // lifecycle meta-events are diverted away from business-consumer delivery
-// (spec §5.1: "生命周期 handler 属 bus 内部控制面，不直接输出给普通
-// consumer"): registering the 6 typed handlers makes the SDK route by
+// (lifecycle handlers are bus-internal control plane, not delivered to
+// ordinary consumers): registering the 6 typed handlers makes the SDK route by
 // event_type to them instead of the customized-event handler that calls
 // emit/Hub.Publish. emit fires t.Fatal if ever invoked for any of the 6.
 func TestBuildDispatcher_LifecycleEventNeverReachesEmit(t *testing.T) {
@@ -461,10 +461,10 @@ func TestBuildDispatcher_LifecycleEventNeverReachesEmit(t *testing.T) {
 }
 
 // TestBuildDispatcher_LifecycleEvents_NormalizeFields covers every one of
-// the 6 handlers' field normalization (spec §5.1's payload facts): body
+// the 6 handlers' field normalization: body
 // SubscriptionId preferred (After.SubscriptionId for updated, body-only for
 // deleted), event_id from header, suspension.code carried verbatim
-// (including an unrecognized/future value — spec §5.4's open vocabulary),
+// (including an unrecognized/future value — an open vocabulary),
 // authority formatted via the shared formatSubscriptionAuthority vocabulary.
 func TestBuildDispatcher_LifecycleEvents_NormalizeFields(t *testing.T) {
 	tests := []struct {
@@ -500,7 +500,7 @@ func TestBuildDispatcher_LifecycleEvents_NormalizeFields(t *testing.T) {
 			},
 		},
 		{
-			name:      "suspended carries an UNKNOWN suspension code verbatim (open vocabulary, spec §5.4)",
+			name:      "suspended carries an UNKNOWN suspension code verbatim (open vocabulary)",
 			eventType: lifecycleEventTypeSuspended,
 			body:      `{"subscription_id":"sub_2b","state":"suspended","suspension":{"code":"some_future_reason_cli_has_never_seen"}}`,
 			want: LifecycleEvent{
@@ -592,8 +592,8 @@ func TestBuildDispatcher_LifecycleEvents_NormalizeFields(t *testing.T) {
 }
 
 // TestBuildDispatcher_LifecycleCollisionWithBusinessType_SkipsLifecycleHandler
-// is the panic-safety guard (spec §5.1: "同一事件类型不重复注册 custom
-// handler，否则 SDK Dispatcher panic"): IF a business EventKey's event_type
+// is the panic-safety guard (registering a custom handler twice for the same
+// event type would panic the SDK Dispatcher): IF a business EventKey's event_type
 // ever collided with one of the 6 lifecycle types (none do today), buildDispatcher
 // must not panic, and the business path (already registered first) keeps
 // serving that event_type instead.

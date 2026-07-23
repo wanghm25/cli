@@ -24,7 +24,7 @@ func doHello(conn net.Conn, eventKey string, eventTypes []string, subscriptionID
 }
 
 // doHelloV2 sends an already-populated v2 Hello (refined consume's HelloV2
-// stage, design spec §4.2/§4.3 — see refined.go's buildHelloV2) and awaits
+// stage — see refined.go's buildHelloV2) and awaits
 // its ack. Shares sendHello's wire implementation with doHello so both
 // frame/deadline/decode exactly once, instead of two independently
 // maintained copies of the same protocol dance.

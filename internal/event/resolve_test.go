@@ -13,7 +13,7 @@ import (
 
 // registerResolveFixtures registers, for the duration of t, a legacy key
 // (im.message.receive_v1) and the im.message.created_v1 refined-subscription
-// base key with its two design-spec §2.2 templates (chat-id/{chat_id} and the
+// base key with its two templates (chat-id/{chat_id} and the
 // fixed-value owner/me). internal/event cannot import events/refined (that
 // package imports internal/event, not the reverse), so this mirrors
 // events/refined/refined_keys_mock.json inline rather than sharing it.
@@ -58,8 +58,8 @@ func registerResolveFixtures(t *testing.T) {
 }
 
 // assertInvalidArgument asserts err is a typed *errs.ValidationError with
-// Subtype invalid_argument and Param "event_key" (errs/ERROR_CONTRACT.md §
-// "Validation parameters": positional arguments use the canonical name
+// Subtype invalid_argument and Param "event_key" (errs/ERROR_CONTRACT.md's
+// "Validation parameters" section: positional arguments use the canonical name
 // without dashes). When hintSubstr is non-empty it must appear in Hint.
 func assertInvalidArgument(t *testing.T, err error, hintSubstr string) *errs.ValidationError {
 	t.Helper()
@@ -82,7 +82,7 @@ func assertInvalidArgument(t *testing.T, err error, hintSubstr string) *errs.Val
 	return ve
 }
 
-// TestResolveEventKey is the design spec §2.3 task-brief case list, verbatim.
+// TestResolveEventKey is the EventKey-resolution case list, verbatim.
 func TestResolveEventKey(t *testing.T) {
 	registerResolveFixtures(t)
 
@@ -95,9 +95,9 @@ func TestResolveEventKey(t *testing.T) {
 	if _, err := ResolveEventKey("im.message.receive_v1/foo/bar"); err == nil {
 		t.Fatal("legacy+suffix must fail")
 	}
-	// bare refined base key rejected (R1)
+	// bare refined base key rejected
 	if _, err := ResolveEventKey("im.message.created_v1"); err == nil {
-		t.Fatal("bare refined base must fail (R1)")
+		t.Fatal("bare refined base must fail")
 	}
 	// placeholder template -> target_resource
 	r, err = ResolveEventKey("im.message.created_v1/chat-id/oc_9f3b1c2d8a")
@@ -215,7 +215,7 @@ func TestResolveEventKey_EmptyValueRejected(t *testing.T) {
 
 // MissingSegmentAndValue: a refined base key with a "/" but no path-segment
 // (or with a path-segment but no value) is still "not materialized" and
-// falls back to the same R1 guidance as the fully bare base key.
+// falls back to the same guidance as the fully bare base key.
 func TestResolveEventKey_MissingSegmentAndValue(t *testing.T) {
 	registerResolveFixtures(t)
 
@@ -241,7 +241,7 @@ func TestResolveEventKey_UnicodeValueRoundTrips(t *testing.T) {
 	}
 }
 
-// SpecialCharsTreatedAsOneOpaqueValue covers spec §2.3's "/ ? & = %" edge
+// SpecialCharsTreatedAsOneOpaqueValue covers the "/ ? & = %" edge
 // case together with "duplicate selector": the raw value looks like a
 // duplicate-key query string (chat_id appearing twice via "a=1&a=2") plus a
 // literal '?' and a validly-escaped '%'. ResolveEventKey must not re-parse

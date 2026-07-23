@@ -449,7 +449,7 @@ func TestApplyRemoteSubscriptionPlan_Suspended_CallsReactivateNotCreate(t *testi
 	}
 }
 
-// ---- E5: encrypted create (key-gen atomicity + no-key-on-non-create) ----
+// ---- encrypted create (key-gen atomicity + no-key-on-non-create) ----
 
 // TestApplyRemoteSubscriptionPlan_EncryptedCreate_GeneratesKeyExactlyOnce locks
 // that an encrypted create (includeResourceData=true) generates a fresh key via
@@ -481,7 +481,7 @@ func TestApplyRemoteSubscriptionPlan_EncryptedCreate_GeneratesKeyExactlyOnce(t *
 
 // TestApplyRemoteSubscriptionPlan_PlaintextAndReuse_NeverGenerateKey proves the
 // key is generated ONLY on an encrypted create — never for a plaintext create,
-// a reuse, or a suspended reactivate (spec §4.7 / task E5).
+// a reuse, or a suspended reactivate.
 func TestApplyRemoteSubscriptionPlan_PlaintextAndReuse_NeverGenerateKey(t *testing.T) {
 	var keyGenCalls int
 	restore := newEncryptKeyFunc
@@ -506,7 +506,7 @@ func TestApplyRemoteSubscriptionPlan_PlaintextAndReuse_NeverGenerateKey(t *testi
 }
 
 // TestApplyRemoteSubscriptionPlan_EncryptedCreate_KeyGenFailure_FailClosed:
-// a key-gen failure aborts the create — never a plaintext fallback (spec §4.7).
+// a key-gen failure aborts the create — never a plaintext fallback.
 func TestApplyRemoteSubscriptionPlan_EncryptedCreate_KeyGenFailure_FailClosed(t *testing.T) {
 	restore := newEncryptKeyFunc
 	newEncryptKeyFunc = func() (string, error) { return "", errors.New("csprng unavailable") }
@@ -523,7 +523,7 @@ func TestApplyRemoteSubscriptionPlan_EncryptedCreate_KeyGenFailure_FailClosed(t 
 }
 
 // TestBuildRefinedCreateBody_AtomicEncrypt proves the encrypt_key is set on the
-// SAME body as include_resource_data (spec §4.7 atomicity), and that a
+// SAME body as include_resource_data (atomicity), and that a
 // plaintext body carries no encrypt block.
 func TestBuildRefinedCreateBody_AtomicEncrypt(t *testing.T) {
 	enc := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", true, "THE_KEY")
@@ -673,8 +673,8 @@ func TestRunRefinedChain_DryRun_OnlyProbeAndPlanRun_NoApplyNoBusNoWrite(t *testi
 }
 
 func TestRunRefinedChain_DryRun_EvenOnConflictingPlan_ReportsInformationallyNoError(t *testing.T) {
-	// Mirrors event.subscription create --dry-run's own precedent (spec
-	// §3.4): dry-run ALWAYS reports the plan informationally, even
+	// Mirrors event.subscription create --dry-run's own precedent:
+	// dry-run ALWAYS reports the plan informationally, even
 	// conflict/suspended -- only preflight itself can fail a dry-run. Only a
 	// REAL (non-dry-run) run turns a conflict into a typed error.
 	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_conflict")}
@@ -939,7 +939,7 @@ func TestRunRefinedChain_Suspended_NonDryRun_AppliesReactivateNotError(t *testin
 	}
 }
 
-// ---- E5: prewarm-before-ready ----
+// ---- prewarm-before-ready ----
 
 // closeRecorder wraps a net.Conn to observe whether Close was called (the
 // rollback signal for a prewarm failure).
@@ -954,7 +954,7 @@ func (c *closeRecorder) Close() error {
 }
 
 // TestRunRefinedChain_Prewarm_RunsAfterHelloBeforeReady_Success proves the
-// prewarm step runs AFTER hello and BEFORE the consumer starts (spec §4.7
+// prewarm step runs AFTER hello and BEFORE the consumer starts (in that
 // ordering), and that a successful prewarm lets the chain proceed normally.
 func TestRunRefinedChain_Prewarm_RunsAfterHelloBeforeReady_Success(t *testing.T) {
 	rec := &orderRecorder{}
@@ -1048,7 +1048,7 @@ func TestRunRefinedChain_PrewarmFails_NotReady_RollsBack(t *testing.T) {
 
 // TestRunRefinedChain_PrewarmTransientError_ReturnedUnchanged proves a
 // transient prewarm failure (network) is surfaced as its original retryable
-// error, NOT relabeled as a decrypt conflict (the E2-review lesson).
+// error, NOT relabeled as a decrypt conflict.
 func TestRunRefinedChain_PrewarmTransientError_ReturnedUnchanged(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()

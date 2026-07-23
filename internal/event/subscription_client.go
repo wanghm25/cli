@@ -11,7 +11,7 @@ import (
 
 	// larkeventv1 alias is REQUIRED: this package's declared name is
 	// larkevent, which collides with the core oapi-sdk-go/v3/event package
-	// (also larkevent) — spec §0.4.
+	// (also larkevent).
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
 	"github.com/larksuite/cli/errs"
@@ -22,9 +22,8 @@ import (
 
 // subscriptionService is the subset of the candidate SDK's typed
 // client.Event.V1.Subscription surface this CLI needs: Create/Get/List/
-// Patch/Renew/Reactivate/Delete for Phase-B `event subscription` commands
-// (see spec §0.2/§9), plus GetEncryptKey — added as a Module E (message
-// decryption) foundation, see task-E-design-note.md's task E1 — which fetches
+// Patch/Renew/Reactivate/Delete for the `event subscription` commands,
+// plus GetEncryptKey — a message-decryption foundation that fetches
 // a subscription's encrypt_key but is not yet called by any command.
 // ListByIterator remains out of scope.
 //
@@ -50,11 +49,11 @@ type subscriptionService interface {
 // the first typed-SDK-service-client usage in this CLI; everywhere else goes
 // through APIClient.DoSDKRequest's raw transport path). It binds one
 // already-resolved CLI identity to the correct per-call access-token option
-// for its whole lifetime, so Phase-B `event subscription` command code calls
+// for its whole lifetime, so the `event subscription` command code calls
 // Create/Get/List/Patch/Renew/Reactivate/Delete without ever handling
 // larkcore.RequestOptionFunc or identity branching itself.
 //
-// Per spec §0.4/§3.2: a user identity carries a larkcore.WithUserAccessToken
+// A user identity carries a larkcore.WithUserAccessToken
 // option on every call; an app/bot identity carries none at all — the SDK
 // mints and caches its own tenant access token from the appID/secret already
 // configured on the *lark.Client. This mirrors how the fork's own e2e harness
@@ -62,7 +61,7 @@ type subscriptionService interface {
 //
 // This client never falls back from one identity to the other: construction
 // fails closed (typed error) instead of guessing, matching the "no silent
-// identity switch" rule that governs the rest of this feature (spec §2.8).
+// identity switch" rule that governs the rest of this feature.
 type SubscriptionClient struct {
 	svc      subscriptionService
 	identity core.Identity
@@ -104,7 +103,7 @@ func newSubscriptionClient(svc subscriptionService, as core.Identity, uat string
 
 // identityOptions returns the per-call larkcore.RequestOptionFunc list for an
 // already-resolved identity: exactly one WithUserAccessToken(uat) for
-// core.AsUser, none for core.AsBot (spec §0.4). Any other identity value
+// core.AsUser, none for core.AsBot. Any other identity value
 // (notably core.AsAuto — "--as auto" must already have been resolved to a
 // concrete identity before reaching this adapter) is rejected rather than
 // defaulted.
@@ -120,7 +119,7 @@ func identityOptions(as core.Identity, uat string) ([]larkcore.RequestOptionFunc
 	case core.AsBot:
 		// No per-call token option: the SDK mints/caches its own tenant
 		// access token from the appID/secret already configured on the
-		// *lark.Client (spec §0.4). uat is intentionally ignored here so a
+		// *lark.Client. uat is intentionally ignored here so a
 		// stray/leftover value never leaks onto a bot-identity call.
 		return nil, nil
 	default:
@@ -154,11 +153,10 @@ func (c *SubscriptionClient) Get(ctx context.Context, req *larkeventv1.GetSubscr
 }
 
 // GetEncryptKey wraps client.Event.V1.Subscription.GetEncryptKey with the
-// bound identity option. Added as a Module E (message decryption) foundation
-// (task-E-design-note.md's task E1): fetches the given subscription's
-// encrypt_key so a later task's bus-side EncryptKeyProvider can decrypt its
-// events. Requires scope event:encrypt_key:read, which read/write do not
-// imply. Not yet called by any command — later Module E tasks wire it in.
+// bound identity option. A message-decryption foundation: fetches the given
+// subscription's encrypt_key so a later bus-side EncryptKeyProvider can
+// decrypt its events. Requires scope event:encrypt_key:read, which read/write do not
+// imply. Not yet called by any command — later work wires it in.
 func (c *SubscriptionClient) GetEncryptKey(ctx context.Context, req *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
 	resp, err := c.svc.GetEncryptKey(ctx, req, c.opts...)
 	if err != nil {

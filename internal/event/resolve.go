@@ -14,8 +14,8 @@ import (
 // ResolvedEventKey is the result of resolving a caller-supplied EventKey
 // string: either a legacy key (looked up as-is, IsRefined false) or a
 // refined-subscription key materialized from a base key + template +
-// selector value (design spec §2.3). Authority is deliberately not part of
-// this shape — the caller binds it from the resolved --as identity (§2.8);
+// selector value. Authority is deliberately not part of
+// this shape — the caller binds it from the resolved --as identity;
 // ResolveEventKey never touches identity.
 type ResolvedEventKey struct {
 	// Definition is the single registered base KeyDefinition: the legacy key
@@ -44,7 +44,7 @@ type ResolvedEventKey struct {
 // ResolveEventKey carries. The whole function operates on a single
 // positional <EventKey> argument (as shown in `event consume <EventKey>` /
 // `event subscription create <refined EventKey>`), so — per
-// errs/ERROR_CONTRACT.md § "Validation parameters" ("for positional
+// errs/ERROR_CONTRACT.md's "Validation parameters" section ("for positional
 // arguments, use the canonical name without dashes") — Param is the
 // canonical snake_case name for that argument, not its bracketed usage
 // placeholder.
@@ -53,10 +53,10 @@ const paramEventKey = "event_key"
 // ResolveEventKey resolves a caller-supplied EventKey string to either a
 // legacy KeyDefinition (exact registry match) or a materialized
 // refined-subscription key (base + template + selector value). It is a pure
-// function: no registry mutation, no identity/authority binding (design spec
-// §2.8 — that is the caller's job once it has resolved --as). Lookup itself
+// function: no registry mutation, no identity/authority binding
+// (that is the caller's job once it has resolved --as). Lookup itself
 // stays frozen and exact-match-only; this is the only refined-aware entry
-// point (design spec §2.3/§2.4).
+// point.
 func ResolveEventKey(input string) (ResolvedEventKey, error) {
 	// Step 1: exact match first. Legacy keys accept ONLY an exact match —
 	// they never enter the split path below, even when input happens to
@@ -110,8 +110,8 @@ func ResolveEventKey(input string) (ResolvedEventKey, error) {
 
 	// Fixed-value templates (e.g. owner/me) compare the raw extracted value
 	// verbatim, before URL decoding — the fixed value itself is a plain
-	// literal, never percent-encoded, so this ordering matches design spec
-	// §2.3 step 3 (match) preceding step 4 (decode/normalize).
+	// literal, never percent-encoded, so this ordering deliberately matches
+	// before URL decoding/normalization.
 	if tmpl.FixedValue != "" && rawValue != tmpl.FixedValue {
 		return ResolvedEventKey{}, errs.NewValidationError(errs.SubtypeInvalidArgument,
 			"EventKey %s/%s requires the fixed value %q; got %q", base, seg, tmpl.FixedValue, rawValue).
@@ -144,7 +144,7 @@ func ResolveEventKey(input string) (ResolvedEventKey, error) {
 	}, nil
 }
 
-// bareRefinedBaseError implements R1: a refined-subscription base key with
+// bareRefinedBaseError implements the bare-base-key rule: a refined-subscription base key with
 // no (complete) template segment can only be used with `event
 // list`/`event schema`; consume/create must receive a materialized key such
 // as one of its KeyTemplates' Example.
@@ -180,8 +180,8 @@ func templatePathSegments(templates []KeyTemplate) []string {
 	return segs
 }
 
-// decodeSelectorValue applies the URL discipline frozen by design spec
-// §2.3: url.PathUnescape EXACTLY ONCE on raw, rejecting a malformed %
+// decodeSelectorValue applies the frozen URL discipline:
+// url.PathUnescape EXACTLY ONCE on raw, rejecting a malformed %
 // escape and rejecting a literal (unescaped) '/' in raw — which would
 // otherwise silently change how the EventKey is segmented instead of being
 // rejected outright. A '/' produced BY decoding (e.g. raw "%2F") is fine and

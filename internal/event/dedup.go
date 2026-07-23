@@ -71,7 +71,7 @@ func (d *DedupFilter) cleanupExpired(now time.Time) {
 }
 
 // RefinedDedupKey builds the dedup key for the refined-subscription domain,
-// with a frozen fallback priority (spec §4.3):
+// with a frozen fallback priority:
 //
 //	① remote_subscription_id + subscription_event_id (preferred: unique within
 //	   the remote Subscription's own event enumeration).

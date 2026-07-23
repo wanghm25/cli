@@ -15,14 +15,14 @@ import (
 	"github.com/larksuite/cli/internal/event/transport"
 )
 
-// ProbeBusEligibility is the refined consume startup chain's first stage
-// (design spec §4.2/§4.9): STRICTLY read-only — it never forks a bus and
+// ProbeBusEligibility is the refined consume startup chain's first stage:
+// STRICTLY read-only — it never forks a bus and
 // never writes anything remote. It runs two checks, in this order:
 //
 //   - (b) local FIRST: busctl.QueryStatus(tr, appID) reads the local bus's
 //     status_response, if any.
 //   - If a local bus IS already reachable, that is the ordinary
-//     N-refined-consumers-share-one-bus case (spec §4.3): its
+//     N-refined-consumers-share-one-bus case: its
 //     status_response must advertise the v2 capability markers
 //     (protocol_version + refined_routing + hello_v2). An old
 //     (pre-refined) bus never sets these at all — their ABSENCE, not a
@@ -30,7 +30,7 @@ import (
 //     protocol.StatusResponse's own doc comment). Attaching a refined
 //     consumer to such a bus would silently misroute or drop dual-indexed
 //     events (it does not understand HelloV2 fields or
-//     remote_subscription_id routing — Task 13/14), so this fails closed:
+//     remote_subscription_id routing), so this fails closed:
 //     typed failed_precondition, Hint prompts `event stop`. The (a) remote
 //     check below is deliberately NOT run in this branch — see why below.
 //   - (a) remote, ONLY if no local bus answered: reuses

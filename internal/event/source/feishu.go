@@ -16,7 +16,7 @@ import (
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	// larkeventv1 alias is REQUIRED (mirrors internal/event/subscription_client.go):
-	// this package's declared name is ALSO "larkevent" (spec §0.4's documented
+	// this package's declared name is ALSO "larkevent" (a documented
 	// collision with the core event package aliased above), so it must be
 	// aliased distinctly.
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
@@ -44,7 +44,7 @@ type FeishuSource struct {
 	OnConnReady func(ctx context.Context, connID string, bindUser func(ctx context.Context, uat string) error)
 
 	// OnLifecycleEvent is invoked from the 6 typed subscription lifecycle
-	// handlers registered in buildDispatcher (spec §5.1) whenever the SDK
+	// handlers registered in buildDispatcher whenever the SDK
 	// routes one of the event.subscription.*_v1 meta-events to this source —
 	// le is already normalized (see LifecycleEvent's own doc). Same
 	// plain-func-over-plain-value reasoning as OnConnReady above: the bus-side
@@ -55,19 +55,19 @@ type FeishuSource struct {
 
 	// EncryptKeyProvider supplies per-subscription_id encrypt_keys so the SDK
 	// EventDispatcher can transparently decrypt whole-envelope encrypted
-	// subscription events (spec §4.7, Module E). An SDK interface type
+	// subscription events. An SDK interface type
 	// (larkevent.EncryptKeyProvider) so this SDK-typed-only package needs no
 	// bus import — the bus wires its own implementation in (bus.go's
 	// startSources). nil is tolerated and is the 100%-unchanged path: without
 	// it buildDispatcher never calls WithEncryptKeyProvider, so an encrypted
 	// envelope simply fails the existing parse (fail-closed, no plaintext
-	// fallback) exactly as before Module E. The key never crosses back out of
+	// fallback) exactly as before decryption support. The key never crosses back out of
 	// the SDK through this field.
 	EncryptKeyProvider larkevent.EncryptKeyProvider
 
 	// OnDecryptFailure is invoked (best-effort) when the SDK dispatcher
-	// fail-closes on an undecryptable subscription envelope (spec §4.7, Module
-	// E task E6). The undecryptable event is already dropped by the SDK — it
+	// fail-closes on an undecryptable subscription envelope. The undecryptable
+	// event is already dropped by the SDK — it
 	// never reaches emit/Hub/stdout; this is purely so the bus can count the
 	// failure and mark the matched consumer degraded. subscriptionID is parsed
 	// from the SDK's stable decrypt-failure log line (the SDK exposes no typed
@@ -77,13 +77,13 @@ type FeishuSource struct {
 }
 
 // LifecycleEvent is FeishuSource's normalized shape for one of the SDK's 6
-// subscription lifecycle meta-events (spec §5.1: activated/updated/
+// subscription lifecycle meta-events (activated/updated/
 // suspended/expiration_reminder/expired/deleted). Every field is a plain
 // primitive (never an SDK pointer type) since this crosses the
 // OnLifecycleEvent boundary into internal/event/bus — bus.go already imports
 // this package (source.FeishuSource/source.Source/source.All()), so this
 // package must never import bus back; defining LifecycleEvent here (rather
-// than in bus, which is where the design note originally located it) is what
+// than in bus) is what
 // keeps that one-way dependency intact. internal/event/bus/lifecycle.go
 // re-exports this exact type under its own package via a type alias so bus
 // code never has to spell out the "source." package qualifier.
@@ -91,8 +91,8 @@ type LifecycleEvent struct {
 	EventType string // header.event_type, e.g. "event.subscription.suspended_v1"
 	EventID   string // header.event_id
 
-	// RemoteSubscriptionID prefers the event BODY's subscription_id (spec
-	// §5.1's payload facts): After.SubscriptionId for updated_v1 (Before is
+	// RemoteSubscriptionID prefers the event BODY's subscription_id:
+	// After.SubscriptionId for updated_v1 (Before is
 	// never used), the top-level SubscriptionId for the other 5 (deleted_v1's
 	// body carries ONLY this field). "" means the body didn't carry one (e.g.
 	// a malformed updated_v1 with no after snapshot) — callers must treat
@@ -105,7 +105,7 @@ type LifecycleEvent struct {
 	// "deleted" value.
 	State string
 
-	// SuspensionCode is body.suspension.code carried VERBATIM (spec §5.4: an
+	// SuspensionCode is body.suspension.code carried VERBATIM (an
 	// open string, never a closed enum — an unrecognized future value must
 	// round-trip unchanged, never fail normalization). "" when absent.
 	SuspensionCode string
@@ -142,7 +142,7 @@ func (s *FeishuSource) Start(ctx context.Context, eventTypes []string, emit func
 	// cli.BindUser are read fresh on every invocation and passed straight
 	// through: THIS package/closure never memoizes them across calls. (The
 	// bus-side identityGate DOES memoize the latest (connID, bindUser) pair
-	// it receives via OnConnReady, Task 18 — so its own bindConsumer can
+	// it receives via OnConnReady — so its own bindConsumer can
 	// (re)bind a specific consumer independently of a fresh ready/reconnect
 	// event, e.g. reacting to an activated_v1/suspended_v1 lifecycle event.
 	// That memoization lives entirely downstream of this closure, which
@@ -179,13 +179,13 @@ func (s *FeishuSource) Start(ctx context.Context, eventTypes []string, emit func
 
 // buildDispatcher constructs the EventDispatcher and registers every
 // handler: business OnCustomizedEvent handlers first, then the 6
-// subscription lifecycle handlers (spec §5.1) — extracted from Start so unit
+// subscription lifecycle handlers, extracted from Start so unit
 // tests can exercise registration and routing without a live WS client
 // (mirrors buildRawHandler's own extraction below).
 func (s *FeishuSource) buildDispatcher(eventTypes []string, emit func(*event.RawEvent)) *dispatcher.EventDispatcher {
 	d := dispatcher.NewEventDispatcher("", "")
 
-	// Module E (spec §4.7): opt into per-subscription decryption. Leaving the
+	// Opt into per-subscription decryption. Leaving the
 	// provider unset keeps the non-encrypted path 100% unchanged (the SDK only
 	// consults it for envelopes carrying a top-level encrypt_info).
 	if s.EncryptKeyProvider != nil {
@@ -200,7 +200,7 @@ func (s *FeishuSource) buildDispatcher(eventTypes []string, emit func(*event.Raw
 		businessEventTypes[et] = struct{}{}
 	}
 
-	// Lifecycle handlers are bus-internal control plane only (spec §5.1):
+	// Lifecycle handlers are bus-internal control plane only:
 	// registering them here makes the SDK route these 6 event types (by
 	// header.event_type) to dispatchLifecycleEvent instead of
 	// rawHandler/emit — they must NEVER reach Hub.Publish/business consumers.
@@ -209,9 +209,9 @@ func (s *FeishuSource) buildDispatcher(eventTypes []string, emit func(*event.Raw
 	return d
 }
 
-// --- subscription lifecycle handlers (spec §5.1) --------------------------
+// --- subscription lifecycle handlers ---
 
-// The 6 subscription lifecycle meta-event types (SDK facts, spec §0.4/§5.1).
+// The 6 subscription lifecycle meta-event types (SDK facts).
 // NO "deactivated" — suspend is "suspended_v1", carrying suspension.code.
 const (
 	lifecycleEventTypeActivated          = "event.subscription.activated_v1"
@@ -364,10 +364,10 @@ func (s *FeishuSource) handleSubscriptionExpired(ctx context.Context, e *larkeve
 	return nil
 }
 
-// handleSubscriptionUpdated normalizes the AFTER snapshot (spec §5.1: "updated
+// handleSubscriptionUpdated normalizes the AFTER snapshot ("updated
 // → e.Event.After.SubscriptionId"); Before is never used for normalization.
 // A nil After (a malformed/unexpected payload) normalizes to a
-// RemoteSubscriptionID=="" event — Submit's own validation (spec §5.2) drops
+// RemoteSubscriptionID=="" event — Submit's own validation drops
 // that, so no special early-return is needed here.
 func (s *FeishuSource) handleSubscriptionUpdated(ctx context.Context, e *larkeventv1.P2SubscriptionUpdatedV1) error {
 	if e == nil || e.Event == nil {
@@ -384,7 +384,7 @@ func (s *FeishuSource) handleSubscriptionUpdated(ctx context.Context, e *larkeve
 	return nil
 }
 
-// handleSubscriptionDeleted is body-only (spec §5.1: deleted_v1's SDK body
+// handleSubscriptionDeleted is body-only (deleted_v1's SDK body
 // carries ONLY subscription_id — no target_resource/authority/state/
 // suspension/expire_time to normalize).
 func (s *FeishuSource) handleSubscriptionDeleted(ctx context.Context, e *larkeventv1.P2SubscriptionDeletedV1) error {
@@ -416,8 +416,8 @@ func (s *FeishuSource) buildRawHandler(emit func(*event.RawEvent)) func(context.
 				EventID    string `json:"event_id"`
 				EventType  string `json:"event_type"`
 				CreateTime string `json:"create_time"`
-				// Subscription is the refined-subscription push envelope
-				// (spec §4.3/§0.4): SDK event/model.go's EventHeader.Subscription
+				// Subscription is the refined-subscription push envelope:
+				// SDK event/model.go's EventHeader.Subscription
 				// shape (resource/authority{type,principal_id}), NOT the OpenAPI
 				// management-side Subscription (target_resource/authority{open_id,
 				// union_id,app_id}) — do not conflate the two. Absent on
@@ -499,7 +499,7 @@ func formatSubscriptionAuthority(authType, principalID string) string {
 type sdkLogger struct {
 	l      *log.Logger
 	notify StatusNotifier
-	// onDecryptFailure (Module E, task E6) is called with the subscription_id
+	// onDecryptFailure is called with the subscription_id
 	// extracted from a fail-closed decrypt-failure SDK Error line. nil = not wired.
 	onDecryptFailure func(subscriptionID string)
 }
@@ -534,7 +534,7 @@ func (a *sdkLogger) Error(_ context.Context, args ...interface{}) {
 	if a.l != nil {
 		a.l.Output(2, "[SDK ERROR] "+msg)
 	}
-	// Module E (task E6): a fail-closed subscription decrypt failure surfaces
+	// A fail-closed subscription decrypt failure surfaces
 	// here (the WS client logs the dispatcher's Do error via this logger).
 	// Detect it and hand the subscription_id to the bus for counting/degrade.
 	a.tryDecryptFailure(msg)
@@ -543,7 +543,7 @@ func (a *sdkLogger) Error(_ context.Context, args ...interface{}) {
 }
 
 // tryDecryptFailure fires onDecryptFailure with the subscription_id parsed from
-// a fail-closed decrypt-failure SDK Error line (Module E, task E6). Best-effort:
+// a fail-closed decrypt-failure SDK Error line. Best-effort:
 // no callback wired, or a line that is not a decrypt failure, is a no-op.
 func (a *sdkLogger) tryDecryptFailure(msg string) {
 	if a.onDecryptFailure == nil {

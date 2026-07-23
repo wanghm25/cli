@@ -129,7 +129,7 @@ func TestHelloAckRejected_RoundTrip(t *testing.T) {
 	}
 }
 
-// --- IPC protocol v2 additive fields (spec §4.2) ---
+// --- IPC protocol v2 additive fields ---
 //
 // These tests cover three things per frame: (1) a v2-populated frame
 // round-trips through Encode/Decode preserving every new field, (2) the
@@ -137,7 +137,7 @@ func TestHelloAckRejected_RoundTrip(t *testing.T) {
 // untouched by the new `remote_subscription_id` field, and (3) an OLD frame
 // (marshaled as if by a pre-v2 build, i.e. missing the new keys entirely)
 // still decodes cleanly with the new fields left at their zero value and the
-// old fields intact — this is the backward-compat contract §4.2 requires.
+// old fields intact — this is the required backward-compat contract.
 
 func TestHello_V2FieldsRoundTrip(t *testing.T) {
 	h := &Hello{
@@ -351,28 +351,28 @@ func TestDecode_OldStatusResponse_BackwardCompat(t *testing.T) {
 	if sr.ProtocolVersion != "" || sr.Capabilities != nil || sr.RegisteredEventTypes != nil {
 		t.Errorf("v2 fields should be zero-valued decoding an old frame, got %+v", sr)
 	}
-	// Task 16 (spec §4.6): the old consumer entry above carries none of the
+	// The old consumer entry above carries none of the
 	// refined-status fields at all — every one of them must decode
 	// zero-valued, exactly like the StatusResponse-level v2 fields above.
 	c := sr.Consumers[0]
 	if c.RefinedSubscription || c.RemoteSubscriptionID != "" || c.OwnerIdentity != "" ||
 		c.OwnerAppID != "" || c.OwnerUserOpenID != "" || c.StaleIdentity || c.DegradedReason != "" ||
 		c.RemoteState != "" || c.RemoteSubscription != nil || c.LastLifecycleEvent != "" {
-		t.Errorf("Task 16 ConsumerInfo fields should be zero-valued decoding an old frame, got %+v", c)
+		t.Errorf("refined-status ConsumerInfo fields should be zero-valued decoding an old frame, got %+v", c)
 	}
-	// Task 18 (spec §5.5): same additive-field guarantee for the 4 action
-	// fields added on top of Task 16/17's shape.
+	// Same additive-field guarantee for the 4 action
+	// fields added on top of the earlier shape.
 	if c.SuspensionReason != "" || c.LastAction != "" || c.LastActionError != "" || c.NextAction != "" {
-		t.Errorf("Task 18 ConsumerInfo action fields should be zero-valued decoding an old frame, got %+v", c)
+		t.Errorf("lifecycle-action ConsumerInfo fields should be zero-valued decoding an old frame, got %+v", c)
 	}
-	// Module E (task E7): the decryption observability fields are additive too
+	// The decryption observability fields are additive too
 	// — an old frame decodes them zero-valued.
 	if c.DecryptState != "" || c.LastDecryptError != nil || c.ResourceData != "" {
-		t.Errorf("Module E ConsumerInfo decrypt fields should be zero-valued decoding an old frame, got %+v", c)
+		t.Errorf("decryption ConsumerInfo fields should be zero-valued decoding an old frame, got %+v", c)
 	}
 }
 
-// TestConsumerInfo_DecryptFieldsRoundTrip locks that the Module E (task E7)
+// TestConsumerInfo_DecryptFieldsRoundTrip locks that the
 // decrypt observability fields round-trip through Encode/Decode.
 func TestConsumerInfo_DecryptFieldsRoundTrip(t *testing.T) {
 	sr := &StatusResponse{
@@ -402,14 +402,14 @@ func TestConsumerInfo_DecryptFieldsRoundTrip(t *testing.T) {
 	}
 }
 
-// --- Task 16 additive ConsumerInfo fields (spec §4.6) ---
+// --- refined-status additive ConsumerInfo fields ---
 //
 // Mirrors the v2-additive-field test shape already established above for
 // Hello/Event/StatusResponse: (1) a fully-populated ConsumerInfo round-trips
 // through Encode/Decode inside a StatusResponse, and (2) omitempty means a
-// ConsumerInfo built the old way (only the pre-Task-16 fields set) marshals
-// to exactly the old wire shape, byte for byte indistinguishable from a
-// pre-Task-16 build.
+// ConsumerInfo built the old way (only the earlier fields set) marshals
+// to exactly the old wire shape, byte for byte indistinguishable from
+// an older build.
 
 func TestConsumerInfo_V2FieldsRoundTrip(t *testing.T) {
 	ci := ConsumerInfo{
@@ -476,17 +476,17 @@ func TestConsumerInfo_V2FieldsOmittedWhenZero(t *testing.T) {
 		`"last_lifecycle_event"`,
 	} {
 		if bytes.Contains(data, []byte(key)) {
-			t.Errorf("zero-valued Task 16 field leaked onto wire: %s in %s", key, data)
+			t.Errorf("zero-valued refined-status field leaked onto wire: %s in %s", key, data)
 		}
 	}
 }
 
-// --- Task 18 additive ConsumerInfo action fields (spec §5.5) ---------------
+// --- lifecycle-action additive ConsumerInfo fields ---
 //
-// Mirrors the Task 16 v2-additive-field test shape immediately above: (1) a
+// Mirrors the refined-status additive-field test shape immediately above: (1) a
 // fully-populated ConsumerInfo round-trips through Encode/Decode inside a
 // StatusResponse, and (2) omitempty means a ConsumerInfo built the old way
-// (only pre-Task-18 fields set) marshals to exactly the old wire shape.
+// (only the earlier fields set) marshals to exactly the old wire shape.
 
 func TestConsumerInfo_Task18ActionFieldsRoundTrip(t *testing.T) {
 	ci := ConsumerInfo{
@@ -539,19 +539,19 @@ func TestConsumerInfo_Task18ActionFieldsOmittedWhenZero(t *testing.T) {
 		`"suspension_reason"`, `"last_action"`, `"last_action_error"`, `"next_action"`,
 	} {
 		if bytes.Contains(data, []byte(key)) {
-			t.Errorf("zero-valued Task 18 field leaked onto wire: %s in %s", key, data)
+			t.Errorf("zero-valued lifecycle-action field leaked onto wire: %s in %s", key, data)
 		}
 	}
 }
 
-// --- Task 16 review fix wave: RemoteSubscriptionInfo refinements -----------
+// --- RemoteSubscriptionInfo refinements ---
 //
-// Fix A support: SuspensionCode carries the remote Subscription's
+// SuspensionCode carries the remote Subscription's
 // suspension code verbatim (SDK service/event/v1/model.go's Suspension.Code
-// doc: "仅 state=suspended 时返回") so status.go's remoteDegradedAdvisory can
+// doc says it is returned only when state=suspended) so status.go's remoteDegradedAdvisory can
 // include it in a "suspended" advisory without re-fetching or guessing
 // anything — this package only carries the value, it does not interpret it.
-// Fix B: IncludeResourceData gains `,omitempty` for consistency with its two
+// IncludeResourceData gains `,omitempty` for consistency with its two
 // siblings (State, ExpireTime) — harmless either way since the enclosing
 // RemoteSubscription pointer is already omitempty, but kept consistent.
 

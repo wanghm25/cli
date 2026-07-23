@@ -132,7 +132,7 @@ func TestDedupFilter_TTLExpiryAfterCleanupRunRespected(t *testing.T) {
 	}
 }
 
-// RefinedDedupKey priority is frozen (spec §4.3): ① remote_subscription_id +
+// RefinedDedupKey priority is frozen: ① remote_subscription_id +
 // subscription_event_id; ② fallback to remote_subscription_id + event_id when
 // subscription_event_id is absent; ③ neither available → ok=false (caller must
 // deliver without dedup and log a warning). remoteSubID=="" always yields

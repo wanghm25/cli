@@ -8,8 +8,8 @@ import (
 	"testing"
 )
 
-// ---- newEncryptKey (Module E task E2 — task-E-design-note.md's "密钥创建
-//与来源": CLI-generated, CSPRNG, in-memory only, no --encrypt-key flag) ----
+// ---- newEncryptKey (CLI-generated, CSPRNG, in-memory only, no
+// --encrypt-key flag) ----
 
 // TestNewEncryptKey_ReturnsNonEmptyString locks the most basic contract:
 // callers (cmd/event/subscription/create.go's encrypted-create path) must
@@ -51,7 +51,7 @@ func TestNewEncryptKey_DecodesTo32BytesOfEntropy(t *testing.T) {
 
 // TestNewEncryptKey_DistinctAcrossCalls locks that this is a genuine
 // CSPRNG-backed generator, not a fixed/static string: two independent calls
-// must never collide (spec §4.7 "密钥创建与来源": a fresh per-subscription
+// must never collide (a fresh per-subscription
 // key every Create).
 func TestNewEncryptKey_DistinctAcrossCalls(t *testing.T) {
 	const attempts = 8

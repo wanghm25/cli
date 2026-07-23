@@ -15,7 +15,7 @@ import (
 // resolveOwnerMeForAuthCheck / resolveChatIDForAuthCheck give
 // TestCheckTemplateAuthTypes_* a real matched ResolvedEventKey.Template
 // (registerResolveFixtures, resolve_test.go) rather than a hand-built one --
-// CheckTemplateAuthTypes is the actual §2.8 tier-2 write-safety gate shared
+// CheckTemplateAuthTypes is the actual tier-2 write-safety gate shared
 // by both `event subscription create` (cmd/event/subscription/create.go)
 // and the refined `event consume` startup chain
 // (cmd/event/consume.go:runRefinedConsume), so it must be exercised against
@@ -70,9 +70,9 @@ func TestCheckTemplateAuthTypes_IdentityIsMember_ReturnsNil(t *testing.T) {
 }
 
 // TestCheckTemplateAuthTypes_IdentityNotMember_ReturnsTypedFailedPrecondition
-// is this task's REQUIRED write-safety case (review Fix 1): the owner/me
+// is the REQUIRED write-safety case: the owner/me
 // template only supports user, so a bot identity must be rejected with the
-// §2.8 typed error -- Subtype failed_precondition, Param "--as", Hint naming
+// typed error -- Subtype failed_precondition, Param "--as", Hint naming
 // the allowed identity -- BEFORE any caller ever reaches a remote write.
 func TestCheckTemplateAuthTypes_IdentityNotMember_ReturnsTypedFailedPrecondition(t *testing.T) {
 	resolved := resolveOwnerMeForAuthCheck(t)

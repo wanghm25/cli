@@ -25,23 +25,23 @@ const (
 	SourceStateReconnecting = "reconnecting"
 )
 
-// Bus IPC protocol version + capability markers (spec §4.2). Defined once,
+// Bus IPC protocol version + capability markers. Defined once,
 // here, so every side that needs to agree on them — the bus, which
 // advertises them in StatusResponse (internal/event/bus's
-// handleStatusQuery), and a later prober (ProbeBusEligibility, Task 15b)
+// handleStatusQuery), and a later prober (ProbeBusEligibility)
 // that reads them back over status_query/status_response — references the
 // SAME identifiers instead of each hand-rolling matching string literals
 // that could silently drift out of sync.
 const (
 	// ProtocolVersionV2 is the bus's IPC protocol marker once it advertises
 	// v2 status fields (ProtocolVersion/Capabilities/RegisteredEventTypes)
-	// and understands a v2 Hello. An old (pre-Phase-C) bus never sets
+	// and understands a v2 Hello. An old (pre-v2) bus never sets
 	// StatusResponse.ProtocolVersion at all — its ABSENCE, not a mismatched
 	// value, is the incompatibility signal a prober checks for.
 	ProtocolVersionV2 = "v2"
 
 	// CapabilityRefinedRouting marks that this bus's Hub can route by
-	// remote_subscription_id (spec §4.3's dual-index routing matrix), not
+	// remote_subscription_id (the dual-index routing matrix), not
 	// just by event_type.
 	CapabilityRefinedRouting = "refined_routing"
 
@@ -69,16 +69,16 @@ type Hello struct {
 	Version        string   `json:"version"`
 	SubscriptionID string   `json:"subscription_id,omitempty"` // empty = fallback to EventKey on bus side
 
-	// --- v2 additive fields (spec §4.2). All optional/omitempty so a v1
+	// --- v2 additive fields. All optional/omitempty so a v1
 	// Hello (missing every field below) still decodes unchanged. A bus
 	// seeing them absent MUST treat the sender as a plain (non-refined) Key
 	// registration — no silent downgrade, no new requirement placed on it.
-	// Populating/consuming these is out of scope here (later Phase-C tasks);
+	// Populating/consuming these is out of scope here (later work);
 	// this struct only carries them over the wire.
 
 	// ConsumerScopeID groups fan-out for a refined-subscription consumer.
 	// Computed client-side from base key + canonical refined key + authority
-	// type + app_id + user_open_id (spec §4.3). Empty for legacy consumers.
+	// type + app_id + user_open_id. Empty for legacy consumers.
 	ConsumerScopeID string `json:"consumer_scope_id,omitempty"`
 
 	// RemoteSubscriptionID is the OpenAPI Subscription primary key (e.g.
@@ -91,12 +91,12 @@ type Hello struct {
 	// Identity is the resolved caller identity for this consumer ("user" or
 	// "bot"). Kept as a plain string rather than core.Identity to keep this
 	// package SDK/domain independent. Consumed by the bus-side owner/current
-	// identity gate (spec §4.4); this field only carries the value.
+	// identity gate; this field only carries the value.
 	Identity string `json:"identity,omitempty"`
 
 	// Profile is the active multi-app config profile name
 	// (core.AppConfig.ProfileName()) at Hello time, recorded as part of the
-	// owner identity fixed at registration (spec §4.4).
+	// owner identity fixed at registration.
 	Profile string `json:"profile,omitempty"`
 
 	// UserOpenID is the open_id of the Identity above (empty when Identity
@@ -130,7 +130,7 @@ type Event struct {
 	Seq        uint64          `json:"seq,omitempty"`
 	Payload    json.RawMessage `json:"payload"`
 
-	// --- v2 additive fields (spec §4.2/§4.3). Optional; populated only when
+	// --- v2 additive fields. Optional; populated only when
 	// this Event is fanned out for a refined-subscription consumer.
 	// Normalized from the push-envelope's EventHeader.Subscription — a
 	// DIFFERENT shape from the OpenAPI management-side Subscription
@@ -155,7 +155,7 @@ type Event struct {
 
 	// SubscriptionEventID is header.subscription.SubscriptionEventID: the
 	// preferred component of the refined dedup key, paired with
-	// RemoteSubscriptionID (spec §4.3 dedup priority ①).
+	// RemoteSubscriptionID (dedup priority ①).
 	SubscriptionEventID string `json:"subscription_event_id,omitempty"`
 }
 
@@ -186,8 +186,8 @@ type ConsumerInfo struct {
 	Received       int64  `json:"received"`
 	Dropped        int64  `json:"dropped"`
 
-	// --- refined-status additive fields (spec §4.6). All optional/omitempty
-	// so a pre-Task-16 consumer entry (only the fields above set) marshals
+	// --- refined-status additive fields. All optional/omitempty
+	// so an older consumer entry (only the fields above set) marshals
 	// to exactly the old wire shape — this is what
 	// TestDecode_OldStatusResponse_BackwardCompat pins. `event status`
 	// (cmd/event/status.go) is the sole consumer of these; Hub.Consumers()
@@ -195,7 +195,7 @@ type ConsumerInfo struct {
 	// subset — see each field's own comment for exactly which side sets it.
 
 	// RefinedSubscription is true when this consumer is bound to a remote
-	// Subscription (RemoteSubscriptionID != ""), i.e. routed by spec §4.3's
+	// Subscription (RemoteSubscriptionID != ""), i.e. routed by the
 	// dual-index matrix rather than by EventTypes() alone. A legacy consumer
 	// is always false here.
 	RefinedSubscription bool `json:"refined_subscription,omitempty"`
@@ -206,14 +206,14 @@ type ConsumerInfo struct {
 	RemoteSubscriptionID string `json:"remote_subscription_id,omitempty"`
 
 	// OwnerIdentity/OwnerAppID/OwnerUserOpenID are the owner identity fixed
-	// at this consumer's registration (spec §4.4, Hello.Identity/Profile/
+	// at this consumer's registration (Hello.Identity/Profile/
 	// UserOpenID + the bus's own AppID) — owner_app_id + owner_user_open_id
 	// is the ONLY authoritative comparison key against a freshly-resolved
 	// "current" identity; UAT is never part of this. OwnerAppID is set for
-	// EVERY consumer (bot, user, or legacy/pre-Task-15) once registered
-	// against a Phase-C bus — it is simply that bus's own AppID, so its
+	// EVERY consumer (bot, user, or legacy) once registered
+	// against a bus — it is simply that bus's own AppID, so its
 	// presence alone is not a "refined" or "user" signal. OwnerUserOpenID
-	//=="" is the discriminator for "bot or legacy/pre-Task-15 registration"
+	//=="" is the discriminator for "bot or legacy registration"
 	// (mirrors Subscriber.OwnerUserOpenID's own doc): only a non-empty
 	// OwnerUserOpenID makes current_profile_match (computed by status.go,
 	// NOT stored here — the bus does not know the querying profile)
@@ -227,26 +227,26 @@ type ConsumerInfo struct {
 	// evaluation. ADVISORY ONLY: no liveness signal exists and status is a
 	// single-shot query, so a live, actively-receiving consumer can still
 	// carry a stale flag from an earlier profile switch that was never
-	// cleared (Task-14 review Minor #1) — a display MUST NOT treat these as
+	// cleared — a display MUST NOT treat these as
 	// "this consumer is dead", only as informational.
 	StaleIdentity  bool   `json:"stale_identity,omitempty"`
 	DegradedReason string `json:"degraded_reason,omitempty"`
 
 	// RemoteState is a short summary of this consumer's remote Subscription
 	// state. Two independent producers, neither the bus's live Publish path:
-	// (a) status.go's weak, optional remote supplement (spec §4.6) sets it
+	// (a) status.go's weak, optional remote supplement sets it
 	// from a live SubscriptionClient.Get when every precondition holds — the
-	// only producer as of Task 16; (b) since Task 17, the bus itself ALSO
+	// only producer in that path; (b) the bus itself ALSO
 	// remembers the last subscription lifecycle meta-event it received for
 	// this consumer's remote Subscription (internal/event/bus/lifecycle.go's
-	// executor, via Conn.SetLifecycleSummary/Hub.Consumers()) — Task 18
-	// extends producer (b) to additionally take the real per-event action
-	// (spec §5.3/§5.4) rather than only recording a summary. Empty until
+	// executor, via Conn.SetLifecycleSummary/Hub.Consumers()) and can take
+	// the real per-event action
+	// rather than only recording a summary. Empty until
 	// either producer runs.
 	RemoteState string `json:"remote_state,omitempty"`
 
 	// RemoteSubscription carries the raw remote Subscription snapshot from
-	// status.go's remote supplement (spec §4.6) — nil unless that weak read
+	// status.go's remote supplement — nil unless that weak read
 	// actually ran and succeeded for this consumer (current app + resolvable
 	// identity + valid unrefreshed token + held event:subscription:read
 	// scope); a nil value always means "local-only for this consumer", never
@@ -254,16 +254,16 @@ type ConsumerInfo struct {
 	RemoteSubscription *RemoteSubscriptionInfo `json:"remote_subscription,omitempty"`
 
 	// LastLifecycleEvent records the most recent typed lifecycle event
-	// (Activated/Updated/Suspended/ExpirationReminder/Expired/Deleted, spec
-	// §5.1) the bus observed for this consumer's remote Subscription.
-	// POPULATED since Task 17 (Hub.Consumers(), from Conn.LastLifecycleEvent()
+	// (Activated/Updated/Suspended/ExpirationReminder/Expired/Deleted)
+	// the bus observed for this consumer's remote Subscription.
+	// POPULATED by Hub.Consumers() (from Conn.LastLifecycleEvent()
 	// — the lifecycle executor's action writes it on every processed event);
 	// "" only means "no lifecycle event observed yet for this consumer", not
 	// "not implemented".
 	LastLifecycleEvent string `json:"last_lifecycle_event,omitempty"`
 
-	// --- lifecycle ACTION fields (spec §5.5, Task 18). All optional/
-	// omitempty so a pre-Task-18 consumer entry (only the fields above set)
+	// --- lifecycle ACTION fields. All optional/
+	// omitempty so an older consumer entry (only the fields above set)
 	// marshals to exactly the old wire shape. Populated by Hub.Consumers()
 	// from the identically-named Conn getters (internal/event/bus/conn.go),
 	// which internal/event/bus/lifecycle.go's subscriptionLifecycleAction
@@ -271,13 +271,13 @@ type ConsumerInfo struct {
 	// doc for exactly when each field changes.
 
 	// SuspensionReason is the most recent suspended_v1's suspension.code,
-	// carried verbatim (spec §5.4: an open string, never a closed enum) —
+	// carried verbatim (an open string, never a closed enum) —
 	// "" once cleared by a later activated_v1, or if never suspended.
 	SuspensionReason string `json:"suspension_reason,omitempty"`
 
 	// LastAction is the most recent remote SubscriptionClient call
 	// subscriptionLifecycleAction attempted for this consumer: "reactivate" /
-	// "renew" / "get" (spec §5.2/§5.3's "at most one such call per event, no
+	// "renew" / "get" (at most one such call per event, no
 	// retry"). "" means no such call has been attempted yet.
 	LastAction string `json:"last_action,omitempty"`
 
@@ -285,21 +285,21 @@ type ConsumerInfo struct {
 	// succeeded, or LastAction itself is ""). Reuses typed error
 	// classification (errs.Problem's Category/Subtype, with permission
 	// failures normalized to "missing_scopes") rather than a new private
-	// error code (spec §5.5).
+	// error code.
 	LastActionError string `json:"last_action_error,omitempty"`
 
 	// NextAction is a short, stable hint for what an operator/AI should do
-	// next while this consumer is degraded (spec §5.5: the recovery command
+	// next while this consumer is degraded (the recovery command
 	// is uniformly "reactivate", never "reactive"/"resume"). "" means no
 	// outstanding recommendation.
 	NextAction string `json:"next_action,omitempty"`
 
-	// --- decryption observability (spec §4.7 "失败语义与可观测性", Module E
-	// task E7). All optional/omitempty so a pre-Module-E consumer entry
+	// --- decryption observability. All optional/omitempty so an older
+	// consumer entry
 	// marshals to exactly the old wire shape (TestDecode_OldStatusResponse_
 	// BackwardCompat). Populated by Hub.Consumers() from Conn's decrypt
 	// getters. A key, ciphertext, or decrypted plaintext NEVER appears here —
-	// only a short classification, a count, and a timestamp (spec §4.7 红线).
+	// only a short classification, a count, and a timestamp.
 
 	// DecryptState is this consumer's most recent decryption status:
 	// "decrypted" (a usable key is available), "decrypt_key_unavailable" (no
@@ -319,7 +319,7 @@ type ConsumerInfo struct {
 	ResourceData string `json:"resource_data,omitempty"`
 }
 
-// DecryptError is ConsumerInfo.LastDecryptError's wire shape (spec §4.7): a
+// DecryptError is ConsumerInfo.LastDecryptError's wire shape: a
 // short classification, a running count, and a timestamp — NEVER a key,
 // ciphertext, decrypted plaintext, or raw SDK error (that would risk an
 // oracle). All omitempty so an absent error contributes nothing.
@@ -330,11 +330,11 @@ type DecryptError struct {
 }
 
 // RemoteSubscriptionInfo is the CLI-facing snapshot of one remote
-// Subscription's live state (spec §4.6's `remote_subscription{state,
+// Subscription's live state (the `remote_subscription{state,
 // expire_time,include_resource_data}`), as returned by status.go's weak
 // remote supplement (internal/event/subscription_client.go's
-// SubscriptionClient.Get). Deliberately minimal — only the three fields spec
-// §4.6 names, plus SuspensionCode (added by the Task 16 review Fix A: the
+// SubscriptionClient.Get). Deliberately minimal — only those three fields,
+// plus SuspensionCode (the
 // one extra piece of the ALREADY-fetched response needed to surface a
 // grounded degraded advisory verbatim, with no new remote call) — rather
 // than reusing cmd/event/subscription's own richer subscriptionRow/
@@ -348,8 +348,8 @@ type RemoteSubscriptionInfo struct {
 	// SuspensionCode is the remote Subscription's suspension code (SDK
 	// service/event/v1/model.go's Suspension.Code), carried verbatim from
 	// status.go's remote supplement. Meaningful ONLY when State=="suspended"
-	// (the SDK's own doc: "仅 state=suspended 时返回" — "returned only when
-	// state=suspended"); "" for every other state, including a suspended
+	// (the SDK's own doc says it is returned only when
+	// state=suspended); "" for every other state, including a suspended
 	// state whose response happened to omit the Suspension object. This
 	// package does not interpret the code, it only carries it — status.go's
 	// remoteDegradedAdvisory is the sole consumer.
@@ -363,10 +363,10 @@ type StatusResponse struct {
 	ActiveConns int            `json:"active_conns"`
 	Consumers   []ConsumerInfo `json:"consumers"`
 
-	// --- v2 additive fields (spec §4.2). Optional; let a future
-	// ProbeBusEligibility (Task 15) read bus capability over the existing
+	// --- v2 additive fields. Optional; let a future
+	// ProbeBusEligibility read bus capability over the existing
 	// status_query/status_response IPC without a new message type. An old
-	// (pre-Phase-C) bus omits all three of these — their absence is itself
+	// (pre-v2) bus omits all three of these — their absence is itself
 	// the incompatibility signal a prober checks for.
 
 	// ProtocolVersion is the bus's IPC protocol marker (e.g. "v2"). Distinct

@@ -13,13 +13,13 @@ import (
 	"github.com/larksuite/cli/internal/core"
 )
 
-// Reconcile plan actions (design spec §3.3/§4.2's state table). Exported so
+// Reconcile plan actions (the remote-state state table). Exported so
 // every caller that reconciles a materialized refined EventKey against
 // remote Subscription state shares one vocabulary instead of each defining
 // its own copy: `event subscription create`
 // (cmd/event/subscription/create.go) originated this logic; the refined
 // `event consume` startup chain's PlanRemoteSubscription stage is the
-// second caller (Task 15b).
+// second caller.
 const (
 	PlanActionCreate    = "create"
 	PlanActionReuse     = "reuse"
@@ -30,8 +30,8 @@ const (
 // SubscriptionLister is the narrow read-only seam ReconcileExisting depends
 // on: enough to classify existing remote Subscription state (event_type +
 // target_resource + authority) without ever writing, so it is safe to call
-// from a --dry-run / plan-only preflight (Task 15b's
-// PlanRemoteSubscription). *SubscriptionClient satisfies this structurally
+// from a --dry-run / plan-only preflight (the
+// PlanRemoteSubscription stage). *SubscriptionClient satisfies this structurally
 // — no explicit "implements" declaration needed, Go interfaces are
 // structural.
 type SubscriptionLister interface {
@@ -41,14 +41,14 @@ type SubscriptionLister interface {
 // SubscriptionCreateAPI extends SubscriptionLister with the write path a
 // caller needs once it has decided, from a ReconcilePlan, to actually
 // create a new remote Subscription (the PlanActionCreate row of the
-// §3.3/§4.2 state table). *SubscriptionClient satisfies this structurally.
+// state table). *SubscriptionClient satisfies this structurally.
 type SubscriptionCreateAPI interface {
 	SubscriptionLister
 	Create(ctx context.Context, req *larkeventv1.CreateSubscriptionReq) (*larkeventv1.CreateSubscriptionResp, error)
 }
 
 // EncryptKeyProber is the narrow seam ReconcileExisting's encryption
-// conflict-matrix (design spec §4.7; task-E-design-note.md's task E2) needs
+// conflict-matrix needs
 // once it reaches an active, include_resource_data=true remote match AND
 // the local request also wants include_resource_data=true (i.e. wants it
 // ENCRYPTED — see ReconcileExisting's own doc comment on why "true" always
@@ -57,9 +57,8 @@ type SubscriptionCreateAPI interface {
 // genuinely encrypted, key-retrievable-by-this-identity match apart from a
 // plaintext resource_data match or one whose key this identity cannot
 // retrieve: ordinary Subscription List/Get responses never return
-// encrypt_key at all (spec §4.7 "密钥创建与来源": "普通 Subscription
-// Get/List 永远不返回密钥"). *SubscriptionClient satisfies this
-// structurally (it gained GetEncryptKey in task E1); so does
+// encrypt_key at all. *SubscriptionClient satisfies this
+// structurally (it gained GetEncryptKey earlier); so does
 // cmd/event/subscription's own createSubscriptionAPI test seam (identical
 // method signature).
 type EncryptKeyProber interface {
@@ -68,8 +67,7 @@ type EncryptKeyProber interface {
 
 // ReconcileOption customizes ReconcileExisting without changing its
 // signature for existing callers: internal/event/consume/refined.go's
-// PlanRemoteSubscription stage (a later Module E task's un-gating target —
-// out of E2's scope, and this task's scope guard forbids touching it) keeps
+// PlanRemoteSubscription stage keeps
 // calling ReconcileExisting exactly as it does today, passing zero options,
 // and remains byte-for-byte unaffected — every option this type carries only
 // changes behavior on the requestedIncludeResourceData=true path, which that
@@ -83,7 +81,7 @@ type reconcileConfig struct {
 }
 
 // WithEncryptKeyProber supplies the EncryptKeyProber ReconcileExisting uses
-// to resolve spec §4.7's encryption conflict matrix — see EncryptKeyProber's
+// to resolve the encryption conflict matrix — see EncryptKeyProber's
 // own doc comment for exactly when it is invoked. Callers whose local
 // request has requestedIncludeResourceData=false never need this option:
 // the branch it configures is unreachable for them.
@@ -92,9 +90,9 @@ func WithEncryptKeyProber(prober EncryptKeyProber) ReconcileOption {
 }
 
 // ReconcilePlan is the outcome of reconciling a create request against
-// remote state (spec §3.3/§4.2's state table), computed identically
-// whether the caller is only previewing (--dry-run, or Task 15b's
-// PlanRemoteSubscription) or is about to write — only what happens AFTER
+// remote state (the state table), computed identically
+// whether the caller is only previewing (--dry-run, or the
+// PlanRemoteSubscription stage) or is about to write — only what happens AFTER
 // the plan differs. Action is one of PlanActionCreate (no blocking match;
 // proceed to Create), PlanActionReuse (an active, payload_options-compatible
 // match exists; return it idempotently), PlanActionConflict (an active but
@@ -103,7 +101,7 @@ func WithEncryptKeyProber(prober EncryptKeyProber) ReconcileOption {
 //
 // A matched "expired" or "deleted"/invisible remote entry, or no match at
 // all, all resolve to PlanActionCreate: expired and deleted subscriptions
-// are inert (spec §3.3 explicitly withholds Renew/auto-Reactivate from
+// are inert (the platform explicitly withholds Renew/auto-Reactivate from
 // expired, but nothing blocks a fresh Create the way an active or suspended
 // entry does), so they are treated the same as "not found" rather than as a
 // separate blocking state.
@@ -113,11 +111,11 @@ type ReconcilePlan struct {
 	ConflictFields []errs.InvalidParam
 }
 
-// ReconcileExisting is the read-only half of §3.3/§4.2: it lists remote
+// ReconcileExisting is the read-only half: it lists remote
 // Subscriptions matching event_type + target_resource, narrows to the one
 // (if any) whose authority matches the effective identity, and classifies
 // it per the state table. It never writes — safe to call from --dry-run or
-// a plan-only preflight (Task 15b's PlanRemoteSubscription).
+// a plan-only preflight (the PlanRemoteSubscription stage).
 //
 // Authority matching is by type only ("user" vs "app"), not by open_id: the
 // caller is expected to always issue List using the effective identity's
@@ -127,15 +125,15 @@ type ReconcilePlan struct {
 // redundant open_id comparison would need an extra call (e.g. resolving "my
 // own open_id") this does not otherwise need.
 //
-// opts is the task-E2 encryption-conflict-matrix extension point (spec
-// §4.7): a caller whose requestedIncludeResourceData is true — meaning it
+// opts is the encryption-conflict-matrix extension point: a caller whose
+// requestedIncludeResourceData is true — meaning it
 // wants an ENCRYPTED subscription, since this CLI's own fail-closed policy
-// never offers a "plaintext resource_data" request (spec §4.7 "载荷与加密模
-// 型") — should pass WithEncryptKeyProber so an active,
+// never offers a "plaintext resource_data" request — should pass
+// WithEncryptKeyProber so an active,
 // include_resource_data=true match can be disambiguated (see
 // EncryptKeyProber's doc comment). A caller with requestedIncludeResourceData
 // == false needs no option at all: internal/event/consume/refined.go's
-// existing call site (out of E2's scope) passes none and is completely
+// existing call site passes none and is completely
 // unaffected by this extension.
 func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, targetResource string, identity core.Identity, requestedIncludeResourceData bool, opts ...ReconcileOption) (*ReconcilePlan, error) {
 	cfg := reconcileConfig{}
@@ -208,27 +206,26 @@ func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, t
 		return &ReconcilePlan{Action: PlanActionSuspended, Existing: match}, nil
 	default:
 		// "expired", "deleted", "", or any other/unknown state: inert:
-		// treat like not-found (spec §3.3).
+		// treat like not-found.
 		return &ReconcilePlan{Action: PlanActionCreate}, nil
 	}
 }
 
-// probeEncryptedActiveMatch implements spec §4.7's conflict-matrix rows for
+// probeEncryptedActiveMatch implements the conflict-matrix rows for
 // an active, include_resource_data=true remote match once the local request
 // also wants include_resource_data=true (encrypted). GetEncryptKey is the
 // only available signal:
 //   - a usable (non-empty) encrypt_key comes back -> the match is genuinely
-//     encrypted and THIS identity can retrieve its key -> reuse it (spec
-//     §4.7: "加密资源详情且密钥可取 -> 复用"); no new Subscription or key is
+//     encrypted and THIS identity can retrieve its key -> reuse it; no new
+//     Subscription or key is
 //     ever created for an already-encrypted, reusable match.
 //   - no key, an empty key, a nil Data, or ANY error (business or
 //     transport) -> "plaintext resource_data" and "encrypted but key
 //     unavailable to this identity/scope" are indistinguishable from this
-//     response alone, and both are unsafe to auto-proceed (spec §4.7:
-//     "加密资源详情但密钥不可取 -> 不得 ready" / "明文资源详情 -> 不支
-//     持") -> conflict, human decision. This deliberately does not try to
-//     distinguish a transport failure from a confirmed empty key (the
-//     task's own controller interpretation): retrying `create` re-probes
+//     response alone, and both are unsafe to auto-proceed -> conflict,
+//     human decision. This deliberately does not try to
+//     distinguish a transport failure from a confirmed empty key:
+//     retrying `create` re-probes
 //     from scratch, and a human resolving a genuine conflict needs the same
 //     guidance (verify the subscription, check `event:encrypt_key:read`, or
 //     delete+recreate) regardless of which case it was.

@@ -30,28 +30,28 @@ import (
 // PlanRemoteSubscription via event.ReconcileExisting; SubscriptionLister),
 // Create (event.SubscriptionCreateAPI's write half), and Reactivate (the
 // suspended-plan write path). It embeds event.SubscriptionCreateAPI — the
-// ready-made seam Task 15a exported for exactly this purpose (see
+// ready-made seam exported for exactly this purpose (see
 // internal/event/reconcile.go's own doc comment) — rather than redeclaring
 // List+Create here. *event.SubscriptionClient satisfies this structurally
 // (Create/Get/List/Patch/Renew/Reactivate/Delete); no explicit "implements"
-// needed. Deliberately does NOT expose Delete: refined cleanup is nil (spec
-// §4.2 — a failure after Apply never auto-deletes the remote subscription),
+// needed. Deliberately does NOT expose Delete: refined cleanup is nil
+// (a failure after Apply never auto-deletes the remote subscription),
 // so the type this whole chain is built against cannot even call Delete.
 type subscriptionApplyAPI interface {
 	event.SubscriptionCreateAPI
 	Reactivate(ctx context.Context, req *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error)
-	// EncryptKeyProber (task E5): PlanRemoteSubscription needs it as the
-	// WithEncryptKeyProber for the encryption conflict matrix (spec §4.7) when
+	// EncryptKeyProber: PlanRemoteSubscription needs it as the
+	// WithEncryptKeyProber for the encryption conflict matrix when
 	// IncludeResourceData is true, and the pre-ready prewarm calls GetEncryptKey
 	// to confirm the subscription's key is retrievable before the consumer goes
-	// ready. *event.SubscriptionClient satisfies it (GetEncryptKey, task E1).
+	// ready. *event.SubscriptionClient satisfies it (GetEncryptKey).
 	event.EncryptKeyProber
 }
 
 // RefinedOptions holds RunRefined's own parameters — deliberately separate
 // from Options (which Run/consumeLoop/writeReadyMarker still use unchanged)
-// so the legacy path is never perturbed by a refined-only field (design
-// note: "do NOT add refined fields to Options/Run").
+// so the legacy path is never perturbed by a refined-only field: refined
+// fields must not be added to Options/Run.
 type RefinedOptions struct {
 	Params    map[string]string
 	JQExpr    string
@@ -72,18 +72,18 @@ type RefinedOptions struct {
 	IsTTY     bool
 
 	// DryRun stops the chain after PlanRemoteSubscription: no Apply, no bus,
-	// no remote write (security-relevant invariant, spec §4.2).
+	// no remote write (security-relevant invariant).
 	DryRun bool
 
-	// IncludeResourceData (task E5, spec §4.7): true creates an ENCRYPTED
+	// IncludeResourceData: true creates an ENCRYPTED
 	// remote Subscription — Plan reconciles against the encryption conflict
 	// matrix (WithEncryptKeyProber), Apply generates a fresh CSPRNG encrypt_key
 	// and submits it atomically with the Create, and a pre-ready prewarm
 	// confirms the key is retrievable before the consumer emits ready. false
-	// (the default) is the pre-E5 plaintext path, byte-for-byte unchanged.
+	// (the default) is the plaintext path, byte-for-byte unchanged.
 	IncludeResourceData bool
 
-	// Identity is the already-resolved --as identity (design spec §2.8 —
+	// Identity is the already-resolved --as identity (
 	// resolved by the caller, e.g. cmd/event/consume.go's resolveIdentity;
 	// RunRefined never guesses or re-resolves it).
 	Identity core.Identity
@@ -95,7 +95,7 @@ type RefinedOptions struct {
 }
 
 // refinedDeps are RunRefined's injectable seams for the 5 ordered stages
-// (design note's refinedDeps shape) so refined_test.go can assert strict
+// so refined_test.go can assert strict
 // order — probe < plan < apply < startBus < hello — and the dry-run
 // short-circuit with a call-recorder, never touching a real network or bus.
 // Production wiring is prodRefinedDeps below; tests substitute their own
@@ -106,8 +106,8 @@ type refinedDeps struct {
 	apply    func(ctx context.Context, plan event.ReconcilePlan) (remoteSubscriptionID string, createdByThisAttempt bool, err error)
 	startBus func(ctx context.Context) (net.Conn, error)
 	hello    func(ctx context.Context, conn net.Conn, remoteSubscriptionID string) (*protocol.HelloAck, *bufio.Reader, error)
-	// prewarm (task E5) runs AFTER a successful HelloV2 registration and BEFORE
-	// the ready marker (spec §4.7): for an encrypted subscription it confirms
+	// prewarm runs AFTER a successful HelloV2 registration and BEFORE
+	// the ready marker: for an encrypted subscription it confirms
 	// the bus will be able to obtain the encrypt_key (by fetching it with the
 	// same authority the bus uses), so the consumer never goes ready when its
 	// events could not be decrypted. nil (or a no-op) for a plaintext
@@ -116,8 +116,8 @@ type refinedDeps struct {
 	prewarm func(ctx context.Context, remoteSubscriptionID string) error
 }
 
-// RunRefined drives the refined-subscription `event consume` startup chain
-// (design spec §4.1/§4.2/§4.9): ProbeBusEligibility (read-only) ->
+// RunRefined drives the refined-subscription `event consume` startup chain:
+// ProbeBusEligibility (read-only) ->
 // PlanRemoteSubscription (List/Get) -> [--dry-run exits here] ->
 // ApplyRemoteSubscriptionPlan (the ONLY remote write: Create/Reactivate) ->
 // StartOrConnectBus -> HelloV2 -> consumeLoop. This is the refined
@@ -142,8 +142,8 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 			return ProbeBusEligibility(ctx, tr, appID, opts.RemoteAPIClient, opts.ErrOut)
 		},
 		plan: func(ctx context.Context) (event.ReconcilePlan, error) {
-			// Task E5: an encrypted request (IncludeResourceData=true) must
-			// reconcile against spec §4.7's encryption conflict matrix — supply
+			// An encrypted request (IncludeResourceData=true) must
+			// reconcile against the encryption conflict matrix — supply
 			// the EncryptKeyProber so an active include_resource_data=true match
 			// is disambiguated (reuse vs conflict) exactly as `event
 			// subscription create` does. The plaintext path passes no option and
@@ -301,7 +301,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 		return applyOkRejectedError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, rejErr)
 	}
 
-	// ---- 6.5 Prewarm the encrypt_key BEFORE ready (task E5, spec §4.7) ----
+	// ---- 6.5 Prewarm the encrypt_key BEFORE ready ----
 	// For an encrypted subscription, confirm the key is retrievable (so the bus
 	// can decrypt) before this consumer ever reports ready. A failure here must
 	// NOT ready the consumer: return a structured error. Rollback of the local
@@ -335,14 +335,14 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 		}
 	}
 	// remote_subscription_id/owner go to their own diagnostic line, never
-	// the ready line itself (design note stage 7 / spec §4.5's stdout
+	// the ready line itself (the stdout
 	// contract — the ready marker format is frozen).
 	if remoteSubscriptionID != "" {
 		fmt.Fprintf(errOut, "[event] refined consumer bound to remote_subscription_id=%s (created_by_this_attempt=%t)\n", remoteSubscriptionID, createdByThisAttempt)
 	}
 
-	// Ready marker uses the FILLED template instance as event_key (design
-	// note stage 7) — consumeOpts.EventKey is already resolved.MaterializedKey.
+	// Ready marker uses the FILLED template instance as event_key —
+	// consumeOpts.EventKey is already resolved.MaterializedKey.
 	writeReadyMarker(errOut, consumeOpts)
 
 	startTime := time.Now()
@@ -351,7 +351,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 	// No PreConsume/cleanup for refined consumers (Apply already handled the
 	// remote-provisioning role PreConsume plays for legacy keys), so unlike
 	// Run there is no cleanup to run panic-safely here — refined cleanup is
-	// nil by design (spec §4.2).
+	// nil by design.
 	defer func() {
 		if !opts.Quiet {
 			reason := exitReason(ctx, emitted.Load(), consumeOpts)
@@ -365,7 +365,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 }
 
 // applyRemoteSubscriptionPlan is the refined startup chain's ONLY remote
-// write (design spec §4.2 stage 4): Create for a fresh plan, Reactivate for
+// write: Create for a fresh plan, Reactivate for
 // a suspended match (auto-resumed — `event consume`'s job is to get the
 // caller listening, unlike `event subscription create`'s own stricter
 // suspended handling), a no-op reuse of the existing id for an
@@ -388,7 +388,7 @@ func applyRemoteSubscriptionPlan(ctx context.Context, svc subscriptionApplyAPI, 
 		return id, false, nil
 
 	case event.PlanActionCreate:
-		// Task E5 (spec §4.7): an encrypted request generates a fresh
+		// An encrypted request generates a fresh
 		// per-subscription encrypt_key via the OS CSPRNG and submits it
 		// ATOMICALLY in the same Create body as include_resource_data=true —
 		// fail-closed: a key-gen failure aborts the create, never falls back to
@@ -396,7 +396,7 @@ func applyRemoteSubscriptionPlan(ctx context.Context, svc subscriptionApplyAPI, 
 		// and is never logged, persisted, returned, or sent to the bus over IPC
 		// (the bus fetches its own copy via GetEncryptKey). The plaintext path
 		// (includeResourceData=false) generates no key — byte-for-byte the
-		// pre-E5 behavior.
+		// pre-existing behavior.
 		var encryptKey string
 		if includeResourceData {
 			encryptKey, err = newEncryptKeyFunc()
@@ -429,7 +429,7 @@ var newEncryptKeyFunc = event.NewEncryptKey
 
 // buildRefinedCreateBody constructs the Create body, always setting
 // include_resource_data and (when non-empty) the encrypt_key on the SAME
-// CreatePayloadOptions within the SAME body value — spec §4.7's atomicity is
+// CreatePayloadOptions within the SAME body value — the atomicity is
 // structural here, exactly like cmd/event/subscription/create.go's
 // buildCreateSubscriptionBody. Split out so a test can assert the atomicity
 // directly against a plain, inspectable body value.
@@ -450,13 +450,13 @@ func buildRefinedCreateBody(eventType, targetResource string, includeResourceDat
 var errPrewarmNoKey = errors.New("subscription encrypt_key is not retrievable") //nolint:forbidigo // sentinel, typed at call site
 
 // prewarmEncryptKey confirms the subscription's encrypt_key is retrievable with
-// this identity/scope (task E5, spec §4.7's "输出 ready 之前预热"). It fetches
+// this identity/scope (prewarmed before the ready marker). It fetches
 // via the SAME GetEncryptKey the bus-side provider uses, with the SAME
 // authority (opts.SubClient is bound to the resolved --as identity, whose
 // current profile HelloV2 already established as the owner) — so a success here
 // guarantees the bus's own first-event fetch will succeed too. It deliberately
 // never returns or logs the key value: it only checks non-empty, then discards
-// resp (spec §4.7 敏感信息红线).
+// resp.
 func prewarmEncryptKey(ctx context.Context, prober event.EncryptKeyProber, remoteSubscriptionID string) error {
 	req := larkeventv1.NewGetEncryptKeySubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()
 	resp, err := prober.GetEncryptKey(ctx, req)
@@ -470,10 +470,10 @@ func prewarmEncryptKey(ctx context.Context, prober event.EncryptKeyProber, remot
 }
 
 // refinedPrewarmError turns a prewarm failure into the structured error the
-// consumer exits with instead of going ready (task E5). A transient failure
+// consumer exits with instead of going ready. A transient failure
 // (context cancel/deadline, or a typed network error) is returned UNCHANGED —
-// it is retryable and must never be relabeled as a decrypt conflict (the
-// E2-review lesson). A genuine failure becomes a failed_precondition classified
+// it is retryable and must never be relabeled as a decrypt conflict.
+// A genuine failure becomes a failed_precondition classified
 // decrypt_key_unavailable, guiding the operator to fix scope/identity (or
 // delete+recreate) — the consumer was NOT started.
 func refinedPrewarmError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, cause error) error {
@@ -516,7 +516,7 @@ func refinedConflictError(resolved event.ResolvedEventKey, identity core.Identit
 
 // applyOkRecoveryHint builds the recovery guidance shared by EVERY
 // post-Apply failure (review Fix 3): once Apply has succeeded, a remote
-// write may have just happened, and refined cleanup is nil (spec §4.2) — no
+// write may have just happened, and refined cleanup is nil — no
 // later failure in this chain (local bus won't start, HelloV2
 // transport/decode error, or the bus rejecting the handshake) may ever
 // delete it. All three must therefore surface the SAME actionable
@@ -531,11 +531,11 @@ func applyOkRecoveryHint(resolved event.ResolvedEventKey, identity core.Identity
 		remoteSubscriptionID, createdByThisAttempt, resolved.MaterializedKey, identity)
 }
 
-// errApplyOkStartBusFailed implements the design note's explicit
+// errApplyOkStartBusFailed implements the explicit
 // apply-succeeded-but-bus-failed contract: typed InternalError, Hint carries
 // remote_subscription_id + created_by_this_attempt + next_action. This never
 // deletes the remote subscription it (maybe) just created — refined cleanup
-// is nil (spec §4.2): a transient local bus failure must not undo a
+// is nil: a transient local bus failure must not undo a
 // successful remote write. The safe recovery is to retry consume, which
 // will Plan-reuse the same remote subscription rather than create a
 // duplicate.
@@ -582,7 +582,7 @@ func applyOkRejectedError(resolved event.ResolvedEventKey, identity core.Identit
 }
 
 // writeRefinedDryRunPreview reports the plan on stderr — stdout is reserved
-// for business-event NDJSON even during a real run (design spec §4.5), so a
+// for business-event NDJSON even during a real run, so a
 // --dry-run preview (never a business event) never touches it; a dry-run
 // leaves stdout completely empty. Structured, no secrets: only the event
 // key/target resource/planned action/existing remote id, nothing UAT- or
@@ -598,7 +598,7 @@ func writeRefinedDryRunPreview(errOut io.Writer, resolved event.ResolvedEventKey
 }
 
 // buildHelloV2 constructs the v2-populated Hello frame for a refined
-// consumer's HelloV2 stage (design spec §4.2/§4.3). Version stays frozen at
+// consumer's HelloV2 stage. Version stays frozen at
 // "v1" — protocol.StatusResponse's own doc comment: the v2 signal is the
 // Capabilities marker, never a Version bump. localSubscriptionID keeps its
 // frozen meaning as the LOCAL per-param fingerprint (fingerprint.go) and is
@@ -640,7 +640,7 @@ func resolveCurrentProfileIdentity() (profile, userOpenID string, err error) {
 	return profile, userOpenID, nil
 }
 
-// computeConsumerScopeID composes ConsumerScopeID (design spec §4.3:302): a
+// computeConsumerScopeID composes ConsumerScopeID: a
 // stable hash of base EventKey + canonical refined key (MaterializedKey) +
 // authority type ("user"/"app") + app_id + user_open_id. Deterministic —
 // the same tuple always yields the same id, which is the point: it groups

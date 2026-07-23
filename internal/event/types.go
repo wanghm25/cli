@@ -26,7 +26,7 @@ type RawEvent struct {
 	Payload    json.RawMessage `json:"payload"`
 	Timestamp  time.Time       `json:"timestamp"`
 
-	// --- refined-subscription push-envelope fields (spec §4.3/§0.4).
+	// --- refined-subscription push-envelope fields.
 	// Normalized from the WS push envelope's header.subscription block,
 	// which is a DIFFERENT shape from the OpenAPI management-side
 	// Subscription (target_resource/authority{open_id,union_id,app_id}) —

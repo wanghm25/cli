@@ -55,7 +55,7 @@ func suspendedSub(id, reason string) *larkeventv1.SubscriptionDetail {
 	}
 }
 
-// ---- ReconcileExisting: state table (spec §3.3/§4.2) ----
+// ---- ReconcileExisting: state table ----
 
 func TestReconcileExisting_NotFound_ReturnsCreateAction(t *testing.T) {
 	fake := &fakeLister{resp: listResp(nil)}
@@ -237,18 +237,17 @@ var _ SubscriptionLister = (*SubscriptionClient)(nil)
 var _ SubscriptionCreateAPI = (*SubscriptionClient)(nil)
 var _ EncryptKeyProber = (*SubscriptionClient)(nil)
 
-// ---- ReconcileExisting: encryption conflict matrix (task-E-design-note.md
-// task E2; design spec §4.7's conflict matrix) ----
+// ---- ReconcileExisting: encryption conflict matrix ----
 //
 // Every test in this block passes requestedIncludeResourceData=true: the
-// CLI's own fail-closed policy (spec §4.7 "载荷与加密模型") means "true"
+// CLI's own fail-closed policy means "true"
 // always means "the caller wants an ENCRYPTED subscription" — there is no
 // CLI-level "plaintext resource_data" request to compare against. The
 // existing requestedIncludeResourceData=false tests above (already GREEN,
-// entirely unmodified by this task) double as the "backward compatible, no
+// entirely unmodified) double as the "backward compatible, no
 // WithEncryptKeyProber option supplied" proof: internal/event/consume/
-// refined.go's own ReconcileExisting call site (out of E2's scope; must not
-// be touched) always passes false and zero options, so it is completely
+// refined.go's own ReconcileExisting call site always passes false and zero
+// options, so it is completely
 // unaffected by every addition below.
 
 // fakeEncryptKeyProber is a network-free stand-in for the EncryptKeyProber
@@ -271,7 +270,7 @@ func encryptKeyResp(key string) *larkeventv1.GetEncryptKeySubscriptionResp {
 }
 
 // TestReconcileExisting_EncryptedBothTrue_UsableKey_ReturnsReuseAction locks
-// spec §4.7's "加密资源详情 | 加密资源详情且密钥可取 | 复用" row: an active
+// the conflict-matrix reuse row: an active
 // match whose include_resource_data is already true, when the local request
 // ALSO wants true (i.e. encrypted), reuses it once GetEncryptKey confirms a
 // usable (non-empty) key — never a new Create, never a new key.
@@ -297,7 +296,7 @@ func TestReconcileExisting_EncryptedBothTrue_UsableKey_ReturnsReuseAction(t *tes
 }
 
 // TestReconcileExisting_EncryptedBothTrue_EmptyKey_ReturnsConflictAction
-// locks spec §4.7's "加密资源详情但密钥不可取" row: a successful
+// locks the "encrypted match, key not retrievable" row: a successful
 // GetEncryptKey response carrying no usable key (empty/absent) must conflict
 // — it is indistinguishable from a plaintext resource_data match, and both
 // are unsafe to auto-reuse.
@@ -366,8 +365,8 @@ func TestReconcileExisting_EncryptedBothTrue_ProberErrors_ReturnsConflictAction(
 }
 
 // TestReconcileExisting_EncryptedRemoteFalse_ReturnsConflict_NeverProbes
-// locks spec §4.7's "加密资源详情 | include_resource_data=false | 冲突,人工
-// 决策" row: when the remote match itself has include_resource_data=false
+// locks the conflict row for an encrypted request against an existing
+// include_resource_data=false match: when the remote match itself has include_resource_data=false
 // but the local request wants true (encrypted), this is a conflict from the
 // existing include_resource_data mismatch alone — the encrypt-key probe
 // must never even run (there is no encrypted state to confirm).
