@@ -293,6 +293,40 @@ type ConsumerInfo struct {
 	// is uniformly "reactivate", never "reactive"/"resume"). "" means no
 	// outstanding recommendation.
 	NextAction string `json:"next_action,omitempty"`
+
+	// --- decryption observability (spec §4.7 "失败语义与可观测性", Module E
+	// task E7). All optional/omitempty so a pre-Module-E consumer entry
+	// marshals to exactly the old wire shape (TestDecode_OldStatusResponse_
+	// BackwardCompat). Populated by Hub.Consumers() from Conn's decrypt
+	// getters. A key, ciphertext, or decrypted plaintext NEVER appears here —
+	// only a short classification, a count, and a timestamp (spec §4.7 红线).
+
+	// DecryptState is this consumer's most recent decryption status:
+	// "decrypted" (a usable key is available), "decrypt_key_unavailable" (no
+	// key: identity mismatch / missing event:encrypt_key:read / GetEncryptKey
+	// failed), or "decrypt_failed" (key held but the SDK could not decrypt).
+	// "" for a plaintext (non-encrypted) subscription.
+	DecryptState string `json:"decrypt_state,omitempty"`
+
+	// LastDecryptError summarizes the most recent decrypt FAILURE (class,
+	// running count, time). nil when none has occurred.
+	LastDecryptError *DecryptError `json:"last_decrypt_error,omitempty"`
+
+	// ResourceData is a display rollup of resource-data availability derived
+	// from DecryptState: "decrypted" (flowing) or "unavailable" (key
+	// unavailable, or decryption failing). "" for a plaintext subscription
+	// (no resource data at all).
+	ResourceData string `json:"resource_data,omitempty"`
+}
+
+// DecryptError is ConsumerInfo.LastDecryptError's wire shape (spec §4.7): a
+// short classification, a running count, and a timestamp — NEVER a key,
+// ciphertext, decrypted plaintext, or raw SDK error (that would risk an
+// oracle). All omitempty so an absent error contributes nothing.
+type DecryptError struct {
+	Class string `json:"class,omitempty"`
+	Count int64  `json:"count,omitempty"`
+	Time  string `json:"time,omitempty"`
 }
 
 // RemoteSubscriptionInfo is the CLI-facing snapshot of one remote

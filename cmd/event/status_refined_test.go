@@ -234,6 +234,60 @@ func TestWriteStatusText_RefinedConsumerSubLine_MismatchShowsAdvisoryAndNextActi
 	}
 }
 
+// --- Module E (task E7): decrypt observability display ----------------------
+
+func TestDecryptAdvisory_PerState(t *testing.T) {
+	// healthy / plaintext: no advisory.
+	if adv, act := decryptAdvisory(protocol.ConsumerInfo{DecryptState: "decrypted"}); adv != "" || act != "" {
+		t.Errorf("decrypted: got (%q,%q), want empty", adv, act)
+	}
+	if adv, _ := decryptAdvisory(protocol.ConsumerInfo{}); adv != "" {
+		t.Errorf("plaintext: got advisory %q, want empty", adv)
+	}
+	// key unavailable: advisory + scope/identity next_action.
+	adv, act := decryptAdvisory(protocol.ConsumerInfo{DecryptState: "decrypt_key_unavailable"})
+	if !strings.Contains(adv, "decrypt_key_unavailable") {
+		t.Errorf("key-unavailable advisory = %q", adv)
+	}
+	if !strings.Contains(act, "event:encrypt_key:read") {
+		t.Errorf("key-unavailable next_action = %q, want it to mention the scope", act)
+	}
+	// decrypt failed: advisory carries the last_decrypt_error detail.
+	adv, act = decryptAdvisory(protocol.ConsumerInfo{
+		DecryptState:     "decrypt_failed",
+		LastDecryptError: &protocol.DecryptError{Class: "decrypt_failed", Count: 5, Time: "2026-07-23T00:00:00Z"},
+	})
+	if !strings.Contains(adv, "count=5") {
+		t.Errorf("decrypt_failed advisory = %q, want it to carry count=5", adv)
+	}
+	if act == "" {
+		t.Errorf("decrypt_failed next_action must be non-empty")
+	}
+}
+
+func TestWriteStatusText_DecryptKeyUnavailable_ShowsResourceDataAndAdvisory(t *testing.T) {
+	var buf bytes.Buffer
+	c := refinedConsumer()
+	c.DecryptState = "decrypt_key_unavailable"
+	c.ResourceData = "unavailable"
+	statuses := []appStatus{{
+		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
+		CurrentIdentityKnown: true, CurrentAppID: "cli_a", CurrentUserOpenID: "ou_1",
+		Consumers: []protocol.ConsumerInfo{c},
+	}}
+	writeStatusText(&buf, statuses)
+	out := buf.String()
+	for _, want := range []string{"resource_data=unavailable", "decrypt_state=decrypt_key_unavailable", "advisory", "event:encrypt_key:read", "next_action"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q; full output:\n%s", want, out)
+		}
+	}
+	// Advisory-only: never described as dead.
+	if strings.Contains(strings.ToLower(out), "dead") {
+		t.Errorf("decrypt advisory must be informational only; full output:\n%s", out)
+	}
+}
+
 func TestWriteStatusText_DegradedReason_ShownAsAdvisory(t *testing.T) {
 	var buf bytes.Buffer
 	c := refinedConsumer()

@@ -6,6 +6,8 @@ package bus
 import (
 	"context"
 	"testing"
+
+	"github.com/larksuite/cli/internal/event/protocol"
 )
 
 // ---- E6: encrypt_key removal on deleted_v1 ----
@@ -109,4 +111,41 @@ func TestBus_OnDecryptFailure_RecordsOnMatchedConsumers(t *testing.T) {
 	// An unknown / empty subscription id is a harmless no-op (never panics).
 	b.onDecryptFailure("sub-unknown")
 	b.onDecryptFailure("")
+}
+
+// ---- E7: Hub.Consumers() populates decrypt observability ----
+
+func TestHubConsumers_PopulatesDecryptObservability(t *testing.T) {
+	hub := NewHub()
+
+	// A healthy encrypted consumer (key available).
+	ok := newConnWithRemoteSub(t, 1, "sub-ok")
+	ok.SetDecryptState(decryptStateDecrypted)
+	hub.RegisterAndIsFirst(ok)
+
+	// A failing encrypted consumer.
+	fail := newConnWithRemoteSub(t, 2, "sub-fail")
+	fail.RecordDecryptFailure()
+	hub.RegisterAndIsFirst(fail)
+
+	// A plaintext consumer (no decrypt state at all).
+	plain := newConnWithRemoteSub(t, 3, "sub-plain")
+	hub.RegisterAndIsFirst(plain)
+
+	byPID := map[int]protocol.ConsumerInfo{}
+	for _, ci := range hub.Consumers() {
+		byPID[ci.PID] = ci
+	}
+
+	if got := byPID[1]; got.DecryptState != decryptStateDecrypted || got.ResourceData != "decrypted" {
+		t.Errorf("healthy consumer: decrypt_state=%q resource_data=%q, want decrypted/decrypted", got.DecryptState, got.ResourceData)
+	}
+	if got := byPID[2]; got.DecryptState != decryptStateFailed || got.ResourceData != "unavailable" {
+		t.Errorf("failing consumer: decrypt_state=%q resource_data=%q, want decrypt_failed/unavailable", got.DecryptState, got.ResourceData)
+	} else if got.LastDecryptError == nil || got.LastDecryptError.Count != 1 || got.LastDecryptError.Class != decryptStateFailed {
+		t.Errorf("failing consumer last_decrypt_error = %+v, want class=decrypt_failed count=1", got.LastDecryptError)
+	}
+	if got := byPID[3]; got.DecryptState != "" || got.ResourceData != "" || got.LastDecryptError != nil {
+		t.Errorf("plaintext consumer must carry no decrypt fields, got %+v", got)
+	}
 }

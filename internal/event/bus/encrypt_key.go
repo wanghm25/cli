@@ -404,5 +404,29 @@ func markDecrypted(conns []*Conn) {
 	}
 }
 
+// resourceDataStatus maps a consumer's decrypt_state to the status display's
+// resource_data rollup (task E7, spec §4.7): "decrypted" when a usable key is
+// available, "unavailable" when the key is missing or decryption is failing,
+// and "" for a plaintext subscription (no resource data at all).
+func resourceDataStatus(decryptState string) string {
+	switch decryptState {
+	case decryptStateDecrypted:
+		return "decrypted"
+	case decryptStateKeyUnavailable, decryptStateFailed:
+		return "unavailable"
+	default:
+		return ""
+	}
+}
+
+// formatDecryptErrorTime renders a decrypt-error timestamp for status
+// (RFC3339, UTC); "" for the zero time. Never carries anything sensitive.
+func formatDecryptErrorTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
 // Compile-time assertion: *encryptKeyProvider is a larkevent.EncryptKeyProvider.
 var _ larkevent.EncryptKeyProvider = (*encryptKeyProvider)(nil)

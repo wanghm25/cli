@@ -365,6 +365,41 @@ func TestDecode_OldStatusResponse_BackwardCompat(t *testing.T) {
 	if c.SuspensionReason != "" || c.LastAction != "" || c.LastActionError != "" || c.NextAction != "" {
 		t.Errorf("Task 18 ConsumerInfo action fields should be zero-valued decoding an old frame, got %+v", c)
 	}
+	// Module E (task E7): the decryption observability fields are additive too
+	// — an old frame decodes them zero-valued.
+	if c.DecryptState != "" || c.LastDecryptError != nil || c.ResourceData != "" {
+		t.Errorf("Module E ConsumerInfo decrypt fields should be zero-valued decoding an old frame, got %+v", c)
+	}
+}
+
+// TestConsumerInfo_DecryptFieldsRoundTrip locks that the Module E (task E7)
+// decrypt observability fields round-trip through Encode/Decode.
+func TestConsumerInfo_DecryptFieldsRoundTrip(t *testing.T) {
+	sr := &StatusResponse{
+		Type: MsgTypeStatusResponse,
+		Consumers: []ConsumerInfo{{
+			PID:              9,
+			EventKey:         "im.message.created_v1/chat-id/oc_x",
+			DecryptState:     "decrypt_failed",
+			ResourceData:     "unavailable",
+			LastDecryptError: &DecryptError{Class: "decrypt_failed", Count: 4, Time: "2026-07-23T00:00:00Z"},
+		}},
+	}
+	var buf bytes.Buffer
+	if err := Encode(&buf, sr); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	msg, err := Decode(bytes.TrimRight(buf.Bytes(), "\n"))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := msg.(*StatusResponse).Consumers[0]
+	if got.DecryptState != "decrypt_failed" || got.ResourceData != "unavailable" {
+		t.Errorf("decrypt_state/resource_data not preserved: %+v", got)
+	}
+	if got.LastDecryptError == nil || got.LastDecryptError.Count != 4 || got.LastDecryptError.Class != "decrypt_failed" {
+		t.Errorf("last_decrypt_error not preserved: %+v", got.LastDecryptError)
+	}
 }
 
 // --- Task 16 additive ConsumerInfo fields (spec §4.6) ---

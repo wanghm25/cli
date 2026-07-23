@@ -582,6 +582,18 @@ func (h *Hub) Consumers() []protocol.ConsumerInfo {
 			info.LastAction = c.LastAction()
 			info.LastActionError = c.LastActionError()
 			info.NextAction = c.NextAction()
+			// Module E (task E7): decryption observability. decrypt_state +
+			// resource_data rollup + last_decrypt_error {class,count,time}.
+			// Never a key/ciphertext/plaintext — only classifications.
+			info.DecryptState = c.DecryptState()
+			info.ResourceData = resourceDataStatus(c.DecryptState())
+			if class, count := c.LastDecryptErrorClass(), c.DecryptFailCount(); class != "" || count > 0 {
+				info.LastDecryptError = &protocol.DecryptError{
+					Class: class,
+					Count: count,
+					Time:  formatDecryptErrorTime(c.LastDecryptErrorTime()),
+				}
+			}
 		}
 		result = append(result, info)
 	}

@@ -45,7 +45,11 @@ REFINED CONSUMERS: additive, read-only fields on top of the legacy output —
 refined_subscription, remote_subscription_id, owner{identity, app_id,
 user_open_id}, current_profile_match, stale_identity, remote_state,
 last_lifecycle_event, suspension_reason, last_action/last_action_error,
-degraded_reason, next_action. Legacy consumer output is unchanged.
+degraded_reason, next_action. For an ENCRYPTED subscription
+(--include-resource-data): resource_data (decrypted/unavailable), decrypt_state
+(decrypted/decrypt_key_unavailable/decrypt_failed), and last_decrypt_error
+{class, count, time} — advisory only, never a key or ciphertext. Legacy
+consumer output is unchanged.
 
 SCOPE: the local view (bus in-memory state) needs no scope and is always
 shown. For a refined consumer, remote_state/expire_time/
@@ -640,6 +644,14 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 	if c.RemoteState != "" {
 		parts = append(parts, fmt.Sprintf("remote_state=%s", c.RemoteState))
 	}
+	// Module E (task E7): resource_data / decrypt_state rollup, when this
+	// consumer's subscription is encrypted (decrypt_state != "").
+	if c.ResourceData != "" {
+		parts = append(parts, fmt.Sprintf("resource_data=%s", c.ResourceData))
+	}
+	if c.DecryptState != "" {
+		parts = append(parts, fmt.Sprintf("decrypt_state=%s", c.DecryptState))
+	}
 	fmt.Fprintf(out, "      %s\n", strings.Join(parts, "  "))
 
 	if c.StaleIdentity {
@@ -656,6 +668,37 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 	// two advisories above may already be printed.
 	if advisory := remoteDegradedAdvisory(c); advisory != "" {
 		fmt.Fprintf(out, "      advisory: %s — informational only (remote-supplement, read-only)\n", advisory)
+	}
+	// Module E (task E7): decryption advisory + read-only next_action for an
+	// encrypted consumer whose resource data cannot currently be decrypted.
+	if advisory, action := decryptAdvisory(c); advisory != "" {
+		fmt.Fprintf(out, "      advisory: %s — informational only\n", advisory)
+		if action != "" {
+			fmt.Fprintf(out, "      next_action: %s\n", action)
+		}
+	}
+}
+
+// decryptAdvisory derives a read-only decryption advisory (+ next_action) from
+// a consumer's decrypt_state/last_decrypt_error (task E7, spec §4.7). Returns
+// ("", "") for a healthy or plaintext consumer (decrypt_state "" or
+// "decrypted"). DISPLAY-ONLY: reads fields already populated by the bus; never
+// a key/ciphertext/plaintext, never an action this command takes itself.
+func decryptAdvisory(c protocol.ConsumerInfo) (advisory, nextAction string) {
+	switch c.DecryptState {
+	case "decrypt_key_unavailable":
+		return "resource data cannot be decrypted: the subscription's encrypt_key is unavailable to the current identity (decrypt_key_unavailable)",
+			"verify this identity holds scope event:encrypt_key:read and owns the subscription (switch --as/profile if it is not the owner), or delete + recreate the subscription after human confirmation"
+	case "decrypt_failed":
+		detail := ""
+		if c.LastDecryptError != nil {
+			detail = fmt.Sprintf(" (last_decrypt_error: class=%s count=%d time=%s)",
+				c.LastDecryptError.Class, c.LastDecryptError.Count, orDash(c.LastDecryptError.Time))
+		}
+		return fmt.Sprintf("resource data decryption is failing%s", detail),
+			"if this persists, confirm the subscription was created by this CLI (its key is CLI-generated) and delete + recreate it after human confirmation"
+	default:
+		return "", ""
 	}
 }
 
@@ -744,6 +787,13 @@ type consumerView struct {
 	CurrentProfileMatch    *bool  `json:"current_profile_match,omitempty"`
 	NextAction             string `json:"next_action,omitempty"`
 	RemoteDegradedAdvisory string `json:"remote_degraded_advisory,omitempty"`
+	// Module E (task E7): decrypt_state/last_decrypt_error/resource_data flow
+	// through automatically from the embedded ConsumerInfo; these two are the
+	// locally-computed advisory + read-only next_action for a decrypt issue,
+	// kept as separate keys (mirroring remote_degraded_advisory) so they never
+	// clobber the identity-mismatch next_action above.
+	DecryptAdvisory   string `json:"decrypt_advisory,omitempty"`
+	DecryptNextAction string `json:"decrypt_next_action,omitempty"`
 }
 
 func writeStatusJSON(w io.Writer, statuses []appStatus) error {
@@ -771,6 +821,7 @@ func writeStatusJSON(w io.Writer, statuses []appStatus) error {
 					cv.NextAction = refinedNextAction(match, applicable)
 				}
 				cv.RemoteDegradedAdvisory = remoteDegradedAdvisory(c)
+				cv.DecryptAdvisory, cv.DecryptNextAction = decryptAdvisory(c)
 				consumers = append(consumers, cv)
 			}
 		}
