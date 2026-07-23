@@ -50,7 +50,7 @@ func readAckFromClient(t *testing.T, b *Bus, hello *protocol.Hello) *protocol.He
 func newEncryptedHelloBus(t *testing.T, logger *log.Logger, cli encryptKeyClient, current currentIdentity) *Bus {
 	t.Helper()
 	hub := NewHub()
-	p := newEncryptKeyProvider(logger)
+	p := newEncryptKeyProvider()
 	p.setNewClient(func(core.Identity, string) (encryptKeyClient, error) { return cli, nil })
 	p.setIdentityGate(gateWith(hub,
 		func() (currentIdentity, error) { return current, nil },

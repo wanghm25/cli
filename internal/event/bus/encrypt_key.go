@@ -6,7 +6,6 @@ package bus
 import (
 	"context"
 	"errors"
-	"log"
 	"sync"
 	"time"
 
@@ -84,8 +83,6 @@ type encryptKeyProvider struct {
 	newClientMu sync.RWMutex
 	newClient   func(as core.Identity, uat string) (encryptKeyClient, error)
 
-	logger *log.Logger
-
 	fetchTimeout time.Duration
 }
 
@@ -93,10 +90,9 @@ type encryptKeyProvider struct {
 // default Hello-time fetch timeout. identityGate/newClient are injected
 // post-construction by bus.go's SetIdentityProviders/SetSubscriptionClient
 // (same "optional, wire before Run()" convention as the lifecycle action).
-func newEncryptKeyProvider(logger *log.Logger) *encryptKeyProvider {
+func newEncryptKeyProvider() *encryptKeyProvider {
 	return &encryptKeyProvider{
 		static:       larkevent.NewStaticEncryptKeyProvider(nil),
-		logger:       logger,
 		fetchTimeout: defaultEncryptKeyFetchTimeout,
 	}
 }
@@ -114,12 +110,6 @@ func (p *encryptKeyProvider) setNewClient(fn func(as core.Identity, uat string) 
 // ("", false) → SDK fail-closed, never a runtime remote fetch.
 func (p *encryptKeyProvider) dispatcherProvider() larkevent.EncryptKeyProvider {
 	return p.static
-}
-
-func (p *encryptKeyProvider) logf(format string, args ...interface{}) {
-	if p.logger != nil {
-		p.logger.Printf(format, args...)
-	}
 }
 
 // Remove drops a subscription's cached key (lifecycle removal). Idempotent.

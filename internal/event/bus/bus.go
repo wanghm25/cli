@@ -104,7 +104,7 @@ func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logge
 		shutdownCh:         make(chan struct{}, 1),
 		lifecycleExecutor:  newLifecycleExecutor(hub, action, logger),
 		lifecycleAction:    action,
-		encryptKeyProvider: newEncryptKeyProvider(logger),
+		encryptKeyProvider: newEncryptKeyProvider(),
 	}
 	// On deleted_v1 the lifecycle action releases the
 	// subscription's cached encrypt_key from the provider. Wired

@@ -4,10 +4,8 @@
 package bus
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"log"
 	"net"
 	"strings"
 	"sync"
@@ -119,7 +117,7 @@ func gateWith(h *Hub, resolveCurrent func() (currentIdentity, error), resolveUAT
 // (zero runtime remote calls on the event hot path).
 func TestEncryptKeyProvider_DispatcherProvider_IsPureStaticCache_NoFetchOnMiss(t *testing.T) {
 	fac := &ekFactory{cli: &fakeEncryptKeyClient{key: "K"}}
-	p := newEncryptKeyProvider(nil)
+	p := newEncryptKeyProvider()
 	p.setNewClient(fac.make)
 
 	dp := p.dispatcherProvider()
@@ -151,7 +149,7 @@ func TestEncryptKeyProvider_FetchAndSet_Bot_FetchesAsBotNoUAT_Caches(t *testing.
 	c := ekOwnerConn(t, "sub-1", "bot", "cli_x", "") // bot: OwnerUserOpenID==""
 	fake := &fakeEncryptKeyClient{key: "BOT_KEY"}
 	fac := &ekFactory{cli: fake}
-	p := newEncryptKeyProvider(nil)
+	p := newEncryptKeyProvider()
 	p.setNewClient(fac.make)
 
 	if err := p.fetchAndSet(context.Background(), "sub-1", c); err != nil {
@@ -191,7 +189,7 @@ func TestEncryptKeyProvider_FetchAndSet_UserOwnerMatch_FreshUAT_Caches(t *testin
 			}
 			return "uat-fresh", nil
 		})
-	p := newEncryptKeyProvider(nil)
+	p := newEncryptKeyProvider()
 	p.setIdentityGate(gate)
 	p.setNewClient(fac.make)
 
@@ -225,7 +223,7 @@ func TestEncryptKeyProvider_FetchAndSet_UserOwnerMismatch_NoFetch_NoHistoricalUA
 	gate := gateWith(h,
 		func() (currentIdentity, error) { return currentIdentity{appID: "cli_x", userOpenID: "ou_current"}, nil },
 		func(_ context.Context, _, _ string) (string, error) { uatCalls++; return "uat-historical", nil })
-	p := newEncryptKeyProvider(nil)
+	p := newEncryptKeyProvider()
 	p.setIdentityGate(gate)
 	p.setNewClient(fac.make)
 
@@ -248,7 +246,7 @@ func TestEncryptKeyProvider_FetchAndSet_GenuineFailure_ReturnsError_NoCache(t *t
 	c := ekOwnerConn(t, "sub-1", "bot", "cli_x", "")
 	fake := &fakeEncryptKeyClient{err: errors.New("permission denied: missing event:encrypt_key:read")}
 	fac := &ekFactory{cli: fake}
-	p := newEncryptKeyProvider(nil)
+	p := newEncryptKeyProvider()
 	p.setNewClient(fac.make)
 
 	if err := p.fetchAndSet(context.Background(), "sub-1", c); err == nil {
@@ -263,7 +261,7 @@ func TestEncryptKeyProvider_FetchAndSet_EmptyKey_ReturnsError(t *testing.T) {
 	c := ekOwnerConn(t, "sub-1", "bot", "cli_x", "")
 	fake := &fakeEncryptKeyClient{key: ""} // success, but no key
 	fac := &ekFactory{cli: fake}
-	p := newEncryptKeyProvider(nil)
+	p := newEncryptKeyProvider()
 	p.setNewClient(fac.make)
 
 	if err := p.fetchAndSet(context.Background(), "sub-1", c); !errors.Is(err, errEncryptKeyEmpty) {
@@ -273,7 +271,7 @@ func TestEncryptKeyProvider_FetchAndSet_EmptyKey_ReturnsError(t *testing.T) {
 
 func TestEncryptKeyProvider_FetchAndSet_NoClientConfigured_Error(t *testing.T) {
 	c := ekOwnerConn(t, "sub-1", "bot", "cli_x", "")
-	p := newEncryptKeyProvider(nil) // no setNewClient
+	p := newEncryptKeyProvider() // no setNewClient
 
 	if err := p.fetchAndSet(context.Background(), "sub-1", c); !errors.Is(err, errEncryptKeyNoClient) {
 		t.Fatalf("fetchAndSet err = %v, want errEncryptKeyNoClient", err)
@@ -284,7 +282,7 @@ func TestEncryptKeyProvider_FetchAndSet_UserSubNoGate_Error_NoFetch(t *testing.T
 	c := ekOwnerConn(t, "sub-1", "user", "cli_x", "ou_me")
 	fake := &fakeEncryptKeyClient{key: "K"}
 	fac := &ekFactory{cli: fake}
-	p := newEncryptKeyProvider(nil)
+	p := newEncryptKeyProvider()
 	p.setNewClient(fac.make) // client set, but NO identity gate
 
 	if err := p.fetchAndSet(context.Background(), "sub-1", c); !errors.Is(err, errEncryptKeyNoGate) {
@@ -297,7 +295,7 @@ func TestEncryptKeyProvider_FetchAndSet_UserSubNoGate_Error_NoFetch(t *testing.T
 
 func TestEncryptKeyProvider_FetchAndSet_EmptySubID_Error(t *testing.T) {
 	c := ekOwnerConn(t, "", "bot", "cli_x", "")
-	p := newEncryptKeyProvider(nil)
+	p := newEncryptKeyProvider()
 	p.setNewClient((&ekFactory{cli: &fakeEncryptKeyClient{key: "K"}}).make)
 	if err := p.fetchAndSet(context.Background(), "", c); !errors.Is(err, errEncryptKeyNoSubID) {
 		t.Fatalf("fetchAndSet err = %v, want errEncryptKeyNoSubID", err)
@@ -312,7 +310,7 @@ func TestEncryptKeyProvider_FetchAndSet_Timeout_Bounded(t *testing.T) {
 	defer close(block)
 	fake := &fakeEncryptKeyClient{key: "K", block: block}
 	fac := &ekFactory{cli: fake}
-	p := newEncryptKeyProvider(nil)
+	p := newEncryptKeyProvider()
 	p.setNewClient(fac.make)
 	p.fetchTimeout = 20 * time.Millisecond
 
@@ -328,7 +326,7 @@ func TestEncryptKeyProvider_FetchAndSet_Timeout_Bounded(t *testing.T) {
 // ---- Remove ----------------------------------------------------------------
 
 func TestEncryptKeyProvider_Remove_EvictsCachedKey(t *testing.T) {
-	p := newEncryptKeyProvider(nil)
+	p := newEncryptKeyProvider()
 	p.static.Set("sub-1", "CACHED")
 	p.Remove("sub-1")
 	if _, ok := p.dispatcherProvider().EncryptKey(context.Background(), "sub-1"); ok {
@@ -363,13 +361,11 @@ func TestEncryptKeyFailureClass_KeyFreeTokens(t *testing.T) {
 
 func TestEncryptKeyProvider_KeyNeverLogged(t *testing.T) {
 	const secret = "SUPER_SECRET_ENCRYPT_KEY_do_not_log"
-	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
 
 	okConn := ekOwnerConn(t, "sub-ok", "bot", "cli_x", "")
 	failConn := ekOwnerConn(t, "sub-fail", "bot", "cli_x", "")
 
-	p := newEncryptKeyProvider(logger)
+	p := newEncryptKeyProvider()
 
 	// Success path caches the secret.
 	p.setNewClient(func(as core.Identity, uat string) (encryptKeyClient, error) {
@@ -384,9 +380,12 @@ func TestEncryptKeyProvider_KeyNeverLogged(t *testing.T) {
 		return &fakeEncryptKeyClient{err: errors.New("boom")}, nil
 	})
 	err := p.fetchAndSet(context.Background(), "sub-fail", failConn)
-	_ = encryptKeyFailureClass(err) // what handleHello logs
+	class := encryptKeyFailureClass(err) // what handleHello logs
 
-	if strings.Contains(buf.String(), secret) {
-		t.Fatalf("log output contains the encrypt_key; RED LINE violated. log:\n%s", buf.String())
+	if err != nil && strings.Contains(err.Error(), secret) {
+		t.Fatalf("returned error contains the encrypt_key; RED LINE violated: %v", err)
+	}
+	if strings.Contains(class, secret) {
+		t.Fatalf("failure classification contains the encrypt_key; RED LINE violated: %s", class)
 	}
 }
