@@ -21,7 +21,7 @@ import (
 
 // fakeGetAPI is a network-free stand-in for *eventlib.SubscriptionClient's
 // Get method — the getSubscriptionAPI test seam. Note it stands in for the
-// already-classifying client (Task 7's SubscriptionClient.Get), not the raw
+// already-classifying client (SubscriptionClient.Get), not the raw
 // SDK service: a business failure there is already surfaced as a non-nil
 // typed `err` (see internal/event/subscription_client.go's classifyFailure),
 // so fixtures simulating a failure set `err`, never a non-zero-code `resp`
@@ -87,15 +87,15 @@ func TestGetSubscription_SingleDetail_JSONShape(t *testing.T) {
 		}
 	}
 	if _, present := generic["local"]; present {
-		t.Errorf(`get --json "local" present (%v), want omitted in Phase B`, generic["local"])
+		t.Errorf(`get --json "local" present (%v), want omitted`, generic["local"])
 	}
 }
 
-// TestGetSubscription_ClientError_PropagatesUnchanged locks §3.6: whatever
+// TestGetSubscription_ClientError_PropagatesUnchanged locks that whatever
 // typed error *eventlib.SubscriptionClient.Get already produced — for a
 // transport failure or for an OAPI business failure such as an unknown/
 // nonexistent remote_subscription_id (both already classified and tested in
-// Task 7, see subscription_client_test.go) — must reach the caller
+// subscription_client_test.go) — must reach the caller
 // unchanged. This command layer must not swallow, downgrade, or re-wrap it.
 func TestGetSubscription_ClientError_PropagatesUnchanged(t *testing.T) {
 	tests := []struct {

@@ -57,7 +57,7 @@ func TestResolveUATAndCheckScopes_UserAllScopesGranted_ReturnsToken(t *testing.T
 }
 
 // TestResolveUATAndCheckScopes_MissingReadScope_ReturnsTypedPermissionError
-// locks spec §3.5/§3.6: list/get require event:subscription:read; when the
+// locks that list/get require event:subscription:read; when the
 // resolved identity's stored scopes are known and lack it, the command must
 // fail closed with a typed *errs.PermissionError carrying MissingScopes —
 // not a bare error, not a silent pass-through.
@@ -178,8 +178,8 @@ func newCmdWithAsFlag(t *testing.T, asValue string) *cobra.Command {
 
 // TestResolveEffectiveIdentity_RejectsBogusAsValue locks that subscription
 // commands validate --as against {user, bot} even though they have no
-// EventKey/KeyTemplate AuthTypes to check against (spec §2.8's last
-// paragraph: list/get/... resolve --as to a single identity with no
+// EventKey/KeyTemplate AuthTypes to check against (they
+// resolve --as to a single identity with no
 // per-template whitelist) — an invalid literal must still fail closed
 // rather than be passed through to the SDK client.
 func TestResolveEffectiveIdentity_RejectsBogusAsValue(t *testing.T) {
@@ -216,8 +216,8 @@ func TestResolveEffectiveIdentity_AcceptsUserAndBot(t *testing.T) {
 	}
 }
 
-// TestResolveEffectiveIdentity_StrictModeRejectsCrossIdentity locks the fix
-// for the Task 8 review finding: resolveEffectiveIdentity must enforce the
+// TestResolveEffectiveIdentity_StrictModeRejectsCrossIdentity locks that
+// resolveEffectiveIdentity must enforce the
 // administrator's configured strict-mode identity policy (f.CheckStrictMode)
 // right after f.ResolveAs — exactly like cmd/api/api.go's apiRun,
 // cmd/service/service.go's serviceMethodRun, and cmd/whoami/whoami.go's
@@ -309,7 +309,7 @@ func TestMapSubscriptionDetail_FullDetail_MapsEveryRemoteField(t *testing.T) {
 		t.Errorf("Remote.UpdateTime = %v, want 1731000000", row.Remote.UpdateTime)
 	}
 	if row.Local != nil {
-		t.Errorf("Local = %v, want nil/omitted — local-consumer association is Phase-C", row.Local)
+		t.Errorf("Local = %v, want nil/omitted — local-consumer association is a future concern", row.Local)
 	}
 }
 

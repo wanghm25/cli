@@ -3,8 +3,7 @@
 
 // Package subscription implements `lark-cli event subscription` — the
 // management-plane commands for the candidate SDK's remote Subscription
-// resource (design spec §3,
-// docs/superpowers/specs/2026-07-21-oapi-event-subscribe-design.md).
+// resource.
 //
 // This file holds the root `subscription` command group plus the pieces
 // shared by every subcommand: --as identity resolution + local scope
@@ -31,10 +30,9 @@ import (
 	"github.com/larksuite/cli/internal/credential"
 )
 
-// NewCmdSubscription builds the `event subscription` command group (spec
-// §3.1). Task 8 wired the read-only list/get pair; Task 9 added create as a
-// sibling, without touching list/get; this change adds update/renew/
-// reactivate/delete the same way, without touching list/get/create.
+// NewCmdSubscription builds the `event subscription` command group: the
+// read-only list/get pair plus the mutating create/update/renew/
+// reactivate/delete subcommands.
 func NewCmdSubscription(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "subscription",
@@ -93,24 +91,23 @@ Subscription here never starts, stops, or changes a local consumer.`,
 	return cmd
 }
 
-// subscriptionReadScopes are the scopes required by both list and get
-// (spec §3.5/§7).
+// subscriptionReadScopes are the scopes required by both list and get.
 var subscriptionReadScopes = []string{"event:subscription:read"}
 
 // subscriptionEncryptKeyReadScopes is the scope required to fetch a
 // subscription's encrypt_key via eventlib.SubscriptionClient.GetEncryptKey
 // (internal/event/subscription_client.go) — event:encrypt_key:read is a
 // distinct scope that neither subscriptionReadScopes nor
-// subscriptionMutationScopes implies (task-E-design-note.md's task E1).
+// subscriptionMutationScopes implies.
 // create.go's createRequiredScopes wires this in for
-// --include-resource-data=true (task E2): that path's reconcile step probes
+// --include-resource-data=true: that path's reconcile step probes
 // GetEncryptKey (eventlib.ReconcileExisting's WithEncryptKeyProber) to
 // classify an existing include_resource_data=true match, so it needs this
 // scope on top of subscriptionMutationScopes.
 var subscriptionEncryptKeyReadScopes = []string{"event:encrypt_key:read"}
 
 // addAsFlag registers the --as flag shared by every subscription
-// subcommand. Per spec §2.8's last paragraph, list/get/update/renew/
+// subcommand. list/get/update/renew/
 // reactivate/delete carry no EventKey/KeyTemplate context, so --as resolves
 // to a single effective identity with no per-template AuthTypes check —
 // unlike `consume`/`create`, which do enforce one (cmd/event/consume.go's
@@ -152,8 +149,8 @@ func resolveEffectiveIdentity(cmd *cobra.Command, f *cmdutil.Factory) (core.Iden
 }
 
 // resolveUATAndCheckScopes resolves the effective identity's access token
-// and performs a local, best-effort scope pre-check against required (spec
-// §3.5). It returns the user access token to bind into
+// and performs a local, best-effort scope pre-check against required.
+// It returns the user access token to bind into
 // eventlib.NewSubscriptionClient — empty for bot identity, which the client
 // ignores.
 //
@@ -219,12 +216,11 @@ type payloadOptionsView struct {
 }
 
 // remoteState is the CLI-facing shape of a SubscriptionDetail's remote-side
-// state, faithfully carrying every remote field this task has available
-// (the task brief: "emit the remote subscription data faithfully").
-// SuspensionReason reuses the vocabulary the design spec already assigns to
-// per-consumer state in the (not-yet-built) bus runtime (§5.5's
-// "suspension_reason"), rather than inventing a second name for the same
-// concept.
+// state, faithfully carrying every remote field available so the remote
+// subscription data is emitted faithfully.
+// SuspensionReason reuses the same "suspension_reason" name used for
+// per-consumer state in the (not-yet-built) bus runtime, rather than
+// inventing a second name for the same concept.
 type remoteState struct {
 	State            string `json:"state,omitempty"`
 	ExpireTime       *int   `json:"expire_time,omitempty"`
@@ -239,8 +235,8 @@ type remoteState struct {
 //
 // Local is always omitted in this change: local-consumer association
 // (which local `event consume` process, if any, is currently bound to this
-// remote subscription) is a Phase-C concern — the bus runtime that would
-// supply that data does not exist yet (design spec §4/§5). Rather than fake
+// remote subscription) is a future concern — the bus runtime that would
+// supply that data does not exist yet. Rather than fake
 // or guess at it, this field is left nil/omitted; a later change populates
 // it once the bus runtime exists, additively, without changing this
 // field's name or position.
@@ -252,23 +248,22 @@ type subscriptionRow struct {
 	Identity             string              `json:"identity,omitempty"`
 	PayloadOptions       *payloadOptionsView `json:"payload_options,omitempty"`
 	Remote               remoteState         `json:"remote"`
-	Local                json.RawMessage     `json:"local,omitempty"` // Phase-C placeholder; see doc comment above.
+	Local                json.RawMessage     `json:"local,omitempty"` // placeholder; see doc comment above.
 }
 
 // mapSubscriptionDetail converts one SDK SubscriptionDetail into the CLI's
 // stable JSON row shape.
 //
 // EventKey: SubscriptionDetail has no field named event_key — the SDK only
-// carries EventType + TargetResource (design spec §0.4). This task maps
+// carries EventType + TargetResource. This maps
 // EventKey to EventType verbatim (a legacy/plain EventKey IS its OAPI
-// event_type, per spec §1.1's own naming table) and additionally surfaces
+// event_type) and additionally surfaces
 // TargetResource as its own field, rather than fabricating a materialized
 // refined-key string (e.g. "im.message.created_v1/chat-id/oc_xxx"): doing
 // that faithfully requires a reverse KeyTemplate lookup (registry base +
 // PathSegment reconstruction from the resource query string) that does not
 // exist yet, and a wrong guess would emit a key-shaped string that `event
-// schema`/`event consume` would not actually recognize. See
-// task-8-report.md for the full rationale.
+// schema`/`event consume` would not actually recognize.
 func mapSubscriptionDetail(d *larkeventv1.SubscriptionDetail) subscriptionRow {
 	if d == nil {
 		return subscriptionRow{}
@@ -295,10 +290,10 @@ func mapSubscriptionDetail(d *larkeventv1.SubscriptionDetail) subscriptionRow {
 	return row
 }
 
-// formatAuthority renders a SubscriptionDetail's Authority using this
-// spec's own compact identity vocabulary (§1.1's naming table: "user:ou_xxx"
-// / "app"). Authority.Type is an open string, not a closed enum (spec
-// §0.4's closing line: "无任何 ... 常量，全部为字符串"), so an unrecognized
+// formatAuthority renders a SubscriptionDetail's Authority using a
+// compact identity vocabulary ("user:ou_xxx"
+// / "app"). Authority.Type is an open string, not a closed enum,
+// so an unrecognized
 // value is passed through verbatim rather than dropped.
 func formatAuthority(a *larkeventv1.Authority) string {
 	if a == nil || a.Type == nil || *a.Type == "" {
@@ -328,13 +323,13 @@ func boolVal(b *bool) bool {
 	return b != nil && *b
 }
 
-// ---- shared pieces for update/renew/reactivate/delete (spec §3.2.4-§3.2.7)
+// ---- shared pieces for update/renew/reactivate/delete ----
 //
 // Unlike create (which keys off a refined EventKey with no remote identity
 // yet, and so branches into create/reuse/conflict/suspended), these four
 // commands all key off an already-existing remote_subscription_id: their
 // --dry-run "parse/identity/scope preflight/remote read/impact analysis"
-// shape (spec §3.4) is therefore identical across all four, differing only
+// shape is therefore identical across all four, differing only
 // in the operation name, the planned_change.action string, and the
 // local_impact note text — so it is built and rendered once here rather
 // than four times. list/get/create keep their own bespoke shapes unchanged.
@@ -353,8 +348,8 @@ func errEmptyRemoteSubscriptionID() error {
 
 // mutationPreflight is the `preflight` sub-object shared by update/renew/
 // reactivate/delete's --dry-run JSON. Unlike create's createPreflight, these
-// commands carry no EventKey/KeyTemplate context (spec §2.8's last
-// paragraph: they resolve --as to a single identity with no per-template
+// commands carry no EventKey/KeyTemplate context (they
+// resolve --as to a single identity with no per-template
 // AuthTypes check), so there is no MatchedTemplate field.
 type mutationPreflight struct {
 	Identity string `json:"identity"`
@@ -362,7 +357,7 @@ type mutationPreflight struct {
 }
 
 // mutationDryRunResult is the shared --dry-run JSON shape for update/renew/
-// reactivate/delete (spec §3.4: operation/dry_run/required_scopes/
+// reactivate/delete (operation/dry_run/required_scopes/
 // preflight/remote_before/planned_change/local_impact/next_action). All
 // four always have a non-nil RemoteBefore by the time this is built: unlike
 // create's target (which may legitimately not exist yet), these commands
@@ -387,7 +382,7 @@ type mutationDryRunResult struct {
 // Preflight.ScopesOK is unconditionally true here — mirroring create.go's
 // buildDryRunResult's own ScopesOK comment. plannedAction is the
 // planned_change.action value (e.g. "update", or a blocked-state variant
-// such as "blocked_suspended" — spec §3.4 always reports the plan
+// such as "blocked_suspended" — the dry-run always reports the plan
 // informationally rather than erroring on remote business state; only the
 // preflight steps themselves are real dry-run failures, mirroring create's
 // own conflict/suspended dry-run handling).
@@ -427,7 +422,7 @@ func writeMutationDryRunText(out io.Writer, result *mutationDryRunResult) {
 // update/renew/reactivate: each of those three SDK calls
 // (Patch/Renew/Reactivate) returns a fresh SubscriptionDetail to echo back.
 // delete has its own deleteResult in delete.go — DeleteSubscriptionResp
-// carries no Data/SubscriptionDetail at all (spec §0.4), so there is nothing
+// carries no Data/SubscriptionDetail at all, so there is nothing
 // fresh to map here.
 type mutationResult struct {
 	Operation            string          `json:"operation"`

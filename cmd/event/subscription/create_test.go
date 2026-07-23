@@ -76,7 +76,7 @@ func registerCreateFixtures(t *testing.T) {
 // resolveCreatedChatID registers the fixtures and resolves the chat-id
 // template, failing the test on any error (every reconcile/outcome test
 // needs a valid ResolvedEventKey as a starting point, not the resolver's own
-// behavior — that is Task 3's). Callers must not also call
+// behavior). Callers must not also call
 // registerCreateFixtures directly — eventlib.RegisterKey panics on a
 // duplicate key.
 func resolveCreatedChatID(t *testing.T) eventlib.ResolvedEventKey {
@@ -235,7 +235,7 @@ func TestReconcileExisting_ActiveConflicting_ReturnsConflictActionWithFields(t *
 	}, false, ""), nil)}
 
 	// requested include_resource_data=false (the only value that can reach
-	// this point once the E-gate rejects true) mismatches the existing true.
+	// this point once the encryption check rejects true) mismatches the existing true.
 	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -580,8 +580,7 @@ func TestCreateRequiredScopes_DoesNotMutateSharedBaseSlice(t *testing.T) {
 	}
 }
 
-// ---- dry-run must never generate a key (design spec §4.7 caution #1;
-// task-E-design-note.md's E2 RED LINE: "dry-run generates no key") ----
+// ---- dry-run must never generate a key ----
 
 // TestDryRun_IncludeResourceDataTrue_NotFound_GeneratesNoKeyAndNoCreateCall
 // drives the exact two calls runCreate's --dry-run branch makes
@@ -621,8 +620,8 @@ func TestDryRun_IncludeResourceDataTrue_NotFound_GeneratesNoKeyAndNoCreateCall(t
 
 // TestDryRun_IncludeResourceDataTrue_ActiveMatch_ProbesButGeneratesNoKey
 // covers the OTHER row a --dry-run preview can reach for an encrypted
-// request: an existing active, include_resource_data=true match. Per design
-// spec §4.7's own cautions, --dry-run's plan step MAY probe remote state
+// request: an existing active, include_resource_data=true match.
+// --dry-run's plan step MAY probe remote state
 // (GetEncryptKey, to report whether the plan would be reuse or conflict)
 // but must still never generate a NEW key — this distinguishes "probing an
 // existing key" (fine, informational) from "creating a new one" (never
@@ -663,12 +662,11 @@ func TestDryRun_IncludeResourceDataTrue_ActiveMatch_ProbesButGeneratesNoKey(t *t
 	}
 }
 
-// ---- encrypted create (task-E-design-note.md task E2: un-gate
-// --include-resource-data=true, atomic Create-time key injection, the
-// encryption conflict matrix, and the redaction RED LINE) ----
+// ---- encrypted create (--include-resource-data=true: atomic Create-time
+// key injection, the encryption conflict matrix, and key redaction) ----
 
 // TestBuildCreateSubscriptionBody_IncludeResourceDataTrueWithKey_SetsBothAtomically
-// is the direct, structural proof of spec §4.7's atomicity requirement:
+// is the direct, structural proof of the atomicity requirement:
 // includeResourceData and a non-empty encryptKey are always set on the SAME
 // returned body value from ONE function call — there is no code path that
 // could build/send them as two separate requests. See
@@ -744,8 +742,8 @@ func TestCreateOrReuseSubscription_Encrypted_NotFound_CreatesAtomicallyWithKey(t
 }
 
 // TestCreateOrReuseSubscription_Encrypted_RemoteFalse_ReturnsConflict locks
-// spec §4.7's "加密资源详情 | include_resource_data=false | 冲突,人工决策"
-// row via createOrReuseSubscription (create.go's own typed-error layer, not
+// the conflict-matrix row "encrypted request vs existing include_resource_data=false
+// -> conflict, human decision" via createOrReuseSubscription (create.go's own typed-error layer, not
 // just the lower-level ReconcileExisting already locked in
 // internal/event/reconcile_test.go).
 func TestCreateOrReuseSubscription_Encrypted_RemoteFalse_ReturnsConflict(t *testing.T) {
@@ -773,7 +771,7 @@ func TestCreateOrReuseSubscription_Encrypted_RemoteFalse_ReturnsConflict(t *test
 }
 
 // TestCreateOrReuseSubscription_Encrypted_RemoteTrueUsableKey_ReusesNoNewCreate
-// locks spec §4.7's "加密资源详情 | 加密资源详情且密钥可取 | 复用" row: an
+// locks the conflict-matrix reuse row: an
 // active, include_resource_data=true match whose key GetEncryptKey confirms
 // usable is reused as-is — never a new Create, never a new key.
 func TestCreateOrReuseSubscription_Encrypted_RemoteTrueUsableKey_ReusesNoNewCreate(t *testing.T) {
@@ -811,8 +809,8 @@ func TestCreateOrReuseSubscription_Encrypted_RemoteTrueUsableKey_ReusesNoNewCrea
 }
 
 // TestCreateOrReuseSubscription_Encrypted_RemoteTrueKeyUnavailable_ReturnsConflictHumanHint
-// locks spec §4.7's "加密资源详情 | 加密资源详情但密钥不可取 | 不得
-// ready/冲突" row: GetEncryptKey returning no usable key (here: a business
+// locks the conflict-matrix row for an encrypted match whose key is NOT
+// retrievable: GetEncryptKey returning no usable key (here: a business
 // error, e.g. missing scope/permission at the remote side) must conflict —
 // with human-actionable guidance (delete+recreate / verify the subscription
 // / check event:encrypt_key:read), never a silent reuse.
@@ -850,7 +848,7 @@ func TestCreateOrReuseSubscription_Encrypted_RemoteTrueKeyUnavailable_ReturnsCon
 }
 
 // TestCreateOrReuseSubscription_Encrypted_CreateFails_SecondReconcileStillRequiresEncryption
-// locks the fail-closed RED LINE: "if create fails, do NOT retry without
+// locks the fail-closed invariant: "if create fails, do NOT retry without
 // encryption / do NOT fall back to a plaintext sub." The post-failure
 // bounded reconcile-and-retry pass (createOrReuseSubscription's own,
 // unrelated-to-encryption "List raced us" recovery) must still request
@@ -888,9 +886,9 @@ func TestCreateOrReuseSubscription_Encrypted_CreateFails_SecondReconcileStillReq
 	}
 }
 
-// ---- redaction RED LINE (task-E-design-note.md's "RED LINES" + this
-// task's own): the generated key must NEVER appear in stdout, stderr, the
-// --json output, the dry-run plan preview, logs, or any error/Hint ----
+// ---- key redaction: the generated key must NEVER appear in stdout,
+// stderr, the --json output, the dry-run plan preview, logs, or any
+// error/Hint ----
 
 // TestEncryptedCreate_Redaction_KeyNeverAppearsInAnyOutput captures every
 // caller-visible output surface an encrypted, successful create produces —
@@ -937,13 +935,13 @@ func TestEncryptedCreate_Redaction_KeyNeverAppearsInAnyOutput(t *testing.T) {
 		t.Fatalf("json.Marshal: %v", err)
 	}
 	if strings.Contains(string(jsonBytes), capturedKey) {
-		t.Errorf("RED LINE VIOLATION: encrypt_key found in --json output: %s", jsonBytes)
+		t.Errorf("REDACTION VIOLATION: encrypt_key found in --json output: %s", jsonBytes)
 	}
 
 	var textBuf bytes.Buffer
 	writeCreateText(&textBuf, result)
 	if strings.Contains(textBuf.String(), capturedKey) {
-		t.Errorf("RED LINE VIOLATION: encrypt_key found in human-text output: %s", textBuf.String())
+		t.Errorf("REDACTION VIOLATION: encrypt_key found in human-text output: %s", textBuf.String())
 	}
 
 	// Also cover the dry-run preview shape (a plan built from the same
@@ -957,7 +955,7 @@ func TestEncryptedCreate_Redaction_KeyNeverAppearsInAnyOutput(t *testing.T) {
 		t.Fatalf("json.Marshal dry-run result: %v", err)
 	}
 	if strings.Contains(string(dryRunJSON), capturedKey) {
-		t.Errorf("RED LINE VIOLATION: encrypt_key found in dry-run plan preview: %s", dryRunJSON)
+		t.Errorf("REDACTION VIOLATION: encrypt_key found in dry-run plan preview: %s", dryRunJSON)
 	}
 }
 
@@ -992,7 +990,7 @@ func TestEncryptedCreate_Redaction_KeyNeverAppearsInErrorOnCreateFailure(t *test
 		t.Fatal("test setup issue: no key was captured, cannot verify redaction")
 	}
 	if strings.Contains(err.Error(), capturedKey) {
-		t.Errorf("RED LINE VIOLATION: encrypt_key found in error message: %v", err)
+		t.Errorf("REDACTION VIOLATION: encrypt_key found in error message: %v", err)
 	}
 }
 
@@ -1080,7 +1078,7 @@ func TestRunCreate_BareRefinedBaseKey_ReturnsR1InvalidArgumentUnchanged(t *testi
 		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeInvalidArgument)
 	}
 	if !strings.Contains(ve.Hint, "event schema") {
-		t.Errorf("Hint = %q, want it to point at `event schema` (R1)", ve.Hint)
+		t.Errorf("Hint = %q, want it to point at `event schema`", ve.Hint)
 	}
 }
 
@@ -1146,8 +1144,8 @@ func TestRunCreate_AsBotOnOwnerMeTemplate_RejectedByTemplateAuthTypes(t *testing
 	}
 }
 
-// TestRunCreate_KeyLevelAuthTypesRejectsBeforeTemplateCheck locks tier 1
-// (spec §2.8): a refined key whose AuthTypes as a whole excludes the
+// TestRunCreate_KeyLevelAuthTypesRejectsBeforeTemplateCheck locks tier 1:
+// a refined key whose AuthTypes as a whole excludes the
 // resolved identity must reject with invalid_argument (not
 // failed_precondition — that is tier 2's, template-specific, error).
 func TestRunCreate_KeyLevelAuthTypesRejectsBeforeTemplateCheck(t *testing.T) {
@@ -1184,16 +1182,16 @@ func TestRunCreate_KeyLevelAuthTypesRejectsBeforeTemplateCheck(t *testing.T) {
 	}
 }
 
-// TestRunCreate_IncludeResourceDataTrue_ReturnsEGateFailedPrecondition
-// previously locked the §9 deferral gate. Task E2 removes that gate and
-// implements real encrypted-create instead (task-E-design-note.md);
+// An earlier test locked a deferral gate that rejected
+// --include-resource-data=true. That gate is gone — encrypted create is
+// implemented instead;
 // TestRunCreate_IncludeResourceDataTrue_MissingEncryptKeyReadScope_ReturnsPermissionError
 // and the createOrReuseSubscription-level tests below
-// (TestCreateOrReuseSubscription_Encrypted_*) are this test's replacement.
+// (TestCreateOrReuseSubscription_Encrypted_*) are its replacement.
 
 // TestRunCreate_IncludeResourceDataFalse_DoesNotRequireEncryptKeyReadScope
 // locks that --include-resource-data=false (the default) never pulls in the
-// extra event:encrypt_key:read scope requirement task E2 adds for =true:
+// extra event:encrypt_key:read scope requirement added for =true:
 // with ONLY the base mutation scopes granted (deliberately omitting
 // event:encrypt_key:read), the flow must proceed past scope preflight into
 // the real reconcile List call — which then fails with an httpmock "no stub
@@ -1222,7 +1220,7 @@ func TestRunCreate_IncludeResourceDataFalse_DoesNotRequireEncryptKeyReadScope(t 
 }
 
 // TestRunCreate_IncludeResourceDataTrue_MissingEncryptKeyReadScope_ReturnsPermissionError
-// locks task E2's scope wiring: --include-resource-data=true additionally
+// locks the scope wiring: --include-resource-data=true additionally
 // requires event:encrypt_key:read (create's reconcile probes GetEncryptKey
 // for an active include_resource_data=true match) on top of the usual
 // event:subscription:{read,write} — missing it alone (both mutation scopes
@@ -1277,8 +1275,8 @@ func TestRunCreate_IncludeResourceDataTrue_AllScopesGranted_PassesScopePreflight
 }
 
 // TestRunCreate_MissingReadScope_ReturnsPermissionError and
-// TestRunCreate_MissingWriteScope_ReturnsPermissionError together lock spec
-// §3.5's key differentiator from list/get: create hard-requires BOTH
+// TestRunCreate_MissingWriteScope_ReturnsPermissionError together lock
+// create's key differentiator from list/get: create hard-requires BOTH
 // event:subscription:read AND event:subscription:write — missing EITHER one
 // alone must still fail closed (read does not imply write, or vice versa).
 func TestRunCreate_MissingReadScope_ReturnsPermissionError(t *testing.T) {
@@ -1353,7 +1351,7 @@ func TestRunCreate_MissingBothScopes_ReturnsPermissionErrorListingBoth(t *testin
 	}
 }
 
-// ---- dry-run output shape (spec §3.4) ----
+// ---- dry-run output shape ----
 
 func TestBuildDryRunResult_NotFound_ShapeAndNoRemoteBefore(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
@@ -1410,7 +1408,7 @@ func TestBuildDryRunResult_ActiveCompatible_RemoteBeforePopulated(t *testing.T) 
 
 // TestBuildDryRunResult_IncludeResourceDataTrue_RequiredScopesIncludesEncryptKeyRead
 // locks that dry-run's own reported required_scopes accurately reflects
-// task E2's conditional third scope: a --dry-run preview must never claim a
+// the conditional third scope: a --dry-run preview must never claim a
 // smaller scope requirement than the real run it is previewing actually
 // checked (both share the same createRequiredScopes call in runCreate).
 func TestBuildDryRunResult_IncludeResourceDataTrue_RequiredScopesIncludesEncryptKeyRead(t *testing.T) {
@@ -1432,7 +1430,7 @@ func TestBuildDryRunResult_IncludeResourceDataTrue_RequiredScopesIncludesEncrypt
 
 // TestDryRun_NotFound_EndToEndViaFakeService_JSONShapeAndNoCreateCall is the
 // primary TDD case from the task brief: `create <refined key> --dry-run`
-// must produce the full §3.4 JSON shape and must NEVER call Create. This
+// must produce the full dry-run JSON shape and must NEVER call Create. This
 // drives the exact same two calls runCreate's --dry-run branch makes
 // (reconcileExisting then buildDryRunResult) against the fakeCreateAPI seam
 // — mirroring how list_test.go/get_test.go test listSubscriptions/
@@ -1480,7 +1478,7 @@ func TestDryRun_NotFound_EndToEndViaFakeService_JSONShapeAndNoCreateCall(t *test
 // TestDryRun_ActiveConflicting_EndToEndViaFakeService_ReportsInformationallyNoCreateCall
 // and TestDryRun_Suspended_EndToEndViaFakeService_ReportsInformationallyNoCreateCall extend
 // TestDryRun_NotFound_EndToEndViaFakeService_JSONShapeAndNoCreateCall to the plan's other
-// two shapes. Per spec §3.4, dry-run always reports the reconcile plan
+// two shapes; dry-run always reports the reconcile plan
 // informationally and never itself errors on conflict/suspended — only the
 // preflight steps (identity/template/scope, already passed by the time
 // runCreate reaches --dry-run) are real dry-run failures. This is the
@@ -1561,7 +1559,7 @@ func TestDryRun_Suspended_EndToEndViaFakeService_ReportsInformationallyNoCreateC
 // TestNewCmdSubscription_RegistersCreateAsWrite locks that create is
 // registered in the subscription group (without disturbing list/get — see
 // TestNewCmdSubscription_RegistersListAndGetAsRead, unmodified) and carries
-// risk=write (spec §3.1), not read like list/get.
+// risk=write, not read like list/get.
 func TestNewCmdSubscription_RegistersCreateAsWrite(t *testing.T) {
 	f := &cmdutil.Factory{}
 	cmd := NewCmdSubscription(f)
@@ -1582,7 +1580,7 @@ func TestNewCmdSubscription_RegistersCreateAsWrite(t *testing.T) {
 }
 
 // TestNewCmdCreate_HasExpectedFlagsAndNoYes mirrors
-// TestNewCmdList_HasExpectedFlags, plus locks spec §3.7: create must NOT
+// TestNewCmdList_HasExpectedFlags, plus locks that create must NOT
 // expose --yes (only update/delete do — create is additive and
 // conflict-precheck'd, not a high-risk confirmation-gated action).
 func TestNewCmdCreate_HasExpectedFlagsAndNoYes(t *testing.T) {
@@ -1594,7 +1592,7 @@ func TestNewCmdCreate_HasExpectedFlagsAndNoYes(t *testing.T) {
 		}
 	}
 	if cmd.Flags().Lookup("yes") != nil {
-		t.Error(`NewCmdCreate must not expose --yes (spec §3.7: only update/delete require confirmation)`)
+		t.Error(`NewCmdCreate must not expose --yes (only update/delete require confirmation)`)
 	}
 	if level, ok := cmdutil.GetRisk(cmd); !ok || level != cmdutil.RiskWrite {
 		t.Errorf("risk = (%q, %v), want (%q, true)", level, ok, cmdutil.RiskWrite)

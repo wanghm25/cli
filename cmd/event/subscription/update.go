@@ -21,7 +21,7 @@ import (
 
 // updateSubscriptionAPI is the subset of *eventlib.SubscriptionClient this
 // command calls: Get (the remote read this command always performs first —
-// spec §3.5's CLI-side invariant that read is hard-required alongside write
+// the CLI-side invariant that read is hard-required alongside write
 // for every mutating subscription command, used here both to detect a
 // suspended target before ever calling Patch and to report remote_before/
 // impact for --dry-run) and Patch (the actual write). See listSubscriptionsAPI
@@ -32,7 +32,7 @@ type updateSubscriptionAPI interface {
 	Patch(ctx context.Context, req *larkeventv1.PatchSubscriptionReq) (*larkeventv1.PatchSubscriptionResp, error)
 }
 
-// updateOpts holds `event subscription update`'s flag values (spec §3.1).
+// updateOpts holds `event subscription update`'s flag values.
 type updateOpts struct {
 	includeResourceData bool
 	dryRun              bool
@@ -40,22 +40,22 @@ type updateOpts struct {
 	asJSON              bool
 }
 
-// NewCmdUpdate builds `event subscription update <remote_subscription_id>`
-// (spec §3.2.4/§3.6/§3.7). The candidate SDK's Patch call only ever touches
-// payload_options (design spec §0.4: "Patch body ... 无 encrypt"), so
+// NewCmdUpdate builds `event subscription update <remote_subscription_id>`.
+// The candidate SDK's Patch call only ever touches
+// payload_options (the Patch body has no encrypt field), so
 // --include-resource-data is update's only mutable input — and, since a
 // caller must pass an explicit intent for that one field, it is required
 // rather than defaulted (unlike create's, which defaults to false).
 //
 // Like create, update requires BOTH event:subscription:read and
-// event:subscription:write (spec §3.5): it always reads the target's
+// event:subscription:write: it always reads the target's
 // current remote state first (Get) — both to refuse updating a suspended
-// subscription (spec §3.2.4: typed failed_precondition guiding `reactivate`
+// subscription (typed failed_precondition guiding `reactivate`
 // instead of silently no-op'ing or corrupting state) and to report
 // remote_before/impact for --dry-run.
 //
 // Unlike create/renew/reactivate, update is a high-risk write on a shared
-// remote resource (spec §3.7): without --yes it returns a typed
+// remote resource: without --yes it returns a typed
 // ConfirmationRequiredError (category confirmation, exit code 10) instead of
 // proceeding; --yes asserts a human already confirmed.
 func NewCmdUpdate(f *cmdutil.Factory) *cobra.Command {
@@ -79,8 +79,8 @@ reactivate <remote_subscription_id>' first) and to report impact for
 
 ALLOWED VALUES: --include-resource-data true|false (required — no default is
 silently applied). --include-resource-data=true is refused: encryption is set
-only at create time and cannot be added, changed, or removed by update (spec
-§4.7), so switching include_resource_data / encryption on an existing
+only at create time and cannot be added, changed, or removed by update, so
+switching include_resource_data / encryption on an existing
 Subscription is not supported here — a typed failed_precondition guides you to
 delete + recreate (after a human confirms) instead.
 
@@ -103,7 +103,7 @@ confirmed. Use --dry-run to preview the plan without changing anything.`,
 	}
 
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
-		"New value for whether to include resource data in delivered events (required: pass explicitly). true is refused: encryption is set only at create time (spec §4.7), so switching include_resource_data / encryption on an existing subscription is not supported via update — delete + recreate (after a human confirms) instead.")
+		"New value for whether to include resource data in delivered events (required: pass explicitly). true is refused: encryption is set only at create time, so switching include_resource_data / encryption on an existing subscription is not supported via update — delete + recreate (after a human confirms) instead.")
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the plan (identity/scope preflight + remote read + impact analysis) without updating anything")
 	cmd.Flags().BoolVar(&o.yes, "yes", false, "Confirm this high-risk write (required unless --dry-run); only pass this after a human has confirmed")
@@ -124,11 +124,10 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 			WithParam("--include-resource-data").
 			WithHint("retry with --include-resource-data=true or --include-resource-data=false")
 	}
-	// Task E3 (spec §4.7 "轮换、删除与缓存失效"): the CLI refuses to switch
+	// The CLI refuses to switch
 	// include_resource_data / encryption ON via update. This is a pure local
 	// check, independent of identity/scope/remote state, so a rejected request
-	// never causes any network activity at all — same ordering rationale as
-	// the §9 E-gate it replaced.
+	// never causes any network activity at all.
 	if o.includeResourceData {
 		return errUpdateCannotSwitchEncryption(remoteSubscriptionID)
 	}
@@ -196,7 +195,7 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 // re-fetch it.
 //
 // The suspended guard is a hard block regardless of yes — there is no point
-// confirming a write that cannot proceed (spec §3.2.4). It runs before the
+// confirming a write that cannot proceed. It runs before the
 // confirmation gate so a suspended target never even reaches "requires
 // confirmation", and Patch is never called in either failing case.
 func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, includeResourceData bool, yes bool) (*larkeventv1.SubscriptionDetail, error) {
@@ -211,7 +210,7 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, remoteSubscript
 
 // doPatchSubscription issues the actual Patch call and unwraps its
 // response. Any error svc.Patch returns (transport, or an already-classified
-// typed business failure from Task 7's SubscriptionClient.Patch) is passed
+// typed business failure from SubscriptionClient.Patch) is passed
 // through unchanged.
 func doPatchSubscription(ctx context.Context, svc updateSubscriptionAPI, remoteSubscriptionID string, includeResourceData bool) (*larkeventv1.SubscriptionDetail, error) {
 	body := larkeventv1.NewPatchSubscriptionReqBodyBuilder().
@@ -234,8 +233,8 @@ func doPatchSubscription(ctx context.Context, svc updateSubscriptionAPI, remoteS
 	return detail, nil
 }
 
-// errUpdateCannotSwitchEncryption implements task E3 / design spec §4.7's
-// "轮换、删除与缓存失效": the CLI refuses to switch include_resource_data or
+// errUpdateCannotSwitchEncryption reports the CLI's refusal to switch
+// include_resource_data or
 // encryption on an existing remote Subscription via update. `encrypt` is a
 // Create-only field (Patch carries no encrypt), so update could never add an
 // encrypt_key to accompany a newly-enabled include_resource_data=true — and
@@ -245,7 +244,7 @@ func doPatchSubscription(ctx context.Context, svc updateSubscriptionAPI, remoteS
 // deleting the Subscription and creating a new one (or creating a separate new
 // Subscription), after a human confirms.
 //
-// This replaces the former §9 E-deferred gate: it is a permanent
+// This is a permanent
 // by-design rejection, not a "not yet supported / retry later" defer, so it
 // deliberately drops the old resource_data_encryption_deferred reason. Like
 // that gate it is a pure local check (no identity/scope/remote read), so a
@@ -254,10 +253,10 @@ func errUpdateCannotSwitchEncryption(remoteSubscriptionID string) error {
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"cannot change include_resource_data or encryption on an existing subscription via update").
 		WithParam("--include-resource-data").
-		WithHint("encryption is set only when a subscription is created and can never be added, changed, or removed afterward (spec §4.7); to switch include_resource_data or enable/rotate encryption a human must confirm, then delete this subscription and create a new one (or create a separate new subscription) — e.g. `lark-cli event subscription delete %s` then `lark-cli event subscription create <refined-event-key> --include-resource-data=true`", remoteSubscriptionID)
+		WithHint("encryption is set only when a subscription is created and can never be added, changed, or removed afterward; to switch include_resource_data or enable/rotate encryption a human must confirm, then delete this subscription and create a new one (or create a separate new subscription) — e.g. `lark-cli event subscription delete %s` then `lark-cli event subscription create <refined-event-key> --include-resource-data=true`", remoteSubscriptionID)
 }
 
-// errUpdateSuspended implements spec §3.2.4's suspended guard: Patch is
+// errUpdateSuspended implements the suspended guard: Patch is
 // never called against a suspended target; the caller is guided to
 // `reactivate` instead of silently no-op'ing or attempting a write the
 // server would reject anyway.
@@ -269,11 +268,11 @@ func errUpdateSuspended(remoteSubscriptionID string, identity core.Identity, rea
 		WithHint("run `lark-cli event subscription reactivate %s --as %s` first, then retry update", remoteSubscriptionID, identity)
 }
 
-// errUpdateConfirmationRequired implements spec §3.7's high-risk-write
+// errUpdateConfirmationRequired implements the high-risk-write
 // confirmation gate for update: category confirmation (exit code 10, see
 // internal/output/exitcode.go's ExitCodeForCategory), risk high-risk-write,
 // and a Hint naming the affected remote_subscription_id/event_key/identity/
-// current state (pids are omitted: no Phase-C bus/local-consumer registry
+// current state (pids are omitted: no bus/local-consumer registry
 // exists yet to know them, mirroring mapSubscriptionDetail's Local field
 // staying nil/omitted for the same reason — see subscription.go's doc
 // comment on subscriptionRow).
@@ -285,10 +284,10 @@ func errUpdateConfirmationRequired(remoteSubscriptionID string, identity core.Id
 
 // updatePlannedAction is --dry-run's planned_change.action value: "update"
 // normally, or the informational "blocked_suspended" when the target is
-// suspended. Per spec §3.4 (and mirroring create.go's own conflict/
-// suspended dry-run handling), dry-run always reports the plan
+// suspended. Like create.go's own conflict/
+// suspended dry-run handling, dry-run always reports the plan
 // informationally rather than erroring on remote business state — only the
-// preflight steps themselves (identity/scope/flag-shape/E-gate, already
+// preflight steps themselves (identity/scope/flag-shape/encryption-check, already
 // passed by the time this is called) are real dry-run failures. The real
 // (non-dry-run) run's equivalent case DOES error — see errUpdateSuspended,
 // called from runUpdate's non-dry-run branch only.

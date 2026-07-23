@@ -20,7 +20,7 @@ import (
 
 // renewSubscriptionAPI is the subset of *eventlib.SubscriptionClient this
 // command calls: Get (the remote read this command always performs first,
-// per spec §3.5's CLI-side read+write invariant, to report remote_before/
+// per the CLI-side read+write invariant, to report remote_before/
 // impact for --dry-run) and Renew (the actual write, which only extends the
 // subscription's TTL). See listSubscriptionsAPI (list.go) for the test-seam
 // rationale.
@@ -29,22 +29,22 @@ type renewSubscriptionAPI interface {
 	Renew(ctx context.Context, req *larkeventv1.RenewSubscriptionReq) (*larkeventv1.RenewSubscriptionResp, error)
 }
 
-// renewOpts holds `event subscription renew`'s flag values (spec §3.1).
+// renewOpts holds `event subscription renew`'s flag values.
 type renewOpts struct {
 	dryRun bool
 	asJSON bool
 }
 
-// NewCmdRenew builds `event subscription renew <remote_subscription_id>`
-// (spec §3.2.5/§3.6). Like create/update/reactivate/delete, renew requires
-// BOTH event:subscription:read and event:subscription:write (spec §3.5):
+// NewCmdRenew builds `event subscription renew <remote_subscription_id>`.
+// Like create/update/reactivate/delete, renew requires
+// BOTH event:subscription:read and event:subscription:write:
 // this command always reads the current remote state first (Get) to report
 // remote_before/impact for --dry-run — a CLI-side design invariant, not an
 // OAPI requirement (a bare Renew call needs no prior read at the API
 // level).
 //
 // Unlike update/delete, renew is not a high-risk confirmation-gated action
-// (spec §3.7: "renew 仅延 TTL") — it does not expose --yes and never returns
+// — it does not expose --yes and never returns
 // a ConfirmationRequiredError.
 func NewCmdRenew(f *cmdutil.Factory) *cobra.Command {
 	var o renewOpts
@@ -152,7 +152,7 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 
 // doRenewSubscription issues the actual Renew call and unwraps its
 // response. Any error svc.Renew returns (transport, or an already-classified
-// typed business failure from Task 7's SubscriptionClient.Renew) is passed
+// typed business failure from SubscriptionClient.Renew) is passed
 // through unchanged.
 func doRenewSubscription(ctx context.Context, svc renewSubscriptionAPI, remoteSubscriptionID string) (*larkeventv1.SubscriptionDetail, error) {
 	req := larkeventv1.NewRenewSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()

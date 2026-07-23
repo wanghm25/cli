@@ -20,7 +20,7 @@ import (
 
 // reactivateSubscriptionAPI is the subset of *eventlib.SubscriptionClient
 // this command calls: Get (the remote read this command always performs
-// first, per spec §3.5's CLI-side read+write invariant, to report
+// first, per the CLI-side read+write invariant, to report
 // remote_before/impact for --dry-run) and Reactivate (the actual write,
 // which resumes delivery on a suspended subscription). See
 // listSubscriptionsAPI (list.go) for the test-seam rationale.
@@ -29,22 +29,21 @@ type reactivateSubscriptionAPI interface {
 	Reactivate(ctx context.Context, req *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error)
 }
 
-// reactivateOpts holds `event subscription reactivate`'s flag values (spec
-// §3.1).
+// reactivateOpts holds `event subscription reactivate`'s flag values.
 type reactivateOpts struct {
 	dryRun bool
 	asJSON bool
 }
 
 // NewCmdReactivate builds `event subscription reactivate
-// <remote_subscription_id>` (spec §3.2.6/§3.6). Like create/update/renew/
+// <remote_subscription_id>`. Like create/update/renew/
 // delete, reactivate requires BOTH event:subscription:read and
-// event:subscription:write (spec §3.5): this command always reads the
+// event:subscription:write: this command always reads the
 // current remote state first (Get) to report remote_before/impact for
 // --dry-run — a CLI-side design invariant, not an OAPI requirement.
 //
 // Unlike update/delete, reactivate is not a high-risk confirmation-gated
-// action (spec §3.7: "reactivate 为恢复") — it does not expose --yes and
+// action — it does not expose --yes and
 // never returns a ConfirmationRequiredError. There is no `suspend` command:
 // the server exposes no such operation, so the only path back from
 // suspended is reactivate.
@@ -153,7 +152,7 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 
 // doReactivateSubscription issues the actual Reactivate call and unwraps
 // its response. Any error svc.Reactivate returns (transport, or an
-// already-classified typed business failure from Task 7's
+// already-classified typed business failure from
 // SubscriptionClient.Reactivate) is passed through unchanged.
 func doReactivateSubscription(ctx context.Context, svc reactivateSubscriptionAPI, remoteSubscriptionID string) (*larkeventv1.SubscriptionDetail, error) {
 	req := larkeventv1.NewReactivateSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()

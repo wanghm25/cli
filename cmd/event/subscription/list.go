@@ -23,14 +23,14 @@ import (
 // command calls. It exists purely as a test seam: tests substitute a fake
 // implementing just this method, so the request-building/response-mapping
 // logic (listSubscriptions) is exercised without a real *lark.Client or
-// network call (design spec §11.5 requires the whole management plane be
+// network call (the whole management plane must be
 // testable via a fake client). eventlib.NewSubscriptionClient's return
 // value satisfies this interface structurally.
 type listSubscriptionsAPI interface {
 	List(ctx context.Context, req *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error)
 }
 
-// listOpts holds `event subscription list`'s flag values (spec §3.1).
+// listOpts holds `event subscription list`'s flag values.
 type listOpts struct {
 	state     string
 	eventKey  string
@@ -39,8 +39,8 @@ type listOpts struct {
 	asJSON    bool
 }
 
-// NewCmdList builds `event subscription list` (spec §3.1/§3.5: read-only,
-// requires event:subscription:read).
+// NewCmdList builds `event subscription list`: read-only,
+// requires event:subscription:read.
 func NewCmdList(f *cmdutil.Factory) *cobra.Command {
 	var o listOpts
 	cmd := &cobra.Command{

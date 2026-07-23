@@ -22,7 +22,7 @@ import (
 // fakeListAPI is a network-free stand-in for *eventlib.SubscriptionClient's
 // List method — the listSubscriptionsAPI test seam — so listSubscriptions'
 // request-building/response-mapping logic is exercised without a real
-// *lark.Client or network call (design spec §11.5).
+// *lark.Client or network call.
 type fakeListAPI struct {
 	resp *larkeventv1.ListSubscriptionResp
 	err  error
@@ -138,7 +138,7 @@ func TestListSubscriptions_TwoItems_JSONShape(t *testing.T) {
 		}
 	}
 	if _, present := row0["local"]; present {
-		t.Errorf(`subscriptions[0]["local"] present (%v), want omitted in Phase B`, row0["local"])
+		t.Errorf(`subscriptions[0]["local"] present (%v), want omitted`, row0["local"])
 	}
 }
 
@@ -182,7 +182,7 @@ func TestListSubscriptions_TransportError_PropagatesTyped(t *testing.T) {
 	}
 	if err.Error() != "boom: connection reset" {
 		// listSubscriptions must pass the error through unchanged — it is
-		// *eventlib.SubscriptionClient's job (already tested in Task 7) to
+		// *eventlib.SubscriptionClient's job (already tested) to
 		// wrap it into a typed error; this command layer must not swallow
 		// or double-wrap it.
 		t.Errorf("err = %v, want it passed through unchanged", err)

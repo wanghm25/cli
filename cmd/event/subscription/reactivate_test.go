@@ -89,7 +89,7 @@ func TestDoReactivateSubscription_SuccessWithNoData_ReturnsTypedInternalError(t 
 	}
 }
 
-// ---- --dry-run output shape (spec §3.4), direct-call end-to-end via the
+// ---- --dry-run output shape, direct-call end-to-end via the
 // fake service — mirrors update_test.go's own dry-run test. Uses a
 // suspended fixture (the realistic target for reactivate) to prove
 // dry-run reports it informationally and never calls Reactivate.
@@ -193,7 +193,7 @@ func TestRunReactivate_MissingWriteScope_ReturnsPermissionError(t *testing.T) {
 	}
 }
 
-// TestNewCmdReactivate_HasExpectedFlagsAndNoYes locks spec §3.7: reactivate
+// TestNewCmdReactivate_HasExpectedFlagsAndNoYes locks that reactivate
 // must NOT expose --yes.
 func TestNewCmdReactivate_HasExpectedFlagsAndNoYes(t *testing.T) {
 	f := &cmdutil.Factory{}
@@ -204,7 +204,7 @@ func TestNewCmdReactivate_HasExpectedFlagsAndNoYes(t *testing.T) {
 		}
 	}
 	if cmd.Flags().Lookup("yes") != nil {
-		t.Error("NewCmdReactivate must not expose --yes (spec §3.7: reactivate is a recovery action, not a high-risk confirmation-gated write)")
+		t.Error("NewCmdReactivate must not expose --yes (reactivate is a recovery action, not a high-risk confirmation-gated write)")
 	}
 	if level, ok := cmdutil.GetRisk(cmd); !ok || level != cmdutil.RiskWrite {
 		t.Errorf("risk = (%q, %v), want (%q, true)", level, ok, cmdutil.RiskWrite)
@@ -230,7 +230,7 @@ func TestNewCmdSubscription_RegistersReactivateAsWrite(t *testing.T) {
 	}
 }
 
-// TestNewCmdSubscription_NoSuspendCommand locks spec §3.7's last line: there
+// TestNewCmdSubscription_NoSuspendCommand locks that there
 // is no `suspend` command — the server exposes no such operation, so the
 // only path back from suspended is `reactivate`.
 func TestNewCmdSubscription_NoSuspendCommand(t *testing.T) {
@@ -238,7 +238,7 @@ func TestNewCmdSubscription_NoSuspendCommand(t *testing.T) {
 	cmd := NewCmdSubscription(f)
 	for _, c := range cmd.Commands() {
 		if c.Name() == "suspend" {
-			t.Fatal(`subscription command group must not have a "suspend" subcommand (spec §3.7: no such server operation)`)
+			t.Fatal(`subscription command group must not have a "suspend" subcommand (no such server operation)`)
 		}
 	}
 }

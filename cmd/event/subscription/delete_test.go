@@ -49,7 +49,7 @@ func okDeleteResp() *larkeventv1.DeleteSubscriptionResp {
 	return &larkeventv1.DeleteSubscriptionResp{ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)}}
 }
 
-// ---- applyDelete (spec §3.7 confirmation gate) ----
+// ---- applyDelete (confirmation gate) ----
 
 func TestApplyDelete_NotYes_ReturnsConfirmationRequired_NoDeleteCall(t *testing.T) {
 	fake := &fakeDeleteAPI{}
@@ -147,7 +147,7 @@ func TestBuildDeleteResult_Shape(t *testing.T) {
 	}
 }
 
-// ---- --dry-run output shape (spec §3.4), direct-call end-to-end via the
+// ---- --dry-run output shape, direct-call end-to-end via the
 // fake service — mirrors update_test.go's own dry-run test.
 
 func TestDeleteDryRun_EndToEndViaFakeService_JSONShapeAndNoDeleteCall(t *testing.T) {

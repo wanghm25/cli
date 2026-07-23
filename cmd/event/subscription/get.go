@@ -27,8 +27,8 @@ type getSubscriptionAPI interface {
 	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
 }
 
-// NewCmdGet builds `event subscription get <remote_subscription_id>` (spec
-// §3.1/§3.5: read-only, requires event:subscription:read).
+// NewCmdGet builds `event subscription get <remote_subscription_id>`:
+// read-only, requires event:subscription:read.
 func NewCmdGet(f *cmdutil.Factory) *cobra.Command {
 	var asJSON bool
 	cmd := &cobra.Command{
@@ -118,9 +118,9 @@ func runGet(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID string,
 // Any error svc.Get returns is passed through unchanged: by the time this
 // function is reached, *eventlib.SubscriptionClient.Get has already turned
 // a transport failure or an OAPI business failure (e.g. an unknown/
-// nonexistent remote_subscription_id) into a typed errs.* error (Task 7,
-// see internal/event/subscription_client.go's classifyFailure) — this
-// command layer must not swallow, downgrade, or re-wrap it (spec §3.6).
+// nonexistent remote_subscription_id) into a typed errs.* error
+// (see internal/event/subscription_client.go's classifyFailure) — this
+// command layer must not swallow, downgrade, or re-wrap it.
 func getSubscription(ctx context.Context, svc getSubscriptionAPI, remoteSubscriptionID string) (*subscriptionRow, error) {
 	req := larkeventv1.NewGetSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()
 	resp, err := svc.Get(ctx, req)

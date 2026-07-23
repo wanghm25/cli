@@ -22,7 +22,7 @@ import (
 
 // deleteSubscriptionAPI is the subset of *eventlib.SubscriptionClient this
 // command calls: Get (the remote read this command always performs first,
-// per spec §3.5's CLI-side read+write invariant, both to report
+// per the CLI-side read+write invariant, both to report
 // remote_before/impact for --dry-run and to describe the affected
 // subscription in the confirmation-required Hint) and Delete (the actual
 // write). See listSubscriptionsAPI (list.go) for the test-seam rationale.
@@ -31,22 +31,22 @@ type deleteSubscriptionAPI interface {
 	Delete(ctx context.Context, req *larkeventv1.DeleteSubscriptionReq) (*larkeventv1.DeleteSubscriptionResp, error)
 }
 
-// deleteOpts holds `event subscription delete`'s flag values (spec §3.1).
+// deleteOpts holds `event subscription delete`'s flag values.
 type deleteOpts struct {
 	dryRun bool
 	yes    bool
 	asJSON bool
 }
 
-// NewCmdDelete builds `event subscription delete <remote_subscription_id>`
-// (spec §3.2.7/§3.6/§3.7). Like create/update/renew/reactivate, delete
-// requires BOTH event:subscription:read and event:subscription:write (spec
-// §3.5): it always reads the current remote state first (Get), both to
+// NewCmdDelete builds `event subscription delete <remote_subscription_id>`.
+// Like create/update/renew/reactivate, delete
+// requires BOTH event:subscription:read and event:subscription:write:
+// it always reads the current remote state first (Get), both to
 // report remote_before/impact for --dry-run and to describe what is about
 // to be deleted in the confirmation-required Hint.
 //
-// Like update, delete is a high-risk write on a shared remote resource
-// (spec §3.7): without --yes it returns a typed ConfirmationRequiredError
+// Like update, delete is a high-risk write on a shared remote resource:
+// without --yes it returns a typed ConfirmationRequiredError
 // (category confirmation, exit code 10) instead of proceeding. Deleting the
 // remote Subscription is explicitly NOT a substitute for stopping a local
 // `event consume` process that may still be using it — that message is
@@ -169,9 +169,9 @@ func applyDelete(ctx context.Context, svc deleteSubscriptionAPI, remoteSubscript
 
 // doDeleteSubscription issues the actual Delete call. Unlike Patch/Renew/
 // Reactivate, DeleteSubscriptionResp carries no Data/SubscriptionDetail at
-// all (spec §0.4) — there is nothing to unwrap on success, so this returns
+// all — there is nothing to unwrap on success, so this returns
 // only an error. Any error svc.Delete returns (transport, or an
-// already-classified typed business failure from Task 7's
+// already-classified typed business failure from
 // SubscriptionClient.Delete) is passed through unchanged.
 func doDeleteSubscription(ctx context.Context, svc deleteSubscriptionAPI, remoteSubscriptionID string) error {
 	req := larkeventv1.NewDeleteSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()
@@ -179,13 +179,12 @@ func doDeleteSubscription(ctx context.Context, svc deleteSubscriptionAPI, remote
 	return err
 }
 
-// errDeleteConfirmationRequired implements spec §3.7's high-risk-write
+// errDeleteConfirmationRequired implements the high-risk-write
 // confirmation gate for delete: category confirmation (exit code 10),
 // risk high-risk-write, and a Hint naming the affected
 // remote_subscription_id/event_key/identity/current state (pids omitted —
 // see update.go's errUpdateConfirmationRequired doc comment for why) plus
-// the required "not a substitute for stopping local consumers" caveat (spec
-// §3.7).
+// the required "not a substitute for stopping local consumers" caveat.
 func errDeleteConfirmationRequired(remoteSubscriptionID string, identity core.Identity, before *subscriptionRow) error {
 	return errs.NewConfirmationRequiredError(errs.RiskHighRiskWrite, "event subscription delete",
 		"deleting remote Subscription %s requires confirmation", remoteSubscriptionID).
@@ -196,8 +195,8 @@ const deleteLocalImpactNote = "`event subscription delete` only removes the remo
 
 // deleteResult is delete's own non-dry-run success JSON shape — distinct
 // from the shared mutationResult (update/renew/reactivate.go) because
-// DeleteSubscriptionResp carries no fresh SubscriptionDetail to echo back
-// (spec §0.4); Subscription here is the last known state, captured by the
+// DeleteSubscriptionResp carries no fresh SubscriptionDetail to echo back;
+// Subscription here is the last known state, captured by the
 // Get this command always performs before deleting.
 type deleteResult struct {
 	Operation            string          `json:"operation"`

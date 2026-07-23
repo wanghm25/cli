@@ -88,7 +88,7 @@ func TestDoRenewSubscription_SuccessWithNoData_ReturnsTypedInternalError(t *test
 	}
 }
 
-// ---- --dry-run output shape (spec §3.4), direct-call end-to-end via the
+// ---- --dry-run output shape, direct-call end-to-end via the
 // fake service — mirrors update_test.go's own dry-run test.
 
 func TestRenewDryRun_EndToEndViaFakeService_JSONShapeAndNoRenewCall(t *testing.T) {
@@ -187,7 +187,7 @@ func TestRunRenew_MissingWriteScope_ReturnsPermissionError(t *testing.T) {
 	}
 }
 
-// TestNewCmdRenew_HasExpectedFlagsAndNoYes locks spec §3.7: renew must NOT
+// TestNewCmdRenew_HasExpectedFlagsAndNoYes locks that renew must NOT
 // expose --yes and must not carry an --include-resource-data flag (that is
 // update-only).
 func TestNewCmdRenew_HasExpectedFlagsAndNoYes(t *testing.T) {
@@ -199,7 +199,7 @@ func TestNewCmdRenew_HasExpectedFlagsAndNoYes(t *testing.T) {
 		}
 	}
 	if cmd.Flags().Lookup("yes") != nil {
-		t.Error("NewCmdRenew must not expose --yes (spec §3.7: renew only extends TTL, not a high-risk confirmation-gated action)")
+		t.Error("NewCmdRenew must not expose --yes (renew only extends TTL, not a high-risk confirmation-gated action)")
 	}
 	if cmd.Flags().Lookup("include-resource-data") != nil {
 		t.Error("NewCmdRenew must not expose --include-resource-data (update-only)")

@@ -68,7 +68,7 @@ func rowFromDetail(t *testing.T, d *larkeventv1.SubscriptionDetail) *subscriptio
 	return row
 }
 
-// ---- applyUpdate (spec §3.2.4/§3.7 decision sequence) ----
+// ---- applyUpdate (decision sequence) ----
 
 func TestApplyUpdate_ActiveNotYes_ReturnsConfirmationRequired_NoPatchCall(t *testing.T) {
 	fake := &fakeUpdateAPI{}
@@ -204,7 +204,7 @@ func TestUpdatePlannedAction(t *testing.T) {
 	}
 }
 
-// ---- --dry-run output shape (spec §3.4), direct-call end-to-end via the
+// ---- --dry-run output shape, direct-call end-to-end via the
 // fake service — mirrors create_test.go's
 // TestDryRun_NotFound_EndToEndViaFakeService_JSONShapeAndNoCreateCall: this
 // drives the exact same two calls runUpdate's --dry-run branch makes
@@ -250,8 +250,8 @@ func TestUpdateDryRun_Active_EndToEndViaFakeService_JSONShapeAndNoPatchCall(t *t
 }
 
 func TestUpdateDryRun_Suspended_ReportsBlockedInformationally_NoPatchCall(t *testing.T) {
-	// Per spec §3.4 (mirroring create.go's own conflict/suspended dry-run
-	// handling): dry-run always reports the plan informationally rather
+	// Mirroring create.go's own conflict/suspended dry-run
+	// handling, dry-run always reports the plan informationally rather
 	// than erroring on remote business state. The suspended guard's typed
 	// failed_precondition (TestApplyUpdate_Suspended_...) only fires on a
 	// REAL run, never under --dry-run.
@@ -322,9 +322,9 @@ func TestRunUpdate_MissingIncludeResourceDataFlag_ReturnsInvalidArgument(t *test
 }
 
 // TestRunUpdate_IncludeResourceDataTrue_RejectsSwitchWithDeleteRecreateGuidance
-// locks task E3: switching include_resource_data / encryption ON via update is
-// refused (encryption is Create-only, spec §4.7). This replaces the old
-// E-deferred gate (reason resource_data_encryption_deferred) — now that the
+// locks that switching include_resource_data / encryption ON via update is
+// refused (encryption is Create-only). This replaces the old
+// deferral gate (reason resource_data_encryption_deferred) — now that the
 // encryption module ships, the rejection is permanent-by-design, not a
 // temporary defer, and guides the caller to delete + recreate (human confirm)
 // rather than to "retry later". Like the gate it replaced, it is a pure local
@@ -364,10 +364,10 @@ func TestRunUpdate_IncludeResourceDataTrue_RejectsSwitchWithDeleteRecreateGuidan
 	if !strings.Contains(ve.Hint, "sub_1") {
 		t.Errorf("Hint = %q, want it to name remote_subscription_id sub_1", ve.Hint)
 	}
-	// The old E-deferred reason must be gone: this is no longer a "not yet
+	// The old deferral reason must be gone: this is no longer a "not yet
 	// supported / retry later" defer.
 	if strings.Contains(msg, "resource_data_encryption_deferred") || strings.Contains(ve.Hint, "resource_data_encryption_deferred") {
-		t.Errorf("error must no longer mention resource_data_encryption_deferred (E-deferred gate retired); got msg=%q hint=%q", msg, ve.Hint)
+		t.Errorf("error must no longer mention resource_data_encryption_deferred (deferral gate retired); got msg=%q hint=%q", msg, ve.Hint)
 	}
 }
 

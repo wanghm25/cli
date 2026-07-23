@@ -20,37 +20,37 @@ import (
 )
 
 // subscriptionMutationScopes are the scopes hard-required by every mutating
-// subscription subcommand (create/update/renew/reactivate/delete — spec
-// §3.5/§7): unlike list/get, which only ever read, every mutating command
+// subscription subcommand (create/update/renew/reactivate/delete):
+// unlike list/get, which only ever read, every mutating command
 // always reads remote state first (List/Get, for idempotency/conflict/impact
 // analysis) before it may write, so it needs read AND write simultaneously —
 // neither implies the other. Declared once here so later sibling commands
 // (update/renew/reactivate/delete) can reuse it without duplicating the list.
 var subscriptionMutationScopes = []string{"event:subscription:read", "event:subscription:write"}
 
-// createOpts holds `event subscription create`'s flag values (spec §3.1).
+// createOpts holds `event subscription create`'s flag values.
 type createOpts struct {
 	includeResourceData bool
 	dryRun              bool
 	asJSON              bool
 }
 
-// NewCmdCreate builds `event subscription create <refined EventKey>` (spec
-// §3.3). Unlike list/get, create additionally: resolves the EventKey via
+// NewCmdCreate builds `event subscription create <refined EventKey>`.
+// Unlike list/get, create additionally: resolves the EventKey via
 // eventlib.ResolveEventKey (target_resource/event_type), enforces the
-// matched KeyTemplate's own AuthTypes on top of the usual identity checks
-// (spec §2.8), requires BOTH event:subscription:read and
-// event:subscription:write (spec §3.5) — plus event:encrypt_key:read when
-// --include-resource-data=true (spec §4.7; task-E-design-note.md's task
-// E2) — creates an ENCRYPTED subscription for --include-resource-data=true
+// matched KeyTemplate's own AuthTypes on top of the usual identity checks,
+// requires BOTH event:subscription:read and
+// event:subscription:write — plus event:encrypt_key:read when
+// --include-resource-data=true — creates an ENCRYPTED subscription for
+// --include-resource-data=true
 // (a fresh CSPRNG-generated per-subscription encrypt_key, submitted
 // atomically with the Create request; see doCreateSubscription), and
-// reconciles against remote state before ever writing (spec §3.3/§4.2:
+// reconciles against remote state before ever writing:
 // not-exist -> create, active+compatible -> idempotent reuse,
 // active+conflicting (including the encryption dimension) -> typed
-// failed_precondition, suspended -> guide reactivate). It never exposes
+// failed_precondition, suspended -> guide reactivate. It never exposes
 // --yes: create is additive and pre-checked for conflicts, so it is not a
-// high-risk confirmation-gated action (spec §3.7) — that is reserved for
+// high-risk confirmation-gated action — that is reserved for
 // update/delete.
 func NewCmdCreate(f *cmdutil.Factory) *cobra.Command {
 	var o createOpts
@@ -134,17 +134,17 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 	// request before doing ANY other work, including a config lookup.
 	resolved, err := eventlib.ResolveEventKey(eventKeyArg)
 	if err != nil {
-		// Passed through unchanged: R1 (bare refined base key), an unknown
+		// Passed through unchanged: a bare refined base key, an unknown
 		// base, a legacy key with a suffix, a bad template segment/value,
-		// etc. are all already typed errors (Task 3) — this command must not
+		// etc. are all already typed errors — this command must not
 		// re-wrap or reword them.
 		return err
 	}
 	if !resolved.IsRefined {
 		// A legacy (non-refined) key has no Template/TargetResource — there
 		// is nothing for this command's reconciliation to key off, and no
-		// remote Subscription resource concept applies to it at all (spec
-		// §3.3 frames `create` exclusively around "refined EventKey").
+		// remote Subscription resource concept applies to it at all — `create`
+		// is defined exclusively for a refined EventKey.
 		return errCreateRequiresRefinedKey(eventKeyArg)
 	}
 
@@ -152,7 +152,7 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 	if err != nil {
 		return err
 	}
-	// Tier 1 (spec §2.8): the identity must be one the whole refined base
+	// Tier 1: the identity must be one the whole refined base
 	// key accepts at all — mirrors cmd/event/consume.go's resolveIdentity.
 	// Empty AuthTypes means "no restriction" (KeyDefinition.AuthTypes' own
 	// doc comment), so guard the call the same way consume.go does: calling
@@ -162,7 +162,7 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 			return err
 		}
 	}
-	// Tier 2 (spec §2.8, stricter — this is what list/get do not need,
+	// Tier 2 (stricter — this is what list/get do not need,
 	// since they carry no EventKey/KeyTemplate context at all): the specific
 	// matched KeyTemplate can be narrower than the key itself (e.g.
 	// "owner/me" is user-only even though the key allows user+bot). A
@@ -216,12 +216,12 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 	return nil
 }
 
-// checkTemplateAuthTypes enforces design spec §2.8's second, stricter
+// checkTemplateAuthTypes enforces the second, stricter
 // identity tier for a refined EventKey with a matched KeyTemplate — see
 // eventlib.CheckTemplateAuthTypes's own doc comment for the full
 // rationale/state (empty = no restriction, violated = typed
 // failed_precondition naming the allowed identities). The check itself
-// moved to internal/event (review fix, Task 15b) so it is shared,
+// moved to internal/event so it is shared,
 // byte-identical, with the refined `event consume` startup chain
 // (cmd/event/consume.go's runRefinedConsume), which needs the exact same
 // tier-2 gate before its own remote write. This thin wrapper keeps this
@@ -234,7 +234,7 @@ func checkTemplateAuthTypes(identity core.Identity, resolved eventlib.ResolvedEv
 // errCreateRequiresRefinedKey rejects a syntactically valid, registered
 // EventKey that resolved as legacy (non-refined): `subscription create` only
 // operates on the remote Subscription resource, which only a materialized
-// refined key maps onto (spec §3.3).
+// refined key maps onto.
 func errCreateRequiresRefinedKey(eventKeyArg string) error {
 	return errs.NewValidationError(errs.SubtypeInvalidArgument,
 		"EventKey %q is not a refined-subscription key; `event subscription create` only accepts a materialized refined EventKey", eventKeyArg).
@@ -245,7 +245,7 @@ func errCreateRequiresRefinedKey(eventKeyArg string) error {
 // createRequiredScopes returns the scopes create's preflight
 // (resolveUATAndCheckScopes) must check for this request: the usual
 // subscriptionMutationScopes, plus event:encrypt_key:read when
-// includeResourceData is true (task-E-design-note.md task E2 — create's
+// includeResourceData is true (create's
 // reconcile probes GetEncryptKey via WithEncryptKeyProber to classify an
 // existing include_resource_data=true match, which needs that scope; see
 // reconcileExisting below). Always builds a fresh slice rather than
@@ -263,13 +263,13 @@ func createRequiredScopes(includeResourceData bool) []string {
 	return scopes
 }
 
-// ---- remote reconciliation (spec §3.3/§4.2) ----
+// ---- remote reconciliation ----
 //
 // The reconcile classification itself — the state table, authority
 // matching, and the ReconcilePlan shape — moved to
-// internal/event/reconcile.go (Task 15a), EXPORTED, so it can be shared
+// internal/event/reconcile.go, EXPORTED, so it can be shared
 // with the refined `event consume` startup chain's PlanRemoteSubscription
-// stage (Task 15b) instead of staying package-private here. The
+// stage instead of staying package-private here. The
 // aliases/thin wrapper below keep this package's own names
 // (reconcilePlan/planAction*/reconcileExisting) so create_test.go and this
 // file's own createOrReuseSubscription/outcomeFromPlan/buildDryRunResult
@@ -277,7 +277,7 @@ func createRequiredScopes(includeResourceData bool) []string {
 
 // createSubscriptionAPI is the subset of *eventlib.SubscriptionClient this
 // command calls: List (to reconcile against the unique key event_type +
-// target_resource + authority before ever writing), Create, and (task E2)
+// target_resource + authority before ever writing), Create, and
 // GetEncryptKey (the encryption conflict-matrix probe reconcileExisting
 // wires in below for an encrypted request — eventlib.EncryptKeyProber's
 // method, added here so the SAME svc value satisfies both
@@ -312,11 +312,11 @@ const (
 // eventlib.ReconcileExisting's own doc comment for the full state-table and
 // authority-matching rationale (unchanged by the move).
 //
-// Task E2 addition: when requestedIncludeResourceData is true (the caller
+// When requestedIncludeResourceData is true (the caller
 // wants an ENCRYPTED subscription), this also supplies svc itself as the
 // eventlib.WithEncryptKeyProber option — svc already satisfies
 // eventlib.EncryptKeyProber structurally (createSubscriptionAPI declares the
-// same GetEncryptKey method), so ReconcileExisting can resolve spec §4.7's
+// same GetEncryptKey method), so ReconcileExisting can resolve the
 // encryption conflict matrix for an active, include_resource_data=true
 // match. requestedIncludeResourceData=false takes the exact same path as
 // before this task (no option supplied) — byte-for-byte unchanged.
@@ -328,13 +328,13 @@ func reconcileExisting(ctx context.Context, svc createSubscriptionAPI, eventType
 }
 
 // newEncryptKeyFunc generates a fresh per-subscription encrypt_key for an
-// encrypted create (task-E-design-note.md task E2; spec §4.7 "密钥创建与来
-// 源"). Indirected through a package-level var — rather than calling
+// encrypted create. Indirected through a package-level var — rather than
+// calling
 // eventlib.NewEncryptKey directly at its one production call site
 // (doCreateSubscription, via createOrReuseSubscription) — solely so tests
 // can substitute a counting spy and assert this is invoked exactly zero
-// times on the --dry-run path (task E2's RED LINE: "dry-run generates no
-// key"), a property that is otherwise awkward to prove directly. Production
+// times on the --dry-run path (a hard invariant: dry-run generates no
+// key), a property that is otherwise awkward to prove directly. Production
 // code must never reassign this outside tests.
 var newEncryptKeyFunc = eventlib.NewEncryptKey
 
@@ -342,30 +342,30 @@ var newEncryptKeyFunc = eventlib.NewEncryptKey
 // either a freshly created Subscription, or an idempotently reused existing
 // one — the two cases createOrReuseSubscription can return without error.
 // Every other reconcilePlan.Action (conflict/suspended) becomes a typed
-// error instead (spec §3.3), never a createOutcome.
+// error instead, never a createOutcome.
 type createOutcome struct {
 	Action string // "created" | "reused"
 	Detail *larkeventv1.SubscriptionDetail
 }
 
-// createOrReuseSubscription is the write-capable half of §3.3/§4.2: it
+// createOrReuseSubscription is the write-capable half: it
 // reconciles against remote state, then acts on the plan — Create when
 // nothing blocks it, idempotent reuse when a compatible active match
 // exists, or a typed failure (never a write) for conflict/suspended.
 //
-// If Create itself fails, this reconciles once more via a fresh List (spec
-// §3.3: "Create 遇 duplicate 或 transport timeout：重新 List 对账") before
+// If Create itself fails, this reconciles once more via a fresh List (on a
+// duplicate or transport timeout, re-List to reconcile) before
 // giving up — a single bounded pass, not a retry loop: List-before-Create is
 // an optimization, not a substitute for the server's own unique-key
 // enforcement. If the second reconcile still finds nothing blocking (or
 // itself fails), the ORIGINAL Create error is what is returned — it is never
 // swallowed in favor of a less informative one. This bounded retry NEVER
 // changes includeResourceData between the two reconcile calls, and never
-// re-attempts Create itself (task E2 RED LINE: a failed encrypted create
+// re-attempts Create itself (fail-closed: a failed encrypted create
 // must not silently fall back to a plaintext subscription, nor generate and
 // submit a second key).
 //
-// Task E2: when includeResourceData is true, a fresh encrypt_key is
+// When includeResourceData is true, a fresh encrypt_key is
 // generated (newEncryptKeyFunc) ONLY once the plan has actually decided to
 // create (never on a reuse/conflict/suspended outcome, and never — by
 // construction, since this function is only reached from runCreate's
@@ -413,7 +413,7 @@ func createOrReuseSubscription(ctx context.Context, svc createSubscriptionAPI, r
 // the first reconcile and the post-Create-failure reconcile in
 // createOrReuseSubscription. includeResourceData is threaded through purely
 // so conflictError can enrich its Hint with encryption-specific guidance
-// (task E2) when this conflict was reached via an encrypted request.
+// when this conflict was reached via an encrypted request.
 func outcomeFromPlan(plan *reconcilePlan, resolved eventlib.ResolvedEventKey, identity core.Identity, includeResourceData bool) (*createOutcome, error) {
 	switch plan.Action {
 	case planActionReuse:
@@ -429,21 +429,21 @@ func outcomeFromPlan(plan *reconcilePlan, resolved eventlib.ResolvedEventKey, id
 
 // doCreateSubscription issues the actual Create call and unwraps its
 // response. Any error svc.Create returns (transport or already-classified
-// typed business failure — Task 7's SubscriptionClient.Create) is passed
+// typed business failure — SubscriptionClient.Create) is passed
 // through unchanged; the caller (createOrReuseSubscription) decides whether
 // to reconcile-and-retry.
 //
-// encryptKey is task E2's addition: when non-empty, it is injected via
+// encryptKey, when non-empty, is injected via
 // PayloadOptionsEncryptBuilder into the SAME CreatePayloadOptions as
-// includeResourceData, in the SAME request this function builds — spec
-// §4.7's atomicity requirement ("Create 请求中的 include_resource_data=true
-// 与 encrypt.encrypt_key 必须原子提交") and the fact that Encrypt is a
+// includeResourceData, in the SAME request this function builds — the
+// atomicity requirement (include_resource_data=true and encrypt.encrypt_key
+// must be submitted together) and the fact that Encrypt is a
 // Create-only field (Patch has no encrypt) both mean this is the ONLY place
 // in this command that ever sets it. Callers must never log encryptKey —
-// see newEncryptKeyFunc's own doc comment for the full RED LINE.
+// see newEncryptKeyFunc's own doc comment.
 func doCreateSubscription(ctx context.Context, svc createSubscriptionAPI, eventType, targetResource string, includeResourceData bool, encryptKey string) (*larkeventv1.SubscriptionDetail, error) {
 	if includeResourceData && encryptKey == "" {
-		// Defensive fail-closed (task E2 RED LINE: atomic, no
+		// Defensive fail-closed (atomic, no
 		// plaintext-fallback path): the sole caller
 		// (createOrReuseSubscription) always generates a key before reaching
 		// here whenever includeResourceData is true, and returns its own
@@ -473,7 +473,7 @@ func doCreateSubscription(ctx context.Context, svc createSubscriptionAPI, eventT
 
 // buildCreateSubscriptionBody constructs the Create request body, always
 // setting includeResourceData and (when non-empty) encryptKey on the SAME
-// CreatePayloadOptions within the SAME returned body value — spec §4.7's
+// CreatePayloadOptions within the SAME returned body value — the
 // atomicity requirement is structural here, not merely a matter of call
 // ordering: there is no code path that could build/send them separately.
 //
@@ -501,13 +501,13 @@ func buildCreateSubscriptionBody(eventType, targetResource string, includeResour
 		Build()
 }
 
-// conflictError implements spec §3.3's "active but conflicting" row and
-// §3.6's error-contract mapping: typed failed_precondition, Param the
+// conflictError implements the "active but conflicting" case and
+// its error-contract mapping: typed failed_precondition, Param the
 // EventKey positional argument, conflicting fields in Params[].Reason, and
 // the existing remote_subscription_id plus a guide-to-`get` in Hint.
 //
-// includeResourceData (task E2) selects an encryption-aware Hint: spec §4.7
-// forbids switching encryption state in place (Encrypt is Create-only), so
+// includeResourceData selects an encryption-aware Hint: encryption cannot be
+// switched in place (Encrypt is Create-only), so
 // an encrypted request's conflict is only ever resolved by a human — verify
 // the existing subscription (and this identity's event:encrypt_key:read
 // scope), or delete and recreate.
@@ -515,7 +515,7 @@ func conflictError(resolved eventlib.ResolvedEventKey, identity core.Identity, p
 	id := strVal(plan.Existing.SubscriptionId)
 	hint := fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before creating a differently-configured one", id, identity, id)
 	if includeResourceData {
-		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s; encryption cannot be changed in place (spec §4.7 — Create-only), so after human confirmation either delete it and create a new encrypted subscription, or verify this identity/app holds scope `event:encrypt_key:read` and can actually retrieve the existing subscription's key", id, identity, id)
+		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s; encryption cannot be changed in place (Create-only), so after human confirmation either delete it and create a new encrypted subscription, or verify this identity/app holds scope `event:encrypt_key:read` and can actually retrieve the existing subscription's key", id, identity, id)
 	}
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"an active subscription already exists for %s with a conflicting configuration (remote_subscription_id=%s)",
@@ -525,7 +525,7 @@ func conflictError(resolved eventlib.ResolvedEventKey, identity core.Identity, p
 		WithHint("%s", hint)
 }
 
-// suspendedError implements spec §3.3's "suspended" row: do not overwrite;
+// suspendedError implements the "suspended" case: do not overwrite;
 // guide the caller to `reactivate` instead of creating a duplicate.
 func suspendedError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan *reconcilePlan) error {
 	id := strVal(plan.Existing.SubscriptionId)
@@ -542,8 +542,8 @@ func suspendedError(resolved eventlib.ResolvedEventKey, identity core.Identity, 
 
 // ---- JSON output shapes ----
 
-// createDryRunResult is `event subscription create --dry-run`'s JSON shape
-// (design spec §3.4). Populated purely from parse/identity/scope preflight
+// createDryRunResult is `event subscription create --dry-run`'s JSON shape.
+// Populated purely from parse/identity/scope preflight
 // (already done by the time runCreate reaches this) plus one remote List —
 // never a Create.
 type createDryRunResult struct {
@@ -560,7 +560,7 @@ type createDryRunResult struct {
 }
 
 // createPreflight summarizes the (already-passed, by the time this is
-// built) identity/template/scope checks §3.4 requires dry-run to perform.
+// built) identity/template/scope checks dry-run performs.
 type createPreflight struct {
 	Identity        string `json:"identity"`
 	MatchedTemplate string `json:"matched_template"`
@@ -634,7 +634,7 @@ func dryRunNextAction(plan *reconcilePlan, resolved eventlib.ResolvedEventKey, i
 
 // createResult is `event subscription create`'s (non-dry-run) JSON shape on
 // success — either a freshly created or an idempotently reused Subscription
-// (spec §3.3; conflict/suspended never reach here, they return a typed error
+// (conflict/suspended never reach here, they return a typed error
 // instead).
 type createResult struct {
 	Operation            string          `json:"operation"`
@@ -655,7 +655,7 @@ func buildCreateResult(resolved eventlib.ResolvedEventKey, identity core.Identit
 	}
 }
 
-// createNextAction implements spec §3.3's "creation succeeding does not
+// createNextAction implements the "creation succeeding does not
 // mean listening started" guidance.
 func createNextAction(resolved eventlib.ResolvedEventKey, identity core.Identity) string {
 	return fmt.Sprintf("run `lark-cli event consume %s --as %s` to start receiving these events", resolved.MaterializedKey, identity)
