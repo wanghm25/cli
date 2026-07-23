@@ -198,6 +198,19 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		return errIncludeResourceDataNotApplicable(eventKey)
 	}
 
+	// --dry-run's own --help text promises it is a no-op for a legacy
+	// (non-refined) EventKey, which never writes remote state at all — a
+	// legacy key has no remote-Subscription plan for a dry-run to preview
+	// at all, unlike the refined branch above (which still runs Probe+Plan
+	// before its own dry-run exit). Report that and exit before identity
+	// resolution, token/API-client setup, or any other preflight below, so
+	// this really is zero side effects: never starts a bus, never calls
+	// consume.Run.
+	if o.dryRun {
+		fmt.Fprintln(f.IOStreams.ErrOut, "[event] dry-run: legacy EventKey has no remote subscription plan — nothing to preview")
+		return nil
+	}
+
 	identity, err := resolveIdentity(cmd, f, keyDef)
 	if err != nil {
 		return err
@@ -416,6 +429,20 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 	if err := eventlib.CheckTemplateAuthTypes(identity, resolved); err != nil {
 		return err
 	}
+	// Scope preflight: --include-resource-data=true needs
+	// event:encrypt_key:read to ever consume the encrypted Subscription
+	// this run may create or reuse. Must run BEFORE any client/subClient
+	// construction below and before consume.RunRefined's own Plan/Apply —
+	// see preflightEncryptKeyScope's own doc comment for why this can't
+	// wait until prewarm. Runs even under --dry-run (mirrors
+	// `event subscription create`'s own preflight placement, ahead of its
+	// dry-run branch) so a preview surfaces the same rejection a real run
+	// would hit, rather than only discovering it on a later real run.
+	if o.includeResourceData {
+		if err := preflightEncryptKeyScope(cmd.Context(), f, cfg.AppID, identity, resolved.MaterializedKey); err != nil {
+			return err
+		}
+	}
 
 	outputDir := o.outputDir
 	if outputDir != "" {
@@ -493,6 +520,59 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 		SubClient:           subClient,
 		IncludeResourceData: o.includeResourceData,
 	})
+}
+
+// refinedEncryptKeyReadScopes is the scope required to fetch a
+// subscription's encrypt_key (eventlib.SubscriptionClient.GetEncryptKey) —
+// mirrors cmd/event/subscription/subscription.go's own (unexported, and in
+// a different package) subscriptionEncryptKeyReadScopes; this package keeps
+// its own copy rather than reaching across a package boundary for one scope
+// string.
+var refinedEncryptKeyReadScopes = []string{"event:encrypt_key:read"}
+
+// preflightEncryptKeyScope is a local, best-effort check that the resolved
+// identity's token already carries event:encrypt_key:read before
+// runRefinedConsume does anything else with --include-resource-data=true.
+// Without it, the only place this scope was ever checked was
+// RunRefined's own prewarm step — which runs AFTER
+// ApplyRemoteSubscriptionPlan (the remote Create) and HelloV2 have already
+// succeeded. By then, a missing scope means the encrypted remote
+// Subscription already exists (refined cleanup is nil: it is never
+// auto-deleted) and simply cannot be consumed — an avoidable
+// create-but-can't-consume outcome. This preflight catches it earlier,
+// before that write ever happens, whenever the token's scopes are knowable
+// locally.
+//
+// Mirrors cmd/event/subscription/subscription.go's own
+// resolveUATAndCheckScopes: scope data being unavailable locally is not
+// treated as "missing" — the check is silently skipped and the real
+// GetEncryptKey call at prewarm remains the authoritative check, exactly as
+// it already was before this preflight existed. This CLI's default
+// credential provider never populates TokenResult.Scopes for a bot/tenant
+// token (internal/credential/default_provider.go's doResolveTAT always
+// returns Scopes==""), so in practice this only ever fires for a user
+// identity — a bot's real GetEncryptKey call remains the sole enforcement,
+// same as before.
+func preflightEncryptKeyScope(ctx context.Context, f *cmdutil.Factory, appID string, identity core.Identity, materializedKey string) error {
+	result, err := f.Credential.ResolveToken(ctx, credential.NewTokenSpec(identity, appID))
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return nil //nolint:nilerr // best-effort: an unresolvable token here is not "missing scope" — prewarm's real GetEncryptKey call remains authoritative
+	}
+	if result == nil || result.Scopes == "" {
+		return nil
+	}
+	missing := auth.MissingScopes(result.Scopes, refinedEncryptKeyReadScopes)
+	if len(missing) == 0 {
+		return nil
+	}
+	return errs.NewPermissionError(errs.SubtypeMissingScope,
+		"missing required scope for --include-resource-data=true (as %s): %s", identity, strings.Join(missing, ", ")).
+		WithIdentity(string(identity)).
+		WithMissingScopes(missing...).
+		WithHint("grant/re-authorize scope `event:encrypt_key:read` for identity %s, then retry `lark-cli event consume %s --include-resource-data=true --as %s` — without it, this run would create (or reuse) an encrypted remote Subscription this consumer could never decrypt", identity, materializedKey, identity)
 }
 
 // resolveIdentityUAT resolves the user access token SubscriptionClient needs

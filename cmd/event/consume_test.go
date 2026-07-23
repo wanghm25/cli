@@ -480,6 +480,46 @@ func TestRunConsume_UnknownEventKeyContractPreserved(t *testing.T) {
 	}
 }
 
+// ---- legacy --dry-run must be a true no-op (never starts a bus) ----
+
+// TestRunConsume_LegacyKey_DryRun_NoOp_ExitsZero_NeverStartsBus locks that
+// --dry-run against a LEGACY (non-refined) EventKey behaves exactly as
+// --help promises: a no-op, because a legacy key has no remote-Subscription
+// plan for a dry-run to preview at all. Before this fix, the legacy branch
+// of runConsume ignored o.dryRun entirely and drove the ordinary
+// consume.Run path (starting a bus). This reuses the same blocked-bus-fork
+// environment as newRefinedConsumeTestFactory (its "events" config dir is a
+// regular file, not a directory):
+// TestRunConsume_OrdinaryKey_NoIncludeResourceDataFlag_UnaffectedNonRegression
+// above proves that WITHOUT --dry-run, this exact legacy key/identity
+// reaches that blocked path and fails with a typed InternalError -- so
+// err == nil here is proof --dry-run exits before ever reaching
+// EnsureBus/forkBus, not merely proof that no error happened to occur. It
+// also locks the printed no-op message and that stdout stays completely
+// empty (no NDJSON), matching a real refined --dry-run's own
+// zero-stdout contract.
+func TestRunConsume_LegacyKey_DryRun_NoOp_ExitsZero_NeverStartsBus(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
+	if err := os.WriteFile(filepath.Join(dir, "events"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f, stdoutBuf, stderrBuf, _ := cmdutil.TestFactory(t, &core.CliConfig{
+		AppID: "cli_consume_test", AppSecret: "secret", Brand: core.BrandFeishu,
+	})
+
+	err := newConsumeCmd(f, "im.message.receive_v1", "--as", "bot", "--dry-run").Execute()
+	if err != nil {
+		t.Fatalf("legacy --dry-run must be a no-op that exits 0, got error: %v", err)
+	}
+	if !strings.Contains(stderrBuf.String(), "nothing to preview") {
+		t.Errorf("expected a no-op message on stderr, got: %q", stderrBuf.String())
+	}
+	if stdoutBuf.Len() != 0 {
+		t.Errorf("legacy --dry-run must never write to stdout, got: %q", stdoutBuf.String())
+	}
+}
+
 // ---- --include-resource-data flag behavior ----
 //
 // `event consume` originally shipped with NO --include-resource-data flag at
@@ -610,6 +650,108 @@ func TestRunConsume_OrdinaryKey_NoIncludeResourceDataFlag_UnaffectedNonRegressio
 	}
 	if _, ok := errs.ProblemOf(err); !ok {
 		t.Fatalf("expected a typed errs.* error even from the unrelated bus-fork failure, got %T: %v", err, err)
+	}
+}
+
+// ---- --include-resource-data=true refined encrypt_key:read scope preflight ----
+//
+// Before this fix, event:encrypt_key:read was only ever checked implicitly
+// at RunRefined's post-Apply/HelloV2 prewarm stage -- so a missing scope
+// meant the encrypted remote Subscription was ALREADY created (refined
+// cleanup is nil: never auto-deleted) by the time the gap was discovered.
+// These tests drive runConsume's real refined entry (via NewCmdConsume +
+// cmd.Execute()) with a Credential whose ResolveToken result carries a
+// CONFIRMED (non-empty) scope string, proving the new local preflight
+// rejects before ever reaching PlanRemoteSubscription's real List call
+// (which this Factory's zero registered HTTP stubs would otherwise fail
+// with an error naming "/open-apis/event/v1/subscriptions" -- exactly as
+// TestRunConsume_RefinedKey_IncludeResourceDataTrue_UnGated_ReachesPlan
+// demonstrates when scopes are NOT locally known).
+
+// fixedScopeTokenResolver resolves a fixed token whose Scopes is a
+// CONFIRMED (non-empty) value a test controls directly -- as opposed to
+// cmdutil.TestFactory's own (unexported) testDefaultToken, which always
+// returns Scopes=="" (unknown -- every local scope precheck in this CLI
+// treats that as a best-effort skip, not "missing").
+type fixedScopeTokenResolver struct{ scopes string }
+
+func (r fixedScopeTokenResolver) ResolveToken(_ context.Context, _ credential.TokenSpec) (*credential.TokenResult, error) {
+	return &credential.TokenResult{Token: "test-user-token", Scopes: r.scopes}, nil
+}
+
+// newRefinedConsumeTestFactoryWithUserScopes mirrors newRefinedConsumeTestFactory
+// (same blocked-bus-fork safety net) but additionally swaps in a Credential
+// whose ResolveToken result carries the given (confirmed, non-empty)
+// scopes, so a test can exercise the local encrypt_key:read preflight's
+// confirmed-missing branch instead of its unknown-scopes/best-effort-skip
+// branch. nil defaultAcct/httpClient mirrors this file's own
+// factoryWithResolver (used by TestResolveTenantToken_* above): an explicit
+// --as short-circuits resolveIdentity before it ever touches Credential,
+// and Factory.CheckStrictMode treats an unresolvable account as
+// strict-mode-off rather than an error, so neither is needed here.
+func newRefinedConsumeTestFactoryWithUserScopes(t *testing.T, scopes string) *cmdutil.Factory {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
+	if err := os.WriteFile(filepath.Join(dir, "events"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{
+		AppID: "cli_consume_test", AppSecret: "secret", Brand: core.BrandFeishu,
+	})
+	f.Credential = credential.NewCredentialProvider(nil, nil, fixedScopeTokenResolver{scopes: scopes}, nil)
+	return f
+}
+
+// TestRunRefinedConsume_IncludeResourceDataTrue_MissingEncryptKeyScope_RejectedBeforePlanApply
+// is this task's REQUIRED case: a user token confirmed to hold
+// event:subscription:{read,write} but NOT event:encrypt_key:read must be
+// rejected as a typed missing_scope error before any Plan/Apply network
+// call, when --include-resource-data=true.
+func TestRunRefinedConsume_IncludeResourceDataTrue_MissingEncryptKeyScope_RejectedBeforePlanApply(t *testing.T) {
+	f := newRefinedConsumeTestFactoryWithUserScopes(t, "event:subscription:read event:subscription:write")
+	err := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a", "--as", "user", "--include-resource-data=true").Execute()
+
+	if err == nil {
+		t.Fatal("expected a missing-scope error, got nil")
+	}
+	var permErr *errs.PermissionError
+	if !errors.As(err, &permErr) {
+		t.Fatalf("expected *errs.PermissionError, got %T: %v", err, err)
+	}
+	if permErr.Category != errs.CategoryAuthorization || permErr.Subtype != errs.SubtypeMissingScope {
+		t.Errorf("problem = %s/%s, want %s/%s", permErr.Category, permErr.Subtype,
+			errs.CategoryAuthorization, errs.SubtypeMissingScope)
+	}
+	if len(permErr.MissingScopes) != 1 || permErr.MissingScopes[0] != "event:encrypt_key:read" {
+		t.Errorf("MissingScopes = %v, want [event:encrypt_key:read]", permErr.MissingScopes)
+	}
+	if strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
+		t.Errorf("the encrypt_key:read scope preflight must reject BEFORE any Plan/Apply network call, got: %v", err)
+	}
+}
+
+// TestRunRefinedConsume_IncludeResourceDataTrue_EncryptKeyScopePresent_PassesPreflight_ReachesPlan
+// is the non-regression counterpart: holding event:encrypt_key:read (on top
+// of the usual subscription scopes) must pass the new preflight and
+// proceed all the way into the real refined chain, exactly like
+// TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOffline
+// -- failing only once it reaches PlanRemoteSubscription's real (stub-less)
+// List call, never earlier. This locks that the new gate does not misfire
+// on a token that already holds the scope it checks for.
+func TestRunRefinedConsume_IncludeResourceDataTrue_EncryptKeyScopePresent_PassesPreflight_ReachesPlan(t *testing.T) {
+	f := newRefinedConsumeTestFactoryWithUserScopes(t, "event:subscription:read event:subscription:write event:encrypt_key:read")
+	err := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a", "--as", "user", "--include-resource-data=true").Execute()
+
+	if err == nil {
+		t.Fatal("expected an error (this Factory registers no HTTP stubs), got nil")
+	}
+	var permErr *errs.PermissionError
+	if errors.As(err, &permErr) && permErr.Subtype == errs.SubtypeMissingScope {
+		t.Fatalf("holding event:encrypt_key:read must not trip the preflight, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
+		t.Errorf("expected the preflight to pass and reach PlanRemoteSubscription's real List call, got: %v", err)
 	}
 }
 

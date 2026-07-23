@@ -225,6 +225,103 @@ func TestProbeBusEligibility_LocalBusMissingOneCapabilityMarker_FailedPreconditi
 	}
 }
 
+// ---- ProbeBusEligibility: Dial-succeeds-but-status-fails is NOT "no local bus" ----
+
+// fakeDialOKStatusFailsTransport plays a local bus that accepts the Dial and
+// reads the status_query, then closes without ever answering it -- Dial
+// itself succeeds (a local bus IS listening) but the status exchange fails
+// afterward (busctl.ErrStatusUnverified), unlike failDialTransport (used
+// elsewhere in this file) where Dial itself is refused.
+type fakeDialOKStatusFailsTransport struct{}
+
+func (fakeDialOKStatusFailsTransport) Listen(string) (net.Listener, error) {
+	return nil, errors.New("fakeDialOKStatusFailsTransport: Listen not supported")
+}
+
+func (fakeDialOKStatusFailsTransport) Dial(string) (net.Conn, error) {
+	client, server := net.Pipe()
+	go func() {
+		defer server.Close()
+		br := bufio.NewReader(server)
+		_, _ = protocol.ReadFrame(br) // read (and discard) the status_query
+		// Deliberately send nothing back, then close: the client's own
+		// ReadFrame sees EOF -- Dial succeeded, the status exchange did not.
+	}()
+	return client, nil
+}
+
+func (fakeDialOKStatusFailsTransport) Address(string) string { return "fake-dial-ok-status-fail-addr" }
+func (fakeDialOKStatusFailsTransport) Cleanup(string)        {}
+
+func TestProbeBusEligibility_LocalBusDialOKStatusUnverified_FailsClosed_NeverChecksRemote(t *testing.T) {
+	// Before the fix, EVERY busctl.QueryStatus error (Dial failing outright,
+	// or Dial succeeding but the subsequent status exchange erroring) was
+	// treated identically as "no local bus" -- so this exact scenario would
+	// have fallen through to the remote-connection check below and, seeing
+	// online_instance_cnt=0, returned nil (Probe passing, Plan/Apply free to
+	// proceed) even though a local bus IS actually running and its
+	// v2-capability could never be confirmed. This locks the fix: it must
+	// fail closed instead, and must never even attempt the remote check.
+	apiClient := &testutil.StubAPIClient{Body: `{"code":0,"data":{"online_instance_cnt":0}}`}
+	tr := fakeDialOKStatusFailsTransport{}
+
+	err := ProbeBusEligibility(context.Background(), tr, "cli_probe_test", apiClient, io.Discard)
+	if err == nil {
+		t.Fatal("expected failed_precondition when a local bus is dialable but its status could not be verified, got nil")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if !strings.Contains(ve.Hint, "event stop") {
+		t.Errorf("Hint should fail closed and prompt `event stop`, got: %q", ve.Hint)
+	}
+	if apiClient.Calls != 0 {
+		t.Errorf("expected the remote connection check to be skipped entirely (a local bus IS reachable), got %d call(s)", apiClient.Calls)
+	}
+}
+
+// ---- ProbeBusEligibility: remote-connection check is bounded regardless of the caller's own ctx ----
+
+// probeDeadlineCapturingAPIClient records whether the ctx it receives for
+// CallAPI carries a deadline, and how far out -- used to prove
+// ProbeBusEligibility bounds its own CheckRemoteConnections call
+// independently of the caller's ctx, without this test actually having to
+// wait out the real bound (which would make it slow).
+type probeDeadlineCapturingAPIClient struct {
+	hadDeadline bool
+	remaining   time.Duration
+}
+
+func (c *probeDeadlineCapturingAPIClient) CallAPI(ctx context.Context, _, _ string, _ interface{}) (json.RawMessage, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		c.hadDeadline = true
+		c.remaining = time.Until(dl)
+	}
+	return json.RawMessage(`{"code":0,"data":{"online_instance_cnt":0}}`), nil
+}
+
+func TestProbeBusEligibility_RemoteConnectionCheck_BoundedRegardlessOfCallerCtx(t *testing.T) {
+	// context.Background() carries no deadline at all -- exactly the shape
+	// of `event consume`'s own ctx when --timeout is left at its 0
+	// (unbounded) default; before the fix, that meant a slow/unreachable
+	// remote API could hang this read-only probe indefinitely.
+	apiClient := &probeDeadlineCapturingAPIClient{}
+	err := ProbeBusEligibility(context.Background(), failDialTransport{}, "cli_probe_test", apiClient, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !apiClient.hadDeadline {
+		t.Fatal("expected the remote-connection-check ctx to carry a deadline even though the caller's own ctx had none")
+	}
+	if apiClient.remaining <= 0 || apiClient.remaining > remoteConnectionCheckTimeout {
+		t.Errorf("expected a bound of at most %s, got %s remaining", remoteConnectionCheckTimeout, apiClient.remaining)
+	}
+}
+
 // ---- computeConsumerScopeID / buildHelloV2 (pure, no network) ----
 
 func TestComputeConsumerScopeID_DeterministicAndSensitiveToEachInput(t *testing.T) {

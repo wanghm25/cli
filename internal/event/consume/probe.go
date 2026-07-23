@@ -5,6 +5,7 @@ package consume
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,7 +21,19 @@ import (
 // never writes anything remote. It runs two checks, in this order:
 //
 //   - (b) local FIRST: busctl.QueryStatus(tr, appID) reads the local bus's
-//     status_response, if any.
+//     status_response, if any. Its error return does not mean one single
+//     thing: Dial itself failing means no local bus is listening (or one
+//     mid-shutdown) — safe to fall through to (a) below. Dial SUCCEEDING
+//     but the status exchange itself erroring afterward
+//     (busctl.ErrStatusUnverified — a write/read timeout, a decode
+//     failure, or an unexpected response type) means the opposite: a local
+//     bus IS running, so (a) must not run (same reason as the healthy-bus
+//     case below — its own connection may already be the reason
+//     online_instance_cnt is nonzero) and there is nothing trustworthy to
+//     fall back to either, since this bus's capabilities were never
+//     confirmed. That case fails closed immediately instead of reaching
+//     either branch below — typed failed_precondition, Hint prompts
+//     `event stop`.
 //   - If a local bus IS already reachable, that is the ordinary
 //     N-refined-consumers-share-one-bus case: its
 //     status_response must advertise the v2 capability markers
@@ -79,6 +92,22 @@ func ProbeBusEligibility(ctx context.Context, tr transport.IPC, appID string, ap
 
 	resp, statusErr := busctl.QueryStatus(tr, appID)
 	if statusErr != nil {
+		if errors.Is(statusErr, busctl.ErrStatusUnverified) {
+			// Dial succeeded -- a local bus IS running -- but the status
+			// exchange itself failed. Unlike the "no local bus reachable"
+			// case below, this must never fall through to the remote
+			// connection check: a running bus whose capabilities cannot be
+			// confirmed might itself be the old/incompatible bus this whole
+			// probe exists to catch, so proceeding to Plan/Apply against it
+			// is exactly the risk this function exists to reject. Fail
+			// closed and point the operator at `event stop` rather than
+			// guess.
+			return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+				"a local event bus for this app is running, but its status could not be verified: %s", statusErr).
+				WithCause(statusErr).
+				WithHint("probe_bus_eligibility: stage=local_bus_status reason=status_unverified; run `lark-cli event stop` then retry — a freshly started bus will answer the status query normally")
+		}
+
 		// No local bus reachable (or one mid-shutdown): safe to ask the
 		// remote API whether some OTHER host/process already has a
 		// connection open for this app, exactly as EnsureBus itself does
@@ -87,7 +116,13 @@ func ProbeBusEligibility(ctx context.Context, tr transport.IPC, appID string, ap
 			fmt.Fprintf(errOut, "[event] probe_bus_eligibility: no API client supplied; skipping remote connection check\n")
 			return nil
 		}
-		count, err := CheckRemoteConnections(ctx, apiClient)
+		// Bounded so a slow/unreachable API cannot hang this read-only
+		// probe on the caller's own ctx — `event consume --timeout`
+		// defaults to 0 (no whole-session bound). Mirrors EnsureBus's own
+		// identical bound for this exact same call (startup.go).
+		checkCtx, cancel := context.WithTimeout(ctx, remoteConnectionCheckTimeout)
+		defer cancel()
+		count, err := CheckRemoteConnections(checkCtx, apiClient)
 		if err != nil {
 			fmt.Fprintf(errOut, "[event] probe_bus_eligibility: remote connection check failed: %v (proceeding)\n", err)
 			return nil

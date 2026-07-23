@@ -28,6 +28,16 @@ import (
 const (
 	dialRetryInterval = 50 * time.Millisecond
 	dialTimeout       = 3 * time.Second
+
+	// remoteConnectionCheckTimeout bounds every CheckRemoteConnections call
+	// made from an otherwise-unbounded caller ctx: `event consume --timeout`
+	// defaults to 0 (no whole-session deadline), so without a LOCAL bound
+	// here a slow or unreachable API would hang the caller indefinitely on
+	// this one preflight read. EnsureBus (below) and ProbeBusEligibility
+	// (probe.go) both wrap their own CheckRemoteConnections call in this
+	// exact same bound, so they fail open (log + proceed) within a bounded
+	// time no matter what the caller's own ctx looks like.
+	remoteConnectionCheckTimeout = 5 * time.Second
 )
 
 // EnsureBus dials the bus daemon for appID, forking a new one if none is running.
@@ -44,7 +54,7 @@ func EnsureBus(ctx context.Context, tr transport.IPC, appID, profileName, domain
 	fmt.Fprintf(errOut, "[event] local bus not found; checking remote connections...\n")
 
 	if apiClient != nil {
-		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, remoteConnectionCheckTimeout)
 		defer cancel()
 		count, checkErr := CheckRemoteConnections(ctx, apiClient)
 		if checkErr != nil {
