@@ -616,8 +616,16 @@ func TestSubscriptionLifecycleAction_Updated_Compatible_Continue(t *testing.T) {
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	// This consumer's own local listening intent (issue #7) — the event
+	// below must match ALL THREE dimensions (authority + target_resource +
+	// include_resource_data) for this to classify compatible.
+	c.SetListenIntent("im.message?chat_id=oc_1", true)
 	hub.RegisterAndIsFirst(c)
-	le := LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: "user:ou_alice"}
+	le := LifecycleEvent{
+		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
+		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
+		IncludeResourceData: true, PayloadOptionsPresent: true,
+	}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
@@ -626,6 +634,88 @@ func TestSubscriptionLifecycleAction_Updated_Compatible_Continue(t *testing.T) {
 	}
 	if deps.client.getCount() != 0 {
 		t.Errorf("Get call count = %d, want 0 (compatible -- no reconcile needed)", deps.client.getCount())
+	}
+}
+
+// TestSubscriptionLifecycleAction_Updated_DifferingTargetResource_DegradedConflict
+// locks issue #7: a remote target_resource change is caught even when
+// Authority still matches — the old code compared Authority alone and would
+// have mis-judged this "compatible".
+func TestSubscriptionLifecycleAction_Updated_DifferingTargetResource_DegradedConflict(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	hub.RegisterAndIsFirst(c)
+
+	le := LifecycleEvent{
+		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
+		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_DIFFERENT",
+		IncludeResourceData: true, PayloadOptionsPresent: true,
+	}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := c.DegradedReason(); got != reasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q (target_resource changed remotely)", got, reasonRemoteSubscriptionConflict)
+	}
+	if deps.client.getCount() != 0 {
+		t.Errorf("Get call count = %d, want 0 (a clear target_resource mismatch needs no reconcile)", deps.client.getCount())
+	}
+}
+
+// TestSubscriptionLifecycleAction_Updated_DifferingIncludeResourceData_DegradedConflict
+// locks issue #7: a remote payload_options.include_resource_data change is
+// caught even when Authority AND target_resource still match.
+func TestSubscriptionLifecycleAction_Updated_DifferingIncludeResourceData_DegradedConflict(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true) // this consumer's own ENCRYPTED intent
+	hub.RegisterAndIsFirst(c)
+
+	le := LifecycleEvent{
+		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
+		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
+		IncludeResourceData: false, PayloadOptionsPresent: true, // remote flipped to plaintext
+	}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := c.DegradedReason(); got != reasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q (include_resource_data changed remotely)", got, reasonRemoteSubscriptionConflict)
+	}
+	if deps.client.getCount() != 0 {
+		t.Errorf("Get call count = %d, want 0 (a clear include_resource_data mismatch needs no reconcile)", deps.client.getCount())
+	}
+}
+
+// TestSubscriptionLifecycleAction_Updated_MissingPayloadOptions_SingleGetReconcile
+// locks issue #7's "insufficient info -> Get, never guess compatible" rule
+// for the NEW dimension specifically: Authority and target_resource both
+// match, but the after snapshot didn't carry payload_options at all.
+func TestSubscriptionLifecycleAction_Updated_MissingPayloadOptions_SingleGetReconcile(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	hub.RegisterAndIsFirst(c)
+	deps.client.getResp = buildGetResp("active", "")
+
+	le := LifecycleEvent{
+		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
+		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
+		// PayloadOptionsPresent deliberately left false: the after snapshot
+		// didn't carry payload_options.include_resource_data at all.
+	}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := deps.client.getCount(); got != 1 {
+		t.Errorf("Get call count = %d, want 1 (include_resource_data unknown -> single Get reconcile, never guessed compatible)", got)
+	}
+	if got := deps.client.reactivateCount(); got != 0 {
+		t.Errorf("Reactivate call count = %d, want 0", got)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -24,17 +25,29 @@ import (
 )
 
 // fakeRefinedGetter is a network-free stand-in for
-// *eventlib.SubscriptionClient's Get method (the refinedSubscriptionGetter
+// *eventlib.SubscriptionClient's Get/List methods (the refinedSubscriptionGetter
 // test seam) — mirrors cmd/event/subscription/get_test.go's fakeGetAPI.
 type fakeRefinedGetter struct {
 	resp  *larkeventv1.GetSubscriptionResp
 	err   error
 	calls int
+
+	// List seam (issue #8): a separate resp/err/call-counter pair so a test
+	// can assert dedup/threshold behavior (Get vs List call counts)
+	// independently.
+	listResp  *larkeventv1.ListSubscriptionResp
+	listErr   error
+	listCalls int
 }
 
 func (f *fakeRefinedGetter) Get(_ context.Context, _ *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error) {
 	f.calls++
 	return f.resp, f.err
+}
+
+func (f *fakeRefinedGetter) List(_ context.Context, _ *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
+	f.listCalls++
+	return f.listResp, f.listErr
 }
 
 var errBoom = errors.New("boom: unreachable")
@@ -472,6 +485,121 @@ func TestSupplementRefinedConsumers_NilGetterIsNoOp(t *testing.T) {
 	supplementRefinedConsumers(context.Background(), nil, consumers) // must not panic
 	if consumers[0].RemoteSubscription != nil {
 		t.Errorf("nil getter must be a no-op: %+v", consumers[0])
+	}
+}
+
+// --- issue #8: dedup by remote_subscription_id + List-above-threshold ---
+
+// TestSupplementRefinedConsumers_DedupsSharedRemoteSubscriptionID locks the
+// dedup fix: two consumers sharing the SAME remote_subscription_id must
+// trigger exactly ONE Get, with the single result fanned out to both —
+// never a duplicate Get per consumer.
+func TestSupplementRefinedConsumers_DedupsSharedRemoteSubscriptionID(t *testing.T) {
+	c1 := refinedConsumer()
+	c2 := refinedConsumer()
+	c2.PID = 456 // a second, DIFFERENT consumer bound to the SAME remote_subscription_id
+	consumers := []protocol.ConsumerInfo{c1, c2}
+	getter := &fakeRefinedGetter{resp: okGetSubscriptionResp("active", 42, false)}
+
+	supplementRefinedConsumers(context.Background(), getter, consumers)
+
+	if getter.calls != 1 {
+		t.Errorf("Get called %d times, want exactly 1 (both consumers share remote_subscription_id=%s)", getter.calls, c1.RemoteSubscriptionID)
+	}
+	for i, c := range consumers {
+		if c.RemoteState != "active" {
+			t.Errorf("consumers[%d].RemoteState = %q, want active (fanned out from the single dedup'd Get)", i, c.RemoteState)
+		}
+	}
+}
+
+// TestSupplementRefinedConsumers_ManyDistinctIDs_UsesListNotManyGets locks
+// the threshold fix: more than remoteSupplementListThreshold DISTINCT
+// remote_subscription_ids must use ONE List call instead of one Get per id.
+func TestSupplementRefinedConsumers_ManyDistinctIDs_UsesListNotManyGets(t *testing.T) {
+	n := remoteSupplementListThreshold + 1
+	consumers := make([]protocol.ConsumerInfo, 0, n)
+	items := make([]*larkeventv1.SubscriptionDetail, 0, n)
+	for i := 0; i < n; i++ {
+		c := refinedConsumer()
+		c.PID = 100 + i
+		c.RemoteSubscriptionID = fmt.Sprintf("sub_%d", i)
+		consumers = append(consumers, c)
+
+		state := "active"
+		id := c.RemoteSubscriptionID
+		items = append(items, &larkeventv1.SubscriptionDetail{SubscriptionId: &id, State: &state})
+	}
+	getter := &fakeRefinedGetter{
+		listResp: &larkeventv1.ListSubscriptionResp{
+			ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
+			Data:    &larkeventv1.ListSubscriptionRespData{Items: items},
+		},
+	}
+
+	supplementRefinedConsumers(context.Background(), getter, consumers)
+
+	if getter.listCalls != 1 {
+		t.Errorf("List called %d times, want 1", getter.listCalls)
+	}
+	if getter.calls != 0 {
+		t.Errorf("Get called %d times, want 0 (List substitutes for per-id Get above the threshold)", getter.calls)
+	}
+	for i, c := range consumers {
+		if c.RemoteState != "active" {
+			t.Errorf("consumers[%d].RemoteState = %q, want active", i, c.RemoteState)
+		}
+	}
+}
+
+// TestSupplementRefinedConsumers_AtThreshold_StillUsesGet locks the boundary:
+// exactly remoteSupplementListThreshold distinct ids must still use Get (one
+// per id), not List — only STRICTLY MORE than the threshold switches over.
+func TestSupplementRefinedConsumers_AtThreshold_StillUsesGet(t *testing.T) {
+	n := remoteSupplementListThreshold
+	consumers := make([]protocol.ConsumerInfo, 0, n)
+	for i := 0; i < n; i++ {
+		c := refinedConsumer()
+		c.PID = 100 + i
+		c.RemoteSubscriptionID = fmt.Sprintf("sub_%d", i)
+		consumers = append(consumers, c)
+	}
+	getter := &fakeRefinedGetter{resp: okGetSubscriptionResp("active", 0, false)}
+
+	supplementRefinedConsumers(context.Background(), getter, consumers)
+
+	if getter.calls != n {
+		t.Errorf("Get called %d times, want %d (one per distinct id, at the threshold)", getter.calls, n)
+	}
+	if getter.listCalls != 0 {
+		t.Errorf("List called %d times, want 0 (threshold not yet exceeded)", getter.listCalls)
+	}
+}
+
+// TestSupplementRefinedConsumers_ListMissingID_StaysLocalOnly: an id NOT
+// present in the List response's one page stays local-only, same
+// "unreachable -> local-only, no fail" contract as an errored/empty Get.
+func TestSupplementRefinedConsumers_ListMissingID_StaysLocalOnly(t *testing.T) {
+	n := remoteSupplementListThreshold + 1
+	consumers := make([]protocol.ConsumerInfo, 0, n)
+	for i := 0; i < n; i++ {
+		c := refinedConsumer()
+		c.PID = 100 + i
+		c.RemoteSubscriptionID = fmt.Sprintf("sub_missing_%d", i)
+		consumers = append(consumers, c)
+	}
+	// List succeeds but returns no items at all -> every id is "not found".
+	getter := &fakeRefinedGetter{listResp: &larkeventv1.ListSubscriptionResp{
+		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
+		Data:    &larkeventv1.ListSubscriptionRespData{},
+	}}
+
+	supplementRefinedConsumers(context.Background(), getter, consumers)
+
+	for i, c := range consumers {
+		if c.RemoteSubscription != nil || c.RemoteState != "" {
+			t.Errorf("consumers[%d] must stay local-only when its id isn't in the List page: %+v", i, c)
+		}
 	}
 }
 

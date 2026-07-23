@@ -157,6 +157,83 @@ func TestHandleHello_EncryptedUserConsumer_OwnerMismatch_Rejected(t *testing.T) 
 	}
 }
 
+// --- issue #7: handleHello populates the registered Conn's own local
+// listening intent (target_resource + include_resource_data) from
+// Hello.TargetResource/Hello.IncludeResourceData, so the updated_v1
+// lifecycle handler (lifecycle.go's classifyUpdateCompatibility) can later
+// compare a remote change against what this consumer actually asked for. ---
+
+func newPlainHelloBus(t *testing.T, logger *log.Logger) *Bus {
+	t.Helper()
+	return &Bus{
+		appID:      "app_123",
+		hub:        NewHub(),
+		logger:     logger,
+		conns:      make(map[*Conn]struct{}),
+		idleTimer:  time.NewTimer(30 * time.Second),
+		shutdownCh: make(chan struct{}, 1),
+	}
+}
+
+func TestHandleHello_PopulatesListenIntentFromHelloV2(t *testing.T) {
+	b := newPlainHelloBus(t, log.New(io.Discard, "", 0))
+	hello := &protocol.Hello{
+		PID:                  8001,
+		EventKey:             "im.message.created_v1/chat-id/oc_1",
+		EventTypes:           []string{"im.message.created_v1"},
+		Identity:             "user",
+		UserOpenID:           "ou_alice",
+		RemoteSubscriptionID: "sub_listen_intent",
+		TargetResource:       "im.message?chat_id=oc_1",
+		IncludeResourceData:  true,
+	}
+	ack := readAckFromClient(t, b, hello)
+	if ack.Rejected {
+		t.Fatalf("hello unexpectedly rejected: %q", ack.RejectReason)
+	}
+
+	conns := b.hub.connsByRemoteSubscriptionID("sub_listen_intent")
+	if len(conns) != 1 {
+		t.Fatalf("connsByRemoteSubscriptionID = %d conns, want 1", len(conns))
+	}
+	c := conns[0]
+	if got := c.TargetResource(); got != "im.message?chat_id=oc_1" {
+		t.Errorf("TargetResource() = %q, want %q", got, "im.message?chat_id=oc_1")
+	}
+	if got := c.IncludeResourceDataIntent(); !got {
+		t.Errorf("IncludeResourceDataIntent() = %v, want true", got)
+	}
+}
+
+// A legacy Hello (no TargetResource/IncludeResourceData set) must leave the
+// registered Conn's listen intent at its zero value — never fabricated.
+func TestHandleHello_LegacyHello_LeavesListenIntentEmpty(t *testing.T) {
+	b := newPlainHelloBus(t, log.New(io.Discard, "", 0))
+	hello := &protocol.Hello{
+		PID:        8002,
+		EventKey:   "mail.x",
+		EventTypes: []string{"mail.x"},
+	}
+	ack := readAckFromClient(t, b, hello)
+	if ack.Rejected {
+		t.Fatalf("hello unexpectedly rejected: %q", ack.RejectReason)
+	}
+
+	var found *Conn
+	for c := range b.conns {
+		found = c
+	}
+	if found == nil {
+		t.Fatal("no Conn registered")
+	}
+	if got := found.TargetResource(); got != "" {
+		t.Errorf("TargetResource() = %q, want \"\" for a legacy Hello", got)
+	}
+	if got := found.IncludeResourceDataIntent(); got {
+		t.Errorf("IncludeResourceDataIntent() = %v, want false for a legacy Hello", got)
+	}
+}
+
 // A plaintext consumer (IncludeResourceData=false) never triggers a key fetch —
 // the fetch client would error if called, yet the consumer registers fine.
 func TestHandleHello_PlaintextConsumer_NoKeyFetch(t *testing.T) {

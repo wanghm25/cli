@@ -225,6 +225,33 @@ func TestConn_SetOwnerIdentity_RoundTrips(t *testing.T) {
 	}
 }
 
+func TestConn_ListenIntent_DefaultEmpty(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	if got := conn.TargetResource(); got != "" {
+		t.Errorf("TargetResource() on a fresh Conn = %q, want \"\" (legacy default)", got)
+	}
+	if got := conn.IncludeResourceDataIntent(); got {
+		t.Errorf("IncludeResourceDataIntent() on a fresh Conn = %v, want false (legacy default)", got)
+	}
+}
+
+func TestConn_SetListenIntent_RoundTrips(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+	conn.SetListenIntent("im.message?chat_id=oc_1", true)
+	if got := conn.TargetResource(); got != "im.message?chat_id=oc_1" {
+		t.Errorf("TargetResource() = %q, want %q", got, "im.message?chat_id=oc_1")
+	}
+	if got := conn.IncludeResourceDataIntent(); !got {
+		t.Errorf("IncludeResourceDataIntent() = %v, want true", got)
+	}
+}
+
 func TestConn_BoundConnID_DefaultEmpty(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()

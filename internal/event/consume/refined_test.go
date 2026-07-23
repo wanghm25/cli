@@ -357,7 +357,7 @@ func TestAuthorityTypeFor_MapsIdentityToRemoteAuthorityVocabulary(t *testing.T) 
 
 func TestBuildHelloV2_PopulatesV2Fields(t *testing.T) {
 	resolved := refinedFixture()
-	h := buildHelloV2(resolved, core.AsUser, "local-sub-id", "my-profile", "ou_user_1", "sub_remote_1", "scope-hash-1")
+	h := buildHelloV2(resolved, core.AsUser, "local-sub-id", "my-profile", "ou_user_1", "sub_remote_1", "scope-hash-1", resolved.TargetResource)
 
 	if h.Type != protocol.MsgTypeHello {
 		t.Errorf("Type = %q, want %q", h.Type, protocol.MsgTypeHello)
@@ -389,6 +389,9 @@ func TestBuildHelloV2_PopulatesV2Fields(t *testing.T) {
 	if h.ConsumerScopeID != "scope-hash-1" {
 		t.Errorf("ConsumerScopeID = %q, want %q", h.ConsumerScopeID, "scope-hash-1")
 	}
+	if h.TargetResource != resolved.TargetResource {
+		t.Errorf("TargetResource = %q, want %q (issue #7: the bus stores this as the consumer's own listening intent)", h.TargetResource, resolved.TargetResource)
+	}
 	var foundHelloV2 bool
 	for _, c := range h.Capabilities {
 		if c == protocol.CapabilityHelloV2 {
@@ -402,7 +405,7 @@ func TestBuildHelloV2_PopulatesV2Fields(t *testing.T) {
 
 func TestBuildHelloV2_BotIdentity_NeverCarriesUserOpenID(t *testing.T) {
 	resolved := refinedFixture()
-	h := buildHelloV2(resolved, core.AsBot, "local-sub-id", "my-profile", "ou_should_be_dropped", "sub_remote_1", "scope-hash-1")
+	h := buildHelloV2(resolved, core.AsBot, "local-sub-id", "my-profile", "ou_should_be_dropped", "sub_remote_1", "scope-hash-1", resolved.TargetResource)
 	if h.Identity != "bot" {
 		t.Errorf("Identity = %q, want %q", h.Identity, "bot")
 	}
@@ -436,7 +439,7 @@ func TestDoHelloV2_SendsPopulatedHelloAndReadsAck(t *testing.T) {
 	}()
 
 	resolved := refinedFixture()
-	hello := buildHelloV2(resolved, core.AsUser, "local-sub", "profile-x", "ou_1", "sub_remote", "scope-1")
+	hello := buildHelloV2(resolved, core.AsUser, "local-sub", "profile-x", "ou_1", "sub_remote", "scope-1", resolved.TargetResource)
 
 	ack, _, err := doHelloV2(client, hello)
 	if err != nil {

@@ -121,6 +121,102 @@ func TestApplyUpdate_ActiveYes_CallsPatchAndReturnsDetail(t *testing.T) {
 	}
 }
 
+// ---- switching-off-encryption guard (issue #13) ----
+
+// TestApplyUpdate_BeforeEncryptedTrue_RequestFalse_ReturnsFailedPrecondition_NoPatchCall
+// locks the core #13 fix: an existing ENCRYPTED subscription
+// (before.PayloadOptions.IncludeResourceData==true) must NEVER be silently
+// Patched to include_resource_data=false — even with --yes.
+func TestApplyUpdate_BeforeEncryptedTrue_RequestFalse_ReturnsFailedPrecondition_NoPatchCall(t *testing.T) {
+	fake := &fakeUpdateAPI{}
+	before := rowFromDetail(t, activeDetail("sub_1", true, "user")) // before: include_resource_data=true
+
+	_, err := applyUpdate(context.Background(), fake, "sub_1", core.AsUser, before, false, true)
+
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if ve.Param != "--include-resource-data" {
+		t.Errorf("Param = %q, want --include-resource-data", ve.Param)
+	}
+	for _, want := range []string{"include_resource_data", "encryption", "delete", "sub_1"} {
+		if !strings.Contains(ve.Error()+ve.Hint, want) {
+			t.Errorf("error+hint = %q / %q, want it to mention %q", ve.Error(), ve.Hint, want)
+		}
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0: switching off an existing encrypted subscription must never Patch", fake.patchCalls)
+	}
+}
+
+// TestApplyUpdate_BeforeEncryptedTrue_RequestFalse_WinsOverSuspended locks the
+// guard ordering: the encryption-switch-off block is a structural
+// "not supported" fact about update itself, so it fires even ahead of the
+// suspended guard (a suspended AND currently-encrypted target still reports
+// the encryption-switch error, not "reactivate first").
+func TestApplyUpdate_BeforeEncryptedTrue_RequestFalse_WinsOverSuspended(t *testing.T) {
+	fake := &fakeUpdateAPI{}
+	d := suspendedDetail("sub_1", "authority_revoked")
+	d.PayloadOptions = &larkeventv1.PayloadOptions{IncludeResourceData: boolPtr(true)}
+	before := rowFromDetail(t, d)
+
+	_, err := applyUpdate(context.Background(), fake, "sub_1", core.AsUser, before, false, true)
+
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) || ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Fatalf("expected failed_precondition, got %T: %v", err, err)
+	}
+	if strings.Contains(ve.Hint, "reactivate") {
+		t.Errorf("Hint = %q, want the encryption-switch guidance, not the suspended/reactivate guidance", ve.Hint)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0", fake.patchCalls)
+	}
+}
+
+// TestApplyUpdate_BeforeFalse_RequestFalse_IsNoOp_StillPatches locks the
+// OTHER half of #13's fix: before==false makes a false request a harmless
+// no-op — it is NOT newly blocked, and proceeds to Patch exactly as before
+// this fix (byte-for-byte pre-existing behavior).
+func TestApplyUpdate_BeforeFalse_RequestFalse_IsNoOp_StillPatches(t *testing.T) {
+	fake := &fakeUpdateAPI{patchFunc: func() (*larkeventv1.PatchSubscriptionResp, error) {
+		return okPatchResp(activeDetail("sub_1", false, "user")), nil
+	}}
+	before := rowFromDetail(t, activeDetail("sub_1", false, "user")) // before: include_resource_data=false
+
+	_, err := applyUpdate(context.Background(), fake, "sub_1", core.AsUser, before, false, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 1 {
+		t.Errorf("patchCalls = %d, want 1 (before=false + false request is a harmless no-op Patch, not blocked)", fake.patchCalls)
+	}
+}
+
+// TestApplyUpdate_BeforeUnknownPayloadOptions_RequestFalse_NotBlocked: a nil
+// PayloadOptions (never observed for a real existing subscription) must never
+// be treated as positive evidence of encryption — an update must not be
+// blocked on a guess.
+func TestApplyUpdate_BeforeUnknownPayloadOptions_RequestFalse_NotBlocked(t *testing.T) {
+	fake := &fakeUpdateAPI{}
+	d := activeDetail("sub_1", false, "user")
+	d.PayloadOptions = nil // wire anomaly: no payload_options at all
+	before := rowFromDetail(t, d)
+
+	_, err := applyUpdate(context.Background(), fake, "sub_1", core.AsUser, before, false, false)
+
+	// yes=false here, so the confirmation gate is expected to fire NEXT —
+	// proving the encryption-switch guard did NOT block this request.
+	var ce *errs.ConfirmationRequiredError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected the confirmation-required gate to run (encryption-switch guard must not fire on unknown before-state), got %T: %v", err, err)
+	}
+}
+
 func TestApplyUpdate_Suspended_ReturnsFailedPrecondition_EvenWithYes_NoPatchCall(t *testing.T) {
 	fake := &fakeUpdateAPI{}
 	before := rowFromDetail(t, suspendedDetail("sub_1", "authority_revoked"))
@@ -196,11 +292,21 @@ func TestDoPatchSubscription_SuccessWithNoData_ReturnsTypedInternalError(t *test
 // ---- updatePlannedAction ----
 
 func TestUpdatePlannedAction(t *testing.T) {
-	if got := updatePlannedAction(rowFromDetail(t, activeDetail("sub_1", false, "user"))); got != "update" {
-		t.Errorf("active: updatePlannedAction = %q, want update", got)
+	if got := updatePlannedAction(rowFromDetail(t, activeDetail("sub_1", false, "user")), false); got != "update" {
+		t.Errorf("active, before=false req=false: updatePlannedAction = %q, want update", got)
 	}
-	if got := updatePlannedAction(rowFromDetail(t, suspendedDetail("sub_1", "authority_revoked"))); got != "blocked_suspended" {
+	if got := updatePlannedAction(rowFromDetail(t, suspendedDetail("sub_1", "authority_revoked")), false); got != "blocked_suspended" {
 		t.Errorf("suspended: updatePlannedAction = %q, want blocked_suspended", got)
+	}
+	// issue #13: before=true (encrypted) + a false request is a structural
+	// "not supported by update" fact, reported ahead of the suspended check.
+	if got := updatePlannedAction(rowFromDetail(t, activeDetail("sub_1", true, "user")), false); got != "blocked_encryption_switch" {
+		t.Errorf("before=true req=false: updatePlannedAction = %q, want blocked_encryption_switch", got)
+	}
+	// before=false + a false request is always a no-op-shaped "update" plan,
+	// never blocked.
+	if got := updatePlannedAction(rowFromDetail(t, activeDetail("sub_1", false, "user")), false); got != "update" {
+		t.Errorf("before=false req=false: updatePlannedAction = %q, want update (no-op Patch, not blocked)", got)
 	}
 }
 
@@ -219,7 +325,7 @@ func TestUpdateDryRun_Active_EndToEndViaFakeService_JSONShapeAndNoPatchCall(t *t
 		t.Fatalf("getSubscription: unexpected error: %v", err)
 	}
 	result := buildMutationDryRunResult("update", "sub_1", core.AsUser, before,
-		updatePlannedAction(before), updateLocalImpactNote, updateDryRunNextAction("sub_1", core.AsUser, before))
+		updatePlannedAction(before, false), updateLocalImpactNote, updateDryRunNextAction("sub_1", core.AsUser, before, false))
 
 	raw, err := json.Marshal(result)
 	if err != nil {
@@ -262,7 +368,7 @@ func TestUpdateDryRun_Suspended_ReportsBlockedInformationally_NoPatchCall(t *tes
 		t.Fatalf("getSubscription: unexpected error: %v", err)
 	}
 	result := buildMutationDryRunResult("update", "sub_1", core.AsUser, before,
-		updatePlannedAction(before), updateLocalImpactNote, updateDryRunNextAction("sub_1", core.AsUser, before))
+		updatePlannedAction(before, false), updateLocalImpactNote, updateDryRunNextAction("sub_1", core.AsUser, before, false))
 
 	if result.PlannedChange.Action != "blocked_suspended" {
 		t.Errorf("PlannedChange.Action = %q, want blocked_suspended", result.PlannedChange.Action)
@@ -272,6 +378,34 @@ func TestUpdateDryRun_Suspended_ReportsBlockedInformationally_NoPatchCall(t *tes
 	}
 	if !strings.Contains(result.NextAction, "reactivate") {
 		t.Errorf("NextAction = %q, want it to guide the caller to `reactivate`", result.NextAction)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0: --dry-run must never issue a write, even for a plan a real run would reject", fake.patchCalls)
+	}
+}
+
+// TestUpdateDryRun_EncryptedBeforeRequestFalse_ReportsBlockedInformationally_NoPatchCall
+// mirrors the suspended dry-run test above for issue #13's NEW blocked
+// reason: dry-run reports "blocked_encryption_switch" informationally
+// (never errors) for an existing ENCRYPTED subscription facing a false
+// request — the real run's typed failed_precondition
+// (TestApplyUpdate_BeforeEncryptedTrue_RequestFalse_...) only fires on a
+// REAL run, never under --dry-run.
+func TestUpdateDryRun_EncryptedBeforeRequestFalse_ReportsBlockedInformationally_NoPatchCall(t *testing.T) {
+	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", true, "user"))}
+
+	before, err := getSubscription(context.Background(), fake, "sub_1")
+	if err != nil {
+		t.Fatalf("getSubscription: unexpected error: %v", err)
+	}
+	result := buildMutationDryRunResult("update", "sub_1", core.AsUser, before,
+		updatePlannedAction(before, false), updateLocalImpactNote, updateDryRunNextAction("sub_1", core.AsUser, before, false))
+
+	if result.PlannedChange.Action != "blocked_encryption_switch" {
+		t.Errorf("PlannedChange.Action = %q, want blocked_encryption_switch", result.PlannedChange.Action)
+	}
+	if !strings.Contains(result.NextAction, "delete") {
+		t.Errorf("NextAction = %q, want it to guide the caller to delete + recreate", result.NextAction)
 	}
 	if fake.patchCalls != 0 {
 		t.Errorf("patchCalls = %d, want 0: --dry-run must never issue a write, even for a plan a real run would reject", fake.patchCalls)

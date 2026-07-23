@@ -120,6 +120,24 @@ type LifecycleEvent struct {
 	Authority string
 
 	ExpireTime int64 // body.expire_time, unix seconds; 0 when absent
+
+	// IncludeResourceData is the AFTER snapshot's
+	// payload_options.include_resource_data, populated ONLY for updated_v1
+	// (handleSubscriptionUpdated) — meaningful ONLY when PayloadOptionsPresent
+	// is true. The other 5 lifecycle event types never populate either of
+	// these two fields, so both stay at their zero value ("false") for those
+	// — bus/lifecycle.go's classifyUpdateCompatibility is the only reader,
+	// and it only ever consults these for an updated_v1 event.
+	IncludeResourceData bool
+
+	// PayloadOptionsPresent distinguishes "the after snapshot carried a
+	// payload_options.include_resource_data value" (true) from "it did not"
+	// (false — e.g. a malformed/unexpected payload) — IncludeResourceData's
+	// zero value (false) is ALSO what an absent payload_options normalizes
+	// to, so this flag is what lets a caller tell a genuine "false" apart
+	// from "unknown" rather than silently treating a missing field as a
+	// confirmed false.
+	PayloadOptionsPresent bool
 }
 
 func (s *FeishuSource) Name() string { return "feishu-websocket" }
@@ -379,8 +397,21 @@ func (s *FeishuSource) handleSubscriptionUpdated(ctx context.Context, e *larkeve
 		s.dispatchLifecycleEvent(ctx, LifecycleEvent{EventType: lifecycleEventTypeUpdated, EventID: eventID})
 		return nil
 	}
-	s.dispatchLifecycleEvent(ctx, normalizeLifecycleEvent(lifecycleEventTypeUpdated, eventID,
-		after.SubscriptionId, after.TargetResource, after.Authority, after.State, after.Suspension, after.ExpireTime))
+	le := normalizeLifecycleEvent(lifecycleEventTypeUpdated, eventID,
+		after.SubscriptionId, after.TargetResource, after.Authority, after.State, after.Suspension, after.ExpireTime)
+	// issue #7: the updated_v1 compatibility check
+	// (bus/lifecycle.go's classifyUpdateCompatibility) needs
+	// payload_options.include_resource_data alongside target_resource/
+	// authority to judge compatibility field-by-field instead of guessing
+	// from Authority alone. PayloadOptionsPresent stays false (and
+	// IncludeResourceData stays its zero value) when the after snapshot
+	// didn't carry a payload_options.include_resource_data at all — never
+	// guessed as a confirmed "false".
+	if after.PayloadOptions != nil && after.PayloadOptions.IncludeResourceData != nil {
+		le.PayloadOptionsPresent = true
+		le.IncludeResourceData = *after.PayloadOptions.IncludeResourceData
+	}
+	s.dispatchLifecycleEvent(ctx, le)
 	return nil
 }
 
@@ -514,6 +545,35 @@ type sdkLogger struct {
 // tail (which carries no key, but also no useful routing info).
 var subscriptionDecryptFailureRe = regexp.MustCompile(`subscription event decryption failed \(subscription_id=([^)]*)\)`)
 
+// decryptFailureLogClass is the fixed classification a decrypt-failure SDK
+// Error line is rewritten to before it ever reaches bus.log (issue #14 / the
+// §4.7 red line: an error may carry at most subscription_id/stage/
+// classification/log_id — never the crypto/padding detail the SDK's raw
+// error tail carries after the matched "(subscription_id=...)", e.g. "illegal
+// base64 data" / "cipher too short" / "ciphertext is not a multiple of the
+// block size", any of which could serve as a decryption oracle). Mirrors
+// Conn.decryptStateFailed's own "decrypt_failed" token (bus/conn.go) rather
+// than inventing a second name for the same concept.
+const decryptFailureLogClass = "decrypt_failed"
+
+// redactDecryptFailureLine detects a decrypt-failure SDK Error line
+// (subscriptionDecryptFailureRe) and truncates it right after the
+// "(subscription_id=...)" it already carries, discarding everything from
+// there to the end of the line — event/dispatcher/dispatcher.go's
+// decryptSubscriptionEnvelope always appends the raw crypto/padding detail as
+// the LAST component of the wrapped ws-client log line ("...: <detail>"), so
+// this is the ONLY place that detail appears on this path — and replacing it
+// with a fixed classification instead. Any harmless prefix context the ws
+// client adds (message_type/message_id/trace_id, etc.) is kept verbatim. A
+// line that is not a decrypt failure is returned byte-for-byte unchanged.
+func redactDecryptFailureLine(msg string) string {
+	loc := subscriptionDecryptFailureRe.FindStringIndex(msg)
+	if loc == nil {
+		return msg
+	}
+	return msg[:loc[1]] + ": classification=" + decryptFailureLogClass
+}
+
 func (a *sdkLogger) Debug(_ context.Context, _ ...interface{}) {}
 func (a *sdkLogger) Info(_ context.Context, args ...interface{}) {
 	msg := fmt.Sprint(args...)
@@ -531,15 +591,25 @@ func (a *sdkLogger) Warn(_ context.Context, args ...interface{}) {
 }
 func (a *sdkLogger) Error(_ context.Context, args ...interface{}) {
 	msg := fmt.Sprint(args...)
+	// A decrypt-failure line's raw SDK tail (base64/cipher/padding detail)
+	// must never reach bus.log (issue #14) — redact BEFORE logging or
+	// notifying. tryDecryptFailure below only ever extracts a
+	// subscription_id from the ORIGINAL msg and never logs/forwards the line
+	// itself, so it intentionally keeps using msg, not the redacted copy.
+	logLine := redactDecryptFailureLine(msg)
 	if a.l != nil {
-		a.l.Output(2, "[SDK ERROR] "+msg)
+		a.l.Output(2, "[SDK ERROR] "+logLine)
 	}
 	// A fail-closed subscription decrypt failure surfaces
 	// here (the WS client logs the dispatcher's Do error via this logger).
 	// Detect it and hand the subscription_id to the bus for counting/degrade.
 	a.tryDecryptFailure(msg)
-	// Errors usually manifest as disconnects; pass msg as detail.
-	a.tryNotify(msg, msg)
+	// Errors usually manifest as disconnects; pass the redacted line as
+	// detail — a decrypt-failure line never matches any of tryNotify's own
+	// prefixes below (sdk_log_patterns.go), so this is a no-op for it today;
+	// using the redacted copy here anyway keeps this call site fail-closed
+	// regardless of future drift.
+	a.tryNotify(logLine, logLine)
 }
 
 // tryDecryptFailure fires onDecryptFailure with the subscription_id parsed from

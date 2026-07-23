@@ -391,13 +391,28 @@ func staleIdentityAdvisory(match, applicable bool) string {
 
 // --- weak remote supplement (read-only) ---
 
-// refinedSubscriptionGetter narrows *eventlib.SubscriptionClient to the one
-// call the remote supplement needs — mirrors
+// refinedSubscriptionGetter narrows *eventlib.SubscriptionClient to the two
+// calls the remote supplement needs — mirrors
 // cmd/event/subscription/get.go's getSubscriptionAPI test seam, so tests
-// substitute a fake with no *lark.Client or network call involved.
+// substitute a fake with no *lark.Client or network call involved. List is
+// the issue #8 addition: once there are more distinct remote_subscription_ids
+// than remoteSupplementListThreshold, ONE List call is cheaper than that many
+// individual Gets.
 type refinedSubscriptionGetter interface {
 	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
+	List(ctx context.Context, req *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error)
 }
+
+// remoteSupplementListThreshold is supplementRefinedConsumers's dedup/List
+// switchover point (issue #8): AT or below this many DISTINCT
+// remote_subscription_ids, one Get per id (as before, just deduped) stays
+// exactly as targeted as before; ABOVE it, a single List call (whatever the
+// server's one default-size page returns) is cheaper than that many
+// individual Gets. This is a weak, best-effort supplement — List takes no id
+// filter, so any wanted id not present in that one page simply stays
+// local-only, same as an unreachable/errored Get would; there is no
+// pagination loop chasing full coverage.
+const remoteSupplementListThreshold = 5
 
 // requiredRemoteSupplementScopes is the single scope status's weak remote
 // read depends on. Kept as an independent literal rather than
@@ -517,49 +532,128 @@ func applyRefinedSupplement(ctx context.Context, statuses []appStatus, curAppID 
 }
 
 // supplementRefinedConsumers fills RemoteSubscription/RemoteState on every
-// refined consumer (RemoteSubscriptionID != "") in consumers by calling
-// getter.Get once per remote_subscription_id. getter is assumed
-// ALREADY gated by every precondition — this function performs no gating,
-// only the read + mapping, so a fake getter exercises it with no Factory/
-// cmd/keychain/network involved. A nil getter, a Get error, or an
-// empty/malformed response for one consumer degrades ONLY that consumer to
-// local-only (unreachable -> local-only, no fail) — it never aborts
-// the rest of the loop and never returns an error itself.
+// refined consumer (RemoteSubscriptionID != "") in consumers. getter is
+// assumed ALREADY gated by every precondition — this function performs no
+// gating, only the read + mapping, so a fake getter exercises it with no
+// Factory/cmd/keychain/network involved. A nil getter, a remote error, or an
+// empty/malformed response for one id degrades ONLY the consumer(s) sharing
+// that id to local-only (unreachable -> local-only, no fail) — it never
+// aborts the rest and never returns an error itself.
+//
+// Issue #8: reads are deduped by remote_subscription_id FIRST — several
+// consumers can share one id (e.g. two local processes bound to the same
+// remote Subscription), and the old code issued one Get per CONSUMER,
+// silently re-fetching the same id repeatedly. Each distinct id is now read
+// exactly once and its result fanned out to every consumer sharing it: at
+// or below remoteSupplementListThreshold distinct ids via one Get per id (as
+// before, just deduped); above it via a single List call instead of that
+// many individual Gets.
 func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionGetter, consumers []protocol.ConsumerInfo) {
 	if getter == nil {
 		return
 	}
+
+	// Group consumer INDICES by remote_subscription_id: the dedup key.
+	byID := map[string][]int{}
 	for i := range consumers {
-		c := &consumers[i]
-		if c.RemoteSubscriptionID == "" {
+		id := consumers[i].RemoteSubscriptionID
+		if id == "" {
 			continue
 		}
-		req := larkeventv1.NewGetSubscriptionReqBuilder().SubscriptionId(c.RemoteSubscriptionID).Build()
+		byID[id] = append(byID[id], i)
+	}
+	if len(byID) == 0 {
+		return
+	}
+
+	var details map[string]*larkeventv1.SubscriptionDetail
+	if len(byID) > remoteSupplementListThreshold {
+		details = listRemoteSupplementDetails(ctx, getter, byID)
+	} else {
+		details = getRemoteSupplementDetails(ctx, getter, byID)
+	}
+
+	for id, idxs := range byID {
+		d, ok := details[id]
+		if !ok {
+			continue // unreachable/error/not-returned -> local-only for every consumer sharing this id
+		}
+		info := mapRemoteSubscriptionInfo(d)
+		for _, i := range idxs {
+			consumers[i].RemoteSubscription = info
+			consumers[i].RemoteState = info.State
+		}
+	}
+}
+
+// getRemoteSupplementDetails fetches each of wantIDs' remote Subscription
+// snapshots via ONE Get per distinct id (issue #8's deduped path: at most
+// len(wantIDs) calls, never one per consumer). An error or empty/malformed
+// response for one id simply omits it from the returned map — the caller
+// treats a missing entry as "stays local-only", never a failure.
+func getRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) map[string]*larkeventv1.SubscriptionDetail {
+	out := make(map[string]*larkeventv1.SubscriptionDetail, len(wantIDs))
+	for id := range wantIDs {
+		req := larkeventv1.NewGetSubscriptionReqBuilder().SubscriptionId(id).Build()
 		resp, err := getter.Get(ctx, req)
 		if err != nil || resp == nil || resp.Data == nil || resp.Data.Subscription == nil {
-			continue // unreachable/error -> local-only for this ONE consumer
+			continue
 		}
-		d := resp.Data.Subscription
-		info := &protocol.RemoteSubscriptionInfo{}
-		if d.State != nil {
-			info.State = *d.State
-		}
-		if d.ExpireTime != nil {
-			info.ExpireTime = int64(*d.ExpireTime)
-		}
-		if d.PayloadOptions != nil && d.PayloadOptions.IncludeResourceData != nil {
-			info.IncludeResourceData = *d.PayloadOptions.IncludeResourceData
-		}
-		if d.Suspension != nil && d.Suspension.Code != nil {
-			// Captured verbatim from the response already fetched above —
-			// NOT a new remote call. Feeds the degraded
-			// advisory (remoteDegradedAdvisory below); this function itself
-			// does no interpretation, only mapping.
-			info.SuspensionCode = *d.Suspension.Code
-		}
-		c.RemoteSubscription = info
-		c.RemoteState = info.State
+		out[id] = resp.Data.Subscription
 	}
+	return out
+}
+
+// listRemoteSupplementDetails fetches ALL of wantIDs' remote Subscription
+// snapshots via ONE SubscriptionClient.List call (issue #8: cheaper than
+// len(wantIDs) individual Gets once there are more than
+// remoteSupplementListThreshold distinct ids). List takes no id filter (only
+// state/target_resource/event_type), so this reads however many the server
+// returns on its single default-size page and keeps only the ones actually
+// asked for; any wanted id NOT present in that one page is simply omitted —
+// same "stays local-only" degrade as an unreachable/errored Get, never a
+// second remote round-trip chasing full coverage (this is a weak,
+// best-effort supplement, not a completeness guarantee).
+func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) map[string]*larkeventv1.SubscriptionDetail {
+	out := make(map[string]*larkeventv1.SubscriptionDetail, len(wantIDs))
+	resp, err := getter.List(ctx, larkeventv1.NewListSubscriptionReqBuilder().Build())
+	if err != nil || resp == nil || resp.Data == nil {
+		return out // unreachable/error -> every id stays local-only, same as today
+	}
+	for _, item := range resp.Data.Items {
+		if item == nil || item.SubscriptionId == nil {
+			continue
+		}
+		id := *item.SubscriptionId
+		if _, wanted := wantIDs[id]; wanted {
+			out[id] = item
+		}
+	}
+	return out
+}
+
+// mapRemoteSubscriptionInfo maps one SDK SubscriptionDetail into the
+// CLI-facing wire shape — shared by both the Get and the List path so they
+// build this identically (extracted from the old inline per-consumer
+// mapping).
+func mapRemoteSubscriptionInfo(d *larkeventv1.SubscriptionDetail) *protocol.RemoteSubscriptionInfo {
+	info := &protocol.RemoteSubscriptionInfo{}
+	if d.State != nil {
+		info.State = *d.State
+	}
+	if d.ExpireTime != nil {
+		info.ExpireTime = int64(*d.ExpireTime)
+	}
+	if d.PayloadOptions != nil && d.PayloadOptions.IncludeResourceData != nil {
+		info.IncludeResourceData = *d.PayloadOptions.IncludeResourceData
+	}
+	if d.Suspension != nil && d.Suspension.Code != nil {
+		// Captured verbatim from the response already fetched above — NOT a
+		// new remote call. Feeds the degraded advisory (remoteDegradedAdvisory
+		// below); this function itself does no interpretation, only mapping.
+		info.SuspensionCode = *d.Suspension.Code
+	}
+	return info
 }
 
 // --- remote degraded advisory (read-only) ---

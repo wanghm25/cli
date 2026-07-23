@@ -190,7 +190,7 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 			consumerScopeID := computeConsumerScopeID(resolved.Definition.Key, resolved.MaterializedKey,
 				authorityTypeFor(opts.Identity), appID, scopeUserOpenID)
 
-			hello := buildHelloV2(resolved, opts.Identity, localSubscriptionID, profile, userOpenID, remoteSubscriptionID, consumerScopeID)
+			hello := buildHelloV2(resolved, opts.Identity, localSubscriptionID, profile, userOpenID, remoteSubscriptionID, consumerScopeID, targetResource)
 			// Tell the bus this is an ENCRYPTED subscription so it fetches the
 			// encrypt_key once (under the owner==current gate) before acking.
 			// The plaintext path leaves this false — no key fetch on the bus.
@@ -556,8 +556,12 @@ func writeRefinedDryRunPreview(errOut io.Writer, resolved event.ResolvedEventKey
 // frozen meaning as the LOCAL per-param fingerprint (fingerprint.go) and is
 // never repurposed to carry the remote id; remoteSubscriptionID is the
 // separate v2 field for that. UserOpenID is only ever set for a user
-// identity — a bot Hello never carries a stray open_id.
-func buildHelloV2(resolved event.ResolvedEventKey, identity core.Identity, localSubscriptionID, profile, userOpenID, remoteSubscriptionID, consumerScopeID string) *protocol.Hello {
+// identity — a bot Hello never carries a stray open_id. targetResource is
+// this consumer's own resolved target resource (issue #7): the bus stores it
+// on the registered Conn as this consumer's local listening intent, so a
+// later updated_v1 lifecycle event can be compared against what was actually
+// asked for rather than against Authority alone.
+func buildHelloV2(resolved event.ResolvedEventKey, identity core.Identity, localSubscriptionID, profile, userOpenID, remoteSubscriptionID, consumerScopeID, targetResource string) *protocol.Hello {
 	h := protocol.NewHello(os.Getpid(), resolved.MaterializedKey, []string{resolved.Definition.EventType}, "v1", localSubscriptionID)
 	h.Identity = string(identity)
 	h.Profile = profile
@@ -566,6 +570,7 @@ func buildHelloV2(resolved event.ResolvedEventKey, identity core.Identity, local
 	}
 	h.RemoteSubscriptionID = remoteSubscriptionID
 	h.ConsumerScopeID = consumerScopeID
+	h.TargetResource = targetResource
 	h.Capabilities = []string{protocol.CapabilityHelloV2}
 	return h
 }

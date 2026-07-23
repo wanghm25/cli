@@ -514,28 +514,66 @@ const (
 	updateUnclear      = "unclear"
 )
 
-// classifyUpdateCompatibility compares the updated_v1 event's Authority
-// against lead's OWN fixed owner identity — the one piece of "local
-// listening intent" every matched
-// consumer structurally carries, without introducing a separate
-// stored target_resource/authority-at-registration snapshot (deliberately
-// out of the Conn field list). An empty Authority (the event didn't
-// carry one, or the SDK payload couldn't be normalized into one) is always
-// "unclear" — never guessed compatible or incompatible.
+// classifyUpdateCompatibility compares the updated_v1 event's AFTER snapshot
+// against lead's OWN stored local listening intent — target_resource +
+// include_resource_data (Conn.TargetResource/IncludeResourceDataIntent,
+// populated from HelloV2 at registration) and authority (lead's fixed owner
+// identity) — the complete "local listening intent" issue #7 requires,
+// rather than Authority alone (a remote change to just the subscription's
+// target_resource or payload_options, with Authority left untouched, must
+// not be mis-judged "compatible").
+//
+// Each of the three dimensions is checked independently: an EMPTY/absent
+// value on the EVENT side (le.Authority=="", le.TargetResource=="", or
+// !le.PayloadOptionsPresent) means that ONE dimension can't be judged, but
+// never by itself forces "unclear" — a CONFIRMED mismatch found on any OTHER
+// dimension is conclusive on its own and wins immediately (no reason to wait
+// on a Get to double-check a dimension we already know disagrees). Only when
+// NONE of the three dimensions produces a confirmed mismatch, but at least
+// one couldn't be judged, does this return "unclear" (the caller then issues
+// a single Get to reconcile — see reconcileWithGet) instead of defaulting to
+// "compatible".
 func classifyUpdateCompatibility(le LifecycleEvent, lead *Conn) string {
-	if le.Authority == "" {
-		return updateUnclear
-	}
-	if lead.OwnerUserOpenID() == "" {
-		if le.Authority == "app" {
-			return updateCompatible
-		}
+	unclear := false
+
+	switch {
+	case le.Authority == "":
+		unclear = true
+	case !authorityMatchesConn(le.Authority, lead):
 		return updateIncompatible
 	}
-	if le.Authority == "user:"+lead.OwnerUserOpenID() {
-		return updateCompatible
+
+	switch {
+	case le.TargetResource == "":
+		unclear = true
+	case le.TargetResource != lead.TargetResource():
+		return updateIncompatible
 	}
-	return updateIncompatible
+
+	switch {
+	case !le.PayloadOptionsPresent:
+		unclear = true
+	case le.IncludeResourceData != lead.IncludeResourceDataIntent():
+		return updateIncompatible
+	}
+
+	if unclear {
+		return updateUnclear
+	}
+	return updateCompatible
+}
+
+// authorityMatchesConn reports whether authority (the updated_v1 event's
+// already-normalized After.Authority, e.g. "user:ou_xxx"/"app") matches
+// lead's OWN fixed owner identity — the same "app" vs "user:<open_id>"
+// vocabulary source/feishu.go's formatLifecycleAuthority/
+// formatSubscriptionAuthority already establish. authority=="" (unclear) must
+// never reach here — classifyUpdateCompatibility's own switch guards that.
+func authorityMatchesConn(authority string, lead *Conn) bool {
+	if lead.OwnerUserOpenID() == "" {
+		return authority == "app"
+	}
+	return authority == "user:"+lead.OwnerUserOpenID()
 }
 
 // errIdentityGateUnconfigured/errSubscriptionClientUnconfigured are returned

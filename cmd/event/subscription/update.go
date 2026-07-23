@@ -129,7 +129,7 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 	// check, independent of identity/scope/remote state, so a rejected request
 	// never causes any network activity at all.
 	if o.includeResourceData {
-		return errUpdateCannotSwitchEncryption(remoteSubscriptionID)
+		return errUpdateCannotSwitchEncryption(remoteSubscriptionID, true)
 	}
 
 	ctx := cmd.Context()
@@ -163,7 +163,7 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 
 	if o.dryRun {
 		result := buildMutationDryRunResult("update", remoteSubscriptionID, identity, before,
-			updatePlannedAction(before), updateLocalImpactNote, updateDryRunNextAction(remoteSubscriptionID, identity, before))
+			updatePlannedAction(before, o.includeResourceData), updateLocalImpactNote, updateDryRunNextAction(remoteSubscriptionID, identity, before, o.includeResourceData))
 		if o.asJSON {
 			output.PrintJson(f.IOStreams.Out, result)
 			return nil
@@ -194,11 +194,19 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 // fetched via Get for --dry-run/remote_before purposes; this does not
 // re-fetch it.
 //
-// The suspended guard is a hard block regardless of yes — there is no point
-// confirming a write that cannot proceed. It runs before the
-// confirmation gate so a suspended target never even reaches "requires
-// confirmation", and Patch is never called in either failing case.
+// The switching-off-encryption guard (issue #13) runs FIRST: it is a
+// structural "update can never do this" fact about the request itself (like
+// the true-direction gate in runUpdate), not a transient readiness problem —
+// even an ACTIVE, non-suspended subscription still cannot have
+// include_resource_data/encryption switched off via Patch. The suspended
+// guard is a hard block regardless of yes — there is no point
+// confirming a write that cannot proceed. Both guards run before the
+// confirmation gate so neither ever reaches "requires confirmation", and
+// Patch is never called in any of the three failing cases.
 func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, includeResourceData bool, yes bool) (*larkeventv1.SubscriptionDetail, error) {
+	if switchingOffEncryption(before, includeResourceData) {
+		return nil, errUpdateCannotSwitchEncryption(remoteSubscriptionID, false)
+	}
 	if before.Remote.State == "suspended" {
 		return nil, errUpdateSuspended(remoteSubscriptionID, identity, before.Remote.SuspensionReason)
 	}
@@ -206,6 +214,25 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, remoteSubscript
 		return nil, errUpdateConfirmationRequired(remoteSubscriptionID, identity, before)
 	}
 	return doPatchSubscription(ctx, svc, remoteSubscriptionID, includeResourceData)
+}
+
+// beforeIncludeResourceData reads before's CURRENT (pre-update, already
+// fetched by runUpdate's own Get) include_resource_data. A nil PayloadOptions
+// (a wire anomaly never observed for a real existing subscription) is
+// treated as "no positive evidence of encryption" rather than a guessed
+// true, so an update is never blocked on a guess.
+func beforeIncludeResourceData(before *subscriptionRow) bool {
+	return before != nil && before.PayloadOptions != nil && before.PayloadOptions.IncludeResourceData
+}
+
+// switchingOffEncryption reports whether this request would flip an
+// existing ENCRYPTED/resource-data subscription's include_resource_data to
+// false via Patch (issue #13): the CURRENT remote state already has
+// include_resource_data=true, and the request is false. before==false makes
+// ANY false request a harmless no-op (already false; Patching false again
+// changes nothing) — that pre-existing behavior is completely unchanged.
+func switchingOffEncryption(before *subscriptionRow, requestedIncludeResourceData bool) bool {
+	return !requestedIncludeResourceData && beforeIncludeResourceData(before)
 }
 
 // doPatchSubscription issues the actual Patch call and unwraps its
@@ -234,26 +261,37 @@ func doPatchSubscription(ctx context.Context, svc updateSubscriptionAPI, remoteS
 }
 
 // errUpdateCannotSwitchEncryption reports the CLI's refusal to switch
-// include_resource_data or
-// encryption on an existing remote Subscription via update. `encrypt` is a
-// Create-only field (Patch carries no encrypt), so update could never add an
-// encrypt_key to accompany a newly-enabled include_resource_data=true — and
-// the CLI will not leave a Subscription in an inconsistent state (resource
-// data toggled while its key can be neither added nor removed). Enabling
-// resource-data/encryption, or rotating a key, is therefore only ever done by
-// deleting the Subscription and creating a new one (or creating a separate new
-// Subscription), after a human confirms.
+// include_resource_data or encryption on an existing remote Subscription via
+// update, in EITHER direction: switching it ON — desiredForRecreate=true, a
+// plaintext subscription requesting --include-resource-data=true, refused
+// UNCONDITIONALLY regardless of remote state (checked in runUpdate before any
+// identity/scope/remote work: `encrypt` is a Create-only field, so update
+// could never mint the matching encrypt_key) — or switching it OFF —
+// desiredForRecreate=false, an already-ENCRYPTED subscription
+// (before.PayloadOptions.IncludeResourceData==true) requesting
+// --include-resource-data=false, which would otherwise silently Patch the
+// flag away (issue #13; checked in applyUpdate, AFTER the remote Get that
+// discovers before's current state, so it fires on a REAL run before Patch —
+// dry-run instead reports it informationally via updatePlannedAction's
+// "blocked_encryption_switch"). Either way the CLI will not leave a
+// Subscription in an inconsistent state (resource data toggled while its key
+// can be neither added nor removed) — switching either
+// direction, or rotating a key, is therefore only ever done by deleting the
+// Subscription and creating a new one (or creating a separate new
+// Subscription), after a human confirms. desiredForRecreate is the value the
+// delete+recreate example command shows (the value the caller actually
+// wants), so the guidance is directionally correct either way.
 //
-// This is a permanent
-// by-design rejection, not a "not yet supported / retry later" defer, so it
-// deliberately drops the old resource_data_encryption_deferred reason. Like
-// that gate it is a pure local check (no identity/scope/remote read), so a
-// rejected request never touches the network.
-func errUpdateCannotSwitchEncryption(remoteSubscriptionID string) error {
+// This is a permanent by-design rejection, not a "not yet supported / retry
+// later" defer. The ON-direction check is a pure local check (no identity/
+// scope/remote read), so a rejected request never touches the network; the
+// OFF-direction check runs after the Get every update already performs, so it
+// adds no extra remote call of its own.
+func errUpdateCannotSwitchEncryption(remoteSubscriptionID string, desiredForRecreate bool) error {
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"cannot change include_resource_data or encryption on an existing subscription via update").
 		WithParam("--include-resource-data").
-		WithHint("encryption is set only when a subscription is created and can never be added, changed, or removed afterward; to switch include_resource_data or enable/rotate encryption a human must confirm, then delete this subscription and create a new one (or create a separate new subscription) — e.g. `lark-cli event subscription delete %s` then `lark-cli event subscription create <refined-event-key> --include-resource-data=true`", remoteSubscriptionID)
+		WithHint("encryption is set only when a subscription is created and can never be added, changed, or removed afterward; to switch include_resource_data or enable/disable/rotate encryption a human must confirm, then delete this subscription and create a new one (or create a separate new subscription) — e.g. `lark-cli event subscription delete %s` then `lark-cli event subscription create <refined-event-key> --include-resource-data=%t`", remoteSubscriptionID, desiredForRecreate)
 }
 
 // errUpdateSuspended implements the suspended guard: Patch is
@@ -283,15 +321,21 @@ func errUpdateConfirmationRequired(remoteSubscriptionID string, identity core.Id
 }
 
 // updatePlannedAction is --dry-run's planned_change.action value: "update"
-// normally, or the informational "blocked_suspended" when the target is
-// suspended. Like create.go's own conflict/
-// suspended dry-run handling, dry-run always reports the plan
+// normally, the informational "blocked_encryption_switch" when this request
+// would flip an existing ENCRYPTED subscription's include_resource_data to
+// false (issue #13 — checked FIRST: this is a structural "not supported"
+// fact about the request, true or false regardless of suspended state), or
+// "blocked_suspended" when the target is suspended. Like create.go's own
+// conflict/suspended dry-run handling, dry-run always reports the plan
 // informationally rather than erroring on remote business state — only the
 // preflight steps themselves (identity/scope/flag-shape/encryption-check, already
 // passed by the time this is called) are real dry-run failures. The real
-// (non-dry-run) run's equivalent case DOES error — see errUpdateSuspended,
-// called from runUpdate's non-dry-run branch only.
-func updatePlannedAction(before *subscriptionRow) string {
+// (non-dry-run) run's equivalent cases DO error — see applyUpdate, called
+// from runUpdate's non-dry-run branch only.
+func updatePlannedAction(before *subscriptionRow, requestedIncludeResourceData bool) string {
+	if switchingOffEncryption(before, requestedIncludeResourceData) {
+		return "blocked_encryption_switch"
+	}
 	if before.Remote.State == "suspended" {
 		return "blocked_suspended"
 	}
@@ -300,7 +344,10 @@ func updatePlannedAction(before *subscriptionRow) string {
 
 const updateLocalImpactNote = "`event subscription update` only changes payload_options on the remote Subscription; it never starts, stops, or changes a local `event consume` process."
 
-func updateDryRunNextAction(remoteSubscriptionID string, identity core.Identity, before *subscriptionRow) string {
+func updateDryRunNextAction(remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, requestedIncludeResourceData bool) string {
+	if switchingOffEncryption(before, requestedIncludeResourceData) {
+		return fmt.Sprintf("this update would be rejected: include_resource_data/encryption cannot be switched off via update; a human must confirm, then run `lark-cli event subscription delete %s` and create a new plaintext subscription instead", remoteSubscriptionID)
+	}
 	if before.Remote.State == "suspended" {
 		return fmt.Sprintf("this update would be rejected while suspended; run `lark-cli event subscription reactivate %s --as %s` first", remoteSubscriptionID, identity)
 	}

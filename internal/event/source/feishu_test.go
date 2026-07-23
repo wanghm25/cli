@@ -4,8 +4,12 @@
 package source
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"log"
+	"strings"
 	"sync"
 	"testing"
 
@@ -413,6 +417,63 @@ func TestSdkLogger_DecryptFailure_NilCallback_NoPanic(t *testing.T) {
 	lg.Error(context.Background(), "err: subscription event decryption failed (subscription_id=sub_x): boom")
 }
 
+// TestSdkLogger_DecryptFailure_LogLineNeverCarriesRawSDKDetail is the
+// security red-line lock (issue #14): the SDK's raw decrypt-failure error
+// tail — crypto/padding detail such as "illegal base64 data" / "cipher too
+// short" / "ciphertext is not a multiple of the block size" — must NEVER
+// reach bus.log. Only subscription_id + a fixed classification may appear;
+// harmless prefix context (message_type/message_id/trace_id) is fine to
+// keep.
+func TestSdkLogger_DecryptFailure_LogLineNeverCarriesRawSDKDetail(t *testing.T) {
+	var buf bytes.Buffer
+	lg := &sdkLogger{l: log.New(&buf, "", 0)}
+
+	const secretDetail = "illegal base64 data: cipher too short, this is padding/algorithm detail that must never leak"
+	// Exactly how ws/client.go wraps a dispatcher Do error for the WS path
+	// (mirrors TestSdkLogger_DecryptFailure_ExtractsSubscriptionID's fixture).
+	lg.Error(context.Background(), fmt.Sprintf(
+		"handle message failed, message_type: event, message_id: m1, trace_id: t1, err: subscription event decryption failed (subscription_id=sub_abc123): %s", secretDetail))
+
+	out := buf.String()
+	for _, leaked := range []string{"illegal base64", "cipher too short", "padding", "algorithm"} {
+		if strings.Contains(out, leaked) {
+			t.Errorf("bus.log must never carry the raw SDK decrypt-failure detail (%q leaked); got: %s", leaked, out)
+		}
+	}
+	if !strings.Contains(out, "sub_abc123") {
+		t.Errorf("bus.log should still carry the subscription_id; got: %s", out)
+	}
+	if !strings.Contains(out, "classification=decrypt_failed") {
+		t.Errorf("bus.log should carry the fixed classification; got: %s", out)
+	}
+	// Harmless prefix context is fine to keep.
+	if !strings.Contains(out, "trace_id: t1") {
+		t.Errorf("harmless prefix context should be preserved; got: %s", out)
+	}
+	// The callback must still receive the subscription_id (redaction must not
+	// break the existing extraction contract).
+	var got string
+	lg2 := &sdkLogger{l: log.New(io.Discard, "", 0), onDecryptFailure: func(subID string) { got = subID }}
+	lg2.Error(context.Background(), fmt.Sprintf(
+		"err: subscription event decryption failed (subscription_id=sub_xyz): %s", secretDetail))
+	if got != "sub_xyz" {
+		t.Errorf("OnDecryptFailure got %q, want sub_xyz (redaction must not break subscription_id extraction)", got)
+	}
+}
+
+// TestSdkLogger_NonDecryptError_LogLineUnchanged: an unrelated Error line
+// (not a decrypt failure) must be forwarded byte-for-byte, unaffected by the
+// new redaction path.
+func TestSdkLogger_NonDecryptError_LogLineUnchanged(t *testing.T) {
+	var buf bytes.Buffer
+	lg := &sdkLogger{l: log.New(&buf, "", 0)}
+	lg.Error(context.Background(), "handle message failed, message_type: event, err: some unrelated transport problem")
+	out := buf.String()
+	if !strings.Contains(out, "some unrelated transport problem") {
+		t.Errorf("a non-decrypt error line must be forwarded unchanged; got: %s", out)
+	}
+}
+
 // TestBuildDispatcher_OnLifecycleEventNil_NoPanic: a FeishuSource with no
 // lifecycle executor configured (OnLifecycleEvent left nil, matching
 // OnConnReady's own nil-tolerant contract) must not panic when a lifecycle
@@ -563,6 +624,42 @@ func TestBuildDispatcher_LifecycleEvents_NormalizeFields(t *testing.T) {
 			want: LifecycleEvent{
 				EventType: lifecycleEventTypeUpdated,
 				EventID:   "evt_lifecycle_test",
+			},
+		},
+		{
+			// issue #7: updated_v1's after.payload_options.include_resource_data
+			// must flow into LifecycleEvent so bus/lifecycle.go's
+			// classifyUpdateCompatibility can compare it against the
+			// consumer's own stored intent, instead of comparing Authority
+			// alone.
+			name:      "updated with after.payload_options.include_resource_data=true",
+			eventType: lifecycleEventTypeUpdated,
+			body:      `{"after":{"subscription_id":"sub_8","target_resource":"im.message?chat_id=oc_8","authority":{"type":"user","open_id":"ou_8"},"state":"active","payload_options":{"include_resource_data":true}}}`,
+			want: LifecycleEvent{
+				EventType:             lifecycleEventTypeUpdated,
+				EventID:               "evt_lifecycle_test",
+				RemoteSubscriptionID:  "sub_8",
+				TargetResource:        "im.message?chat_id=oc_8",
+				Authority:             "user:ou_8",
+				State:                 "active",
+				IncludeResourceData:   true,
+				PayloadOptionsPresent: true,
+			},
+		},
+		{
+			// An explicit false must be distinguished from "absent": both
+			// stay IncludeResourceData==false, but ONLY the explicit case
+			// also sets PayloadOptionsPresent==true.
+			name:      "updated with after.payload_options.include_resource_data=false",
+			eventType: lifecycleEventTypeUpdated,
+			body:      `{"after":{"subscription_id":"sub_9","state":"active","payload_options":{"include_resource_data":false}}}`,
+			want: LifecycleEvent{
+				EventType:             lifecycleEventTypeUpdated,
+				EventID:               "evt_lifecycle_test",
+				RemoteSubscriptionID:  "sub_9",
+				State:                 "active",
+				IncludeResourceData:   false,
+				PayloadOptionsPresent: true,
 			},
 		},
 	}

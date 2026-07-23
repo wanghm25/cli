@@ -55,6 +55,21 @@ type Conn struct {
 	ownerAppID      string
 	ownerUserOpenID string
 
+	// listenTargetResource/listenIncludeResourceData record this consumer's
+	// own local listening INTENT for its remote Subscription — target_resource
+	// and payload_options.include_resource_data — populated from a refined
+	// consumer's HelloV2 (Hello.TargetResource/Hello.IncludeResourceData) in
+	// handleHello. Same zero-lock, write-once-before-Start()-then-read-only
+	// convention as remoteSubscriptionID/owner* above. Together with
+	// ownerIdentity/ownerAppID/ownerUserOpenID (this consumer's registered
+	// AUTHORITY) these form the complete "local listening intent" the
+	// updated_v1 lifecycle handler (lifecycle.go's classifyUpdateCompatibility)
+	// compares an incoming event's After snapshot against field-by-field,
+	// rather than comparing Authority alone. ""/false (the zero value) for a
+	// legacy consumer that never calls SetListenIntent.
+	listenTargetResource      string
+	listenIncludeResourceData bool
+
 	// identityMu guards the mutable post-registration identity-gate state
 	// below. Unlike remoteSubscriptionID/owner* (write-once-then-read-only),
 	// these are written repeatedly AFTER Start() — by identity.go's
@@ -210,6 +225,24 @@ func (c *Conn) OwnerAppID() string { return c.ownerAppID }
 // consumer — the identity gate never gates or binds these (bot
 // consumers are NEVER identity-gated).
 func (c *Conn) OwnerUserOpenID() string { return c.ownerUserOpenID }
+
+// SetListenIntent records this consumer's own local listening intent —
+// target_resource + include_resource_data — from Hello.TargetResource/
+// Hello.IncludeResourceData. Call before Start() (same convention as
+// SetRemoteSubscriptionID/SetOwnerIdentity) — set once, read-only afterward.
+func (c *Conn) SetListenIntent(targetResource string, includeResourceData bool) {
+	c.listenTargetResource = targetResource
+	c.listenIncludeResourceData = includeResourceData
+}
+
+// TargetResource returns this consumer's own local listening intent's
+// target_resource ("" for a legacy consumer / never set).
+func (c *Conn) TargetResource() string { return c.listenTargetResource }
+
+// IncludeResourceDataIntent returns this consumer's own local listening
+// intent's include_resource_data (false for a legacy consumer / never set,
+// or a genuine plaintext subscription).
+func (c *Conn) IncludeResourceDataIntent() bool { return c.listenIncludeResourceData }
 
 // BoundConnID returns the WS connection_id this consumer's owner was last
 // successfully BindUser'd on ("" = never bound). identity.go's onConnReady

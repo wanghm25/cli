@@ -406,6 +406,12 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 	// the BUS's own AppID: a bus is per-app, so Hello carries no separate
 	// app_id field to read instead.
 	bc.SetOwnerIdentity(hello.Identity, b.appID, hello.UserOpenID)
+	// This consumer's own local listening intent (issue #7): "" /false for a
+	// legacy Hello that never sets these — the updated_v1 lifecycle handler
+	// (lifecycle.go's classifyUpdateCompatibility) only ever compares a
+	// REFINED consumer's fields (a legacy Conn's RemoteSubscriptionID stays ""
+	// and so never matches a real lifecycle event's non-empty one).
+	bc.SetListenIntent(hello.TargetResource, hello.IncludeResourceData)
 	bc.SetLogger(b.logger)
 
 	// Encrypted refined consumer: fetch the subscription's encrypt_key ONCE

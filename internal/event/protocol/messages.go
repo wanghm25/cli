@@ -98,6 +98,14 @@ type Hello struct {
 	// and must never be repurposed to carry this remote id.
 	RemoteSubscriptionID string `json:"remote_subscription_id,omitempty"`
 
+	// TargetResource is this consumer's own local listening intent — the
+	// resource (e.g. "im.message?chat_id=oc_xxx") it resolved and used to
+	// Create/reuse RemoteSubscriptionID. The bus stores it on the registered
+	// Conn (Conn.SetListenIntent) so a later updated_v1 lifecycle event can be
+	// compared against what this consumer actually asked for, rather than
+	// against the event's own Authority alone. Empty for a legacy consumer.
+	TargetResource string `json:"target_resource,omitempty"`
+
 	// Identity is the resolved caller identity for this consumer ("user" or
 	// "bot"). Kept as a plain string rather than core.Identity to keep this
 	// package SDK/domain independent. Consumed by the bus-side owner/current
