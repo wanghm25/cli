@@ -13,8 +13,8 @@ import (
 	"github.com/larksuite/cli/internal/core"
 )
 
-// currentIdentity is the CLI's active identity resolved AT ACTION TIME (spec
-// §4.4) — never a value cached from bus startup. The ONLY authoritative
+// currentIdentity is the CLI's active identity resolved AT ACTION TIME
+// — never a value cached from bus startup. The ONLY authoritative
 // comparison key against a consumer's owner identity is appID+userOpenID;
 // UAT/tokens are never part of this comparison and never flow through this
 // type.
@@ -23,7 +23,7 @@ type currentIdentity struct {
 	userOpenID string
 }
 
-// ownerMatchesCurrent is the spec §4.4 comparison: owner_app_id +
+// ownerMatchesCurrent is the owner comparison: owner_app_id +
 // owner_user_open_id, exactly. Never compares tokens.
 func ownerMatchesCurrent(ownerAppID, ownerUserOpenID string, cur currentIdentity) bool {
 	return ownerAppID == cur.appID && ownerUserOpenID == cur.userOpenID
@@ -35,7 +35,7 @@ func ownerMatchesCurrent(ownerAppID, ownerUserOpenID string, cur currentIdentity
 // (which means current WAS resolved but didn't match this consumer's owner).
 const reasonCurrentIdentityUnresolved = "current_identity_unresolved"
 
-// resolveCurrentIdentity is the PRODUCTION resolveCurrent (spec §4.4):
+// resolveCurrentIdentity is the PRODUCTION resolveCurrent:
 // LoadMultiAppConfig reads config.json fresh on every call — no in-process
 // caching — so this is never a bus-startup-cached value, unlike
 // Factory.Config()/ResolveAccount(). CurrentAppConfig("") + Users[0] mirrors
@@ -56,7 +56,7 @@ func resolveCurrentIdentity() (currentIdentity, error) {
 }
 
 // identityGate implements the bus-side owner/current identity gate +
-// BindUser wiring (spec §4.4). resolveCurrent and resolveUAT are injected so
+// BindUser wiring. resolveCurrent and resolveUAT are injected so
 // tests exercise every branch (match/mismatch/error/changing-across-calls)
 // without touching disk or keychain; production wires resolveCurrent to
 // resolveCurrentIdentity above and resolveUAT to the credential chain
@@ -68,7 +68,7 @@ type identityGate struct {
 	logger         *log.Logger
 
 	// connMu guards connID/bindUser below: the LATEST values FeishuSource's
-	// ready closure passed to onConnReady (spec §4.4), memoized (Task 18) so
+	// ready closure passed to onConnReady, memoized so
 	// bindConsumer can be invoked independently of a fresh WS ready/reconnect
 	// callback — specifically, by subscriptionLifecycleAction
 	// (internal/event/bus/lifecycle.go) reacting to an activated_v1/
@@ -111,13 +111,13 @@ var (
 // WS client's OnReady (first usable connection of a run) and OnReconnected
 // (every successful reconnect — connID rotates each dial, so a stale
 // binding from before is never assumed valid) callbacks. It memoizes
-// (connID, bindUser) for bindConsumer's later, independent use (Task 18)
+// (connID, bindUser) for bindConsumer's later, independent use
 // and then runs bindConsumer for every registered USER consumer (bot
 // consumers are invisible here — Hub.userConns already filters them out,
-// spec §4.4: bot consumers are NEVER identity-gated or BindUser'd). Each
+// bot consumers are NEVER identity-gated or BindUser'd). Each
 // consumer's outcome (bound / stale / degraded) is entirely bindConsumer's
-// concern — a single consumer's failure never affects any other (spec
-// §4.4), and a resolveCurrent failure degrades only the consumers actually
+// concern — a single consumer's failure never affects any other,
+// and a resolveCurrent failure degrades only the consumers actually
 // evaluated rather than crashing/killing the WS connection.
 func (g *identityGate) onConnReady(ctx context.Context, connID string, bindUser func(context.Context, string) error) {
 	if g == nil || g.hub == nil {
@@ -133,11 +133,11 @@ func (g *identityGate) onConnReady(ctx context.Context, connID string, bindUser 
 	}
 }
 
-// bindConsumer performs the per-consumer bind sequence (spec §4.4): owner==
+// bindConsumer performs the per-consumer bind sequence: owner==
 // current check -> resolveUAT -> bindUser -> SetBoundConnID. Factored out of
-// onConnReady's own loop body (Task 18) so a lifecycle action — e.g.
+// onConnReady's own loop body so a lifecycle action — e.g.
 // subscriptionLifecycleAction reacting to activated_v1 (resume running) or a
-// successful suspended_v1 Reactivate (spec §5.3/§5.4) — can (re)bind ONE
+// successful suspended_v1 Reactivate — can (re)bind ONE
 // specific consumer independently of a fresh WS ready/reconnect event, using
 // the LATEST (connID, bindUser) onConnReady last memoized.
 //
@@ -146,7 +146,7 @@ func (g *identityGate) onConnReady(ctx context.Context, connID string, bindUser 
 // success from failure without re-deriving it from Conn state:
 //   - resolveCurrent fails -> SetDegraded(reasonCurrentIdentityUnresolved).
 //   - owner != current -> SetStaleIdentity() — NEVER loads a UAT for that
-//     (historical) owner, NEVER binds (spec §8's red line, reused here).
+//     (historical) owner, NEVER binds (the security red line, reused here).
 //   - already bound on the memoized connID -> no-op success (no duplicate
 //     Bind).
 //   - no WS connection has ever become ready (bindUser still nil) ->
@@ -154,7 +154,7 @@ func (g *identityGate) onConnReady(ctx context.Context, connID string, bindUser 
 //   - resolveUAT fails -> SetDegraded("bind_failed: uat_unavailable").
 //   - bindUser fails -> SetDegraded("bind_failed: bind_api_error").
 //   - success -> SetBoundConnID(connID) (which itself clears stale/degraded/
-//     nextAction — spec §5.4/§5.5).
+//     nextAction).
 func (g *identityGate) bindConsumer(ctx context.Context, c *Conn) error {
 	if g == nil {
 		return errors.New("identity gate: not configured")

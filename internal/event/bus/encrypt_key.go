@@ -16,13 +16,13 @@ import (
 	"github.com/larksuite/cli/internal/core"
 )
 
-// decrypt_state tokens (spec §4.7 "失败语义与可观测性"). A small, stable
-// vocabulary a status display can key off (E7). decryptStateFailed is added by
-// E6 (the SDK-decrypt-failure path); E4 only ever produces the first two.
+// decrypt_state tokens for failure/observability. A small, stable
+// vocabulary a status display can key off. decryptStateFailed covers
+// the SDK-decrypt-failure path; the fetch path only ever produces the first two.
 const (
 	decryptStateDecrypted      = "decrypted"
 	decryptStateKeyUnavailable = "decrypt_key_unavailable"
-	decryptStateFailed         = "decrypt_failed" // key held but SDK decrypt/parse failed (task E6)
+	decryptStateFailed         = "decrypt_failed" // key held but SDK decrypt/parse failed
 )
 
 // encryptKeyProviderDefaults — internal control-plane housekeeping timings,
@@ -36,9 +36,9 @@ const (
 )
 
 // encryptKeyClient is the narrow seam encryptKeyProvider needs from
-// *eventlib.SubscriptionClient: GetEncryptKey ONLY (spec §4.7 — the provider
+// *eventlib.SubscriptionClient: GetEncryptKey ONLY (the provider
 // never lists/creates/patches). *eventlib.SubscriptionClient satisfies it
-// structurally (it gained GetEncryptKey in task E1), so bus.go's
+// structurally (it gained GetEncryptKey earlier), so bus.go's
 // SetSubscriptionClient passes one straight through; tests substitute a fake
 // with no *lark.Client or network call — the same test-seam idiom as
 // subscriptionActionClient (lifecycle.go).
@@ -46,44 +46,44 @@ type encryptKeyClient interface {
 	GetEncryptKey(ctx context.Context, req *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error)
 }
 
-// encryptKeyProvider is the CLI's larkevent.EncryptKeyProvider implementation
-// (spec §4.7 "解密位置与运行时边界"): the SDK EventDispatcher calls
+// encryptKeyProvider is the CLI's larkevent.EncryptKeyProvider
+// implementation: the SDK EventDispatcher calls
 // EncryptKey(ctx, subscription_id) SYNCHRONOUSLY, before parsing/routing an
 // encrypted subscription envelope. On a cache miss it fetches the key via
 // GetEncryptKey using the OWNER identity resolved from the bus's own consumer
 // registry, then backfills the SDK's concurrency-safe StaticEncryptKeyProvider
 // so subsequent events for the same subscription decrypt with zero network.
 //
-// SECURITY (spec §4.7 敏感信息红线): the fetched encrypt_key lives ONLY inside
+// SECURITY: the fetched encrypt_key lives ONLY inside
 // the SDK StaticEncryptKeyProvider's in-memory map (released on Remove / bus
 // exit). It is NEVER logged, put on the wire (IPC), placed in status, or
 // returned anywhere except back to the SDK dispatcher that asked for it. The
 // UAT used to fetch it is likewise never logged. owner != current NEVER loads a
-// historical owner's UAT (spec §8 red line, reused from the Task 14 gate).
+// historical owner's UAT (the security red line, reused from the delivery gate).
 //
-// DISPATCH SAFETY (spec §4.7 "缓存 miss 时不可避免会延迟当前事件的 dispatch"):
+// DISPATCH SAFETY (a cache miss inevitably delays the current event's dispatch):
 // because EncryptKey blocks the dispatcher, a miss is guarded by (1) a short
 // per-fetch timeout, (2) per-subscription_id singleflight (one in-flight fetch
 // per id, concurrent callers share its result), (3) bounded total concurrency,
 // and (4) a failure cooldown so a genuine no-key does not hammer the API. There
 // is NO infinite retry. A transient failure (context cancel/deadline) is NOT
 // cached as a permanent failure — it is a bus-restart / cache-eviction / race
-// fallback that a later event re-attempts (the E2-review lesson).
+// fallback that a later event re-attempts.
 type encryptKeyProvider struct {
 	// static is the SDK's own concurrency-safe cache (the authoritative key
 	// store). The provider only ever Set()s a freshly fetched key here and
-	// Remove()s on lifecycle deletion (E6); it never reads keys back out for
+	// Remove()s on lifecycle deletion; it never reads keys back out for
 	// any purpose other than answering EncryptKey.
 	static *larkevent.StaticEncryptKeyProvider
 
-	// hub is the subscription_id -> owner map (spec §4.7 note 3): the Hub's
+	// hub is the subscription_id -> owner map: the Hub's
 	// consumer registry IS that map — connsByRemoteSubscriptionID(subID) yields
 	// the refined consumer(s), whose owner{Identity,AppID,UserOpenID} fields
-	// (fixed at Hello registration, spec §4.4) are the ONLY identity signal.
+	// (fixed at Hello registration) are the ONLY identity signal.
 	// An unknown subscription (no registered consumer) is never guessed at.
 	hub *Hub
 
-	// gate supplies resolveCurrent + resolveUAT (spec §4.4/§8) for a USER
+	// gate supplies resolveCurrent + resolveUAT for a USER
 	// subscription's owner==current check and fresh-UAT mint. nil until
 	// SetIdentityProviders — a user subscription then cannot be served (returns
 	// no key), but a bot subscription (no UAT needed) still can.
@@ -154,7 +154,7 @@ func (p *encryptKeyProvider) logf(format string, args ...interface{}) {
 	}
 }
 
-// Remove drops a subscription's cached key (E6 lifecycle removal). Idempotent.
+// Remove drops a subscription's cached key (lifecycle removal). Idempotent.
 // Also clears any recorded failure for the id so a fresh subscription reusing
 // the same id (unlikely, but harmless) starts clean.
 func (p *encryptKeyProvider) Remove(subID string) {
@@ -170,10 +170,10 @@ func (p *encryptKeyProvider) Remove(subID string) {
 // EncryptKey implements larkevent.EncryptKeyProvider. Returns (key, true) only
 // when a usable key is available; ("", false) otherwise (the SDK then leaves
 // the envelope encrypted, which fails the downstream parse fail-closed — no
-// plaintext fallback, spec §4.7).
+// plaintext fallback).
 func (p *encryptKeyProvider) EncryptKey(ctx context.Context, subID string) (string, bool) {
 	// Fast path: the SDK cache already has it (the common case after the first
-	// fetch or an E5 prewarm). No lock contention beyond the static's own RWMutex.
+	// fetch or a prewarm). No lock contention beyond the static's own RWMutex.
 	if key, ok := p.static.EncryptKey(ctx, subID); ok {
 		return key, true
 	}
@@ -216,7 +216,7 @@ func (p *encryptKeyProvider) fetch(ctx context.Context, subID string) (string, b
 		return "", false
 	}
 
-	// subscription_id -> owner, via the Hub registry (spec §4.7 note 3). An
+	// subscription_id -> owner, via the Hub registry. An
 	// unknown subscription / one with no active consumer is never guessed at.
 	conns := p.hub.connsByRemoteSubscriptionID(subID)
 	if len(conns) == 0 {
@@ -264,13 +264,13 @@ func (p *encryptKeyProvider) fetch(ctx context.Context, subID string) (string, b
 	if err != nil {
 		if isTransientCtxErr(fctx, err) {
 			// context cancel/deadline: bus restart / eviction / race window,
-			// never a confirmed no-key (E2-review lesson). Drop this event
+			// never a confirmed no-key. Drop this event
 			// only; do not cache, do not mark permanently.
 			return "", false
 		}
 		// A genuine business/transport failure (missing event:encrypt_key:read
 		// scope, revoked auth, subscription gone, ...). The SDK error is
-		// deliberately not surfaced verbatim (no oracle, spec §4.7): only a
+		// deliberately not surfaced verbatim (no oracle): only a
 		// classified state + a cooldown.
 		p.logf("[encrypt-key] GetEncryptKey failed for subscription_id=%s (key unavailable)", subID)
 		markDecryptKeyUnavailable(conns)
@@ -297,14 +297,14 @@ func (p *encryptKeyProvider) fetch(ctx context.Context, subID string) (string, b
 }
 
 // resolveOwnerIdentity turns owner's fixed registration identity into the
-// (identity, uat) GetEncryptKey must run as (spec §4.7 "GetEncryptKey 必须使用
-// 与 Subscription authority 一致的身份"):
+// (identity, uat) GetEncryptKey must run as — the identity must match the
+// Subscription's own authority:
 //   - bot/legacy owner (OwnerUserOpenID()=="") -> core.AsBot, no UAT, no gate
-//     (bot consumers are NEVER identity-gated — the Task 14 precedent).
+//     (bot consumers are NEVER identity-gated — the same precedent).
 //   - user owner -> owner==current gate (reuse ownerMatchesCurrent /
 //     resolveCurrent). owner != current marks stale_identity +
-//     decrypt_key_unavailable and returns without loading ANY UAT (spec §8:
-//     never a historical owner's UAT). Otherwise a FRESH UAT is minted for the
+//     decrypt_key_unavailable and returns without loading ANY UAT
+//     (never a historical owner's UAT). Otherwise a FRESH UAT is minted for the
 //     current identity.
 //
 // ok==false means "cannot serve this subscription now"; the conns have already
@@ -330,7 +330,7 @@ func (p *encryptKeyProvider) resolveOwnerIdentity(ctx context.Context, owner *Co
 		return "", "", false
 	}
 	if !ownerMatchesCurrent(owner.OwnerAppID(), owner.OwnerUserOpenID(), cur) {
-		// owner != current: NO fetch, NO historical UAT (spec §8). Mark
+		// owner != current: NO fetch, NO historical UAT. Mark
 		// stale_identity (as the Publish/lifecycle gates do) AND the decrypt
 		// state so status can advise switching profile.
 		for _, c := range conns {
@@ -386,7 +386,7 @@ func isTransientCtxErr(fctx context.Context, err error) bool {
 }
 
 // markDecryptKeyUnavailable sets decrypt_state=decrypt_key_unavailable on every
-// matched consumer (spec §4.7 失败语义). A pure local state write — never logs
+// matched consumer. A pure local state write — never logs
 // a reason that could leak key material.
 func markDecryptKeyUnavailable(conns []*Conn) {
 	for _, c := range conns {
@@ -405,7 +405,7 @@ func markDecrypted(conns []*Conn) {
 }
 
 // resourceDataStatus maps a consumer's decrypt_state to the status display's
-// resource_data rollup (task E7, spec §4.7): "decrypted" when a usable key is
+// resource_data rollup: "decrypted" when a usable key is
 // available, "unavailable" when the key is missing or decryption is failing,
 // and "" for a plaintext subscription (no resource data at all).
 func resourceDataStatus(decryptState string) string {

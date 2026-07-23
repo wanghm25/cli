@@ -43,16 +43,16 @@ type Subscriber interface {
 	EventTypes() []string
 	// RemoteSubscriptionID is the remote Subscription (OpenAPI primary key,
 	// e.g. "sub_xxx") this consumer is bound to; "" means legacy (routed by
-	// EventTypes() only, spec §4.3's dual-index routing matrix). Distinct
+	// EventTypes() only, the dual-index routing matrix). Distinct
 	// from SubscriptionID, which is the local per-resource fingerprint used
 	// for the registration/cleanup machinery above and is unrelated to this.
 	RemoteSubscriptionID() string
 	// OwnerAppID and OwnerUserOpenID are the owner identity fixed at this
-	// consumer's registration (spec §4.4): owner_app_id + owner_user_open_id
+	// consumer's registration: owner_app_id + owner_user_open_id
 	// is the ONLY comparison key against the freshly-resolved "current"
 	// identity — UAT is never compared. OwnerUserOpenID()=="" marks a bot
-	// consumer OR a legacy/pre-Task-15 registration (Hello.Identity/
-	// UserOpenID arrive "" until Task 15's client populates them); Hub.Publish's
+	// consumer OR a legacy registration (Hello.Identity/
+	// UserOpenID arrive "" until a refined client populates them); Hub.Publish's
 	// identity gate (and identity.go's bind gate) bypass these entirely —
 	// bot consumers are NEVER identity-gated or BindUser'd.
 	OwnerAppID() string
@@ -82,8 +82,8 @@ type Hub struct {
 	cleanupInProgress map[string]chan struct{}
 	logger            atomic.Pointer[log.Logger]
 
-	// legacyDedup and refinedDedup are separate dedup domains (spec §4.3:
-	// "去重在识别路由域后执行，不在 Source 入口全局吞" — dedup runs AFTER
+	// legacyDedup and refinedDedup are separate dedup domains:
+	// dedup runs AFTER
 	// routing-domain identification, never as one global gate at the source
 	// entry). legacyDedup keys by event_id alone (today's behavior, applied
 	// to every event regardless of remote_subscription_id — legacy consumers
@@ -95,9 +95,9 @@ type Hub struct {
 	legacyDedup  *event.DedupFilter
 	refinedDedup *event.DedupFilter
 
-	// currentResolver is the identity gate's fresh-current-identity resolver
-	// (spec §4.4), wired by Bus.SetIdentityProviders via SetCurrentResolver.
-	// nil (the zero value — every pre-Task-14 NewHub()/NewBus() caller,
+	// currentResolver is the identity gate's fresh-current-identity resolver,
+	// wired by Bus.SetIdentityProviders via SetCurrentResolver.
+	// nil (the zero value — every non-gated NewHub()/NewBus() caller,
 	// including every existing test) means NO identity gating: every
 	// consumer is delivered to exactly as before this task. Guarded by mu
 	// (read together with the subscribers snapshot at the top of Publish)
@@ -120,8 +120,8 @@ func NewHub() *Hub {
 func (h *Hub) SetLogger(l *log.Logger) { h.logger.Store(l) }
 
 // SetCurrentResolver wires the identity gate's fresh-current-identity
-// resolver (spec §4.4) into Publish's delivery gate. nil disables gating
-// entirely (the NewHub() default) — this is how every pre-Task-14 caller
+// resolver into Publish's delivery gate. nil disables gating
+// entirely (the NewHub() default) — this is how every non-gated caller
 // (and every test that never calls this) keeps exactly today's behavior.
 func (h *Hub) SetCurrentResolver(fn func() (currentIdentity, error)) {
 	h.mu.Lock()
@@ -131,7 +131,7 @@ func (h *Hub) SetCurrentResolver(fn func() (currentIdentity, error)) {
 
 // userConns returns every registered *Conn with a non-empty owner user
 // (OwnerUserOpenID() != "") — i.e. every USER consumer whose owner was
-// fixed at registration (spec §4.4). Bot/legacy consumers (OwnerUserOpenID()
+// fixed at registration. Bot/legacy consumers (OwnerUserOpenID()
 // == "") are excluded: they are never identity-gated or BindUser'd. Only
 // *Conn is inspected (not the bare Subscriber interface) because the
 // identity gate needs to mutate Conn-only state (BoundConnID/StaleIdentity/
@@ -156,8 +156,8 @@ func (h *Hub) userConns() []*Conn {
 // connsByRemoteSubscriptionID returns every registered *Conn bound to the
 // given remote Subscription id (mirrors userConns's shape/whitebox
 // s.(*Conn) type-assert above — only *Conn carries the lifecycle-summary
-// state LifecycleExecutor's summary action needs to mutate, spec §5.1/Task
-// 17). remoteSubID=="" always returns nil: there is no "legacy" bucket
+// state LifecycleExecutor's summary action needs to mutate).
+// remoteSubID=="" always returns nil: there is no "legacy" bucket
 // here — callers only ever look this up with a concrete
 // remote_subscription_id already read off a LifecycleEvent, which validates
 // non-empty before reaching this point (internal/event/bus/lifecycle.go's
@@ -313,11 +313,11 @@ type publishMatch struct {
 
 // Publish fans out a RawEvent to all matching subscribers (non-blocking).
 //
-// Dual-index routing (spec §4.3): a refined consumer (Subscriber.RemoteSubscriptionID()
+// Dual-index routing: a refined consumer (Subscriber.RemoteSubscriptionID()
 // != "") is matched ONLY by remote_subscription_id equality — never by
 // event_type alone, and never when raw has no remote_subscription_id (never
 // guess which resource an unqualified event belongs to; the consumer-side
-// re-checks event_type/owner/identity later, spec §4.3:300). A legacy
+// re-checks event_type/owner/identity later). A legacy
 // consumer (RemoteSubscriptionID() == "") keeps today's event_type matching
 // unconditionally — including for refined-native events, which legacy
 // consumers still receive via event_type compat delivery.
@@ -344,8 +344,8 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 			}
 		}
 	}
-	// Snapshotted alongside subscribers under the same RLock (spec §4.4):
-	// nil means no identity gating configured (every pre-Task-14 caller).
+	// Snapshotted alongside subscribers under the same RLock:
+	// nil means no identity gating configured (every non-gated caller).
 	currentResolver := h.currentResolver
 	h.mu.RUnlock()
 
@@ -359,7 +359,7 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 		sourceTime = fmt.Sprintf("%d", raw.Timestamp.UnixMilli())
 	}
 
-	// Split dedup (spec §4.3): runs AFTER routing-domain identification, not
+	// Split dedup: runs AFTER routing-domain identification, not
 	// as one global event_id gate at the source entry — otherwise the same
 	// physical event delivered under two remote_subscription_id contexts
 	// would have its second delivery swallowed before Hub.Publish even got to
@@ -387,7 +387,7 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 		}
 	}
 
-	// Identity gate (spec §4.4) state, resolved AT MOST ONCE per Publish
+	// Identity gate state, resolved AT MOST ONCE per Publish
 	// call — lazily, only when a matched subscriber is actually a USER
 	// consumer (OwnerUserOpenID() != ""); bot/legacy consumers never pay
 	// this cost and are never gated, regardless of currentResolver.
@@ -424,7 +424,7 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 			}
 			if !ownerMatchesCurrent(s.OwnerAppID(), s.OwnerUserOpenID(), identityCur) {
 				// owner != current: NO delivery, NO remote change, marked
-				// stale_identity. This is the core spec §4.4 invariant.
+				// stale_identity. This is the core identity-gate invariant.
 				if c, ok := s.(*Conn); ok {
 					c.SetStaleIdentity()
 				}
@@ -439,7 +439,7 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 			s.NextSeq(),
 			raw.Payload,
 		)
-		// v2 fields (spec §4.3): populated whenever the RAW event is refined,
+		// v2 fields: populated whenever the RAW event is refined,
 		// regardless of which domain THIS recipient matched in — a legacy
 		// consumer receiving a refined-native event via event_type compat
 		// delivery gets them too (harmless: omitempty on the wire, and this
@@ -496,13 +496,13 @@ func (h *Hub) SubCount(subscriptionID string) int {
 }
 
 // RegisteredEventTypes returns the deduplicated union of EventTypes() across
-// every currently registered subscriber (spec §4.2). Mirrors
+// every currently registered subscriber. Mirrors
 // subscribedEventTypes's (bus.go) dedup-via-seen-set shape, but aggregates
 // over LIVE registered consumers rather than the static event registry, and
 // EventKeyCount's h.mu-guarded read pattern. handleStatusQuery (bus.go)
 // calls this to populate StatusResponse.RegisteredEventTypes so a status
 // probe can tell whether a given event type currently has any consumer on
-// this bus — an old (pre-Task-15a) bus never reported this at all.
+// this bus — an old (pre-v2) bus never reported this at all.
 func (h *Hub) RegisteredEventTypes() []string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -537,11 +537,11 @@ func (h *Hub) BroadcastSourceStatus(source, state, detail string) {
 
 // Consumers returns info about all connected consumers.
 //
-// Refined-status fields (spec §4.6, Task 16): RemoteSubscriptionID/
+// Refined-status fields: RemoteSubscriptionID/
 // OwnerAppID/OwnerUserOpenID are already on the Subscriber interface, so
 // they're read directly for every subscriber, refined or not — OwnerAppID in
-// particular is populated for EVERY consumer registered against a Phase-C
-// bus (it is just that bus's own AppID, spec §4.4), not only refined ones.
+// particular is populated for EVERY consumer registered against a
+// bus (it is just that bus's own AppID), not only refined ones.
 // OwnerIdentity/StaleIdentity/DegradedReason are *Conn-only state (not part
 // of Subscriber — see Conn's own doc comment on identityMu), so they need
 // the same s.(*Conn) type-assert the Publish delivery gate already uses
@@ -570,11 +570,11 @@ func (h *Hub) Consumers() []protocol.ConsumerInfo {
 			info.OwnerIdentity = c.OwnerIdentity()
 			info.StaleIdentity = c.StaleIdentity()
 			info.DegradedReason = c.DegradedReason()
-			// Populate the summary fields (spec §5.1, Task 17) from the Conn
+			// Populate the summary fields from the Conn
 			// getters the lifecycle executor's action writes to.
 			info.LastLifecycleEvent = c.LastLifecycleEvent()
 			info.RemoteState = c.RemoteState()
-			// Task 18: the real per-event action's own state (spec §5.5) —
+			// The real per-event action's own state —
 			// suspension.code verbatim, the last attempted OAPI action +
 			// its classified outcome, and the current recommended recovery
 			// step.
@@ -582,7 +582,7 @@ func (h *Hub) Consumers() []protocol.ConsumerInfo {
 			info.LastAction = c.LastAction()
 			info.LastActionError = c.LastActionError()
 			info.NextAction = c.NextAction()
-			// Module E (task E7): decryption observability. decrypt_state +
+			// Decryption observability. decrypt_state +
 			// resource_data rollup + last_decrypt_error {class,count,time}.
 			// Never a key/ciphertext/plaintext — only classifications.
 			info.DecryptState = c.DecryptState()

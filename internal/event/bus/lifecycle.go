@@ -31,8 +31,7 @@ type LifecycleEvent = source.LifecycleEvent
 
 const (
 	// lifecycleExecutorWorkers/lifecycleExecutorSlots are the bounded
-	// in-memory executor's fixed capacity (spec §5.2: "代码常量固定小容量
-	// (如 worker=2、槽位=32)，纳入测试"). Deliberately code constants, not
+	// in-memory executor's fixed capacity. Deliberately code constants, not
 	// env-configurable (unlike e.g. hub.go's exclusiveCleanupWaitTimeout) —
 	// lifecycle handling is control-plane housekeeping, never a scalable
 	// data path.
@@ -40,28 +39,27 @@ const (
 	lifecycleExecutorSlots   = 32
 )
 
-// lifecycleActionTimeout bounds every single action dispatch (spec §5.2:
-// "每个 OAPI 动作短超时；超时=失败"). A package-level var (not a const) so
+// lifecycleActionTimeout bounds every single action dispatch with a short
+// timeout (timeout = failure). A package-level var (not a const) so
 // tests can override it directly, exactly like hub.go's
 // exclusiveCleanupWaitTimeout — restore the saved value when done.
 var lifecycleActionTimeout = 5 * time.Second
 
 // reasonLifecycleExecutorFull is the SetDegraded classification used when
-// the bounded queue is full (spec §5.2: "记 lifecycle_executor_full").
+// the bounded queue is full (recorded as lifecycle_executor_full).
 const reasonLifecycleExecutorFull = "lifecycle_executor_full"
 
-// lifecycleAction is the pluggable per-event action seam (Task 17/18
-// boundary): Task 17 supplies ONLY summaryLifecycleAction (record
+// lifecycleAction is the pluggable per-event action seam. One
+// implementation (summaryLifecycleAction) only records
 // lastLifecycleEvent/remoteState on the matched consumer(s) — no OAPI, no
-// BindUser). Task 18 swaps in the real action (Reactivate/Renew/Get/
-// BindUser, spec §5.3/§5.4) by constructing lifecycleExecutor with a
-// different lifecycleAction — the executor mechanics below (dedup/merge/
-// bounded queue/cancel/timeout) never change.
+// BindUser. The real action (subscriptionLifecycleAction:
+// Reactivate/Renew/Get/BindUser) is swapped in by constructing
+// lifecycleExecutor with a different lifecycleAction — the executor
+// mechanics below (dedup/merge/bounded queue/cancel/timeout) never change.
 type lifecycleAction interface {
 	// Handle runs ONE lifecycle event's action to completion or until ctx is
 	// done (lifecycleActionTimeout). A returned error is classified and
-	// logged only — the executor never retries or re-queues (spec §5.2:
-	// "超时=失败...不重试不入队").
+	// logged only — the executor never retries or re-queues.
 	Handle(ctx context.Context, le LifecycleEvent) error
 }
 
@@ -70,16 +68,16 @@ type lifecycleActionFunc func(ctx context.Context, le LifecycleEvent) error
 
 func (f lifecycleActionFunc) Handle(ctx context.Context, le LifecycleEvent) error { return f(ctx, le) }
 
-// lifecycleExecutor is the bounded, single-shot, in-memory executor (spec
-// §5.2) FeishuSource's 6 typed lifecycle handlers feed into via
+// lifecycleExecutor is the bounded, single-shot, in-memory executor
+// FeishuSource's 6 typed lifecycle handlers feed into via
 // Bus.startSources wiring fs.OnLifecycleEvent = executor.Submit. No disk/
 // persistence; every bit of state here is dropped on Cancel (bus shutdown)
-// — a fresh bus always starts empty (spec: "退出：不落盘、不跨进程恢复；
-// 后续由 status/subscription get 重新读事实").
+// — a fresh bus always starts empty; a later status/subscription get
+// re-reads the facts.
 type lifecycleExecutor struct {
 	hub    *Hub
 	action lifecycleAction
-	// dedup is the THIRD DedupFilter domain (spec §5.2): separate from
+	// dedup is the THIRD DedupFilter domain: separate from
 	// Hub's legacyDedup/refinedDedup — lifecycle events never reach
 	// Hub.Publish, so they need their own dedup domain here.
 	dedup  *event.DedupFilter
@@ -87,13 +85,13 @@ type lifecycleExecutor struct {
 
 	mu sync.Mutex
 	// pending[remote_subscription_id] holds the LATEST not-yet-started
-	// event for that id (the in-flight/pending MERGE target, spec §5.2:
-	// "保最新摘要"). busy[remote_subscription_id] marks that a run for that
+	// event for that id (the in-flight/pending MERGE target that keeps
+	// the latest summary). busy[remote_subscription_id] marks that a run for that
 	// id is currently queued-or-running — Submit consults it to decide
 	// whether to also send a fresh queue token or just merge into pending.
-	// Task 17 has exactly one action kind, so remote_subscription_id ALONE
-	// is the complete merge key (spec §5.2's "同 remote_subscription_id+同动作"
-	// merge scope); if Task 18 introduces multiple concurrently-distinct
+	// There is currently one action kind, so remote_subscription_id ALONE
+	// is the complete merge key (the merge scope is "same
+	// remote_subscription_id + same action"); if multiple concurrently-distinct
 	// action kinds sharing one remote_subscription_id, extend this key to
 	// remoteSubID+"\x00"+actionKind.
 	pending map[string]LifecycleEvent
@@ -129,15 +127,15 @@ func newLifecycleExecutor(hub *Hub, action lifecycleAction, logger *log.Logger) 
 
 // Submit is FeishuSource.OnLifecycleEvent's implementation (bus.go's
 // startSources wires fs.OnLifecycleEvent = executor.Submit). Runs in the
-// SDK's own handler goroutine (spec §5.2: "不阻塞 SDK handler") — every
+// SDK's own handler goroutine (never blocking it) — every
 // branch below is an O(1) map/channel op, never a blocking receive or I/O.
 func (e *lifecycleExecutor) Submit(ctx context.Context, le LifecycleEvent) {
 	if le.EventID == "" || le.RemoteSubscriptionID == "" {
 		e.logf("WARN: lifecycle event missing event_id/remote_subscription_id (type=%s); dropping", le.EventType)
 		return
 	}
-	// RefinedDedupKey's subEventID param is forced to "" (spec §5.2: "force
-	// the event_id component") so the key always falls to the
+	// RefinedDedupKey's subEventID param is forced to "" (to force
+	// the event_id component) so the key always falls to the
 	// remote_subscription_id+event_id branch, never subscription_event_id
 	// (that field belongs to the CONSUMER-delivery dedup domain, hub.go's
 	// refinedDedup — a different domain entirely).
@@ -161,8 +159,8 @@ func (e *lifecycleExecutor) Submit(ctx context.Context, le LifecycleEvent) {
 	}
 	e.pending[mergeKey] = le
 	if e.busy[mergeKey] {
-		// Already queued-or-running for this remote_subscription_id (spec
-		// §5.2 merge): pending[mergeKey] above is now this submission's
+		// Already queued-or-running for this remote_subscription_id (a
+		// merge): pending[mergeKey] above is now this submission's
 		// LATEST value — whichever run drains this key next (the one
 		// already scheduled, or a re-run after it finishes, see runKey)
 		// picks it up. No second queue send, no blocking wait.
@@ -175,7 +173,7 @@ func (e *lifecycleExecutor) Submit(ctx context.Context, le LifecycleEvent) {
 	select {
 	case e.queue <- mergeKey:
 	default:
-		// Full: never block, never pile up (spec §5.2).
+		// Full: never block, never pile up.
 		e.mu.Lock()
 		delete(e.busy, mergeKey)
 		delete(e.pending, mergeKey)
@@ -201,11 +199,11 @@ func (e *lifecycleExecutor) workerLoop() {
 
 // runKey drains pending[key] and runs the action; if a NEWER event arrived
 // while that run was in flight, it loops to pick that up too — this is the
-// spec §5.2 in-flight/pending merge, without ever letting Submit itself
+// in-flight/pending merge, without ever letting Submit itself
 // block or wait.
 //
 // The e.closed check below (NOT workerLoop's ctx.Done() select case) is
-// what makes "not-started work is discarded" (spec §5.2) deterministic:
+// what makes "not-started work is discarded" deterministic:
 // workerLoop's `select { case <-e.ctx.Done(): ...; case key := <-e.queue:
 // ...}` can still pick the queue branch even after Cancel() has fired (Go's
 // select breaks ties between simultaneously-ready cases pseudo-randomly, it
@@ -217,7 +215,7 @@ func (e *lifecycleExecutor) workerLoop() {
 // branch a worker happened to take to get here. An ALREADY-RUNNING e.runOne
 // (this function's own in-progress call, entered before closed was set) is
 // completely unaffected — it keeps running, bounded only by its own
-// lifecycleActionTimeout (spec §5.2: "已开始用自身超时结束").
+// lifecycleActionTimeout.
 func (e *lifecycleExecutor) runKey(key string) {
 	for {
 		e.mu.Lock()
@@ -253,12 +251,12 @@ func (e *lifecycleExecutor) runKey(key string) {
 	}
 }
 
-// runOne runs the pluggable action with a bounded per-action timeout (spec
-// §5.2: short timeout, timeout=failure, no retry/re-queue). The timeout ctx
+// runOne runs the pluggable action with a bounded per-action timeout
+// (short timeout, timeout=failure, no retry/re-queue). The timeout ctx
 // is deliberately rooted in context.Background(), NOT e.ctx: Cancel()
 // (shutdown) must let an ALREADY-STARTED run finish under its own timeout
-// rather than killing it the instant Cancel is called (spec §5.2: "已开始
-// 用自身超时结束"). What stops the executor from STARTING new work is
+// rather than killing it the instant Cancel is called. What stops the
+// executor from STARTING new work is
 // e.closed (runKey's check, under e.mu) — NOT e.ctx.Done(); the latter only
 // wakes an idle worker blocked on an empty queue (workerLoop's select), it
 // does not reliably win a race against a queue receive that's also ready
@@ -272,11 +270,11 @@ func (e *lifecycleExecutor) runOne(le LifecycleEvent) {
 	}
 }
 
-// markFull records the bounded-queue-full outcome (spec §5.2: matched
+// markFull records the bounded-queue-full outcome (matched
 // consumer(s) degraded via the reasonLifecycleExecutorFull classification;
 // the handler itself never blocks — see Submit's select/default above).
-// Also sets the §5.2 explicit management next_action (Task 18 review Minor
-// 2): the dropped event could have been ANY of the 6 lifecycle types, so
+// Also sets an explicit management next_action: the dropped event could
+// have been ANY of the 6 lifecycle types, so
 // rather than presuming a specific fix (e.g. "reactivate", which would be
 // wrong if the dropped event were actually expired/deleted), nextActionGet
 // points at the safe, universally-applicable "go read the current state"
@@ -291,10 +289,10 @@ func (e *lifecycleExecutor) markFull(le LifecycleEvent) {
 }
 
 // Cancel stops accepting new work and lets already-started runs finish under
-// their own lifecycleActionTimeout (spec §5.2: "已开始用自身超时结束");
+// their own lifecycleActionTimeout;
 // not-yet-started (queued/pending) work is discarded once the worker
-// goroutines exit — no disk, no cross-process handoff (spec §5.2: "不落盘、
-// 不跨进程恢复"); a later status query re-reads the facts instead. Safe to
+// goroutines exit — no disk, no cross-process handoff; a later status
+// query re-reads the facts instead. Safe to
 // call more than once (idempotent) and safe to call from Bus shutdown.
 func (e *lifecycleExecutor) Cancel() {
 	e.mu.Lock()
@@ -324,15 +322,15 @@ func (e *lifecycleExecutor) logf(format string, args ...interface{}) {
 	}
 }
 
-// summaryLifecycleAction is Task 17's ONLY lifecycleAction implementation:
+// summaryLifecycleAction is one lifecycleAction implementation:
 // it performs no remote call and no BindUser — it just records this
 // lifecycle event's summary on every LOCAL consumer currently bound to the
-// event's remote_subscription_id (spec §5.1). A miss (no matched consumer)
+// event's remote_subscription_id. A miss (no matched consumer)
 // records nothing and is not an error — this bus simply has no live
-// consumer for that remote Subscription right now. Task 18 replaces this
-// with the real per-event action (Reactivate/Renew/Get/BindUser, §5.3/§5.4)
-// by constructing the executor with a different lifecycleAction — this
-// function's SHAPE (lifecycleAction) is the seam, not this implementation.
+// consumer for that remote Subscription right now. The real per-event
+// action (Reactivate/Renew/Get/BindUser) replaces this by constructing the
+// executor with a different lifecycleAction — this function's SHAPE
+// (lifecycleAction) is the seam, not this implementation.
 func summaryLifecycleAction(hub *Hub) lifecycleAction {
 	return lifecycleActionFunc(func(_ context.Context, le LifecycleEvent) error {
 		for _, c := range hub.connsByRemoteSubscriptionID(le.RemoteSubscriptionID) {
@@ -343,22 +341,22 @@ func summaryLifecycleAction(hub *Hub) lifecycleAction {
 }
 
 // ============================================================================
-// Task 18: subscriptionLifecycleAction — the REAL per-event action
-// (spec §5.3/§5.4/§5.5), including the §8 owner==current security gate and
+// subscriptionLifecycleAction — the REAL per-event action
+// including the owner==current security gate and
 // the deleted-tombstone. Constructed once by bus.go's NewBus and wired into
 // newLifecycleExecutor in place of summaryLifecycleAction; its two remote
 // dependencies (identityGate, the SubscriptionClient factory) start nil and
 // are filled in post-construction by bus.go's SetIdentityProviders/
 // SetSubscriptionClient (mirrors those methods' own "optional, call before
-// Run()" convention) — so a Bus that never wires either (every Task 17 test,
-// and any bus not yet given credentials) still gets full summary recording
+// Run()" convention) — so a Bus that never wires either (a summary-only bus,
+// or any bus not yet given credentials) still gets full summary recording
 // with zero remote calls and zero panics.
 // ============================================================================
 
 // subscriptionActionClient is the subset of *eventlib.SubscriptionClient
 // (internal/event/subscription_client.go) this action needs: a single Get
-// (state-source-of-truth reconcile, spec §5.3's "顺序不明/未知 code -> Get
-// 一次") and single Reactivate/Renew (spec §5.3/§5.4's "at most ONE such
+// (state-source-of-truth reconcile: on an unclear order or unknown code, Get
+// once) and single Reactivate/Renew (at most ONE such
 // remote call per event, never a retry"). Declared here — narrower than
 // SubscriptionClient's full Create/Get/List/Patch/Renew/Reactivate/Delete
 // surface — purely as a test seam: *eventlib.SubscriptionClient satisfies it
@@ -375,9 +373,8 @@ type subscriptionActionClient interface {
 // Event type strings, mirrored from source/feishu.go's identically-named,
 // identically-valued but UNEXPORTED constants (lifecycleEventTypeActivated
 // et al.) — package bus cannot reference those directly since they're
-// private to package source, and re-exporting them there is out of this
-// task's sanctioned feishu.go scope (comment-only change, see the
-// "never memoize" doc update). These 6 strings are SDK facts (spec §5.1),
+// private to package source, and re-exporting them there is out of
+// scope for this change. These 6 strings are SDK facts,
 // stable across this whole feature — if they ever change, both copies must
 // be updated together.
 const (
@@ -390,27 +387,27 @@ const (
 )
 
 // suspensionCodeAuthorityRevoked is the ONLY confirmed stable suspension.code
-// value (spec §5.4). suspension.code is otherwise an open string CLI never
+// value. suspension.code is otherwise an open string CLI never
 // builds a closed enum for (source/feishu.go's LifecycleEvent.SuspensionCode
 // doc) — any OTHER value (including a future, currently-unknown one) takes
-// the §5.4 "default branch" (reconcileWithGet) rather than guessing that
+// the "default branch" (reconcileWithGet) rather than guessing that
 // Reactivate is the right recovery action.
 const suspensionCodeAuthorityRevoked = "authority_revoked"
 
 // tombstoneTTL bounds how long a deleted remote_subscription_id is
 // remembered, purely in-memory, so a late/out-of-order activated_v1 or
 // updated_v1 for the SAME id arriving shortly after a deleted_v1 cannot
-// resurrect it (spec §5.3). A package var (not const) so tests shrink it;
+// resurrect it. A package var (not const) so tests shrink it;
 // deliberately a fixed default rather than env-configurable — mirrors
 // lifecycleExecutorWorkers/Slots's own "control-plane housekeeping, not a
 // scalable data path" rationale (this file's earlier doc comment).
 var tombstoneTTL = 10 * time.Minute
 
-// tombstoneStore is a TTL in-memory map[remote_subscription_id]expiry
-// (spec §5.3). Purely in-memory: a bus restart clears it entirely, exactly
+// tombstoneStore is a TTL in-memory map[remote_subscription_id]expiry.
+// Purely in-memory: a bus restart clears it entirely, exactly
 // like the lifecycleExecutor's own pending/busy maps — there is nothing to
-// persist or recover across a process boundary here (spec §5.2's "不落盘、
-// 不跨进程恢复" applies equally to this bookkeeping).
+// persist or recover across a process boundary here (the no-persistence
+// rule applies equally to this bookkeeping).
 type tombstoneStore struct {
 	mu     sync.Mutex
 	expiry map[string]time.Time
@@ -421,8 +418,8 @@ func newTombstoneStore() *tombstoneStore {
 }
 
 // mark records/refreshes a live tombstone for remoteSubID (called on every
-// deleted_v1, hit or miss — spec §5.3's table: BOTH columns "保 TTL 内存
-// tombstone").
+// deleted_v1, hit or miss — both table columns keep a TTL in-memory
+// tombstone).
 func (t *tombstoneStore) mark(remoteSubID string) {
 	if remoteSubID == "" {
 		return
@@ -452,13 +449,13 @@ func (t *tombstoneStore) isLive(remoteSubID string) bool {
 	return true
 }
 
-// --- degraded/next_action classification tokens (spec §5.5) ---------------
+// --- degraded/next_action classification tokens ---
 // Reused (never per-branch bespoke strings) so a status display can key off
 // a small, stable vocabulary. reasonRemoteSubscriptionConflict's exact
-// string is spec-literal ("不兼容标 degraded/remote_subscription_conflict");
-// the others are Task 18's own short, consistent classifications, chosen to
+// string is the canonical remote_subscription_conflict token;
+// the others are our own short, consistent classifications, chosen to
 // mirror the existing bind_failed:*/current_identity_unresolved/
-// lifecycle_executor_full style already established by Task 14/17.
+// lifecycle_executor_full style already established elsewhere.
 const (
 	reasonRemoteSubscriptionConflict     = "remote_subscription_conflict"
 	reasonRemoteSubscriptionSuspended    = "remote_subscription_suspended"
@@ -468,7 +465,7 @@ const (
 	reasonRemoteStateUnreconciled        = "remote_state_unreconciled"
 )
 
-// next_action tokens. Spec §5.5: "恢复命令统一 reactivate" — nextActionReactivate
+// next_action tokens. The recovery command is uniformly "reactivate" — nextActionReactivate
 // is used verbatim, literally spelled "reactivate", never "reactive"/"resume".
 const (
 	nextActionReactivate = "reactivate"
@@ -479,8 +476,8 @@ const (
 )
 
 // classifyLifecycleActionError maps an OAPI action failure to a short,
-// reusable classification (spec §5.5: "不新增私有错误码；OAPI 失败复用 typed
-// 分类；权限问题 missing_scopes") — never a raw error string (which could leak
+// reusable classification (reuse the typed error classification, mapping
+// permission problems to missing_scopes) — never a raw error string (which could leak
 // upstream detail into a status display) and never a bespoke new code.
 func classifyLifecycleActionError(err error) string {
 	if err == nil {
@@ -499,7 +496,7 @@ func classifyLifecycleActionError(err error) string {
 }
 
 // markActionResult records which action was attempted and its classified
-// outcome on every conn in conns (spec §5.5's last_action/last_action_error)
+// outcome on every conn in conns (last_action/last_action_error)
 // — always both together, success (err==nil) included, so a fresh attempt
 // always supersedes a stale error from a previous one.
 func markActionResult(conns []*Conn, action string, err error) {
@@ -510,7 +507,7 @@ func markActionResult(conns []*Conn, action string, err error) {
 	}
 }
 
-// updateCompatibility classification (spec §5.3's updated_v1 row).
+// updateCompatibility classification (updated_v1 row).
 const (
 	updateCompatible   = "compatible"
 	updateIncompatible = "incompatible"
@@ -519,10 +516,10 @@ const (
 
 // classifyUpdateCompatibility compares the updated_v1 event's Authority
 // against lead's OWN fixed owner identity — the one piece of "local
-// listening intent" (spec §5.3: "比较 Before/After 与本地意图") every matched
-// consumer structurally carries, without Task 18 introducing a separate
+// listening intent" every matched
+// consumer structurally carries, without introducing a separate
 // stored target_resource/authority-at-registration snapshot (deliberately
-// out of this task's Conn field list). An empty Authority (the event didn't
+// out of the Conn field list). An empty Authority (the event didn't
 // carry one, or the SDK payload couldn't be normalized into one) is always
 // "unclear" — never guessed compatible or incompatible.
 func classifyUpdateCompatibility(le LifecycleEvent, lead *Conn) string {
@@ -544,7 +541,7 @@ func classifyUpdateCompatibility(le LifecycleEvent, lead *Conn) string {
 // errIdentityGateUnconfigured/errSubscriptionClientUnconfigured are returned
 // (never panicked) when a dependency subscriptionLifecycleAction needs
 // hasn't been wired yet (bus.go's SetIdentityProviders/SetSubscriptionClient
-// not called) — this is the expected, tested state for every Task 17 test
+// not called) — this is the expected, tested state for a summary-only bus
 // and any bus not yet given credentials, so it must degrade the specific
 // consumer involved, never crash the executor's worker goroutine.
 var (
@@ -553,7 +550,7 @@ var (
 )
 
 // eligibilityResult is eligibleConns's output: conns is the subset of the
-// input allowed to trigger a remote action or BindUser (spec §8); cur is the
+// input allowed to trigger a remote action or BindUser; cur is the
 // current identity resolveCurrent produced (zero value if no user conn ever
 // required resolving it, e.g. an all-bot match).
 type eligibilityResult struct {
@@ -561,10 +558,10 @@ type eligibilityResult struct {
 	cur   currentIdentity
 }
 
-// subscriptionLifecycleAction is Task 18's REAL lifecycleAction: the
-// per-event switch, the §8 owner==current security gate, single-action-per-
+// subscriptionLifecycleAction is the REAL lifecycleAction: the
+// per-event switch, the owner==current security gate, single-action-per-
 // event Reactivate/Renew/Get, and the deleted-tombstone. It still performs
-// Task 17's summary recording (extended: see Handle) so it is a strict
+// the summary recording (extended: see Handle) so it is a strict
 // superset, never a regression, of summaryLifecycleAction.
 type subscriptionLifecycleAction struct {
 	hub    *Hub
@@ -574,11 +571,11 @@ type subscriptionLifecycleAction struct {
 	newSubClient func(as core.Identity, uat string) (subscriptionActionClient, error)
 
 	// encryptKeyRemover releases a subscription's cached encrypt_key from the
-	// bus-side provider (Module E, task E6) when its remote Subscription is
+	// bus-side provider when its remote Subscription is
 	// gone: on deleted_v1 (handleDeleted). nil until wired by bus.go's NewBus
 	// (b.encryptKeyProvider.Remove) — a bus with no provider configured (never,
-	// in production) simply skips the release. Releasing the key here is spec
-	// §4.7's "收到 deleted_v1 ... 执行 Remove(subscription_id)": the key must not
+	// in production) simply skips the release. Releasing the key on
+	// deleted_v1 ensures the key does not
 	// outlive the subscription in memory.
 	encryptKeyRemover func(subID string)
 
@@ -610,10 +607,10 @@ func (a *subscriptionLifecycleAction) logf(format string, args ...interface{}) {
 	}
 }
 
-// Handle implements lifecycleAction (spec §5.3/§5.4/§8). Every lifecycle
+// Handle implements lifecycleAction. Every lifecycle
 // event, hit or miss, eligible or not, ALWAYS gets its summary recorded
-// first (Task 17 behavior, extended: deleted_v1 synthesizes an explicit
-// "deleted" state since its body carries none — spec §5.3 "删 active 快照")
+// first (extended: deleted_v1 synthesizes an explicit
+// "deleted" state since its body carries none)
 // — then a live deleted-tombstone drops a resurrecting activated_v1/
 // updated_v1 before any further processing, then the per-event switch runs.
 func (a *subscriptionLifecycleAction) Handle(ctx context.Context, le LifecycleEvent) error {
@@ -628,7 +625,7 @@ func (a *subscriptionLifecycleAction) Handle(ctx context.Context, le LifecycleEv
 	}
 
 	if a.isTombstonedResurrection(le) {
-		a.logf("lifecycle: dropping %s for remote_subscription_id=%s (tombstoned after an earlier deleted_v1, spec §5.3)",
+		a.logf("lifecycle: dropping %s for remote_subscription_id=%s (tombstoned after an earlier deleted_v1)",
 			le.EventType, le.RemoteSubscriptionID)
 		return nil
 	}
@@ -659,8 +656,8 @@ func (a *subscriptionLifecycleAction) isTombstonedResurrection(le LifecycleEvent
 }
 
 // eligibleConns splits conns into those allowed to trigger a REMOTE action
-// or BindUser (spec §8's red line): a bot/legacy conn (OwnerUserOpenID()==
-// "") is ALWAYS eligible — the same Task 14 precedent hub.go's Publish gate
+// or BindUser (the security red line): a bot/legacy conn (OwnerUserOpenID()==
+// "") is ALWAYS eligible — the same precedent hub.go's Publish gate
 // and identity.go's onConnReady already establish (bot/legacy consumers are
 // NEVER identity-gated), since there is no separate "historical bot user"
 // concept to mis-recover into. A USER conn is eligible ONLY when a FRESHLY
@@ -705,7 +702,7 @@ func (a *subscriptionLifecycleAction) eligibleConns(conns []*Conn) eligibilityRe
 // remote action will use, bound to c's OWN identity — bot -> core.AsBot, no
 // uat; user -> core.AsUser with a FRESH uat minted for cur (never a
 // historical identity — c is only ever passed here after eligibleConns
-// already verified ownerMatchesCurrent(c, cur), spec §8).
+// already verified ownerMatchesCurrent(c, cur)).
 func (a *subscriptionLifecycleAction) buildClientForConn(ctx context.Context, c *Conn, cur currentIdentity) (subscriptionActionClient, error) {
 	if a.newSubClient == nil {
 		return nil, errSubscriptionClientUnconfigured
@@ -722,13 +719,12 @@ func (a *subscriptionLifecycleAction) buildClientForConn(ctx context.Context, c 
 
 // --- activated --------------------------------------------------------------
 
-// handleActivated implements spec §5.3's activated_v1 row: store active +
+// handleActivated implements the activated_v1 row: store active +
 // clear suspension (informational bookkeeping, applies to EVERY matched
 // conn regardless of eligibility — no remote call/BindUser is involved in
 // just clearing a local field); a user consumer additionally needs
 // bindConsumer to succeed before being considered running again, else it
-// stays degraded awaiting a rebind. A miss never builds a consumer (spec:
-// "更新摘要，不建 consumer").
+// stays degraded awaiting a rebind. A miss never builds a consumer.
 func (a *subscriptionLifecycleAction) handleActivated(ctx context.Context, conns []*Conn) error {
 	if len(conns) == 0 {
 		return nil
@@ -753,9 +749,9 @@ func (a *subscriptionLifecycleAction) handleActivated(ctx context.Context, conns
 
 // --- updated -----------------------------------------------------------------
 
-// handleUpdated implements spec §5.3's updated_v1 row. A miss just keeps the
+// handleUpdated implements the updated_v1 row. A miss just keeps the
 // After summary already recorded by Handle. On a hit, only ELIGIBLE conns
-// (spec §8 — this Get is a remote call too, never issued on behalf of a
+// (this Get is a remote call too, never issued on behalf of a
 // historical/non-current identity) are classified compatible/incompatible/
 // unclear against the event's Authority.
 func (a *subscriptionLifecycleAction) handleUpdated(ctx context.Context, le LifecycleEvent, conns []*Conn) error {
@@ -780,20 +776,20 @@ func (a *subscriptionLifecycleAction) handleUpdated(ctx context.Context, le Life
 			c.SetNextAction(nextActionGet)
 		}
 		return nil
-	default: // order unclear (spec: "顺序不明 Get 一次")
+	default: // order unclear: Get once
 		return a.reconcileWithGet(ctx, le, res)
 	}
 }
 
 // --- suspended ---------------------------------------------------------------
 
-// handleSuspended implements spec §5.3's suspended_v1 row + §5.4's recovery
+// handleSuspended implements the suspended_v1 row + recovery
 // rule. suspension.code is ALWAYS recorded verbatim on every matched conn,
 // hit or miss, eligible or not (bookkeeping, not an action). A miss or an
 // ineligible match (owner != current, or no identity gate configured) never
-// Reactivates or BindUsers — the §8 red line. Only the ONE confirmed stable
+// Reactivates or BindUsers — the security red line. Only the ONE confirmed stable
 // code (authority_revoked) auto-Reactivates; any other value takes the
-// §5.4 default branch (a single Get reconcile, never a guessed action).
+// default branch (a single Get reconcile, never a guessed action).
 func (a *subscriptionLifecycleAction) handleSuspended(ctx context.Context, le LifecycleEvent, conns []*Conn) error {
 	for _, c := range conns {
 		c.SetSuspensionReason(le.SuspensionCode)
@@ -812,7 +808,7 @@ func (a *subscriptionLifecycleAction) handleSuspended(ctx context.Context, le Li
 }
 
 // reactivateAndMaybeBind issues the SINGLE Reactivate call and, on success,
-// additionally requires bindConsumer for every USER conn (spec §5.4: bot
+// additionally requires bindConsumer for every USER conn (bot
 // only needs Reactivate; user needs Reactivate AND bindConsumer — either
 // failing means NOT running).
 func (a *subscriptionLifecycleAction) reactivateAndMaybeBind(ctx context.Context, le LifecycleEvent, res eligibilityResult) error {
@@ -857,7 +853,7 @@ func (a *subscriptionLifecycleAction) reactivateAndMaybeBind(ctx context.Context
 
 // --- expiration_reminder -----------------------------------------------------
 
-// handleExpirationReminder implements spec §5.3's expiration_reminder_v1
+// handleExpirationReminder implements the expiration_reminder_v1
 // row: a SINGLE Renew on a hit+eligible match; success clears any prior
 // degraded state (the remote expire_time itself is refreshed server-side —
 // no local field caches it, spec RemoteSubscriptionInfo.ExpireTime is a
@@ -899,11 +895,11 @@ func (a *subscriptionLifecycleAction) handleExpirationReminder(ctx context.Conte
 
 // --- expired / deleted: local bookkeeping only, NEVER a remote call --------
 
-// handleExpired implements spec §5.3's expired_v1 row: degraded, guide
+// handleExpired implements the expired_v1 row: degraded, guide
 // rebuild, and — unconditionally, regardless of eligibility — NO Renew, NO
 // auto-Reactivate. Applying this to every matched conn (even one whose
 // owner != current) is safe: it is pure local bookkeeping, never a remote
-// call or BindUser, so it isn't the kind of "action" spec §8 gates.
+// call or BindUser, so it isn't the kind of "action" the security gate covers.
 func (a *subscriptionLifecycleAction) handleExpired(conns []*Conn) error {
 	for _, c := range conns {
 		c.SetDegraded(reasonRemoteSubscriptionExpired)
@@ -912,14 +908,14 @@ func (a *subscriptionLifecycleAction) handleExpired(conns []*Conn) error {
 	return nil
 }
 
-// handleDeleted implements spec §5.3's deleted_v1 row: delete the active
+// handleDeleted implements the deleted_v1 row: delete the active
 // snapshot (Handle already synthesized remoteState="deleted"), degraded,
-// NO rebuild — and tombstones remoteSubID for BOTH hit and miss (spec's
-// table: both columns "保 TTL 内存 tombstone"), so a late/out-of-order
+// NO rebuild — and tombstones remoteSubID for BOTH hit and miss (both
+// table columns keep a TTL in-memory tombstone), so a late/out-of-order
 // activated_v1/updated_v1 for the same id cannot resurrect it.
 func (a *subscriptionLifecycleAction) handleDeleted(le LifecycleEvent, conns []*Conn) error {
 	a.tombstone.mark(le.RemoteSubscriptionID)
-	// Module E (task E6, spec §4.7): the subscription is gone — release its
+	// The subscription is gone — release its
 	// cached encrypt_key from the bus provider so the key does not outlive the
 	// subscription in memory. Best-effort, idempotent, and never fails the
 	// event: a nil remover (no provider wired) or an unknown id is a no-op.
@@ -935,7 +931,7 @@ func (a *subscriptionLifecycleAction) handleDeleted(le LifecycleEvent, conns []*
 
 // --- reconcile (single Get) --------------------------------------------------
 
-// reconcileWithGet issues the SINGLE Get spec §5.3/§5.4 calls for when
+// reconcileWithGet issues the SINGLE Get for when
 // order/compatibility is unclear (updated_v1) or the suspension.code isn't
 // the one confirmed stable value (suspended_v1's default branch) — "state
 // source of truth = Get/List, never second-level update_time". The fetched

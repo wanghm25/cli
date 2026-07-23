@@ -34,13 +34,12 @@ type Conn struct {
 	// remoteSubscriptionID is set post-construction via SetRemoteSubscriptionID
 	// (mirrors SetLogger/SetOnClose: no locking needed, populated once before
 	// Start() and only read afterward). Empty ("") means legacy — populated
-	// from Hello.RemoteSubscriptionID in handleHello (spec §4.3); the CLIENT
-	// that sends a non-empty value is Task 15, so this is "" in practice
-	// until then.
+	// from Hello.RemoteSubscriptionID in handleHello; only a refined CLIENT
+	// sends a non-empty value, so this is "" for a client that does not.
 	remoteSubscriptionID string
 
 	// owner* fields fix this consumer's identity at registration
-	// (handleHello, spec §4.4) from Hello.Identity/Profile/UserOpenID + the
+	// (handleHello) from Hello.Identity/Profile/UserOpenID + the
 	// bus's own AppID — a bus is per-app, so there is no separate "hello
 	// carries a different app_id" case to handle. Same zero-lock convention
 	// as remoteSubscriptionID above: set once via SetOwnerIdentity before
@@ -48,8 +47,8 @@ type Conn struct {
 	//
 	// ownerUserOpenID == "" is the discriminator the identity gate (hub.go
 	// Publish's delivery gate + identity.go's onConnReady bind gate) uses to
-	// mean "bot or legacy/pre-Task-15 consumer" — such consumers are NEVER
-	// identity-gated or BindUser'd (spec §4.4). A bot Hello (Identity=="bot")
+	// mean "bot or legacy consumer" — such consumers are NEVER
+	// identity-gated or BindUser'd. A bot Hello (Identity=="bot")
 	// always carries UserOpenID=="" (protocol/messages.go's Hello.UserOpenID
 	// doc), so this falls out naturally with no extra bot-specific branch.
 	ownerIdentity   string
@@ -61,14 +60,14 @@ type Conn struct {
 	// these are written repeatedly AFTER Start() — by identity.go's
 	// onConnReady (the WS ready/reconnect callback's goroutine) and by
 	// Hub.Publish's per-event delivery gate (the source's emit goroutine) —
-	// and read by a future status command (Task 16), so they need real
+	// and read by the status command, so they need real
 	// synchronization rather than the zero-lock convention above.
 	identityMu     sync.Mutex
 	boundConnID    string
 	staleIdentity  bool
 	degradedReason string
 
-	// --- lifecycle summary state (spec §5.1/§5.5, Task 17) -----------------
+	// --- lifecycle summary state ---
 	// lastLifecycleEvent/lastLifecycleEventID/remoteState summarize the most
 	// recent subscription lifecycle meta-event the lifecycle executor's
 	// action (internal/event/bus/lifecycle.go) observed for this consumer's
@@ -79,52 +78,52 @@ type Conn struct {
 	lastLifecycleEventID string
 	remoteState          string
 
-	// --- lifecycle ACTION state (spec §5.3/§5.4/§5.5, Task 18) --------------
+	// --- lifecycle ACTION state ---
 	// suspensionReason/lastAction/lastActionError/nextAction record the real
 	// per-event action subscriptionLifecycleAction (lifecycle.go) took (or,
-	// per the spec §8 red line, deliberately did NOT take) for this
+	// per the security red line, deliberately did NOT take) for this
 	// consumer's remote Subscription. Same identityMu, same writers/readers
 	// as the summary fields just above.
 	//
 	//   - suspensionReason: body.suspension.code carried VERBATIM from the
-	//     most recent suspended_v1 (spec §5.4: an open string, never a closed
-	//     enum) — cleared to "" by a later activated_v1 (spec §5.3).
+	//     most recent suspended_v1 (an open string, never a closed
+	//     enum) — cleared to "" by a later activated_v1.
 	//   - lastAction/lastActionError: which ONE remote SubscriptionClient
-	//     call (spec §5.2/§5.3: "reactivate"/"renew"/"get" — at most one per
+	//     call ("reactivate"/"renew"/"get" — at most one per
 	//     event, never a retry) subscriptionLifecycleAction last attempted
 	//     for this consumer, and its classified failure reason ("" on
 	//     success, or no action attempted yet). lastActionError reuses typed
 	//     error classification (errs.Problem's Category/Subtype) rather than
-	//     inventing a new private error code (spec §5.5) — see
+	//     inventing a new private error code — see
 	//     classifyLifecycleActionError.
 	//   - nextAction: a short, stable hint for what an operator/AI should do
 	//     next while this consumer is degraded (e.g. nextActionReactivate —
-	//     spec §5.5: "恢复命令统一 reactivate", never "reactive"/"resume").
+	//     the recovery command is uniformly "reactivate", never "reactive"/"resume").
 	//     "" means no outstanding recommendation.
 	suspensionReason string
 	lastAction       string
 	lastActionError  string
 	nextAction       string
 
-	// --- decryption state (spec §4.7 "失败语义与可观测性", Module E) ----------
+	// --- decryption state (failure/observability) ---
 	// decryptState is this consumer's most recent per-subscription decryption
-	// status, produced by the bus-side EncryptKeyProvider (encrypt_key.go, E4)
-	// and the SDK-decrypt-failure path (E6): "" (no encrypted delivery seen /
+	// status, produced by the bus-side EncryptKeyProvider (encrypt_key.go)
+	// and the SDK-decrypt-failure path: "" (no encrypted delivery seen /
 	// not applicable), "decrypted" (a usable key is available), or an error
 	// class — "decrypt_key_unavailable" (no key: identity mismatch, missing
 	// scope, GetEncryptKey failed) / "decrypt_failed" (key held but SDK
 	// decrypt/parse failed). Same identityMu, same writers/readers as the
 	// lifecycle block above. NEVER holds a key, ciphertext, or raw error — only
-	// a short classification (spec §4.7 敏感信息红线).
+	// a short classification.
 	decryptState string
 
 	// lastDecryptError* summarize the most recent SDK decrypt FAILURE observed
-	// for this consumer's subscription (task E6; surfaced by E7's status as
+	// for this consumer's subscription (surfaced by the status command as
 	// last_decrypt_error {class,count,time}). decryptFailCount is the running
 	// total; once it reaches decryptFailDegradeThreshold the consumer is also
-	// marked degraded ("single fail → count; persistent fail → degraded", spec
-	// §4.7). class is a fixed token ("decrypt_failed"), never a raw SDK error —
-	// no padding/algorithm detail (no oracle, spec §4.7 红线).
+	// marked degraded (single fail → count; persistent fail → degraded).
+	// class is a fixed token ("decrypt_failed"), never a raw SDK error —
+	// no padding/algorithm detail (no oracle).
 	decryptFailCount      int64
 	lastDecryptErrorClass string
 	lastDecryptErrorTime  time.Time
@@ -187,9 +186,9 @@ func (c *Conn) EventTypes() []string { return c.eventTypes }
 // for every Conn until SetRemoteSubscriptionID is called).
 func (c *Conn) RemoteSubscriptionID() string { return c.remoteSubscriptionID }
 
-// SetOwnerIdentity records the owner identity fixed at registration (spec
-// §4.4): identity is "user" or "bot" (Hello.Identity, verbatim — "" for a
-// legacy/pre-Task-15 Hello); appID/userOpenID are the ONLY fields the
+// SetOwnerIdentity records the owner identity fixed at registration:
+// identity is "user" or "bot" (Hello.Identity, verbatim — "" for a
+// legacy Hello); appID/userOpenID are the ONLY fields the
 // identity gate compares against the freshly-resolved current identity
 // (never UAT). Call before Start() (same convention as
 // SetRemoteSubscriptionID) — set once, read-only afterward.
@@ -200,15 +199,15 @@ func (c *Conn) SetOwnerIdentity(identity, appID, userOpenID string) {
 }
 
 // OwnerIdentity returns the owner's Hello.Identity ("user"/"bot"/"" for a
-// legacy/pre-Task-15 registration). Not part of Subscriber — only the
+// legacy registration). Not part of Subscriber — only the
 // comparison fields below are.
 func (c *Conn) OwnerIdentity() string { return c.ownerIdentity }
 
 // OwnerAppID satisfies Subscriber: "" for a never-set (legacy/test) Conn.
 func (c *Conn) OwnerAppID() string { return c.ownerAppID }
 
-// OwnerUserOpenID satisfies Subscriber: "" marks a bot or legacy/pre-Task-15
-// consumer — the identity gate never gates or binds these (spec §4.4: bot
+// OwnerUserOpenID satisfies Subscriber: "" marks a bot or legacy
+// consumer — the identity gate never gates or binds these (bot
 // consumers are NEVER identity-gated).
 func (c *Conn) OwnerUserOpenID() string { return c.ownerUserOpenID }
 
@@ -225,8 +224,7 @@ func (c *Conn) BoundConnID() string {
 
 // SetBoundConnID records a successful BindUser for connID and clears any
 // prior stale/degraded state — a fresh successful bind supersedes all three
-// (spec §5.4/§5.5: Task 18 added nextAction to what a fresh bind supersedes,
-// alongside the staleIdentity/degradedReason Task 14 already cleared here).
+// (staleIdentity, degradedReason, and nextAction).
 func (c *Conn) SetBoundConnID(connID string) {
 	c.identityMu.Lock()
 	defer c.identityMu.Unlock()
@@ -237,7 +235,7 @@ func (c *Conn) SetBoundConnID(connID string) {
 }
 
 // StaleIdentity reports whether this consumer's owner last mismatched the
-// current identity (spec §4.4): while true, the identity gate delivers NO
+// current identity: while true, the identity gate delivers NO
 // events, attempts NO BindUser, and loads NO UAT for this consumer.
 func (c *Conn) StaleIdentity() bool {
 	c.identityMu.Lock()
@@ -256,7 +254,7 @@ func (c *Conn) SetStaleIdentity() {
 
 // DegradedReason returns why this consumer is degraded ("" = not degraded).
 // Deliberately a short classified string, never a raw error or token — this
-// may be surfaced by a future status command (Task 16).
+// may be surfaced by the status command.
 func (c *Conn) DegradedReason() string {
 	c.identityMu.Lock()
 	defer c.identityMu.Unlock()
@@ -265,7 +263,7 @@ func (c *Conn) DegradedReason() string {
 
 // SetDegraded records a per-consumer failure reason (e.g. a bind/UAT error,
 // or an unresolved current identity). A single consumer's failure must
-// never affect any other consumer (spec §4.4) — callers only ever set this
+// never affect any other consumer — callers only ever set this
 // on the ONE Conn that failed.
 func (c *Conn) SetDegraded(reason string) {
 	c.identityMu.Lock()
@@ -297,7 +295,7 @@ func (c *Conn) RemoteState() string {
 }
 
 // SetLifecycleSummary records one lifecycle event's summary
-// (LifecycleExecutor's summary-only action, spec §5.1). eventType/eventID
+// (LifecycleExecutor's summary-only action). eventType/eventID
 // are recorded verbatim and always overwrite (both are always non-empty by
 // the time Submit's own validation lets an event through). state is applied
 // ONLY when non-empty: deleted_v1's SDK body carries no state field at all,
@@ -317,16 +315,16 @@ func (c *Conn) SetLifecycleSummary(eventType, eventID, state string) {
 
 // SuspensionReason returns the most recent suspended_v1's suspension.code,
 // carried verbatim ("" = never suspended, or cleared by a later
-// activated_v1 — spec §5.3/§5.4).
+// activated_v1).
 func (c *Conn) SuspensionReason() string {
 	c.identityMu.Lock()
 	defer c.identityMu.Unlock()
 	return c.suspensionReason
 }
 
-// SetSuspensionReason records body.suspension.code VERBATIM (spec §5.4: an
+// SetSuspensionReason records body.suspension.code VERBATIM (an
 // open string, CLI never builds a closed enum for it) — pass "" to clear
-// (activated_v1's hit path does this, spec §5.3).
+// (activated_v1's hit path does this).
 func (c *Conn) SetSuspensionReason(reason string) {
 	c.identityMu.Lock()
 	defer c.identityMu.Unlock()
@@ -372,7 +370,7 @@ func (c *Conn) NextAction() string {
 }
 
 // SetNextAction records the current recommended recovery step ("" = none
-// outstanding). Spec §5.5: the recovery command is uniformly "reactivate"
+// outstanding). The recovery command is uniformly "reactivate"
 // (never "reactive"/"resume") wherever that's what's being recommended.
 func (c *Conn) SetNextAction(action string) {
 	c.identityMu.Lock()
@@ -382,7 +380,7 @@ func (c *Conn) SetNextAction(action string) {
 
 // clearActionDegraded clears BOTH degradedReason and nextAction together —
 // used whenever a lifecycle action's outcome means "fully healthy again"
-// (spec §5.4: a bare successful Reactivate for a bot, or a successful
+// (a bare successful Reactivate for a bot, or a successful
 // Reactivate+bindConsumer pair for a user; likewise a successful Renew).
 // Deliberately does NOT touch suspensionReason/lastAction/lastActionError —
 // those are historical record-keeping, not "is this consumer currently
@@ -395,15 +393,15 @@ func (c *Conn) clearActionDegraded() {
 }
 
 // DecryptState returns this consumer's most recent decryption status ("" =
-// none/not applicable). A short classification only — never a key/ciphertext
-// (spec §4.7 敏感信息红线).
+// none/not applicable). A short classification only — never a
+// key/ciphertext.
 func (c *Conn) DecryptState() string {
 	c.identityMu.Lock()
 	defer c.identityMu.Unlock()
 	return c.decryptState
 }
 
-// SetDecryptState records the decryption status (Module E). state is one of
+// SetDecryptState records the decryption status. state is one of
 // the small stable tokens documented on the decryptState field — never a raw
 // SDK error or any key material.
 func (c *Conn) SetDecryptState(state string) {
@@ -413,17 +411,17 @@ func (c *Conn) SetDecryptState(state string) {
 }
 
 // decryptFailDegradeThreshold is how many decrypt failures a consumer tolerates
-// before it is additionally marked degraded (spec §4.7: "single-event fail →
-// drop+count; persistent fail → degraded"). A small fixed value — this is
+// before it is additionally marked degraded (single-event fail →
+// drop+count; persistent fail → degraded). A small fixed value — this is
 // control-plane observability, not a tuned data path.
 const decryptFailDegradeThreshold = 3
 
 // RecordDecryptFailure records one fail-closed SDK decrypt failure for this
-// consumer (task E6). It increments the counter, stamps the last error
+// consumer. It increments the counter, stamps the last error
 // class/time, and sets decrypt_state=decrypt_failed; once failures persist
 // (>= decryptFailDegradeThreshold) it also marks the consumer degraded. It
 // records ONLY a fixed classification — never a key, ciphertext, decrypted
-// plaintext, or raw SDK error (spec §4.7 敏感信息红线). The undecryptable event
+// plaintext, or raw SDK error. The undecryptable event
 // itself is dropped by the SDK before ever reaching delivery.
 func (c *Conn) RecordDecryptFailure() {
 	c.identityMu.Lock()
