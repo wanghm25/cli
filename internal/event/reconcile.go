@@ -47,6 +47,50 @@ type SubscriptionCreateAPI interface {
 	Create(ctx context.Context, req *larkeventv1.CreateSubscriptionReq) (*larkeventv1.CreateSubscriptionResp, error)
 }
 
+// EncryptKeyProber is the narrow seam ReconcileExisting's encryption
+// conflict-matrix (design spec §4.7; task-E-design-note.md's task E2) needs
+// once it reaches an active, include_resource_data=true remote match AND
+// the local request also wants include_resource_data=true (i.e. wants it
+// ENCRYPTED — see ReconcileExisting's own doc comment on why "true" always
+// means "encrypted" for this CLI's fail-closed policy). Calling
+// GetEncryptKey(subscription_id) is the ONLY available signal to tell a
+// genuinely encrypted, key-retrievable-by-this-identity match apart from a
+// plaintext resource_data match or one whose key this identity cannot
+// retrieve: ordinary Subscription List/Get responses never return
+// encrypt_key at all (spec §4.7 "密钥创建与来源": "普通 Subscription
+// Get/List 永远不返回密钥"). *SubscriptionClient satisfies this
+// structurally (it gained GetEncryptKey in task E1); so does
+// cmd/event/subscription's own createSubscriptionAPI test seam (identical
+// method signature).
+type EncryptKeyProber interface {
+	GetEncryptKey(ctx context.Context, req *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error)
+}
+
+// ReconcileOption customizes ReconcileExisting without changing its
+// signature for existing callers: internal/event/consume/refined.go's
+// PlanRemoteSubscription stage (a later Module E task's un-gating target —
+// out of E2's scope, and this task's scope guard forbids touching it) keeps
+// calling ReconcileExisting exactly as it does today, passing zero options,
+// and remains byte-for-byte unaffected — every option this type carries only
+// changes behavior on the requestedIncludeResourceData=true path, which that
+// call site never reaches (it always passes false).
+type ReconcileOption func(*reconcileConfig)
+
+// reconcileConfig carries the (currently sole) optional dependency
+// ReconcileOption values can set.
+type reconcileConfig struct {
+	encryptProber EncryptKeyProber
+}
+
+// WithEncryptKeyProber supplies the EncryptKeyProber ReconcileExisting uses
+// to resolve spec §4.7's encryption conflict matrix — see EncryptKeyProber's
+// own doc comment for exactly when it is invoked. Callers whose local
+// request has requestedIncludeResourceData=false never need this option:
+// the branch it configures is unreachable for them.
+func WithEncryptKeyProber(prober EncryptKeyProber) ReconcileOption {
+	return func(c *reconcileConfig) { c.encryptProber = prober }
+}
+
 // ReconcilePlan is the outcome of reconciling a create request against
 // remote state (spec §3.3/§4.2's state table), computed identically
 // whether the caller is only previewing (--dry-run, or Task 15b's
@@ -82,7 +126,23 @@ type ReconcilePlan struct {
 // already scopes a List response to that caller's own authority; a second,
 // redundant open_id comparison would need an extra call (e.g. resolving "my
 // own open_id") this does not otherwise need.
-func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, targetResource string, identity core.Identity, requestedIncludeResourceData bool) (*ReconcilePlan, error) {
+//
+// opts is the task-E2 encryption-conflict-matrix extension point (spec
+// §4.7): a caller whose requestedIncludeResourceData is true — meaning it
+// wants an ENCRYPTED subscription, since this CLI's own fail-closed policy
+// never offers a "plaintext resource_data" request (spec §4.7 "载荷与加密模
+// 型") — should pass WithEncryptKeyProber so an active,
+// include_resource_data=true match can be disambiguated (see
+// EncryptKeyProber's doc comment). A caller with requestedIncludeResourceData
+// == false needs no option at all: internal/event/consume/refined.go's
+// existing call site (out of E2's scope) passes none and is completely
+// unaffected by this extension.
+func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, targetResource string, identity core.Identity, requestedIncludeResourceData bool, opts ...ReconcileOption) (*ReconcilePlan, error) {
+	cfg := reconcileConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	req := larkeventv1.NewListSubscriptionReqBuilder().
 		EventType(eventType).
 		TargetResource(targetResource).
@@ -111,17 +171,39 @@ func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, t
 		if match.PayloadOptions != nil {
 			existingIncluded = boolVal(match.PayloadOptions.IncludeResourceData)
 		}
-		if existingIncluded == requestedIncludeResourceData {
+		if existingIncluded != requestedIncludeResourceData {
+			return &ReconcilePlan{
+				Action:   PlanActionConflict,
+				Existing: match,
+				ConflictFields: []errs.InvalidParam{{
+					Name:   "include_resource_data",
+					Reason: fmt.Sprintf("existing subscription has include_resource_data=%t, this request has include_resource_data=%t", existingIncluded, requestedIncludeResourceData),
+				}},
+			}, nil
+		}
+		if !requestedIncludeResourceData {
+			// Both sides agree on plain "no resource data" -- the
+			// unencrypted reuse row; no encryption dimension applies.
 			return &ReconcilePlan{Action: PlanActionReuse, Existing: match}, nil
 		}
-		return &ReconcilePlan{
-			Action:   PlanActionConflict,
-			Existing: match,
-			ConflictFields: []errs.InvalidParam{{
-				Name:   "include_resource_data",
-				Reason: fmt.Sprintf("existing subscription has include_resource_data=%t, this request has include_resource_data=%t", existingIncluded, requestedIncludeResourceData),
-			}},
-		}, nil
+		// Both sides say include_resource_data=true (i.e. both want it
+		// ENCRYPTED). An existing match reporting include_resource_data=true
+		// is ambiguous on its own -- it may or may not have been created
+		// with an encrypt_key, and ordinary List/Get never reveals that --
+		// so this cannot be decided from `match` alone; see
+		// probeEncryptedActiveMatch.
+		if cfg.encryptProber == nil {
+			// Defensive fail-closed: every caller able to reach
+			// requestedIncludeResourceData=true today (create.go's
+			// encrypted-create path) always supplies a prober. Silently
+			// reusing here without confirming the key is retrievable would
+			// defeat the entire conflict matrix, so a missing prober is
+			// treated as an internal error rather than as "assume
+			// compatible".
+			return nil, errs.NewInternalError(errs.SubtypeUnknown,
+				"reconcile: requestedIncludeResourceData=true requires WithEncryptKeyProber to classify an existing include_resource_data=true match; none was supplied")
+		}
+		return probeEncryptedActiveMatch(ctx, cfg.encryptProber, match)
 	case "suspended":
 		return &ReconcilePlan{Action: PlanActionSuspended, Existing: match}, nil
 	default:
@@ -129,6 +211,42 @@ func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, t
 		// treat like not-found (spec §3.3).
 		return &ReconcilePlan{Action: PlanActionCreate}, nil
 	}
+}
+
+// probeEncryptedActiveMatch implements spec §4.7's conflict-matrix rows for
+// an active, include_resource_data=true remote match once the local request
+// also wants include_resource_data=true (encrypted). GetEncryptKey is the
+// only available signal:
+//   - a usable (non-empty) encrypt_key comes back -> the match is genuinely
+//     encrypted and THIS identity can retrieve its key -> reuse it (spec
+//     §4.7: "加密资源详情且密钥可取 -> 复用"); no new Subscription or key is
+//     ever created for an already-encrypted, reusable match.
+//   - no key, an empty key, a nil Data, or ANY error (business or
+//     transport) -> "plaintext resource_data" and "encrypted but key
+//     unavailable to this identity/scope" are indistinguishable from this
+//     response alone, and both are unsafe to auto-proceed (spec §4.7:
+//     "加密资源详情但密钥不可取 -> 不得 ready" / "明文资源详情 -> 不支
+//     持") -> conflict, human decision. This deliberately does not try to
+//     distinguish a transport failure from a confirmed empty key (the
+//     task's own controller interpretation): retrying `create` re-probes
+//     from scratch, and a human resolving a genuine conflict needs the same
+//     guidance (verify the subscription, check `event:encrypt_key:read`, or
+//     delete+recreate) regardless of which case it was.
+func probeEncryptedActiveMatch(ctx context.Context, prober EncryptKeyProber, match *larkeventv1.SubscriptionDetail) (*ReconcilePlan, error) {
+	id := strVal(match.SubscriptionId)
+	req := larkeventv1.NewGetEncryptKeySubscriptionReqBuilder().SubscriptionId(id).Build()
+	resp, err := prober.GetEncryptKey(ctx, req)
+	if err == nil && resp != nil && resp.Data != nil && strVal(resp.Data.EncryptKey) != "" {
+		return &ReconcilePlan{Action: PlanActionReuse, Existing: match}, nil
+	}
+	return &ReconcilePlan{
+		Action:   PlanActionConflict,
+		Existing: match,
+		ConflictFields: []errs.InvalidParam{{
+			Name:   "include_resource_data",
+			Reason: "existing subscription has include_resource_data=true but its encrypt_key could not be confirmed retrievable with this identity (remote may be plaintext resource_data, or the key is unavailable — indistinguishable from here, and both unsafe to auto-reuse); delete and recreate after human confirmation, or verify the subscription and the `event:encrypt_key:read` scope",
+		}},
+	}, nil
 }
 
 // AuthorityMatchesIdentity reports whether a, an already-observed remote

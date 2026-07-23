@@ -101,9 +101,12 @@ var subscriptionReadScopes = []string{"event:subscription:read"}
 // subscription's encrypt_key via eventlib.SubscriptionClient.GetEncryptKey
 // (internal/event/subscription_client.go) — event:encrypt_key:read is a
 // distinct scope that neither subscriptionReadScopes nor
-// subscriptionMutationScopes implies (task-E-design-note.md's task E1). This
-// is a Module E (message decryption) foundation const only: nothing wires it
-// into a command's required-scopes check yet.
+// subscriptionMutationScopes implies (task-E-design-note.md's task E1).
+// create.go's createRequiredScopes wires this in for
+// --include-resource-data=true (task E2): that path's reconcile step probes
+// GetEncryptKey (eventlib.ReconcileExisting's WithEncryptKeyProber) to
+// classify an existing include_resource_data=true match, so it needs this
+// scope on top of subscriptionMutationScopes.
 var subscriptionEncryptKeyReadScopes = []string{"event:encrypt_key:read"}
 
 // addAsFlag registers the --as flag shared by every subscription

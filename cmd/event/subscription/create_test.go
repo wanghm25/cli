@@ -4,10 +4,12 @@
 package subscription
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -112,6 +114,15 @@ type fakeCreateAPI struct {
 
 	createFunc  func() (*larkeventv1.CreateSubscriptionResp, error)
 	createCalls int
+
+	// getEncryptKeyFunc/getEncryptKeyCalls back the fake GetEncryptKey below
+	// — the seam the encryption conflict-matrix's probe
+	// (eventlib.ReconcileExisting's WithEncryptKeyProber) depends on. A nil
+	// getEncryptKeyFunc defaults to "no usable key" (okEncryptKeyResp(""))
+	// rather than success-with-a-key, so a test that forgets to set it up
+	// fails toward the safe (conflict) outcome, not a silent reuse.
+	getEncryptKeyFunc  func() (*larkeventv1.GetEncryptKeySubscriptionResp, error)
+	getEncryptKeyCalls int
 }
 
 func (f *fakeCreateAPI) List(_ context.Context, req *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
@@ -128,6 +139,24 @@ func (f *fakeCreateAPI) Create(_ context.Context, _ *larkeventv1.CreateSubscript
 		return okCreateResp(&larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_new")}), nil
 	}
 	return f.createFunc()
+}
+
+func (f *fakeCreateAPI) GetEncryptKey(_ context.Context, _ *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
+	f.getEncryptKeyCalls++
+	if f.getEncryptKeyFunc == nil {
+		return okEncryptKeyResp(""), nil
+	}
+	return f.getEncryptKeyFunc()
+}
+
+// okEncryptKeyResp builds a synthetic, always-successful
+// GetEncryptKeySubscriptionResp carrying key (which may be "" to model "no
+// usable key returned").
+func okEncryptKeyResp(key string) *larkeventv1.GetEncryptKeySubscriptionResp {
+	return &larkeventv1.GetEncryptKeySubscriptionResp{
+		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
+		Data:    &larkeventv1.GetEncryptKeySubscriptionRespData{EncryptKey: strPtr(key)},
+	}
 }
 
 // fixedList returns a fakeCreateAPI.listFunc that always returns the same
@@ -513,6 +542,482 @@ func TestCreateOrReuseSubscription_CreateFails_ReconcileFindsNothing_ReturnsOrig
 	}
 }
 
+// ---- createRequiredScopes ----
+
+func TestCreateRequiredScopes_False_ReturnsBaseMutationScopesOnly(t *testing.T) {
+	got := createRequiredScopes(false)
+	want := []string{"event:subscription:read", "event:subscription:write"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("createRequiredScopes(false) = %v, want %v", got, want)
+	}
+}
+
+func TestCreateRequiredScopes_True_AlsoIncludesEncryptKeyReadScope(t *testing.T) {
+	got := createRequiredScopes(true)
+	want := map[string]bool{"event:subscription:read": true, "event:subscription:write": true, "event:encrypt_key:read": true}
+	if len(got) != len(want) {
+		t.Fatalf("createRequiredScopes(true) = %v, want exactly %v", got, want)
+	}
+	for _, s := range got {
+		if !want[s] {
+			t.Errorf("unexpected scope %q", s)
+		}
+	}
+}
+
+// TestCreateRequiredScopes_DoesNotMutateSharedBaseSlice guards against a
+// classic Go append-aliasing bug: createRequiredScopes(true) must build a
+// fresh slice rather than appending onto (and potentially reallocating
+// into, or worse, overwriting) subscriptionMutationScopes's own backing
+// array, which every OTHER caller of subscriptionMutationScopes (dry-run's
+// own createDryRunResult default, other mutating subcommands) still relies
+// on being exactly its original 2-element literal.
+func TestCreateRequiredScopes_DoesNotMutateSharedBaseSlice(t *testing.T) {
+	before := append([]string(nil), subscriptionMutationScopes...)
+	_ = createRequiredScopes(true)
+	if !reflect.DeepEqual(subscriptionMutationScopes, before) {
+		t.Errorf("subscriptionMutationScopes mutated: got %v, want %v", subscriptionMutationScopes, before)
+	}
+}
+
+// ---- dry-run must never generate a key (design spec §4.7 caution #1;
+// task-E-design-note.md's E2 RED LINE: "dry-run generates no key") ----
+
+// TestDryRun_IncludeResourceDataTrue_NotFound_GeneratesNoKeyAndNoCreateCall
+// drives the exact two calls runCreate's --dry-run branch makes
+// (reconcileExisting then buildDryRunResult) with includeResourceData=true
+// and asserts, via a spy substituted for the package-level key generator,
+// that it is invoked exactly zero times — even though the plan lands on
+// planActionCreate, the one row a REAL (non-dry-run) run would generate a
+// key for.
+func TestDryRun_IncludeResourceDataTrue_NotFound_GeneratesNoKeyAndNoCreateCall(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	fake := &fakeCreateAPI{listFunc: fixedList(okListResp(nil, false, ""), nil)}
+
+	keyGenCalls := 0
+	orig := newEncryptKeyFunc
+	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return orig() }
+	t.Cleanup(func() { newEncryptKeyFunc = orig })
+
+	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsBot, true)
+	if err != nil {
+		t.Fatalf("reconcileExisting: unexpected error: %v", err)
+	}
+	if plan.Action != planActionCreate {
+		t.Fatalf("Action = %q, want %q", plan.Action, planActionCreate)
+	}
+	result := buildDryRunResult(resolved, core.AsBot, plan, true)
+	if result.PlannedChange.Action != planActionCreate {
+		t.Errorf("PlannedChange.Action = %q, want %q", result.PlannedChange.Action, planActionCreate)
+	}
+
+	if keyGenCalls != 0 {
+		t.Errorf("key generator invoked %d times during --dry-run, want 0", keyGenCalls)
+	}
+	if fake.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write", fake.createCalls)
+	}
+}
+
+// TestDryRun_IncludeResourceDataTrue_ActiveMatch_ProbesButGeneratesNoKey
+// covers the OTHER row a --dry-run preview can reach for an encrypted
+// request: an existing active, include_resource_data=true match. Per design
+// spec §4.7's own cautions, --dry-run's plan step MAY probe remote state
+// (GetEncryptKey, to report whether the plan would be reuse or conflict)
+// but must still never generate a NEW key — this distinguishes "probing an
+// existing key" (fine, informational) from "creating a new one" (never
+// during --dry-run).
+func TestDryRun_IncludeResourceDataTrue_ActiveMatch_ProbesButGeneratesNoKey(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	fake := &fakeCreateAPI{
+		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
+			activeDetail("sub_enc", true, "app"), // "app" authority matches core.AsBot identity
+		}, false, ""), nil),
+		getEncryptKeyFunc: func() (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
+			return okEncryptKeyResp("usable-key-from-remote"), nil
+		},
+	}
+
+	keyGenCalls := 0
+	orig := newEncryptKeyFunc
+	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return orig() }
+	t.Cleanup(func() { newEncryptKeyFunc = orig })
+
+	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsBot, true)
+	if err != nil {
+		t.Fatalf("reconcileExisting: unexpected error: %v", err)
+	}
+	if plan.Action != planActionReuse {
+		t.Fatalf("Action = %q, want %q (usable remote key -> reuse)", plan.Action, planActionReuse)
+	}
+	_ = buildDryRunResult(resolved, core.AsBot, plan, true)
+
+	if fake.getEncryptKeyCalls != 1 {
+		t.Errorf("getEncryptKeyCalls = %d, want 1: dry-run's plan step may probe remote state", fake.getEncryptKeyCalls)
+	}
+	if keyGenCalls != 0 {
+		t.Errorf("key generator invoked %d times during --dry-run, want 0: probing an existing key must never generate a new one", keyGenCalls)
+	}
+	if fake.createCalls != 0 {
+		t.Error("createCalls must be 0 for --dry-run")
+	}
+}
+
+// ---- encrypted create (task-E-design-note.md task E2: un-gate
+// --include-resource-data=true, atomic Create-time key injection, the
+// encryption conflict matrix, and the redaction RED LINE) ----
+
+// TestBuildCreateSubscriptionBody_IncludeResourceDataTrueWithKey_SetsBothAtomically
+// is the direct, structural proof of spec §4.7's atomicity requirement:
+// includeResourceData and a non-empty encryptKey are always set on the SAME
+// returned body value from ONE function call — there is no code path that
+// could build/send them as two separate requests. See
+// buildCreateSubscriptionBody's own doc comment for why this must be
+// asserted against ITS return value rather than a captured
+// *larkeventv1.CreateSubscriptionReq (the SDK request wrapper's Body field
+// is never actually populated by its own builder — verified while writing
+// this test).
+func TestBuildCreateSubscriptionBody_IncludeResourceDataTrueWithKey_SetsBothAtomically(t *testing.T) {
+	body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", true, "the-generated-key")
+
+	if body.EventType == nil || *body.EventType != "im.message.created_v1" {
+		t.Errorf("EventType = %v, want im.message.created_v1", body.EventType)
+	}
+	if body.TargetResource == nil || *body.TargetResource != "im.message?chat_id=oc_aaa" {
+		t.Errorf("TargetResource = %v, want im.message?chat_id=oc_aaa", body.TargetResource)
+	}
+	if body.PayloadOptions == nil {
+		t.Fatal("PayloadOptions = nil, want set")
+	}
+	if !boolVal(body.PayloadOptions.IncludeResourceData) {
+		t.Error("PayloadOptions.IncludeResourceData = false, want true")
+	}
+	if body.PayloadOptions.Encrypt == nil || strVal(body.PayloadOptions.Encrypt.EncryptKey) != "the-generated-key" {
+		t.Fatalf("PayloadOptions.Encrypt = %+v, want EncryptKey=the-generated-key", body.PayloadOptions.Encrypt)
+	}
+}
+
+// TestBuildCreateSubscriptionBody_EmptyKey_OmitsEncrypt locks the
+// includeResourceData=false path (and any defensive empty-key call): Encrypt
+// must be left nil, never an empty-but-present struct — mirroring how
+// PayloadOptionsEncrypt is Create-only and must not appear at all when there
+// is no key.
+func TestBuildCreateSubscriptionBody_EmptyKey_OmitsEncrypt(t *testing.T) {
+	body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "")
+
+	if boolVal(body.PayloadOptions.IncludeResourceData) {
+		t.Error("PayloadOptions.IncludeResourceData = true, want false")
+	}
+	if body.PayloadOptions.Encrypt != nil {
+		t.Errorf("PayloadOptions.Encrypt = %+v, want nil when no key is supplied", body.PayloadOptions.Encrypt)
+	}
+}
+
+// TestCreateOrReuseSubscription_Encrypted_NotFound_CreatesAtomicallyWithKey
+// is the primary TDD case at createOrReuseSubscription's own level: no
+// existing match -> generate a key -> Create exactly once (never a separate
+// "create plain" + "add encryption" pair of calls) -> return the resulting
+// subscription_id. See TestBuildCreateSubscriptionBody_* above for the
+// direct proof of what that one call's body actually contains.
+func TestCreateOrReuseSubscription_Encrypted_NotFound_CreatesAtomicallyWithKey(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	fake := &fakeCreateAPI{
+		listFunc: fixedList(okListResp(nil, false, ""), nil),
+		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) {
+			return okCreateResp(activeDetail("sub_encrypted_new", true, "app")), nil
+		},
+	}
+
+	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Action != "created" {
+		t.Errorf("Action = %q, want created", outcome.Action)
+	}
+	if strVal(outcome.Detail.SubscriptionId) != "sub_encrypted_new" {
+		t.Errorf("Detail.SubscriptionId = %q, want sub_encrypted_new", strVal(outcome.Detail.SubscriptionId))
+	}
+	if fake.createCalls != 1 {
+		t.Errorf("createCalls = %d, want exactly 1 (one atomic Create)", fake.createCalls)
+	}
+}
+
+// TestCreateOrReuseSubscription_Encrypted_RemoteFalse_ReturnsConflict locks
+// spec §4.7's "加密资源详情 | include_resource_data=false | 冲突,人工决策"
+// row via createOrReuseSubscription (create.go's own typed-error layer, not
+// just the lower-level ReconcileExisting already locked in
+// internal/event/reconcile_test.go).
+func TestCreateOrReuseSubscription_Encrypted_RemoteFalse_ReturnsConflict(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	fake := &fakeCreateAPI{
+		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
+			activeDetail("sub_plain", false, "app"), // "app" authority matches core.AsBot identity
+		}, false, ""), nil),
+	}
+
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if fake.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (a conflict must never call Create)", fake.createCalls)
+	}
+	if fake.getEncryptKeyCalls != 0 {
+		t.Errorf("getEncryptKeyCalls = %d, want 0: the probe must never run when the state mismatch is already decisive", fake.getEncryptKeyCalls)
+	}
+}
+
+// TestCreateOrReuseSubscription_Encrypted_RemoteTrueUsableKey_ReusesNoNewCreate
+// locks spec §4.7's "加密资源详情 | 加密资源详情且密钥可取 | 复用" row: an
+// active, include_resource_data=true match whose key GetEncryptKey confirms
+// usable is reused as-is — never a new Create, never a new key.
+func TestCreateOrReuseSubscription_Encrypted_RemoteTrueUsableKey_ReusesNoNewCreate(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	fake := &fakeCreateAPI{
+		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
+			activeDetail("sub_already_encrypted", true, "app"), // "app" authority matches core.AsBot identity
+		}, false, ""), nil),
+		getEncryptKeyFunc: func() (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
+			return okEncryptKeyResp("usable-remote-key"), nil
+		},
+	}
+
+	keyGenCalls := 0
+	orig := newEncryptKeyFunc
+	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return orig() }
+	t.Cleanup(func() { newEncryptKeyFunc = orig })
+
+	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Action != "reused" {
+		t.Errorf("Action = %q, want reused", outcome.Action)
+	}
+	if strVal(outcome.Detail.SubscriptionId) != "sub_already_encrypted" {
+		t.Errorf("Detail.SubscriptionId = %q, want sub_already_encrypted", strVal(outcome.Detail.SubscriptionId))
+	}
+	if fake.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (reuse must never call Create)", fake.createCalls)
+	}
+	if keyGenCalls != 0 {
+		t.Errorf("key generator invoked %d times, want 0: reusing an existing encrypted match must never generate a new key", keyGenCalls)
+	}
+}
+
+// TestCreateOrReuseSubscription_Encrypted_RemoteTrueKeyUnavailable_ReturnsConflictHumanHint
+// locks spec §4.7's "加密资源详情 | 加密资源详情但密钥不可取 | 不得
+// ready/冲突" row: GetEncryptKey returning no usable key (here: a business
+// error, e.g. missing scope/permission at the remote side) must conflict —
+// with human-actionable guidance (delete+recreate / verify the subscription
+// / check event:encrypt_key:read), never a silent reuse.
+func TestCreateOrReuseSubscription_Encrypted_RemoteTrueKeyUnavailable_ReturnsConflictHumanHint(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	fake := &fakeCreateAPI{
+		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
+			activeDetail("sub_key_unavailable", true, "app"), // "app" authority matches core.AsBot identity
+		}, false, ""), nil),
+		getEncryptKeyFunc: func() (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
+			return nil, errors.New("boom: synthetic permission failure")
+		},
+	}
+
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if !strings.Contains(ve.Hint, "sub_key_unavailable") {
+		t.Errorf("Hint = %q, want it to mention remote_subscription_id sub_key_unavailable", ve.Hint)
+	}
+	if !strings.Contains(ve.Hint, "event:encrypt_key:read") {
+		t.Errorf("Hint = %q, want it to mention scope event:encrypt_key:read", ve.Hint)
+	}
+	if !strings.Contains(ve.Hint, "delete") {
+		t.Errorf("Hint = %q, want it to guide delete+recreate", ve.Hint)
+	}
+	if fake.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (a conflict must never call Create)", fake.createCalls)
+	}
+}
+
+// TestCreateOrReuseSubscription_Encrypted_CreateFails_SecondReconcileStillRequiresEncryption
+// locks the fail-closed RED LINE: "if create fails, do NOT retry without
+// encryption / do NOT fall back to a plaintext sub." The post-failure
+// bounded reconcile-and-retry pass (createOrReuseSubscription's own,
+// unrelated-to-encryption "List raced us" recovery) must still request
+// includeResourceData=true on its second reconcile — proven here by racing
+// in a PLAINTEXT match on that second List: if the implementation ever
+// silently downgraded to includeResourceData=false after an encrypted
+// Create failure, this plaintext match would wrongly look like a compatible
+// reuse instead of a conflict.
+func TestCreateOrReuseSubscription_Encrypted_CreateFails_SecondReconcileStillRequiresEncryption(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	fake := &fakeCreateAPI{
+		listFunc: func(call int) (*larkeventv1.ListSubscriptionResp, error) {
+			if call == 1 {
+				return okListResp(nil, false, ""), nil
+			}
+			return okListResp([]*larkeventv1.SubscriptionDetail{
+				activeDetail("sub_raced_plaintext", false, "user"),
+			}, false, ""), nil
+		},
+		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) {
+			return nil, errors.New("boom: synthetic create failure")
+		},
+	}
+
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, true)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError (conflict, not a silent plaintext fallback), got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if fake.createCalls != 1 {
+		t.Errorf("createCalls = %d, want 1 (never retry Create, encrypted or otherwise)", fake.createCalls)
+	}
+}
+
+// ---- redaction RED LINE (task-E-design-note.md's "RED LINES" + this
+// task's own): the generated key must NEVER appear in stdout, stderr, the
+// --json output, the dry-run plan preview, logs, or any error/Hint ----
+
+// TestEncryptedCreate_Redaction_KeyNeverAppearsInAnyOutput captures every
+// caller-visible output surface an encrypted, successful create produces —
+// the --json result (json.Marshal of buildCreateResult's return value) and
+// the human-text result (writeCreateText) — and asserts the actual
+// generated key (captured directly via a spy on the package-level
+// generator, i.e. ground truth, not a guess) is byte-for-byte absent from
+// both. The control that this key really was generated and used for this
+// exact create attempt (so the negative assertions below are not vacuous)
+// is TestBuildCreateSubscriptionBody_IncludeResourceDataTrueWithKey_SetsBothAtomically
+// plus this test's own createCalls==1 check: doCreateSubscription always
+// builds its request body via buildCreateSubscriptionBody(..., encryptKey)
+// with exactly the value newEncryptKeyFunc returned (createOrReuseSubscription
+// threads it straight through with no intermediate transformation).
+func TestEncryptedCreate_Redaction_KeyNeverAppearsInAnyOutput(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+
+	var capturedKey string
+	orig := newEncryptKeyFunc
+	newEncryptKeyFunc = func() (string, error) {
+		k, err := orig()
+		capturedKey = k
+		return k, err
+	}
+	t.Cleanup(func() { newEncryptKeyFunc = orig })
+
+	fake := &fakeCreateAPI{listFunc: fixedList(okListResp(nil, false, ""), nil)}
+
+	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedKey == "" {
+		t.Fatal("test setup issue: no key was captured, cannot verify redaction")
+	}
+	if fake.createCalls != 1 {
+		t.Fatalf("createCalls = %d, want exactly 1 (control: the generated key must have actually been used for a real create attempt)", fake.createCalls)
+	}
+
+	result := buildCreateResult(resolved, core.AsBot, outcome)
+
+	jsonBytes, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if strings.Contains(string(jsonBytes), capturedKey) {
+		t.Errorf("RED LINE VIOLATION: encrypt_key found in --json output: %s", jsonBytes)
+	}
+
+	var textBuf bytes.Buffer
+	writeCreateText(&textBuf, result)
+	if strings.Contains(textBuf.String(), capturedKey) {
+		t.Errorf("RED LINE VIOLATION: encrypt_key found in human-text output: %s", textBuf.String())
+	}
+
+	// Also cover the dry-run preview shape (a plan built from the same
+	// createOutcome-adjacent reconcilePlan) for completeness, even though
+	// this particular call path (a completed, non-dry-run create) does not
+	// itself render one.
+	plan := &reconcilePlan{Action: planActionCreate}
+	dryRunResult := buildDryRunResult(resolved, core.AsBot, plan, true)
+	dryRunJSON, err := json.Marshal(dryRunResult)
+	if err != nil {
+		t.Fatalf("json.Marshal dry-run result: %v", err)
+	}
+	if strings.Contains(string(dryRunJSON), capturedKey) {
+		t.Errorf("RED LINE VIOLATION: encrypt_key found in dry-run plan preview: %s", dryRunJSON)
+	}
+}
+
+// TestEncryptedCreate_Redaction_KeyNeverAppearsInErrorOnCreateFailure covers
+// the error path: even when the atomic Create call itself fails, the
+// resulting typed error's Error()/Hint must never contain the key that was
+// generated and submitted for that attempt.
+func TestEncryptedCreate_Redaction_KeyNeverAppearsInErrorOnCreateFailure(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+
+	var capturedKey string
+	orig := newEncryptKeyFunc
+	newEncryptKeyFunc = func() (string, error) {
+		k, err := orig()
+		capturedKey = k
+		return k, err
+	}
+	t.Cleanup(func() { newEncryptKeyFunc = orig })
+
+	fake := &fakeCreateAPI{
+		listFunc: fixedList(okListResp(nil, false, ""), nil), // both reconciles: nothing found
+		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) {
+			return nil, errors.New("boom: synthetic create failure")
+		},
+	}
+
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if capturedKey == "" {
+		t.Fatal("test setup issue: no key was captured, cannot verify redaction")
+	}
+	if strings.Contains(err.Error(), capturedKey) {
+		t.Errorf("RED LINE VIOLATION: encrypt_key found in error message: %v", err)
+	}
+}
+
+// TestDoCreateSubscription_IncludeResourceDataTrueWithEmptyKey_FailsClosed
+// is a defense-in-depth structural guard: doCreateSubscription itself must
+// refuse to submit include_resource_data=true with an empty encryptKey,
+// rather than ever letting an "encrypted intent, but actually unencrypted"
+// Create request reach the platform. Every real caller
+// (createOrReuseSubscription) already generates a key before reaching here
+// whenever includeResourceData is true, and returns its own error early if
+// generation fails — so this is unreachable via the production call graph
+// today, but locks the invariant against future modification (e.g. a new
+// caller that forgets to generate a key first).
+func TestDoCreateSubscription_IncludeResourceDataTrueWithEmptyKey_FailsClosed(t *testing.T) {
+	fake := &fakeCreateAPI{}
+
+	_, err := doCreateSubscription(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", true, "")
+	if err == nil {
+		t.Fatal("expected an error (fail-closed, no plaintext-fallback), got nil")
+	}
+	if fake.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0: must refuse before ever calling Create", fake.createCalls)
+	}
+}
+
 // ---- checkTemplateAuthTypes ----
 
 func TestCheckTemplateAuthTypes_OwnerMeTemplate_RejectsBot(t *testing.T) {
@@ -679,42 +1184,25 @@ func TestRunCreate_KeyLevelAuthTypesRejectsBeforeTemplateCheck(t *testing.T) {
 	}
 }
 
-func TestRunCreate_IncludeResourceDataTrue_ReturnsEGateFailedPrecondition(t *testing.T) {
-	registerCreateFixtures(t)
-	f := &cmdutil.Factory{}
-	cmd := NewCmdCreate(f)
-	cmd.SetOut(io.Discard)
-	cmd.SetErr(io.Discard)
-	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "bot", "--include-resource-data=true"})
+// TestRunCreate_IncludeResourceDataTrue_ReturnsEGateFailedPrecondition
+// previously locked the §9 deferral gate. Task E2 removes that gate and
+// implements real encrypted-create instead (task-E-design-note.md);
+// TestRunCreate_IncludeResourceDataTrue_MissingEncryptKeyReadScope_ReturnsPermissionError
+// and the createOrReuseSubscription-level tests below
+// (TestCreateOrReuseSubscription_Encrypted_*) are this test's replacement.
 
-	err := cmd.Execute()
-	if err == nil {
-		t.Fatal("expected an E-gate error, got nil")
-	}
-	var ve *errs.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
-	}
-	if ve.Subtype != errs.SubtypeFailedPrecondition {
-		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
-	}
-	if ve.Param != "--include-resource-data" {
-		t.Errorf("Param = %q, want --include-resource-data", ve.Param)
-	}
-	if !strings.Contains(ve.Hint, "resource_data_encryption_deferred") {
-		t.Errorf("Hint = %q, want it to name reason resource_data_encryption_deferred", ve.Hint)
-	}
-}
-
-func TestRunCreate_IncludeResourceDataFalse_PassesEGate(t *testing.T) {
-	// --include-resource-data=false (the default) must never hit the E-gate.
-	// This uses cmdutil.TestFactory (a real, network-free httpmock-backed
-	// client) with both scopes granted so the flow proceeds past the E-gate
-	// and scope preflight into the real reconcile List call — which then
-	// fails with an httpmock "no stub registered" error (no stub is
-	// registered here on purpose). That failure is expected and irrelevant
-	// to this test: the only thing asserted is that the failure is NOT the
-	// E-gate's specific typed error.
+// TestRunCreate_IncludeResourceDataFalse_DoesNotRequireEncryptKeyReadScope
+// locks that --include-resource-data=false (the default) never pulls in the
+// extra event:encrypt_key:read scope requirement task E2 adds for =true:
+// with ONLY the base mutation scopes granted (deliberately omitting
+// event:encrypt_key:read), the flow must proceed past scope preflight into
+// the real reconcile List call — which then fails with an httpmock "no stub
+// registered" error (no stub is registered here on purpose, mirroring the
+// existing --include-resource-data=false convention in this file). That
+// failure is expected and irrelevant to this test: the only thing asserted
+// is that the failure is NOT a *errs.PermissionError naming
+// event:encrypt_key:read.
+func TestRunCreate_IncludeResourceDataFalse_DoesNotRequireEncryptKeyReadScope(t *testing.T) {
 	registerCreateFixtures(t)
 	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "cli_x"})
 	f.Credential = credential.NewCredentialProvider(nil, nil, &fakeTokenResolver{
@@ -727,9 +1215,64 @@ func TestRunCreate_IncludeResourceDataFalse_PassesEGate(t *testing.T) {
 	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "bot", "--include-resource-data=false"})
 
 	err := cmd.Execute()
-	var ve *errs.ValidationError
-	if errors.As(err, &ve) && ve.Subtype == errs.SubtypeFailedPrecondition && ve.Param == "--include-resource-data" {
-		t.Fatalf("--include-resource-data=false must not trip the E-gate, got: %v", err)
+	var permErr *errs.PermissionError
+	if errors.As(err, &permErr) {
+		t.Fatalf("--include-resource-data=false must not require event:encrypt_key:read, got: %v", err)
+	}
+}
+
+// TestRunCreate_IncludeResourceDataTrue_MissingEncryptKeyReadScope_ReturnsPermissionError
+// locks task E2's scope wiring: --include-resource-data=true additionally
+// requires event:encrypt_key:read (create's reconcile probes GetEncryptKey
+// for an active include_resource_data=true match) on top of the usual
+// event:subscription:{read,write} — missing it alone (both mutation scopes
+// otherwise granted) must fail closed with a typed permission error naming
+// it, never silently proceed without the probe capability.
+func TestRunCreate_IncludeResourceDataTrue_MissingEncryptKeyReadScope_ReturnsPermissionError(t *testing.T) {
+	registerCreateFixtures(t)
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "cli_x"})
+	f.Credential = credential.NewCredentialProvider(nil, nil, &fakeTokenResolver{
+		result: &credential.TokenResult{Token: "t-tok", Scopes: "event:subscription:read event:subscription:write"},
+	}, nil)
+
+	cmd := NewCmdCreate(f)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "bot", "--include-resource-data=true"})
+
+	err := cmd.Execute()
+	var permErr *errs.PermissionError
+	if !errors.As(err, &permErr) {
+		t.Fatalf("expected *errs.PermissionError, got %T: %v", err, err)
+	}
+	if len(permErr.MissingScopes) != 1 || permErr.MissingScopes[0] != "event:encrypt_key:read" {
+		t.Errorf("MissingScopes = %v, want [event:encrypt_key:read]", permErr.MissingScopes)
+	}
+}
+
+// TestRunCreate_IncludeResourceDataTrue_AllScopesGranted_PassesScopePreflight
+// is --include-resource-data=true's counterpart of
+// TestRunCreate_IncludeResourceDataFalse_DoesNotRequireEncryptKeyReadScope:
+// with ALL THREE scopes granted (including event:encrypt_key:read), the
+// flow must proceed past scope preflight into the real reconcile List call
+// (which then fails with an expected, unregistered httpmock stub — the only
+// thing asserted here is that it is NOT a *errs.PermissionError).
+func TestRunCreate_IncludeResourceDataTrue_AllScopesGranted_PassesScopePreflight(t *testing.T) {
+	registerCreateFixtures(t)
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "cli_x"})
+	f.Credential = credential.NewCredentialProvider(nil, nil, &fakeTokenResolver{
+		result: &credential.TokenResult{Token: "t-tok", Scopes: "event:subscription:read event:subscription:write event:encrypt_key:read"},
+	}, nil)
+
+	cmd := NewCmdCreate(f)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "bot", "--include-resource-data=true"})
+
+	err := cmd.Execute()
+	var permErr *errs.PermissionError
+	if errors.As(err, &permErr) {
+		t.Fatalf("all three scopes were granted, must not report a permission error, got: %v", err)
 	}
 }
 
@@ -816,7 +1359,7 @@ func TestBuildDryRunResult_NotFound_ShapeAndNoRemoteBefore(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
 	plan := &reconcilePlan{Action: planActionCreate}
 
-	result := buildDryRunResult(resolved, core.AsUser, plan)
+	result := buildDryRunResult(resolved, core.AsUser, plan, false)
 
 	if result.Operation != "create" {
 		t.Errorf("Operation = %q, want create", result.Operation)
@@ -852,7 +1395,7 @@ func TestBuildDryRunResult_ActiveCompatible_RemoteBeforePopulated(t *testing.T) 
 	existing := activeDetail("sub_existing", false, "user")
 	plan := &reconcilePlan{Action: planActionReuse, Existing: existing}
 
-	result := buildDryRunResult(resolved, core.AsUser, plan)
+	result := buildDryRunResult(resolved, core.AsUser, plan, false)
 
 	if result.RemoteBefore == nil {
 		t.Fatal("RemoteBefore = nil, want the existing subscription row")
@@ -862,6 +1405,28 @@ func TestBuildDryRunResult_ActiveCompatible_RemoteBeforePopulated(t *testing.T) 
 	}
 	if result.PlannedChange.RemoteSubscriptionID != "sub_existing" {
 		t.Errorf("PlannedChange.RemoteSubscriptionID = %q, want sub_existing", result.PlannedChange.RemoteSubscriptionID)
+	}
+}
+
+// TestBuildDryRunResult_IncludeResourceDataTrue_RequiredScopesIncludesEncryptKeyRead
+// locks that dry-run's own reported required_scopes accurately reflects
+// task E2's conditional third scope: a --dry-run preview must never claim a
+// smaller scope requirement than the real run it is previewing actually
+// checked (both share the same createRequiredScopes call in runCreate).
+func TestBuildDryRunResult_IncludeResourceDataTrue_RequiredScopesIncludesEncryptKeyRead(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	plan := &reconcilePlan{Action: planActionCreate}
+
+	result := buildDryRunResult(resolved, core.AsUser, plan, true)
+
+	want := map[string]bool{"event:subscription:read": true, "event:subscription:write": true, "event:encrypt_key:read": true}
+	if len(result.RequiredScopes) != len(want) {
+		t.Fatalf("RequiredScopes = %v, want exactly %v", result.RequiredScopes, want)
+	}
+	for _, s := range result.RequiredScopes {
+		if !want[s] {
+			t.Errorf("unexpected required scope %q", s)
+		}
 	}
 }
 
@@ -881,7 +1446,7 @@ func TestDryRun_NotFound_EndToEndViaFakeService_JSONShapeAndNoCreateCall(t *test
 	if err != nil {
 		t.Fatalf("reconcileExisting: unexpected error: %v", err)
 	}
-	result := buildDryRunResult(resolved, core.AsBot, plan)
+	result := buildDryRunResult(resolved, core.AsBot, plan, false)
 
 	raw, err := json.Marshal(result)
 	if err != nil {
@@ -938,7 +1503,7 @@ func TestDryRun_ActiveConflicting_EndToEndViaFakeService_ReportsInformationallyN
 	if plan.Action != planActionConflict {
 		t.Fatalf("Action = %q, want %q", plan.Action, planActionConflict)
 	}
-	result := buildDryRunResult(resolved, core.AsUser, plan)
+	result := buildDryRunResult(resolved, core.AsUser, plan, false)
 
 	if result.PlannedChange.Action != planActionConflict {
 		t.Errorf("PlannedChange.Action = %q, want %q", result.PlannedChange.Action, planActionConflict)
@@ -971,7 +1536,7 @@ func TestDryRun_Suspended_EndToEndViaFakeService_ReportsInformationallyNoCreateC
 	if plan.Action != planActionSuspended {
 		t.Fatalf("Action = %q, want %q", plan.Action, planActionSuspended)
 	}
-	result := buildDryRunResult(resolved, core.AsUser, plan)
+	result := buildDryRunResult(resolved, core.AsUser, plan, false)
 
 	if result.PlannedChange.Action != planActionSuspended {
 		t.Errorf("PlannedChange.Action = %q, want %q", result.PlannedChange.Action, planActionSuspended)
