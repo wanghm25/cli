@@ -41,11 +41,10 @@ type updateOpts struct {
 }
 
 // NewCmdUpdate builds `event subscription update <remote_subscription_id>`.
-// The candidate SDK's Patch call only ever touches
-// payload_options (the Patch body has no encrypt field), so
-// --include-resource-data is update's only mutable input — and, since a
-// caller must pass an explicit intent for that one field, it is required
-// rather than defaulted (unlike create's, which defaults to false).
+// The platform update API only accepts payload_options here (the Patch body
+// has no encrypt field), so --include-resource-data is update's only mutable
+// input. The caller must pass an explicit intent for that one field; unlike
+// create, this command does not silently default it to false.
 //
 // Like create, update requires BOTH event:subscription:read and
 // event:subscription:write: it always reads the target's
@@ -64,9 +63,9 @@ func NewCmdUpdate(f *cmdutil.Factory) *cobra.Command {
 		Use:   "update <remote_subscription_id>",
 		Short: "Update a remote event Subscription's payload options",
 		Long: `Update the payload_options of an existing remote Subscription by its
-remote_subscription_id. The candidate SDK's Patch call only ever touches
-payload_options — --include-resource-data is the only mutable field, and it
-must be passed explicitly (true or false); there is nothing else to update.
+remote_subscription_id. The platform update API only accepts payload_options
+here: --include-resource-data is the only mutable field, and it must be passed
+explicitly (true or false); there is nothing else to update.
 
 IDENTITY: --as user|bot|auto, resolved to one effective identity (no
 per-template check — this command carries no EventKey context).
@@ -194,15 +193,14 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 // fetched via Get for --dry-run/remote_before purposes; this does not
 // re-fetch it.
 //
-// The switching-off-encryption guard (issue #13) runs FIRST: it is a
-// structural "update can never do this" fact about the request itself (like
-// the true-direction gate in runUpdate), not a transient readiness problem —
-// even an ACTIVE, non-suspended subscription still cannot have
-// include_resource_data/encryption switched off via Patch. The suspended
-// guard is a hard block regardless of yes — there is no point
-// confirming a write that cannot proceed. Both guards run before the
-// confirmation gate so neither ever reaches "requires confirmation", and
-// Patch is never called in any of the three failing cases.
+// The switching-off-encryption guard runs FIRST: it is a structural "update
+// can never do this" fact about the request itself (like the true-direction
+// gate in runUpdate), not a transient readiness problem — even an ACTIVE,
+// non-suspended subscription still cannot have include_resource_data/encryption
+// switched off via Patch. The suspended guard is a hard block regardless of
+// yes — there is no point confirming a write that cannot proceed. Both guards
+// run before the confirmation gate so neither ever reaches "requires
+// confirmation", and Patch is never called in any of the three failing cases.
 func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, includeResourceData bool, yes bool) (*larkeventv1.SubscriptionDetail, error) {
 	if switchingOffEncryption(before, includeResourceData) {
 		return nil, errUpdateCannotSwitchEncryption(remoteSubscriptionID, false)
@@ -227,7 +225,7 @@ func beforeIncludeResourceData(before *subscriptionRow) bool {
 
 // switchingOffEncryption reports whether this request would flip an
 // existing ENCRYPTED/resource-data subscription's include_resource_data to
-// false via Patch (issue #13): the CURRENT remote state already has
+// false via Patch: the CURRENT remote state already has
 // include_resource_data=true, and the request is false. before==false makes
 // ANY false request a harmless no-op (already false; Patching false again
 // changes nothing) — that pre-existing behavior is completely unchanged.
@@ -270,9 +268,9 @@ func doPatchSubscription(ctx context.Context, svc updateSubscriptionAPI, remoteS
 // desiredForRecreate=false, an already-ENCRYPTED subscription
 // (before.PayloadOptions.IncludeResourceData==true) requesting
 // --include-resource-data=false, which would otherwise silently Patch the
-// flag away (issue #13; checked in applyUpdate, AFTER the remote Get that
-// discovers before's current state, so it fires on a REAL run before Patch —
-// dry-run instead reports it informationally via updatePlannedAction's
+// flag away (checked in applyUpdate, AFTER the remote Get that discovers
+// before's current state, so it fires on a REAL run before Patch — dry-run
+// instead reports it informationally via updatePlannedAction's
 // "blocked_encryption_switch"). Either way the CLI will not leave a
 // Subscription in an inconsistent state (resource data toggled while its key
 // can be neither added nor removed) — switching either
@@ -282,11 +280,11 @@ func doPatchSubscription(ctx context.Context, svc updateSubscriptionAPI, remoteS
 // delete+recreate example command shows (the value the caller actually
 // wants), so the guidance is directionally correct either way.
 //
-// This is a permanent by-design rejection, not a "not yet supported / retry
-// later" defer. The ON-direction check is a pure local check (no identity/
-// scope/remote read), so a rejected request never touches the network; the
-// OFF-direction check runs after the Get every update already performs, so it
-// adds no extra remote call of its own.
+// This is a permanent by-design rejection, not a retryable readiness problem.
+// The ON-direction check is a pure local check (no identity/scope/remote read),
+// so a rejected request never touches the network; the OFF-direction check runs
+// after the Get every update already performs, so it adds no extra remote call
+// of its own.
 func errUpdateCannotSwitchEncryption(remoteSubscriptionID string, desiredForRecreate bool) error {
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"cannot change include_resource_data or encryption on an existing subscription via update").
@@ -323,10 +321,10 @@ func errUpdateConfirmationRequired(remoteSubscriptionID string, identity core.Id
 // updatePlannedAction is --dry-run's planned_change.action value: "update"
 // normally, the informational "blocked_encryption_switch" when this request
 // would flip an existing ENCRYPTED subscription's include_resource_data to
-// false (issue #13 — checked FIRST: this is a structural "not supported"
-// fact about the request, true or false regardless of suspended state), or
-// "blocked_suspended" when the target is suspended. Like create.go's own
-// conflict/suspended dry-run handling, dry-run always reports the plan
+// false. That is a structural "not supported by update" fact about the
+// request, regardless of suspended state. "blocked_suspended" means the target
+// itself is suspended. Like create.go's own conflict/suspended dry-run handling,
+// dry-run always reports the plan
 // informationally rather than erroring on remote business state — only the
 // preflight steps themselves (identity/scope/flag-shape/encryption-check, already
 // passed by the time this is called) are real dry-run failures. The real

@@ -83,8 +83,8 @@ type Hello struct {
 	// Hello (missing every field below) still decodes unchanged. A bus
 	// seeing them absent MUST treat the sender as a plain (non-refined) Key
 	// registration — no silent downgrade, no new requirement placed on it.
-	// Populating/consuming these is out of scope here (later work);
-	// this struct only carries them over the wire.
+	// This package only defines the wire shape; producer and consumer packages
+	// decide which fields to populate and how to interpret them.
 
 	// ConsumerScopeID groups fan-out for a refined-subscription consumer.
 	// Computed client-side from base key + canonical refined key + authority

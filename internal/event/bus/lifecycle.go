@@ -515,13 +515,10 @@ const (
 )
 
 // classifyUpdateCompatibility compares the updated_v1 event's AFTER snapshot
-// against lead's OWN stored local listening intent — target_resource +
-// include_resource_data (Conn.TargetResource/IncludeResourceDataIntent,
-// populated from HelloV2 at registration) and authority (lead's fixed owner
-// identity) — the complete "local listening intent" issue #7 requires,
-// rather than Authority alone (a remote change to just the subscription's
-// target_resource or payload_options, with Authority left untouched, must
-// not be mis-judged "compatible").
+// against lead's own stored local listening intent: target_resource,
+// include_resource_data, and authority. A remote change to just the
+// subscription's target_resource or payload_options, with Authority left
+// untouched, must not be mis-judged as compatible.
 //
 // Each of the three dimensions is checked independently: an EMPTY/absent
 // value on the EVENT side (le.Authority=="", le.TargetResource=="", or
@@ -896,7 +893,7 @@ func (a *subscriptionLifecycleAction) reactivateAndMaybeBind(ctx context.Context
 // handleExpirationReminder implements the expiration_reminder_v1
 // row: a SINGLE Renew on a hit+eligible match; success clears any prior
 // degraded state (the remote expire_time itself is refreshed server-side —
-// no local field caches it, spec RemoteSubscriptionInfo.ExpireTime is a
+// no local field caches it; protocol.RemoteSubscriptionInfo.ExpireTime is a
 // status.go-only, separately-fetched concept).
 func (a *subscriptionLifecycleAction) handleExpirationReminder(ctx context.Context, le LifecycleEvent, conns []*Conn) error {
 	if len(conns) == 0 {

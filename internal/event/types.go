@@ -34,10 +34,10 @@ type RawEvent struct {
 	// header.subscription (i.e. non-refined events, or events observed
 	// before this normalization existed).
 	//
-	// A later task copies RemoteSubscriptionID/Authority/SubscriptionEventID
-	// verbatim into protocol.Event's fields of the same name; Resource maps
-	// to protocol.Event.TargetResource (name differs intentionally from
-	// Resource here — do not rename either field to match the other).
+	// RemoteSubscriptionID, Authority, and SubscriptionEventID are copied into
+	// protocol.Event fields with the same names. Resource maps to
+	// protocol.Event.TargetResource; the different names reflect the source
+	// envelope vocabulary versus the consumer-facing IPC vocabulary.
 
 	// RemoteSubscriptionID identifies which remote Subscription delivered
 	// this event, from header.subscription.subscription_id.
@@ -199,8 +199,8 @@ type KeyDefinition struct {
 
 	// RefinedSubscription marks this KeyDefinition as a refined-subscription
 	// base key: it is not consumed directly, only materialized through one of
-	// KeyTemplates (resolution added in a later task). Default false = an
-	// ordinary EventKey, looked up and consumed as-is.
+	// KeyTemplates. Default false = an ordinary EventKey, looked up and
+	// consumed as-is.
 	RefinedSubscription bool `json:"refined_subscription,omitempty"`
 
 	// ResourceType is the OAPI resource type that KeyTemplates select against

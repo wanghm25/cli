@@ -97,12 +97,12 @@ type Hub struct {
 
 	// currentResolver is the identity gate's fresh-current-identity resolver,
 	// wired by Bus.SetIdentityProviders via SetCurrentResolver.
-	// nil (the zero value — every non-gated NewHub()/NewBus() caller,
-	// including every existing test) means NO identity gating: every
-	// consumer is delivered to exactly as before this task. Guarded by mu
-	// (read together with the subscribers snapshot at the top of Publish)
-	// rather than a separate lock/atomic — it changes at most once in
-	// practice (bus construction, before Run starts accepting events).
+	// nil (the zero value — every non-gated NewHub()/NewBus() caller)
+	// means NO identity gating: every consumer is delivered according to the
+	// legacy ungated behavior. Guarded by mu (read together with the
+	// subscribers snapshot at the top of Publish) rather than a separate
+	// lock/atomic — it changes at most once in practice (bus construction,
+	// before Run starts accepting events).
 	currentResolver func() (currentIdentity, error)
 }
 
@@ -316,8 +316,7 @@ type publishMatch struct {
 // Dual-index routing: a refined consumer (Subscriber.RemoteSubscriptionID()
 // != "") is matched ONLY by remote_subscription_id equality — never by
 // event_type alone, and never when raw has no remote_subscription_id (never
-// guess which resource an unqualified event belongs to; the consumer-side
-// re-checks event_type/owner/identity later). A legacy
+// guess which resource an unqualified event belongs to). A legacy
 // consumer (RemoteSubscriptionID() == "") keeps today's event_type matching
 // unconditionally — including for refined-native events, which legacy
 // consumers still receive via event_type compat delivery.

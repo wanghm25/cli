@@ -20,12 +20,10 @@ import (
 	"github.com/larksuite/cli/internal/errclass"
 )
 
-// subscriptionService is the subset of the candidate SDK's typed
+// subscriptionService is the subset of the SDK's typed
 // client.Event.V1.Subscription surface this CLI needs: Create/Get/List/
-// Patch/Renew/Reactivate/Delete for the `event subscription` commands,
-// plus GetEncryptKey — a message-decryption foundation that fetches
-// a subscription's encrypt_key but is not yet called by any command.
-// ListByIterator remains out of scope.
+// Patch/Renew/Reactivate/Delete for the `event subscription` commands, plus
+// GetEncryptKey for the bus-side encrypted-event decrypt provider.
 //
 // It exists purely as a test seam: the concrete *lark.Client's
 // Event.V1.Subscription value satisfies this interface structurally (Go
@@ -44,10 +42,8 @@ type subscriptionService interface {
 	Delete(ctx context.Context, req *larkeventv1.DeleteSubscriptionReq, options ...larkcore.RequestOptionFunc) (*larkeventv1.DeleteSubscriptionResp, error)
 }
 
-// SubscriptionClient is a thin CLI <-> lark.Client adapter over the candidate
-// SDK's typed Subscription service (client.Event.V1.Subscription — this is
-// the first typed-SDK-service-client usage in this CLI; everywhere else goes
-// through APIClient.DoSDKRequest's raw transport path). It binds one
+// SubscriptionClient is a thin CLI <-> lark.Client adapter over the SDK's typed
+// Subscription service (client.Event.V1.Subscription). It binds one
 // already-resolved CLI identity to the correct per-call access-token option
 // for its whole lifetime, so the `event subscription` command code calls
 // Create/Get/List/Patch/Renew/Reactivate/Delete without ever handling
@@ -56,8 +52,7 @@ type subscriptionService interface {
 // A user identity carries a larkcore.WithUserAccessToken
 // option on every call; an app/bot identity carries none at all — the SDK
 // mints and caches its own tenant access token from the appID/secret already
-// configured on the *lark.Client. This mirrors how the fork's own e2e harness
-// (scene/eventsub + internal/e2e/clients.go) drives the same service.
+// configured on the *lark.Client.
 //
 // This client never falls back from one identity to the other: construction
 // fails closed (typed error) instead of guessing, matching the "no silent
@@ -153,10 +148,10 @@ func (c *SubscriptionClient) Get(ctx context.Context, req *larkeventv1.GetSubscr
 }
 
 // GetEncryptKey wraps client.Event.V1.Subscription.GetEncryptKey with the
-// bound identity option. A message-decryption foundation: fetches the given
-// subscription's encrypt_key so a later bus-side EncryptKeyProvider can
-// decrypt its events. Requires scope event:encrypt_key:read, which read/write do not
-// imply. Not yet called by any command — later work wires it in.
+// bound identity option. The bus calls it during encrypted refined consumer
+// registration to fetch that subscription's encrypt_key and preload the SDK
+// decrypt provider. Requires scope event:encrypt_key:read, which read/write
+// do not imply.
 func (c *SubscriptionClient) GetEncryptKey(ctx context.Context, req *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
 	resp, err := c.svc.GetEncryptKey(ctx, req, c.opts...)
 	if err != nil {

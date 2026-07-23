@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 // Package subscription implements `lark-cli event subscription` — the
-// management-plane commands for the candidate SDK's remote Subscription
-// resource.
+// management-plane commands for remote event Subscription resources.
 //
 // This file holds the root `subscription` command group plus the pieces
 // shared by every subcommand: --as identity resolution + local scope

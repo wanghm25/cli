@@ -15,6 +15,7 @@ import (
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+
 	// larkeventv1 alias is REQUIRED (mirrors internal/event/subscription_client.go):
 	// this package's declared name is ALSO "larkevent" (a documented
 	// collision with the core event package aliased above), so it must be
@@ -399,11 +400,10 @@ func (s *FeishuSource) handleSubscriptionUpdated(ctx context.Context, e *larkeve
 	}
 	le := normalizeLifecycleEvent(lifecycleEventTypeUpdated, eventID,
 		after.SubscriptionId, after.TargetResource, after.Authority, after.State, after.Suspension, after.ExpireTime)
-	// issue #7: the updated_v1 compatibility check
-	// (bus/lifecycle.go's classifyUpdateCompatibility) needs
-	// payload_options.include_resource_data alongside target_resource/
-	// authority to judge compatibility field-by-field instead of guessing
-	// from Authority alone. PayloadOptionsPresent stays false (and
+	// The bus-side compatibility check needs payload_options.include_resource_data
+	// alongside target_resource and authority so it can compare the remote
+	// subscription snapshot against the local listening intent field by field.
+	// PayloadOptionsPresent stays false (and
 	// IncludeResourceData stays its zero value) when the after snapshot
 	// didn't carry a payload_options.include_resource_data at all — never
 	// guessed as a confirmed "false".
@@ -502,7 +502,7 @@ func (s *FeishuSource) buildRawHandler(emit func(*event.RawEvent)) func(context.
 }
 
 // formatSubscriptionAuthority normalizes the push-envelope's
-// header.subscription.authority{type,principal_id} into this spec's compact
+// header.subscription.authority{type,principal_id} into this package's compact
 // identity vocabulary. Mirrors cmd/event/subscription/subscription.go's
 // formatAuthority (same "user:<id>" / "user" / "app" / passthrough rules),
 // but takes the push-envelope's {type, principal_id} shape rather than the
@@ -545,15 +545,12 @@ type sdkLogger struct {
 // tail (which carries no key, but also no useful routing info).
 var subscriptionDecryptFailureRe = regexp.MustCompile(`subscription event decryption failed \(subscription_id=([^)]*)\)`)
 
-// decryptFailureLogClass is the fixed classification a decrypt-failure SDK
-// Error line is rewritten to before it ever reaches bus.log (issue #14 / the
-// §4.7 red line: an error may carry at most subscription_id/stage/
-// classification/log_id — never the crypto/padding detail the SDK's raw
-// error tail carries after the matched "(subscription_id=...)", e.g. "illegal
-// base64 data" / "cipher too short" / "ciphertext is not a multiple of the
-// block size", any of which could serve as a decryption oracle). Mirrors
-// Conn.decryptStateFailed's own "decrypt_failed" token (bus/conn.go) rather
-// than inventing a second name for the same concept.
+// decryptFailureLogClass is the fixed classification used when a decrypt-failure
+// SDK error line is rewritten before it reaches bus.log. The log must not carry
+// the crypto/padding detail in the SDK's raw error tail, e.g. "illegal base64
+// data", "cipher too short", or "ciphertext is not a multiple of the block
+// size", because those details could become a decryption oracle. The token
+// mirrors Conn.decryptStateFailed's "decrypt_failed" state.
 const decryptFailureLogClass = "decrypt_failed"
 
 // redactDecryptFailureLine detects a decrypt-failure SDK Error line
@@ -592,8 +589,8 @@ func (a *sdkLogger) Warn(_ context.Context, args ...interface{}) {
 func (a *sdkLogger) Error(_ context.Context, args ...interface{}) {
 	msg := fmt.Sprint(args...)
 	// A decrypt-failure line's raw SDK tail (base64/cipher/padding detail)
-	// must never reach bus.log (issue #14) — redact BEFORE logging or
-	// notifying. tryDecryptFailure below only ever extracts a
+	// must never reach bus.log. Redact before logging or notifying.
+	// tryDecryptFailure below only ever extracts a
 	// subscription_id from the ORIGINAL msg and never logs/forwards the line
 	// itself, so it intentionally keeps using msg, not the redacted copy.
 	logLine := redactDecryptFailureLine(msg)

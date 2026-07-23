@@ -213,9 +213,9 @@ func (p *encryptKeyProvider) resolveOwnerIdentity(ctx context.Context, owner *Co
 }
 
 // encryptKeyProvider fetch sentinels. Each is deliberately key-free and safe to
-// log/classify. errEncryptKeyOwnerMismatch reuses the same §8 red line the
-// delivery/lifecycle gates enforce: owner != current never fetches, never
-// loads a historical UAT.
+// log/classify. errEncryptKeyOwnerMismatch uses the same identity boundary as
+// the delivery/lifecycle gates: owner != current never fetches and never loads
+// a historical UAT.
 var (
 	errEncryptKeyNoSubID       = errors.New("encrypt-key: empty remote_subscription_id")
 	errEncryptKeyNoOwner       = errors.New("encrypt-key: no owner consumer")

@@ -11,14 +11,11 @@ import (
 )
 
 // encryptKeyRandomBytes is the number of OS-CSPRNG bytes read to build one
-// fresh per-subscription encrypt_key. The candidate SDK's EventDecrypt derives
-// the actual AES-256 key via `sha256.Sum256([]byte(encrypt_key))` (verified
-// in the 4c77bba clone's event/event.go) — so encrypt_key itself has no
-// fixed platform format, only entropy matters, and the SDK never decodes it
-// back to raw bytes. 32 bytes (256 bits) matches the AES-256 key size the
-// hash produces and is this repo's own bar for a generated secret; there is
-// no reason to exceed it since the hash saturates at 256 bits regardless of
-// how much more input entropy is supplied.
+// fresh per-subscription encrypt_key. The SDK derives the AES-256 key by
+// hashing the encrypt_key string, so the encrypt_key itself has no fixed
+// platform format; only entropy matters, and the SDK never decodes it back to
+// raw bytes. 32 bytes (256 bits) matches the derived key size and is this
+// repo's bar for a generated subscription secret.
 const encryptKeyRandomBytes = 32
 
 // newEncryptKey generates one fresh, high-entropy per-subscription

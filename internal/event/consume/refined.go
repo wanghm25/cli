@@ -175,7 +175,7 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 			}
 
 			// scopeUserOpenID mirrors buildHelloV2's own bot-drops-UserOpenID
-			// rule (review Fix 2, Minor #3): a bot consumer's ConsumerScopeID
+			// rule: a bot consumer's ConsumerScopeID
 			// must be user-independent, matching what actually goes out on
 			// the wire — otherwise it would vary with whoever happens to be
 			// logged in on this host, fragmenting app-level fan-out for a
@@ -286,8 +286,8 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 	ack, br, err := deps.hello(ctx, conn, remoteSubscriptionID)
 	if err != nil {
 		// Same rationale as the startBus-fail branch above: Apply already
-		// succeeded, so this must carry the same recovery Hint (review Fix
-		// 3), not a generic unactionable message.
+		// succeeded, so this must carry the same recovery Hint, not a
+		// generic unactionable message.
 		return errApplyOkHelloFailed(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, err)
 	}
 	// An encrypted consumer whose Hello-time key fetch failed is rejected by
@@ -467,8 +467,8 @@ func refinedConflictError(resolved event.ResolvedEventKey, identity core.Identit
 }
 
 // applyOkRecoveryHint builds the recovery guidance shared by EVERY
-// post-Apply failure (review Fix 3): once Apply has succeeded, a remote
-// write may have just happened, and refined cleanup is nil — no
+// post-Apply failure: once Apply has succeeded, a remote write may have just
+// happened, and refined cleanup is nil — no
 // later failure in this chain (local bus won't start, HelloV2
 // transport/decode error, or the bus rejecting the handshake) may ever
 // delete it. All three must therefore surface the SAME actionable
@@ -498,13 +498,10 @@ func errApplyOkStartBusFailed(resolved event.ResolvedEventKey, identity core.Ide
 		WithHint(applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
 }
 
-// errApplyOkHelloFailed is errApplyOkStartBusFailed's HelloV2 counterpart
-// (review Fix 3, Minor #2): a transport/decode error during the HelloV2
-// handshake, AFTER Apply already succeeded and the bus already started, must
-// be exactly as actionable — same typed InternalError shape, same recovery
-// Hint — as a startBus failure. Before this fix, this path returned a
-// generic InternalError with no Hint at all, even though it leaves the exact
-// same remote-subscription-behind situation.
+// errApplyOkHelloFailed is errApplyOkStartBusFailed's HelloV2 counterpart. A
+// transport/decode error during the HelloV2 handshake happens after Apply
+// already succeeded and the bus already started, so it must be as actionable
+// as a startBus failure and carry the same recovery hint.
 func errApplyOkHelloFailed(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool, cause error) error {
 	return errs.NewInternalError(errs.SubtypeUnknown,
 		"remote subscription is ready but the event bus handshake failed: %s", cause).
@@ -513,18 +510,12 @@ func errApplyOkHelloFailed(resolved event.ResolvedEventKey, identity core.Identi
 }
 
 // applyOkRejectedError is errApplyOkStartBusFailed's bus-rejection
-// counterpart (review Fix 3, Minor #2): rejectionError (consume.go, shared
-// with the legacy Run path) already returns a typed failed_precondition
-// naming the single-consumer conflict — that guidance stays useful and is
-// deliberately left in Message untouched. What it lacks, and what this adds,
-// is the SAME remote_subscription_id/created_by_this_attempt/next_action
-// recovery Hint every other post-Apply failure in this chain carries — Apply
-// already succeeded here too, so it is exactly as important to know the
-// remote subscription was left as-is. Appended (never replacing) the
-// original Hint so neither piece of guidance is lost. rejectionError only
-// ever returns nil or a *errs.ValidationError (see its own doc comment); the
-// errors.As failing is not a reachable case today, but falls back to
-// returning rejErr unchanged rather than panicking if that ever changes.
+// counterpart. rejectionError (consume.go, shared with the legacy Run path)
+// already returns a typed failed_precondition naming the single-consumer
+// conflict; this appends the same remote_subscription_id/
+// created_by_this_attempt/next_action recovery hint used by other post-Apply
+// failures. The original hint is preserved so the local rejection reason and
+// the remote recovery context are both visible.
 func applyOkRejectedError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool, rejErr error) error {
 	var ve *errs.ValidationError
 	if !errors.As(rejErr, &ve) {
@@ -557,10 +548,10 @@ func writeRefinedDryRunPreview(errOut io.Writer, resolved event.ResolvedEventKey
 // never repurposed to carry the remote id; remoteSubscriptionID is the
 // separate v2 field for that. UserOpenID is only ever set for a user
 // identity — a bot Hello never carries a stray open_id. targetResource is
-// this consumer's own resolved target resource (issue #7): the bus stores it
-// on the registered Conn as this consumer's local listening intent, so a
-// later updated_v1 lifecycle event can be compared against what was actually
-// asked for rather than against Authority alone.
+// this consumer's own resolved target resource; the bus stores it on the
+// registered Conn as this consumer's local listening intent, so a later
+// updated_v1 lifecycle event can be compared against what was actually asked
+// for rather than against Authority alone.
 func buildHelloV2(resolved event.ResolvedEventKey, identity core.Identity, localSubscriptionID, profile, userOpenID, remoteSubscriptionID, consumerScopeID, targetResource string) *protocol.Hello {
 	h := protocol.NewHello(os.Getpid(), resolved.MaterializedKey, []string{resolved.Definition.EventType}, "v1", localSubscriptionID)
 	h.Identity = string(identity)

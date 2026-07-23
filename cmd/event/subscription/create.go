@@ -318,8 +318,8 @@ const (
 // eventlib.EncryptKeyProber structurally (createSubscriptionAPI declares the
 // same GetEncryptKey method), so ReconcileExisting can resolve the
 // encryption conflict matrix for an active, include_resource_data=true
-// match. requestedIncludeResourceData=false takes the exact same path as
-// before this task (no option supplied) — byte-for-byte unchanged.
+// match. requestedIncludeResourceData=false takes the plaintext path with
+// no encryption probe.
 func reconcileExisting(ctx context.Context, svc createSubscriptionAPI, eventType, targetResource string, identity core.Identity, requestedIncludeResourceData bool) (*reconcilePlan, error) {
 	if requestedIncludeResourceData {
 		return eventlib.ReconcileExisting(ctx, svc, eventType, targetResource, identity, true, eventlib.WithEncryptKeyProber(svc))
@@ -483,12 +483,11 @@ func doCreateSubscription(ctx context.Context, svc createSubscriptionAPI, eventT
 // *larkeventv1.CreateSubscriptionReq itself (what
 // NewCreateSubscriptionReqBuilder().Body(body).Build() produces) is NOT
 // similarly inspectable from this package: its builder stores body into an
-// internal, unexported apiReq field for the SDK's own transport to read
-// (verified in the 4c77bba clone's resource.go), never into
-// CreateSubscriptionReq's own same-named exported Body field — so a test
-// capturing the built *CreateSubscriptionReq itself (e.g. via a fake
-// Create's captured request) cannot read back what it carried; testing this
-// function directly is the only way to assert the request's actual content.
+// internal, unexported apiReq field for the SDK's own transport to read,
+// never into CreateSubscriptionReq's own same-named exported Body field. A
+// test capturing the built *CreateSubscriptionReq itself therefore cannot
+// read back what it carried; testing this function directly is the reliable
+// way to assert the request's actual content.
 func buildCreateSubscriptionBody(eventType, targetResource string, includeResourceData bool, encryptKey string) *larkeventv1.CreateSubscriptionReqBody {
 	payloadOptions := larkeventv1.NewCreatePayloadOptionsBuilder().IncludeResourceData(includeResourceData)
 	if encryptKey != "" {

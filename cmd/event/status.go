@@ -392,26 +392,23 @@ func staleIdentityAdvisory(match, applicable bool) string {
 // --- weak remote supplement (read-only) ---
 
 // refinedSubscriptionGetter narrows *eventlib.SubscriptionClient to the two
-// calls the remote supplement needs — mirrors
-// cmd/event/subscription/get.go's getSubscriptionAPI test seam, so tests
-// substitute a fake with no *lark.Client or network call involved. List is
-// the issue #8 addition: once there are more distinct remote_subscription_ids
-// than remoteSupplementListThreshold, ONE List call is cheaper than that many
-// individual Gets.
+// calls the remote supplement needs. Tests substitute a fake with no
+// *lark.Client or network call involved. List is included so the supplement can
+// switch from one Get per id to one List call when many distinct
+// remote_subscription_ids are present.
 type refinedSubscriptionGetter interface {
 	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
 	List(ctx context.Context, req *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error)
 }
 
 // remoteSupplementListThreshold is supplementRefinedConsumers's dedup/List
-// switchover point (issue #8): AT or below this many DISTINCT
-// remote_subscription_ids, one Get per id (as before, just deduped) stays
-// exactly as targeted as before; ABOVE it, a single List call (whatever the
-// server's one default-size page returns) is cheaper than that many
-// individual Gets. This is a weak, best-effort supplement — List takes no id
-// filter, so any wanted id not present in that one page simply stays
-// local-only, same as an unreachable/errored Get would; there is no
-// pagination loop chasing full coverage.
+// switchover point: at or below this many distinct remote_subscription_ids,
+// one Get per id stays targeted; above it, a single List call (whatever the
+// server's one default-size page returns) is cheaper than that many individual
+// Gets. This is a weak, best-effort supplement — List takes no id filter, so
+// any wanted id not present in that one page simply stays local-only, same as
+// an unreachable/errored Get would; there is no pagination loop chasing full
+// coverage.
 const remoteSupplementListThreshold = 5
 
 // requiredRemoteSupplementScopes is the single scope status's weak remote
@@ -540,14 +537,12 @@ func applyRefinedSupplement(ctx context.Context, statuses []appStatus, curAppID 
 // that id to local-only (unreachable -> local-only, no fail) — it never
 // aborts the rest and never returns an error itself.
 //
-// Issue #8: reads are deduped by remote_subscription_id FIRST — several
-// consumers can share one id (e.g. two local processes bound to the same
-// remote Subscription), and the old code issued one Get per CONSUMER,
-// silently re-fetching the same id repeatedly. Each distinct id is now read
-// exactly once and its result fanned out to every consumer sharing it: at
-// or below remoteSupplementListThreshold distinct ids via one Get per id (as
-// before, just deduped); above it via a single List call instead of that
-// many individual Gets.
+// Reads are deduped by remote_subscription_id first. Several consumers can
+// share one id (e.g. two local processes bound to the same remote
+// Subscription), so each distinct id is read exactly once and its result is
+// fanned out to every consumer sharing it: at or below
+// remoteSupplementListThreshold distinct ids via one Get per id; above it via
+// a single List call instead of that many individual Gets.
 func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionGetter, consumers []protocol.ConsumerInfo) {
 	if getter == nil {
 		return
@@ -587,10 +582,10 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 }
 
 // getRemoteSupplementDetails fetches each of wantIDs' remote Subscription
-// snapshots via ONE Get per distinct id (issue #8's deduped path: at most
-// len(wantIDs) calls, never one per consumer). An error or empty/malformed
-// response for one id simply omits it from the returned map — the caller
-// treats a missing entry as "stays local-only", never a failure.
+// snapshots via ONE Get per distinct id: at most len(wantIDs) calls, never one
+// per consumer. An error or empty/malformed response for one id simply omits it
+// from the returned map — the caller treats a missing entry as "stays
+// local-only", never a failure.
 func getRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) map[string]*larkeventv1.SubscriptionDetail {
 	out := make(map[string]*larkeventv1.SubscriptionDetail, len(wantIDs))
 	for id := range wantIDs {
@@ -605,14 +600,14 @@ func getRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionG
 }
 
 // listRemoteSupplementDetails fetches ALL of wantIDs' remote Subscription
-// snapshots via ONE SubscriptionClient.List call (issue #8: cheaper than
-// len(wantIDs) individual Gets once there are more than
-// remoteSupplementListThreshold distinct ids). List takes no id filter (only
-// state/target_resource/event_type), so this reads however many the server
-// returns on its single default-size page and keeps only the ones actually
-// asked for; any wanted id NOT present in that one page is simply omitted —
-// same "stays local-only" degrade as an unreachable/errored Get, never a
-// second remote round-trip chasing full coverage (this is a weak,
+// snapshots via ONE SubscriptionClient.List call. This is cheaper than
+// individual Gets once there are more than remoteSupplementListThreshold
+// distinct ids. List takes no id filter (only state/target_resource/event_type),
+// so this reads however many the server returns on its single default-size page
+// and keeps only the ones actually asked for; any wanted id NOT present in that
+// one page is simply omitted — same "stays local-only" degrade as an
+// unreachable/errored Get, never a second remote round-trip chasing full
+// coverage (this is a weak,
 // best-effort supplement, not a completeness guarantee).
 func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) map[string]*larkeventv1.SubscriptionDetail {
 	out := make(map[string]*larkeventv1.SubscriptionDetail, len(wantIDs))
