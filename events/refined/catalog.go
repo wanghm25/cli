@@ -16,7 +16,7 @@ var refinedKeysMockJSON []byte
 
 // Keys returns the MOCK refined-subscription catalog.
 // meta-swap: replace this embedded mock with the fetch_meta-driven catalog
-// once the new meta ships (spec §0.3/§2.2). Registry/consumers unchanged.
+// once the new meta ships. Registry/consumers unchanged.
 func Keys() []event.KeyDefinition {
 	var defs []event.KeyDefinition
 	if err := json.Unmarshal(refinedKeysMockJSON, &defs); err != nil {
