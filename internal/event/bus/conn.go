@@ -106,6 +106,18 @@ type Conn struct {
 	lastActionError  string
 	nextAction       string
 
+	// --- decryption state (spec §4.7 "失败语义与可观测性", Module E) ----------
+	// decryptState is this consumer's most recent per-subscription decryption
+	// status, produced by the bus-side EncryptKeyProvider (encrypt_key.go, E4)
+	// and the SDK-decrypt-failure path (E6): "" (no encrypted delivery seen /
+	// not applicable), "decrypted" (a usable key is available), or an error
+	// class — "decrypt_key_unavailable" (no key: identity mismatch, missing
+	// scope, GetEncryptKey failed) / "decrypt_failed" (key held but SDK
+	// decrypt/parse failed). Same identityMu, same writers/readers as the
+	// lifecycle block above. NEVER holds a key, ciphertext, or raw error — only
+	// a short classification (spec §4.7 敏感信息红线).
+	decryptState string
+
 	onClose         func(*Conn)
 	checkLastForKey func(scope string) bool
 	logger          *log.Logger
@@ -369,6 +381,24 @@ func (c *Conn) clearActionDegraded() {
 	defer c.identityMu.Unlock()
 	c.degradedReason = ""
 	c.nextAction = ""
+}
+
+// DecryptState returns this consumer's most recent decryption status ("" =
+// none/not applicable). A short classification only — never a key/ciphertext
+// (spec §4.7 敏感信息红线).
+func (c *Conn) DecryptState() string {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	return c.decryptState
+}
+
+// SetDecryptState records the decryption status (Module E). state is one of
+// the small stable tokens documented on the decryptState field — never a raw
+// SDK error or any key material.
+func (c *Conn) SetDecryptState(state string) {
+	c.identityMu.Lock()
+	defer c.identityMu.Unlock()
+	c.decryptState = state
 }
 
 func (c *Conn) SendCh() chan interface{} { return c.sendCh }

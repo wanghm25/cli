@@ -52,6 +52,18 @@ type FeishuSource struct {
 	// wired to needs internal/core-adjacent state this SDK-typed-only package
 	// must stay out of. nil is tolerated (no lifecycle executor configured).
 	OnLifecycleEvent func(ctx context.Context, le LifecycleEvent)
+
+	// EncryptKeyProvider supplies per-subscription_id encrypt_keys so the SDK
+	// EventDispatcher can transparently decrypt whole-envelope encrypted
+	// subscription events (spec §4.7, Module E). An SDK interface type
+	// (larkevent.EncryptKeyProvider) so this SDK-typed-only package needs no
+	// bus import — the bus wires its own implementation in (bus.go's
+	// startSources). nil is tolerated and is the 100%-unchanged path: without
+	// it buildDispatcher never calls WithEncryptKeyProvider, so an encrypted
+	// envelope simply fails the existing parse (fail-closed, no plaintext
+	// fallback) exactly as before Module E. The key never crosses back out of
+	// the SDK through this field.
+	EncryptKeyProvider larkevent.EncryptKeyProvider
 }
 
 // LifecycleEvent is FeishuSource's normalized shape for one of the SDK's 6
@@ -162,6 +174,13 @@ func (s *FeishuSource) Start(ctx context.Context, eventTypes []string, emit func
 // (mirrors buildRawHandler's own extraction below).
 func (s *FeishuSource) buildDispatcher(eventTypes []string, emit func(*event.RawEvent)) *dispatcher.EventDispatcher {
 	d := dispatcher.NewEventDispatcher("", "")
+
+	// Module E (spec §4.7): opt into per-subscription decryption. Leaving the
+	// provider unset keeps the non-encrypted path 100% unchanged (the SDK only
+	// consults it for envelopes carrying a top-level encrypt_info).
+	if s.EncryptKeyProvider != nil {
+		d.WithEncryptKeyProvider(s.EncryptKeyProvider)
+	}
 
 	rawHandler := s.buildRawHandler(emit)
 

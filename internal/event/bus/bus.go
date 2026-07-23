@@ -71,6 +71,18 @@ type Bus struct {
 	// recording, zero remote calls, zero panics) until wired.
 	lifecycleAction *subscriptionLifecycleAction
 
+	// encryptKeyProvider is the bus-side larkevent.EncryptKeyProvider (Module
+	// E, task E4) the FeishuSource dispatcher decrypts encrypted subscription
+	// envelopes with (spec §4.7). Always constructed by NewBus (never nil), but
+	// like lifecycleAction its two remote dependencies (identityGate, the
+	// GetEncryptKey client factory) start nil and are filled in by
+	// SetIdentityProviders/SetSubscriptionClient — until then it serves bot
+	// subscriptions with no key and user subscriptions not at all, always
+	// fail-closed. The key it caches lives ONLY in this object's in-memory SDK
+	// StaticEncryptKeyProvider — never logged, never on the IPC wire, never in
+	// status (spec §4.7 敏感信息红线).
+	encryptKeyProvider *encryptKeyProvider
+
 	// pidHandle pins the alive.lock fd to the bus lifetime; OS releases on exit.
 	pidHandle *busdiscover.Handle
 }
@@ -88,9 +100,10 @@ func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logge
 		startTime: time.Now(),
 		conns:     make(map[*Conn]struct{}),
 		// Buffered so shutdown and source-exit paths never drop the signal.
-		shutdownCh:        make(chan struct{}, 1),
-		lifecycleExecutor: newLifecycleExecutor(hub, action, logger),
-		lifecycleAction:   action,
+		shutdownCh:         make(chan struct{}, 1),
+		lifecycleExecutor:  newLifecycleExecutor(hub, action, logger),
+		lifecycleAction:    action,
+		encryptKeyProvider: newEncryptKeyProvider(hub, logger),
 	}
 }
 
@@ -116,6 +129,9 @@ func (b *Bus) SetIdentityProviders(resolveUAT func(ctx context.Context, appID, u
 	// Task 18: the real lifecycle action's owner==current gate (spec §8) and
 	// bindConsumer (activated/suspended-recovery) both need this SAME gate.
 	b.lifecycleAction.setIdentityGate(b.identityGate)
+	// Module E (E4): the encrypt-key provider reuses the SAME gate for a user
+	// subscription's owner==current check + fresh-UAT mint (spec §4.7/§8).
+	b.encryptKeyProvider.setIdentityGate(b.identityGate)
 }
 
 // SetSubscriptionClient injects the *lark.Client Task 18's real lifecycle
@@ -138,6 +154,13 @@ func (b *Bus) SetSubscriptionClient(sdk *lark.Client) {
 		return
 	}
 	b.lifecycleAction.setNewSubscriptionClient(func(as core.Identity, uat string) (subscriptionActionClient, error) {
+		return event.NewSubscriptionClient(sdk, as, uat)
+	})
+	// Module E (E4): the encrypt-key provider fetches keys via GetEncryptKey on
+	// the SAME per-app *lark.Client, deciding the per-call identity (bot, or a
+	// specific user's FRESH uat — never a historical one, spec §8) fresh for
+	// every fetch, exactly like the lifecycle action above.
+	b.encryptKeyProvider.setNewClient(func(as core.Identity, uat string) (encryptKeyClient, error) {
 		return event.NewSubscriptionClient(sdk, as, uat)
 	})
 }
@@ -247,6 +270,11 @@ func (b *Bus) startSources(ctx context.Context) {
 			fs.OnConnReady = b.identityGate.onConnReady
 		}
 		fs.OnLifecycleEvent = b.lifecycleExecutor.Submit
+		// Module E (E4): the dispatcher decrypts encrypted subscription
+		// envelopes via this provider (spec §4.7). Non-encrypted events never
+		// reach it (the SDK only calls EncryptKey for envelopes carrying a
+		// top-level encrypt_info), so wiring it is a no-op for the plaintext path.
+		fs.EncryptKeyProvider = b.encryptKeyProvider
 		sources = []source.Source{fs}
 	}
 	eventTypes := subscribedEventTypes()

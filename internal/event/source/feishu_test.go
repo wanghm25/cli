@@ -6,6 +6,7 @@ package source
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
@@ -300,6 +301,66 @@ func TestBuildDispatcher_RegistersAllSixLifecycleHandlers_NoPanic(t *testing.T) 
 
 	if len(captured) != len(types) {
 		t.Fatalf("OnLifecycleEvent called %d times, want %d (captured=%+v)", len(captured), len(types), captured)
+	}
+}
+
+// recordingEncryptKeyProvider is a structural larkevent.EncryptKeyProvider that
+// records which subscription_ids it was asked for (Module E wiring tests).
+type recordingEncryptKeyProvider struct {
+	mu    sync.Mutex
+	asked []string
+	key   string
+	ok    bool
+}
+
+func (r *recordingEncryptKeyProvider) EncryptKey(_ context.Context, subID string) (string, bool) {
+	r.mu.Lock()
+	r.asked = append(r.asked, subID)
+	r.mu.Unlock()
+	return r.key, r.ok
+}
+
+// encryptedEnvelope is a whole-envelope encrypted subscription push body (spec
+// §4.7): top-level plaintext encrypt_info (routing) + encrypt (ciphertext).
+const encryptedEnvelope = `{"encrypt_info":{"subscription":{"subscription_id":"sub_enc_1"}},"encrypt":"not-real-ciphertext"}`
+
+// TestBuildDispatcher_EncryptKeyProviderConsultedAndFailClosed proves task E4's
+// wiring: with an EncryptKeyProvider set, buildDispatcher calls
+// WithEncryptKeyProvider, so the SDK consults it (by subscription_id) for an
+// encrypted envelope. On a miss the envelope stays encrypted and fails the
+// downstream parse fail-closed — it NEVER reaches emit (no ciphertext delivery).
+func TestBuildDispatcher_EncryptKeyProviderConsultedAndFailClosed(t *testing.T) {
+	prov := &recordingEncryptKeyProvider{ok: false} // miss
+	s := &FeishuSource{EncryptKeyProvider: prov}
+	var emitted int
+	d := s.buildDispatcher([]string{"im.message.receive_v1"}, func(*event.RawEvent) { emitted++ })
+
+	// A miss leaves the body encrypted -> downstream parse fails -> Do errors.
+	// That error is the fail-closed behavior; we assert on the side effects.
+	_, _ = d.Do(context.Background(), []byte(encryptedEnvelope))
+
+	prov.mu.Lock()
+	asked := append([]string(nil), prov.asked...)
+	prov.mu.Unlock()
+	if len(asked) != 1 || asked[0] != "sub_enc_1" {
+		t.Fatalf("provider consulted for %v, want [sub_enc_1] (WithEncryptKeyProvider not wired?)", asked)
+	}
+	if emitted != 0 {
+		t.Errorf("emit called %d times, want 0: an undecryptable envelope must never be delivered", emitted)
+	}
+}
+
+// TestBuildDispatcher_NilEncryptKeyProvider_Unchanged proves the opt-in
+// contract: with no provider, WithEncryptKeyProvider is never called, so an
+// encrypted envelope is handled exactly as before Module E (parse-fails, no
+// emit) — and no provider is consulted because there is none.
+func TestBuildDispatcher_NilEncryptKeyProvider_Unchanged(t *testing.T) {
+	s := &FeishuSource{} // no EncryptKeyProvider
+	var emitted int
+	d := s.buildDispatcher([]string{"im.message.receive_v1"}, func(*event.RawEvent) { emitted++ })
+	_, _ = d.Do(context.Background(), []byte(encryptedEnvelope))
+	if emitted != 0 {
+		t.Errorf("emit called %d times, want 0", emitted)
 	}
 }
 
