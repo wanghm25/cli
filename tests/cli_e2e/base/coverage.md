@@ -1,9 +1,9 @@
 # Base CLI E2E Coverage
 
 ## Metrics
-- Denominator: 78 leaf commands
-- Covered: 22
-- Coverage: 28.2%
+- Denominator: 80 leaf commands
+- Covered: 24
+- Coverage: 30.0%
 
 ## Summary
 - TestBase_BasicWorkflow: proves `+base-create`, `+base-get`, `+table-create`, `+table-get`, and `+table-list`; key `t.Run(...)` proof points are `get base as bot`, `get table as bot`, and `list tables and find created table as bot`.
@@ -12,8 +12,10 @@
 - TestBaseRecordBatchUpdatePerRecordDryRun: proves `+record-batch-update` preserves the per-record `update_records` request shape.
 - TestBaseRecordBatchUpdatePerRecordWorkflow: creates two records, updates different field types in one request, asserts the minimal response contract, reads both records back, verifies a missing record ID is not prevalidated, and cleans up the temporary Base.
 - TestBase_RoleWorkflow: proves `+advperm-enable`, `+role-create`, `+role-list`, `+role-get`, and `+role-update`; key `t.Run(...)` proof points are `list as bot`, `get as bot`, and `update as bot`.
+- TestBaseTableCopyDryRun: proves user/bot `+table-copy` and `+table-copy-status` request shapes, including the schema-safe default, table-name path escaping, explicit all+wait orchestration, Cobra duration parsing, and the opaque task ID body.
+- TestBaseTableCopyWorkflow: feature-gated by `LARK_CLI_E2E_BASE_TABLE_COPY_READY=1` until the OpenAPI is deployed; creates a source table and record, proves schema-only copy, all no-wait plus status, all wait, record inclusion, and cleanup.
 - Cleanup note: `+table-delete` and `+role-delete` only run in cleanup and are intentionally left uncovered.
-- Blocked area: dashboard, field, most record operations, form, view, and workflow operations still lack deterministic create/read/update workflows in this suite.
+- Blocked area: table-copy live integration remains deployment-gated; dashboard, field, most record operations, form, view, and workflow operations still lack deterministic create/read/update workflows in this suite.
 
 ## Command Table
 
@@ -73,6 +75,8 @@
 | ✓ | base +role-list | shortcut | base_role_workflow_test.go::TestBase_RoleWorkflow/list as bot | `--base-token` | |
 | ✓ | base +role-update | shortcut | base_role_workflow_test.go::TestBase_RoleWorkflow/update as bot | `--base-token`; `--role-id`; `--json` | |
 | ✓ | base +table-create | shortcut | base/helpers_test.go::createTableWithRetry | `--base-token`; `--name`; optional `--fields`; optional `--view` | helper asserts table id |
+| ✓ | base +table-copy | shortcut | base_table_copy_dryrun_test.go::TestBaseTableCopyDryRun; base_table_copy_workflow_test.go::TestBaseTableCopyWorkflow | `--table-id` ID/name; default `--range schema`; explicit `--range all --wait --timeout`; user/bot | dry-run covered; live workflow is deployment-gated and not yet verified |
+| ✓ | base +table-copy-status | shortcut | base_table_copy_dryrun_test.go::TestBaseTableCopyDryRun/status; base_table_copy_workflow_test.go::TestBaseTableCopyWorkflow/all no-wait and status | opaque `--task-id`; user/bot | dry-run covered; live polling is deployment-gated and not yet verified |
 | ✕ | base +table-delete | shortcut |  | none | cleanup only |
 | ✓ | base +table-get | shortcut | base_basic_workflow_test.go::TestBase_BasicWorkflow/get table as bot | `--base-token`; `--table-id` | |
 | ✓ | base +table-list | shortcut | base_basic_workflow_test.go::TestBase_BasicWorkflow/list tables and find created table as bot | `--base-token` | |
