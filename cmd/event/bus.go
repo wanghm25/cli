@@ -5,6 +5,7 @@ package event
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/larksuite/cli/errs"
+	"github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
@@ -20,6 +22,39 @@ import (
 	"github.com/larksuite/cli/internal/event/bus"
 	"github.com/larksuite/cli/internal/event/transport"
 )
+
+// getStoredUAToken is indirected so verifyUATBelongsToUser is testable without
+// the OS keychain. Production reads the keychain-backed UAT store, which is
+// keyed by (appID, userOpenID). Tests override it.
+var getStoredUAToken = auth.GetStoredToken
+
+// errUATUserMismatch is verifyUATBelongsToUser's rejection: the freshly
+// resolved UAT provably belongs to a different user than the one the identity
+// gate resolved as current. Deliberately names no token value.
+var errUATUserMismatch = errors.New("event bus: resolved user access token does not belong to the requested user (the active profile/user may have switched); refusing to use another user's token")
+
+// verifyUATBelongsToUser confirms a freshly resolved UAT actually belongs to
+// userOpenID. ResolveToken re-resolves the active account by appID alone, so a
+// profile / active-user switch between the identity gate's resolveCurrent and
+// this mint could otherwise return a DIFFERENT user's token (review
+// #5/#6/#10). The keychain stores each user's UAT under (appID, userOpenID):
+// when a token IS stored for the requested user and the resolved token differs,
+// it provably belongs to someone else and is rejected. A missing stored token
+// (e.g. an extension credential provider that keeps nothing in the keychain,
+// which owns its own identity binding) cannot be disproven here and falls back
+// to the fresh owner==current gate the caller already applied — never a
+// false reject. Never compares or logs the token value beyond an equality
+// check against the same user's own stored copy.
+func verifyUATBelongsToUser(appID, userOpenID, token string) error {
+	if userOpenID == "" || token == "" {
+		return nil
+	}
+	stored := getStoredUAToken(appID, userOpenID)
+	if stored != nil && stored.AccessToken != token {
+		return errUATUserMismatch
+	}
+	return nil
+}
 
 // NewCmdBus creates the hidden `event _bus` daemon subcommand, forked by the consume client; fork argv lives in consume/startup.go.
 func NewCmdBus(f *cmdutil.Factory) *cobra.Command {
@@ -53,17 +88,23 @@ func NewCmdBus(f *cmdutil.Factory) *cobra.Command {
 			// configured extension credential provider, not just the
 			// built-in keychain-backed default) and is uncached for UAT —
 			// see internal/credential/default_provider.go's resolveUAT doc
-			// ("may be refreshed between calls"). userOpenID is accepted
-			// for parity with the identity gate's seam (and potential
-			// future use/diagnostics) but isn't threaded through:
-			// ResolveToken has no per-user-open-id parameter and instead
-			// re-resolves the active account itself via the same
-			// fresh-config-read path the gate's resolveCurrent just used,
-			// so the two can never disagree on which stored token gets
-			// fetched within one connect/reconnect action.
+			// ("may be refreshed between calls").
+			//
+			// ResolveToken has no per-user-open-id parameter: it re-resolves
+			// the active account itself by appID. The identity gate resolves
+			// current=(appID,userOpenID) FIRST and passes userOpenID here, so
+			// a profile / active-user switch between those two steps could mint
+			// a DIFFERENT user's token. verifyUATBelongsToUser closes that race
+			// (review #5/#6/#10): the keychain stores each user's UAT under
+			// (appID, userOpenID), so a resolved token that provably belongs to
+			// another user is rejected — no wrong-user UAT ever reaches
+			// Renew/Reactivate/Get/BindUser or the Hello-time encrypt_key fetch.
 			b.SetIdentityProviders(func(ctx context.Context, appID, userOpenID string) (string, error) {
 				result, err := f.Credential.ResolveToken(ctx, credential.NewTokenSpec(core.AsUser, appID))
 				if err != nil {
+					return "", err
+				}
+				if err := verifyUATBelongsToUser(appID, userOpenID, result.Token); err != nil {
 					return "", err
 				}
 				return result.Token, nil

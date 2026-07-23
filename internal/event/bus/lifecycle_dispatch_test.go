@@ -696,11 +696,15 @@ func TestSubscriptionLifecycleAction_Updated_OwnerMismatch_NoGet(t *testing.T) {
 }
 
 // =========================================================================
-// activated -- store active, clear suspension; user needs bindConsumer to
-// resume running.
+// activated -- clear suspension bookkeeping + suspension-degraded state, but
+// NEVER bind (review #11: receiving activated does not prove the subscription
+// is locally started; BindUser is left to consume start / Reactivate recovery
+// / reconnect).
 // =========================================================================
 
-func TestSubscriptionLifecycleAction_Activated_User_BindSucceeds_ClearsSuspensionAndDegraded(t *testing.T) {
+// A user consumer on activated_v1 clears its suspension + suspension-degraded
+// state, but the bus NEVER binds — the core bind-discipline invariant.
+func TestSubscriptionLifecycleAction_Activated_User_ClearsSuspension_NeverBinds(t *testing.T) {
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
@@ -715,19 +719,41 @@ func TestSubscriptionLifecycleAction_Activated_User_BindSucceeds_ClearsSuspensio
 	}
 
 	if got := c.SuspensionReason(); got != "" {
-		t.Errorf("SuspensionReason() = %q, want \"\" (activated clears suspension, spec §5.3)", got)
+		t.Errorf("SuspensionReason() = %q, want \"\" (activated clears suspension)", got)
 	}
 	if got := c.DegradedReason(); got != "" {
-		t.Errorf("DegradedReason() = %q, want \"\"", got)
+		t.Errorf("DegradedReason() = %q, want \"\" (suspension-degraded cleared on activated)", got)
 	}
 	if got := c.NextAction(); got != "" {
 		t.Errorf("NextAction() = %q, want \"\"", got)
 	}
-	if got := deps.bind.callCount(); got != 1 {
-		t.Errorf("bindUser call count = %d, want 1", got)
+	// The whole point of #11: activated_v1 NEVER binds.
+	if got := deps.bind.callCount(); got != 0 {
+		t.Errorf("bindUser call count = %d, want 0 (activated_v1 must NEVER bind)", got)
 	}
-	if got := c.BoundConnID(); got != "conn-1" {
-		t.Errorf("BoundConnID() = %q, want %q", got, "conn-1")
+	if got := c.BoundConnID(); got != "" {
+		t.Errorf("BoundConnID() = %q, want \"\" (activated must not bind)", got)
+	}
+}
+
+// Even with a bind fully wired AND the consumer already bound on a prior
+// connection, a fresh activated_v1 issues no NEW bind — proves the bind
+// call-count is 0 regardless of surrounding state (invariant lock).
+func TestSubscriptionLifecycleAction_Activated_User_BindWired_StillZeroBinds(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	hub.RegisterAndIsFirst(c)
+
+	le := LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := deps.bind.callCount(); got != 0 {
+		t.Errorf("bindUser call count = %d, want 0 (activated_v1 must NEVER bind even with bind wired)", got)
+	}
+	if got := deps.uat.callCount(); got != 0 {
+		t.Errorf("resolveUAT call count = %d, want 0 (no bind ⇒ no UAT mint on activated)", got)
 	}
 }
 
@@ -747,31 +773,6 @@ func TestSubscriptionLifecycleAction_Activated_Bot_ClearsWithoutBind(t *testing.
 	}
 	if got := deps.bind.callCount(); got != 0 {
 		t.Errorf("bindUser call count = %d, want 0", got)
-	}
-}
-
-func TestSubscriptionLifecycleAction_Activated_User_BindFails_DegradedNextActionRebind(t *testing.T) {
-	hub := NewHub()
-
-	uat := &fakeUATResolver{uat: "uat-1"}
-	fb := &fakeBindUser{failCall: map[int]error{1: errors.New("bind_user: 500")}}
-	gate := newIdentityGate(hub, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
-	gate.onConnReady(context.Background(), "conn-1", fb.bind) // memoize only -- no conns registered yet
-	action := newSubscriptionLifecycleAction(hub, discardTestLogger())
-	action.setIdentityGate(gate)
-
-	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
-	hub.RegisterAndIsFirst(c)
-
-	le := LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
-	if err := action.Handle(context.Background(), le); err != nil {
-		t.Fatalf("Handle returned err: %v", err)
-	}
-	if got := c.DegradedReason(); got == "" {
-		t.Error("DegradedReason() empty -- a failed bind must leave the consumer degraded, awaiting rebind")
-	}
-	if got := c.NextAction(); got != nextActionRebind {
-		t.Errorf("NextAction() = %q, want %q", got, nextActionRebind)
 	}
 }
 

@@ -111,9 +111,9 @@ Subscription: the CLI generates a per-subscription encrypt_key (OS CSPRNG,
 in-memory only, never printed/logged/persisted — there is no --encrypt-key
 flag) and submits it atomically with the Create; the bus then fetches the key
 via GetEncryptKey to decrypt events. This additionally requires scope
-event:encrypt_key:read on the resolved identity — the consumer confirms the
-key is retrievable (prewarm) before it reports ready, and refuses to start
-(typed decrypt_key_unavailable, no half-registered consumer) if it is not.
+event:encrypt_key:read on the resolved identity — the bus fetches the key once
+when the consumer registers and refuses to ready it (typed
+decrypt_key_unavailable, no half-registered consumer) if it cannot.
 Passing --include-resource-data=true on an ORDINARY (non-refined) key is
 always rejected as typed invalid_argument: the flag only ever controls a
 refined key's remote Subscription, so it can never silently no-op there.`,
@@ -140,7 +140,7 @@ refined key's remote Subscription, so it can never silently no-op there.`,
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the refined-subscription remote-write plan (probe + plan only) without applying it, starting the bus, or writing anything remote. No-op for legacy (non-refined) EventKeys, which never write remote state at all.")
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
-		"Include resource data in a refined key's remote Subscription (mirrors 'event subscription create'). false (the default) is a no-op. true creates an ENCRYPTED subscription (CLI-generated per-subscription encrypt_key, never printed/logged; requires scope event:encrypt_key:read) and prewarms the key before the consumer reports ready. Always rejected as invalid_argument on an ordinary (non-refined) key.")
+		"Include resource data in a refined key's remote Subscription (mirrors 'event subscription create'). false (the default) is a no-op. true creates an ENCRYPTED subscription (CLI-generated per-subscription encrypt_key, never printed/logged; requires scope event:encrypt_key:read); the bus must be able to fetch the key when the consumer registers or the consumer refuses to start. Always rejected as invalid_argument on an ordinary (non-refined) key.")
 	cmdutil.SetRisk(cmd, "read")
 
 	return cmd
@@ -177,8 +177,9 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		// a refined key — it creates an ENCRYPTED remote Subscription. The
 		// flag flows through to
 		// RunRefined (RefinedOptions.IncludeResourceData), which reconciles
-		// against the encryption conflict matrix, generates + injects a fresh
-		// CSPRNG encrypt_key on create, and prewarms the key before ready.
+		// against the encryption conflict matrix and generates + injects a
+		// fresh CSPRNG encrypt_key on create; the bus fetches that key when the
+		// consumer registers (rejecting the Hello if it cannot).
 		// This is a materialized refined key: drive the refined
 		// startup chain — ProbeBusEligibility
 		// (read-only) -> PlanRemoteSubscription (List/Get) -> [--dry-run
@@ -434,7 +435,7 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 	// this run may create or reuse. Must run BEFORE any client/subClient
 	// construction below and before consume.RunRefined's own Plan/Apply —
 	// see preflightEncryptKeyScope's own doc comment for why this can't
-	// wait until prewarm. Runs even under --dry-run (mirrors
+	// wait until the bus's Hello-time fetch. Runs even under --dry-run (mirrors
 	// `event subscription create`'s own preflight placement, ahead of its
 	// dry-run branch) so a preview surfaces the same rejection a real run
 	// would hit, rather than only discovering it on a later real run.
@@ -533,33 +534,32 @@ var refinedEncryptKeyReadScopes = []string{"event:encrypt_key:read"}
 // preflightEncryptKeyScope is a local, best-effort check that the resolved
 // identity's token already carries event:encrypt_key:read before
 // runRefinedConsume does anything else with --include-resource-data=true.
-// Without it, the only place this scope was ever checked was
-// RunRefined's own prewarm step — which runs AFTER
-// ApplyRemoteSubscriptionPlan (the remote Create) and HelloV2 have already
-// succeeded. By then, a missing scope means the encrypted remote
-// Subscription already exists (refined cleanup is nil: it is never
-// auto-deleted) and simply cannot be consumed — an avoidable
+// Without it, this scope would only be exercised by the bus's Hello-time
+// GetEncryptKey fetch — which runs AFTER ApplyRemoteSubscriptionPlan (the
+// remote Create) and the bus handshake. By then, a missing scope means the
+// encrypted remote Subscription already exists (refined cleanup is nil: it is
+// never auto-deleted) and simply cannot be consumed — an avoidable
 // create-but-can't-consume outcome. This preflight catches it earlier,
 // before that write ever happens, whenever the token's scopes are knowable
 // locally.
 //
 // Mirrors cmd/event/subscription/subscription.go's own
 // resolveUATAndCheckScopes: scope data being unavailable locally is not
-// treated as "missing" — the check is silently skipped and the real
-// GetEncryptKey call at prewarm remains the authoritative check, exactly as
-// it already was before this preflight existed. This CLI's default
+// treated as "missing" — the check is silently skipped and the bus's own
+// Hello-time GetEncryptKey fetch remains the authoritative check. This CLI's
+// default
 // credential provider never populates TokenResult.Scopes for a bot/tenant
 // token (internal/credential/default_provider.go's doResolveTAT always
 // returns Scopes==""), so in practice this only ever fires for a user
-// identity — a bot's real GetEncryptKey call remains the sole enforcement,
-// same as before.
+// identity — for a bot, the bus's Hello-time GetEncryptKey fetch remains the
+// sole enforcement.
 func preflightEncryptKeyScope(ctx context.Context, f *cmdutil.Factory, appID string, identity core.Identity, materializedKey string) error {
 	result, err := f.Credential.ResolveToken(ctx, credential.NewTokenSpec(identity, appID))
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
-		return nil //nolint:nilerr // best-effort: an unresolvable token here is not "missing scope" — prewarm's real GetEncryptKey call remains authoritative
+		return nil //nolint:nilerr // best-effort: an unresolvable token here is not "missing scope" — the bus's Hello-time GetEncryptKey fetch remains authoritative
 	}
 	if result == nil || result.Scopes == "" {
 		return nil

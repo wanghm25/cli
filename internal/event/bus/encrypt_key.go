@@ -13,130 +13,91 @@ import (
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
+	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/core"
 )
 
 // decrypt_state tokens for failure/observability. A small, stable
 // vocabulary a status display can key off. decryptStateFailed covers
-// the SDK-decrypt-failure path; the fetch path only ever produces the first two.
+// the SDK-decrypt-failure path; the Hello-time fetch only ever produces
+// decrypted (success) or a rejected Hello (no consumer, so no state).
 const (
 	decryptStateDecrypted      = "decrypted"
 	decryptStateKeyUnavailable = "decrypt_key_unavailable"
 	decryptStateFailed         = "decrypt_failed" // key held but SDK decrypt/parse failed
 )
 
-// encryptKeyProviderDefaults — internal control-plane housekeeping timings,
-// not a scalable data path (mirrors lifecycleExecutor's own rationale). Fields
-// on the provider (not consts) so tests shrink them; deliberately not
-// env-configurable.
-const (
-	defaultEncryptKeyFetchTimeout   = 5 * time.Second
-	defaultEncryptKeyFailCooldown   = 30 * time.Second
-	defaultEncryptKeyMaxConcurrency = 4
-)
+// defaultEncryptKeyFetchTimeout bounds the ONE Hello-time GetEncryptKey call.
+// A field on the provider (not a const) so tests can shrink it; deliberately
+// not env-configurable — this is control-plane housekeeping, run once per
+// encrypted consumer registration, never a hot path.
+const defaultEncryptKeyFetchTimeout = 5 * time.Second
 
-// encryptKeyClient is the narrow seam encryptKeyProvider needs from
-// *eventlib.SubscriptionClient: GetEncryptKey ONLY (the provider
-// never lists/creates/patches). *eventlib.SubscriptionClient satisfies it
-// structurally (it gained GetEncryptKey earlier), so bus.go's
-// SetSubscriptionClient passes one straight through; tests substitute a fake
-// with no *lark.Client or network call — the same test-seam idiom as
-// subscriptionActionClient (lifecycle.go).
+// encryptKeyClient is the narrow seam the provider needs from
+// *event.SubscriptionClient: GetEncryptKey ONLY (the provider never
+// lists/creates/patches). *event.SubscriptionClient satisfies it structurally,
+// so bus.go's SetSubscriptionClient passes one straight through; tests
+// substitute a fake with no *lark.Client or network call — the same test-seam
+// idiom as subscriptionActionClient (lifecycle.go).
 type encryptKeyClient interface {
 	GetEncryptKey(ctx context.Context, req *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error)
 }
 
-// encryptKeyProvider is the CLI's larkevent.EncryptKeyProvider
-// implementation: the SDK EventDispatcher calls
-// EncryptKey(ctx, subscription_id) SYNCHRONOUSLY, before parsing/routing an
-// encrypted subscription envelope. On a cache miss it fetches the key via
-// GetEncryptKey using the OWNER identity resolved from the bus's own consumer
-// registry, then backfills the SDK's concurrency-safe StaticEncryptKeyProvider
-// so subsequent events for the same subscription decrypt with zero network.
+// encryptKeyProvider manages per-subscription encrypt_keys for the bus's SDK
+// dispatcher. It is NOT itself the dispatcher's provider — the SDK dispatcher
+// is wired to the plain static cache (dispatcherProvider() below), whose
+// EncryptKey is a pure map lookup: a miss returns ("", false) and the SDK
+// fails the decrypt CLOSED, with ZERO runtime remote calls. There is no
+// lazy/hot-path fetch-on-miss, no owner/UAT judgment on the event path, and no
+// singleflight/cooldown machinery.
 //
-// SECURITY: the fetched encrypt_key lives ONLY inside
-// the SDK StaticEncryptKeyProvider's in-memory map (released on Remove / bus
-// exit). It is NEVER logged, put on the wire (IPC), placed in status, or
-// returned anywhere except back to the SDK dispatcher that asked for it. The
-// UAT used to fetch it is likewise never logged. owner != current NEVER loads a
-// historical owner's UAT (the security red line, reused from the delivery gate).
+// A key enters the cache exactly one way: fetchAndSet, called by the bus from
+// handleHello when an ENCRYPTED refined consumer registers. It resolves the
+// owner identity (owner==current gate for a user subscription; bot needs no
+// UAT), calls GetEncryptKey once, and registers the result. It leaves the
+// cache via Remove (lifecycle deleted_v1) or bus exit.
 //
-// DISPATCH SAFETY (a cache miss inevitably delays the current event's dispatch):
-// because EncryptKey blocks the dispatcher, a miss is guarded by (1) a short
-// per-fetch timeout, (2) per-subscription_id singleflight (one in-flight fetch
-// per id, concurrent callers share its result), (3) bounded total concurrency,
-// and (4) a failure cooldown so a genuine no-key does not hammer the API. There
-// is NO infinite retry. A transient failure (context cancel/deadline) is NOT
-// cached as a permanent failure — it is a bus-restart / cache-eviction / race
-// fallback that a later event re-attempts.
+// SECURITY: the fetched encrypt_key lives ONLY inside the SDK
+// StaticEncryptKeyProvider's in-memory map. It is NEVER logged, put on the IPC
+// wire, placed in status, or returned anywhere except back to the SDK
+// dispatcher that asked for it. The UAT used to fetch it is likewise never
+// logged, and owner != current NEVER loads a historical owner's UAT.
 type encryptKeyProvider struct {
-	// static is the SDK's own concurrency-safe cache (the authoritative key
-	// store). The provider only ever Set()s a freshly fetched key here and
-	// Remove()s on lifecycle deletion; it never reads keys back out for
-	// any purpose other than answering EncryptKey.
+	// static is the SDK's own concurrency-safe cache and the authoritative
+	// key store — also the object handed to the dispatcher as its
+	// EncryptKeyProvider. fetchAndSet Set()s a freshly fetched key here;
+	// Remove()s on lifecycle deletion; the provider never reads keys back out.
 	static *larkevent.StaticEncryptKeyProvider
 
-	// hub is the subscription_id -> owner map: the Hub's
-	// consumer registry IS that map — connsByRemoteSubscriptionID(subID) yields
-	// the refined consumer(s), whose owner{Identity,AppID,UserOpenID} fields
-	// (fixed at Hello registration) are the ONLY identity signal.
-	// An unknown subscription (no registered consumer) is never guessed at.
-	hub *Hub
-
-	// gate supplies resolveCurrent + resolveUAT for a USER
-	// subscription's owner==current check and fresh-UAT mint. nil until
-	// SetIdentityProviders — a user subscription then cannot be served (returns
-	// no key), but a bot subscription (no UAT needed) still can.
+	// gate supplies resolveCurrent + resolveUAT for a USER subscription's
+	// owner==current check and fresh-UAT mint. nil until SetIdentityProviders —
+	// a user subscription then cannot be served (fetchAndSet returns an error →
+	// Hello rejected), but a bot subscription (no UAT needed) still can.
 	gate *identityGate
 
 	// newClient builds a GetEncryptKey-capable client bound to a resolved
-	// identity. nil until SetSubscriptionClient — a nil newClient means the
-	// provider can never fetch (every miss returns no key). Guarded by its own
+	// identity. nil until SetSubscriptionClient — a nil newClient means no
+	// fetch can happen (fetchAndSet returns an error). Guarded by its own
 	// RWMutex only because SetSubscriptionClient may run slightly before Run()
-	// on the setup goroutine while a test drives EncryptKey; in production it is
+	// while a test drives fetchAndSet; in production it is
 	// set-once-before-Run.
 	newClientMu sync.RWMutex
 	newClient   func(as core.Identity, uat string) (encryptKeyClient, error)
 
 	logger *log.Logger
 
-	// inflight is the singleflight map: subscription_id -> *encryptKeyFetch.
-	inflight sync.Map
-
-	// failMu guards failedAt: subscription_id -> time of last GENUINE (non-
-	// transient) fetch failure. A subsequent miss within failCooldown returns
-	// no key without re-fetching.
-	failMu   sync.Mutex
-	failedAt map[string]time.Time
-
-	// sem bounds total concurrent in-flight fetches.
-	sem chan struct{}
-
 	fetchTimeout time.Duration
-	failCooldown time.Duration
 }
 
-// encryptKeyFetch is one singleflight in-flight fetch: done is closed when the
-// leader finishes, at which point key/ok hold its result for every waiter.
-type encryptKeyFetch struct {
-	done chan struct{}
-	key  string
-	ok   bool
-}
-
-// newEncryptKeyProvider builds a provider with an empty SDK cache and default
-// guard timings. identityGate/newClient are injected post-construction by
-// bus.go's SetIdentityProviders/SetSubscriptionClient (same "optional, wire
-// before Run()" convention as the lifecycle action's own dependencies).
-func newEncryptKeyProvider(hub *Hub, logger *log.Logger) *encryptKeyProvider {
+// newEncryptKeyProvider builds a provider with an empty SDK cache and the
+// default Hello-time fetch timeout. identityGate/newClient are injected
+// post-construction by bus.go's SetIdentityProviders/SetSubscriptionClient
+// (same "optional, wire before Run()" convention as the lifecycle action).
+func newEncryptKeyProvider(logger *log.Logger) *encryptKeyProvider {
 	return &encryptKeyProvider{
 		static:       larkevent.NewStaticEncryptKeyProvider(nil),
-		hub:          hub,
 		logger:       logger,
-		failedAt:     make(map[string]time.Time),
-		sem:          make(chan struct{}, defaultEncryptKeyMaxConcurrency),
 		fetchTimeout: defaultEncryptKeyFetchTimeout,
-		failCooldown: defaultEncryptKeyFailCooldown,
 	}
 }
 
@@ -148,6 +109,13 @@ func (p *encryptKeyProvider) setNewClient(fn func(as core.Identity, uat string) 
 	p.newClientMu.Unlock()
 }
 
+// dispatcherProvider is the EncryptKeyProvider the SDK dispatcher is wired to:
+// the plain static cache. Its EncryptKey is a pure lookup — a miss returns
+// ("", false) → SDK fail-closed, never a runtime remote fetch.
+func (p *encryptKeyProvider) dispatcherProvider() larkevent.EncryptKeyProvider {
+	return p.static
+}
+
 func (p *encryptKeyProvider) logf(format string, args ...interface{}) {
 	if p.logger != nil {
 		p.logger.Printf(format, args...)
@@ -155,127 +123,58 @@ func (p *encryptKeyProvider) logf(format string, args ...interface{}) {
 }
 
 // Remove drops a subscription's cached key (lifecycle removal). Idempotent.
-// Also clears any recorded failure for the id so a fresh subscription reusing
-// the same id (unlikely, but harmless) starts clean.
 func (p *encryptKeyProvider) Remove(subID string) {
 	if subID == "" {
 		return
 	}
 	p.static.Remove(subID)
-	p.failMu.Lock()
-	delete(p.failedAt, subID)
-	p.failMu.Unlock()
 }
 
-// EncryptKey implements larkevent.EncryptKeyProvider. Returns (key, true) only
-// when a usable key is available; ("", false) otherwise (the SDK then leaves
-// the envelope encrypted, which fails the downstream parse fail-closed — no
-// plaintext fallback).
-func (p *encryptKeyProvider) EncryptKey(ctx context.Context, subID string) (string, bool) {
-	// Fast path: the SDK cache already has it (the common case after the first
-	// fetch or a prewarm). No lock contention beyond the static's own RWMutex.
-	if key, ok := p.static.EncryptKey(ctx, subID); ok {
-		return key, true
-	}
+// fetchAndSet fetches subID's encrypt_key ONCE (at Hello time) under the
+// owner==current identity gate and registers it in the SDK static cache, so
+// the dispatcher decrypts later events for this subscription with zero
+// network. owner is the just-built consumer whose owner identity was fixed
+// from its HelloV2 — bot (OwnerUserOpenID()=="") fetches as core.AsBot with no
+// UAT and no gate; a user owner must pass owner==current, then a FRESH,
+// open_id-verified UAT is minted for the current identity (NEVER a historical
+// owner's UAT).
+//
+// Returns nil only once a usable key is cached. Any error (owner mismatch /
+// missing gate|client / GetEncryptKey failure / empty key) means the caller
+// (handleHello) must REJECT the Hello so the consumer never registers. The
+// returned error NEVER carries the key: on success the owner's decrypt_state is
+// marked decrypted; the SDK error is deliberately not surfaced verbatim to the
+// consumer (no oracle) — handleHello logs only a classified reason.
+func (p *encryptKeyProvider) fetchAndSet(ctx context.Context, subID string, owner *Conn) error {
 	if subID == "" {
-		return "", false
+		return errEncryptKeyNoSubID
+	}
+	if owner == nil {
+		return errEncryptKeyNoOwner
 	}
 
-	// Singleflight: collapse concurrent misses for the SAME subscription_id
-	// into one fetch. The leader (loaded==false) performs it; every waiter
-	// blocks on done and shares the outcome.
-	f := &encryptKeyFetch{done: make(chan struct{})}
-	actual, loaded := p.inflight.LoadOrStore(subID, f)
-	if loaded {
-		lead := actual.(*encryptKeyFetch)
-		select {
-		case <-lead.done:
-			return lead.key, lead.ok
-		case <-ctx.Done():
-			// Our own dispatch was cancelled while waiting — transient, drop
-			// this event; the leader still completes and backfills the cache.
-			return "", false
-		}
-	}
-	defer func() {
-		close(f.done)
-		p.inflight.Delete(subID)
-	}()
-
-	key, ok := p.fetch(ctx, subID)
-	f.key, f.ok = key, ok
-	return key, ok
-}
-
-// fetch is the singleflight leader body: owner resolution -> owner==current
-// gate -> UAT -> GetEncryptKey -> backfill. Returns ("", false) on any failure
-// (already recorded/marked). Never logs the key.
-func (p *encryptKeyProvider) fetch(ctx context.Context, subID string) (string, bool) {
-	// Do not hammer a genuine no-key: honor the failure cooldown first.
-	if p.recentlyFailed(subID) {
-		return "", false
-	}
-
-	// subscription_id -> owner, via the Hub registry. An
-	// unknown subscription / one with no active consumer is never guessed at.
-	conns := p.hub.connsByRemoteSubscriptionID(subID)
-	if len(conns) == 0 {
-		p.logf("[encrypt-key] no consumer registered for subscription_id=%s; not fetching a key", subID)
-		return "", false
-	}
-	owner := conns[0]
-
-	identity, uat, ok := p.resolveOwnerIdentity(ctx, owner, conns)
-	if !ok {
-		// resolveOwnerIdentity already marked the consumers appropriately.
-		return "", false
+	identity, uat, err := p.resolveOwnerIdentity(ctx, owner)
+	if err != nil {
+		return err
 	}
 
 	p.newClientMu.RLock()
 	newClient := p.newClient
 	p.newClientMu.RUnlock()
 	if newClient == nil {
-		p.logf("[encrypt-key] no subscription client configured on this bus; cannot fetch key for subscription_id=%s", subID)
-		markDecryptKeyUnavailable(conns)
-		return "", false
+		return errEncryptKeyNoClient
 	}
 	cli, err := newClient(identity, uat)
 	if err != nil {
-		p.logf("[encrypt-key] building subscription client failed for subscription_id=%s: %v", subID, err)
-		markDecryptKeyUnavailable(conns)
-		p.recordFailure(subID)
-		return "", false
+		return err
 	}
 
-	// Bound both slot-acquisition and the call itself by one short timeout.
 	fctx, cancel := context.WithTimeout(ctx, p.fetchTimeout)
 	defer cancel()
-	select {
-	case p.sem <- struct{}{}:
-		defer func() { <-p.sem }()
-	case <-fctx.Done():
-		// Overloaded / cancelled before we even got a slot: transient, not a
-		// permanent failure — do NOT cache, a later event re-attempts.
-		return "", false
-	}
-
 	req := larkeventv1.NewGetEncryptKeySubscriptionReqBuilder().SubscriptionId(subID).Build()
 	resp, err := cli.GetEncryptKey(fctx, req)
 	if err != nil {
-		if isTransientCtxErr(fctx, err) {
-			// context cancel/deadline: bus restart / eviction / race window,
-			// never a confirmed no-key. Drop this event
-			// only; do not cache, do not mark permanently.
-			return "", false
-		}
-		// A genuine business/transport failure (missing event:encrypt_key:read
-		// scope, revoked auth, subscription gone, ...). The SDK error is
-		// deliberately not surfaced verbatim (no oracle): only a
-		// classified state + a cooldown.
-		p.logf("[encrypt-key] GetEncryptKey failed for subscription_id=%s (key unavailable)", subID)
-		markDecryptKeyUnavailable(conns)
-		p.recordFailure(subID)
-		return "", false
+		return err
 	}
 
 	key := ""
@@ -283,124 +182,78 @@ func (p *encryptKeyProvider) fetch(ctx context.Context, subID string) (string, b
 		key = *resp.Data.EncryptKey
 	}
 	if key == "" {
-		p.logf("[encrypt-key] GetEncryptKey returned no key for subscription_id=%s", subID)
-		markDecryptKeyUnavailable(conns)
-		p.recordFailure(subID)
-		return "", false
+		return errEncryptKeyEmpty
 	}
 
-	// Backfill the SDK cache and mark the consumers healthy. NEVER log key.
+	// Backfill the SDK cache; mark the owner healthy. NEVER log key.
 	p.static.Set(subID, key)
-	p.clearFailure(subID)
-	markDecrypted(conns)
-	return key, true
+	owner.SetDecryptState(decryptStateDecrypted)
+	return nil
 }
 
 // resolveOwnerIdentity turns owner's fixed registration identity into the
 // (identity, uat) GetEncryptKey must run as — the identity must match the
 // Subscription's own authority:
 //   - bot/legacy owner (OwnerUserOpenID()=="") -> core.AsBot, no UAT, no gate
-//     (bot consumers are NEVER identity-gated — the same precedent).
+//     (bot consumers are NEVER identity-gated — the same precedent as
+//     onConnReady/eligibleConns).
 //   - user owner -> owner==current gate (reuse ownerMatchesCurrent /
-//     resolveCurrent). owner != current marks stale_identity +
-//     decrypt_key_unavailable and returns without loading ANY UAT
-//     (never a historical owner's UAT). Otherwise a FRESH UAT is minted for the
-//     current identity.
-//
-// ok==false means "cannot serve this subscription now"; the conns have already
-// been marked. It NEVER returns a UAT for an identity other than the freshly
-// resolved current one.
-func (p *encryptKeyProvider) resolveOwnerIdentity(ctx context.Context, owner *Conn, conns []*Conn) (core.Identity, string, bool) {
+//     resolveCurrent). owner != current returns errEncryptKeyOwnerMismatch
+//     WITHOUT loading ANY UAT (never a historical owner's UAT). Otherwise a
+//     FRESH, open_id-verified UAT is minted for the current identity.
+func (p *encryptKeyProvider) resolveOwnerIdentity(ctx context.Context, owner *Conn) (core.Identity, string, error) {
 	if owner.OwnerUserOpenID() == "" {
-		return core.AsBot, "", true
+		return core.AsBot, "", nil
 	}
 	if p.gate == nil {
-		p.logf("[encrypt-key] no identity gate configured; cannot resolve a user identity for a user subscription")
-		markDecryptKeyUnavailable(conns)
-		return "", "", false
+		return "", "", errEncryptKeyNoGate
 	}
 	cur, err := p.gate.resolveCurrent()
 	if err != nil {
-		// current identity unresolved: transient-ish (config/keychain may
-		// recover) — mark it but do NOT record a permanent failure.
-		for _, c := range conns {
-			c.SetDegraded(reasonCurrentIdentityUnresolved)
-			c.SetDecryptState(decryptStateKeyUnavailable)
-		}
-		return "", "", false
+		return "", "", err
 	}
 	if !ownerMatchesCurrent(owner.OwnerAppID(), owner.OwnerUserOpenID(), cur) {
-		// owner != current: NO fetch, NO historical UAT. Mark
-		// stale_identity (as the Publish/lifecycle gates do) AND the decrypt
-		// state so status can advise switching profile.
-		for _, c := range conns {
-			c.SetStaleIdentity()
-			c.SetDecryptState(decryptStateKeyUnavailable)
-		}
-		return "", "", false
+		return "", "", errEncryptKeyOwnerMismatch
 	}
 	uat, err := p.gate.resolveUAT(ctx, cur.appID, cur.userOpenID)
 	if err != nil {
-		p.logf("[encrypt-key] UAT resolution failed for a user subscription (key unavailable)")
-		markDecryptKeyUnavailable(conns)
-		return "", "", false
+		return "", "", err
 	}
-	return core.AsUser, uat, true
+	return core.AsUser, uat, nil
 }
 
-func (p *encryptKeyProvider) recentlyFailed(subID string) bool {
-	p.failMu.Lock()
-	defer p.failMu.Unlock()
-	at, ok := p.failedAt[subID]
-	if !ok {
-		return false
-	}
-	if time.Since(at) >= p.failCooldown {
-		delete(p.failedAt, subID)
-		return false
-	}
-	return true
-}
+// encryptKeyProvider fetch sentinels. Each is deliberately key-free and safe to
+// log/classify. errEncryptKeyOwnerMismatch reuses the same §8 red line the
+// delivery/lifecycle gates enforce: owner != current never fetches, never
+// loads a historical UAT.
+var (
+	errEncryptKeyNoSubID       = errors.New("encrypt-key: empty remote_subscription_id")
+	errEncryptKeyNoOwner       = errors.New("encrypt-key: no owner consumer")
+	errEncryptKeyNoGate        = errors.New("encrypt-key: no identity gate configured for a user subscription")
+	errEncryptKeyOwnerMismatch = errors.New("encrypt-key: subscription owner does not match current identity")
+	errEncryptKeyNoClient      = errors.New("encrypt-key: no subscription client configured")
+	errEncryptKeyEmpty         = errors.New("encrypt-key: GetEncryptKey returned no key")
+)
 
-func (p *encryptKeyProvider) recordFailure(subID string) {
-	p.failMu.Lock()
-	p.failedAt[subID] = time.Now()
-	p.failMu.Unlock()
-}
-
-func (p *encryptKeyProvider) clearFailure(subID string) {
-	p.failMu.Lock()
-	delete(p.failedAt, subID)
-	p.failMu.Unlock()
-}
-
-// isTransientCtxErr reports whether a GetEncryptKey failure was a
-// context cancel/deadline (transient) rather than a confirmed no-key. Checks
-// fctx.Err() directly (robust regardless of how the client wrapped the error)
-// as well as the error chain.
-func isTransientCtxErr(fctx context.Context, err error) bool {
-	if fctx.Err() != nil {
-		return true
-	}
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
-// markDecryptKeyUnavailable sets decrypt_state=decrypt_key_unavailable on every
-// matched consumer. A pure local state write — never logs
-// a reason that could leak key material.
-func markDecryptKeyUnavailable(conns []*Conn) {
-	for _, c := range conns {
-		c.SetDecryptState(decryptStateKeyUnavailable)
-	}
-}
-
-// markDecrypted records that a usable key is now available (a strong proxy for
-// "these events will decrypt"): decrypt_state=decrypted, clearing a prior
-// decrypt_key_unavailable. The SDK decrypts transparently downstream, so this
-// is the closest signal the bus has without hooking per-event AES.
-func markDecrypted(conns []*Conn) {
-	for _, c := range conns {
-		c.SetDecryptState(decryptStateDecrypted)
+// encryptKeyFailureClass maps a fetchAndSet error to a short, key-free
+// classification safe to write to bus.log. It NEVER echoes a raw SDK error
+// (which could carry upstream detail) — a genuine permission failure (the #1
+// operational cause: missing event:encrypt_key:read) is called out
+// specifically so ops can act, everything else collapses to a generic token.
+func encryptKeyFailureClass(err error) string {
+	switch {
+	case errors.Is(err, errEncryptKeyOwnerMismatch):
+		return "owner_mismatch"
+	case errors.Is(err, errEncryptKeyNoGate):
+		return "no_identity_gate"
+	case errors.Is(err, errEncryptKeyNoClient):
+		return "no_subscription_client"
+	case errors.Is(err, errEncryptKeyEmpty):
+		return "no_key_returned"
+	case errs.IsPermission(err):
+		return "missing_scopes"
+	default:
+		return "unavailable"
 	}
 }
 
@@ -427,6 +280,3 @@ func formatDecryptErrorTime(t time.Time) string {
 	}
 	return t.UTC().Format(time.RFC3339)
 }
-
-// Compile-time assertion: *encryptKeyProvider is a larkevent.EncryptKeyProvider.
-var _ larkevent.EncryptKeyProvider = (*encryptKeyProvider)(nil)

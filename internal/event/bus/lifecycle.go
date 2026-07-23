@@ -632,7 +632,7 @@ func (a *subscriptionLifecycleAction) Handle(ctx context.Context, le LifecycleEv
 
 	switch le.EventType {
 	case lifecycleEventTypeActivated:
-		return a.handleActivated(ctx, conns)
+		return a.handleActivated(conns)
 	case lifecycleEventTypeUpdated:
 		return a.handleUpdated(ctx, le, conns)
 	case lifecycleEventTypeSuspended:
@@ -719,13 +719,21 @@ func (a *subscriptionLifecycleAction) buildClientForConn(ctx context.Context, c 
 
 // --- activated --------------------------------------------------------------
 
-// handleActivated implements the activated_v1 row: store active +
-// clear suspension (informational bookkeeping, applies to EVERY matched
-// conn regardless of eligibility — no remote call/BindUser is involved in
-// just clearing a local field); a user consumer additionally needs
-// bindConsumer to succeed before being considered running again, else it
-// stays degraded awaiting a rebind. A miss never builds a consumer.
-func (a *subscriptionLifecycleAction) handleActivated(ctx context.Context, conns []*Conn) error {
+// handleActivated implements the activated_v1 row: clear the suspension
+// bookkeeping on EVERY matched conn (informational — the remote subscription
+// is no longer suspended), and clear a prior suspension-degraded state for the
+// eligible conns whose owner still matches current. It NEVER calls
+// bindConsumer: receiving activated_v1 does not prove the subscription is
+// locally started, so BindUser is left strictly to the three places that DO
+// prove it — a new local consume start (onConnReady), a CLI-executed Reactivate
+// recovery (reactivateAndMaybeBind), and a WS reconnect (onConnReady). No
+// remote call is issued either. A miss never builds a consumer.
+//
+// Event DELIVERY to a user consumer stays gated by owner==current on every
+// fan-out (hub.go Publish), independent of BindUser — so clearing the
+// suspension-degraded flag here is advisory only and never opens a delivery
+// path for a mismatched owner (eligibleConns marks those stale instead).
+func (a *subscriptionLifecycleAction) handleActivated(conns []*Conn) error {
 	if len(conns) == 0 {
 		return nil
 	}
@@ -734,15 +742,9 @@ func (a *subscriptionLifecycleAction) handleActivated(ctx context.Context, conns
 	}
 	res := a.eligibleConns(conns)
 	for _, c := range res.conns {
-		if c.OwnerUserOpenID() == "" {
+		if c.DegradedReason() == reasonRemoteSubscriptionSuspended {
 			c.clearActionDegraded()
-			continue
 		}
-		if err := a.identityGate.bindConsumer(ctx, c); err != nil {
-			c.SetNextAction(nextActionRebind)
-			continue
-		}
-		c.clearActionDegraded()
 	}
 	return nil
 }

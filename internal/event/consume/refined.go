@@ -42,9 +42,10 @@ type subscriptionApplyAPI interface {
 	Reactivate(ctx context.Context, req *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error)
 	// EncryptKeyProber: PlanRemoteSubscription needs it as the
 	// WithEncryptKeyProber for the encryption conflict matrix when
-	// IncludeResourceData is true, and the pre-ready prewarm calls GetEncryptKey
-	// to confirm the subscription's key is retrievable before the consumer goes
-	// ready. *event.SubscriptionClient satisfies it (GetEncryptKey).
+	// IncludeResourceData is true (reuse-vs-conflict disambiguation).
+	// *event.SubscriptionClient satisfies it (GetEncryptKey). The consume side
+	// never fetches the key itself — the bus fetches it once at Hello time
+	// (internal/event/bus encryptKeyProvider.fetchAndSet).
 	event.EncryptKeyProber
 }
 
@@ -78,9 +79,11 @@ type RefinedOptions struct {
 	// IncludeResourceData: true creates an ENCRYPTED
 	// remote Subscription — Plan reconciles against the encryption conflict
 	// matrix (WithEncryptKeyProber), Apply generates a fresh CSPRNG encrypt_key
-	// and submits it atomically with the Create, and a pre-ready prewarm
-	// confirms the key is retrievable before the consumer emits ready. false
-	// (the default) is the plaintext path, byte-for-byte unchanged.
+	// and submits it atomically with the Create, and the HelloV2 carries the
+	// flag so the bus fetches that key once at registration (rejecting the
+	// Hello with decrypt_key_unavailable if it cannot, so the consumer never
+	// readies). false (the default) is the plaintext path, byte-for-byte
+	// unchanged.
 	IncludeResourceData bool
 
 	// Identity is the already-resolved --as identity (
@@ -106,14 +109,6 @@ type refinedDeps struct {
 	apply    func(ctx context.Context, plan event.ReconcilePlan) (remoteSubscriptionID string, createdByThisAttempt bool, err error)
 	startBus func(ctx context.Context) (net.Conn, error)
 	hello    func(ctx context.Context, conn net.Conn, remoteSubscriptionID string) (*protocol.HelloAck, *bufio.Reader, error)
-	// prewarm runs AFTER a successful HelloV2 registration and BEFORE
-	// the ready marker: for an encrypted subscription it confirms
-	// the bus will be able to obtain the encrypt_key (by fetching it with the
-	// same authority the bus uses), so the consumer never goes ready when its
-	// events could not be decrypted. nil (or a no-op) for a plaintext
-	// subscription. A non-nil error means "do NOT ready" — runRefinedChain
-	// rolls back the local registration (the deferred conn.Close unregisters).
-	prewarm func(ctx context.Context, remoteSubscriptionID string) error
 }
 
 // RunRefined drives the refined-subscription `event consume` startup chain:
@@ -161,12 +156,6 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 		apply: func(ctx context.Context, plan event.ReconcilePlan) (string, bool, error) {
 			return applyRemoteSubscriptionPlan(ctx, opts.SubClient, eventType, targetResource, plan, opts.IncludeResourceData)
 		},
-		prewarm: func(ctx context.Context, remoteSubscriptionID string) error {
-			if !opts.IncludeResourceData {
-				return nil // plaintext subscription: nothing to decrypt, nothing to prewarm
-			}
-			return prewarmEncryptKey(ctx, opts.SubClient, remoteSubscriptionID)
-		},
 		startBus: func(ctx context.Context) (net.Conn, error) {
 			return EnsureBus(ctx, tr, appID, profileName, domain, opts.RemoteAPIClient, opts.ErrOut)
 		},
@@ -202,6 +191,10 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 				authorityTypeFor(opts.Identity), appID, scopeUserOpenID)
 
 			hello := buildHelloV2(resolved, opts.Identity, localSubscriptionID, profile, userOpenID, remoteSubscriptionID, consumerScopeID)
+			// Tell the bus this is an ENCRYPTED subscription so it fetches the
+			// encrypt_key once (under the owner==current gate) before acking.
+			// The plaintext path leaves this false — no key fetch on the bus.
+			hello.IncludeResourceData = opts.IncludeResourceData
 			return doHelloV2(conn, hello)
 		},
 	}
@@ -297,21 +290,17 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 		// 3), not a generic unactionable message.
 		return errApplyOkHelloFailed(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, err)
 	}
+	// An encrypted consumer whose Hello-time key fetch failed is rejected by
+	// the bus with a fixed decrypt_key_unavailable reason (the bus, not the
+	// consume side, owns the key fetch now). Surface it as a typed
+	// failed_precondition guiding the operator to fix scope/identity — NOT the
+	// single-consumer hint the generic rejection carries. The consumer was
+	// never registered on the bus, so there is nothing local to roll back.
+	if ack != nil && ack.Rejected && ack.RejectReason == protocol.RejectReasonDecryptKeyUnavailable {
+		return refinedDecryptKeyUnavailableError(resolved, opts.Identity, remoteSubscriptionID)
+	}
 	if rejErr := rejectionError(ack, resolved.MaterializedKey); rejErr != nil {
 		return applyOkRejectedError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, rejErr)
-	}
-
-	// ---- 6.5 Prewarm the encrypt_key BEFORE ready ----
-	// For an encrypted subscription, confirm the key is retrievable (so the bus
-	// can decrypt) before this consumer ever reports ready. A failure here must
-	// NOT ready the consumer: return a structured error. Rollback of the local
-	// registration is the deferred conn.Close() above — closing the IPC
-	// connection makes the bus unregister this consumer, so no half-registered
-	// consumer is left behind.
-	if deps.prewarm != nil {
-		if err := deps.prewarm(ctx, remoteSubscriptionID); err != nil {
-			return refinedPrewarmError(resolved, opts.Identity, remoteSubscriptionID, err)
-		}
 	}
 
 	consumeOpts := Options{
@@ -445,59 +434,22 @@ func buildRefinedCreateBody(eventType, targetResource string, includeResourceDat
 		Build()
 }
 
-// errPrewarmNoKey is prewarmEncryptKey's sentinel for "GetEncryptKey succeeded
-// but returned no usable key" — a genuine (not transient) unavailability.
-var errPrewarmNoKey = errors.New("subscription encrypt_key is not retrievable") //nolint:forbidigo // sentinel, typed at call site
-
-// prewarmEncryptKey confirms the subscription's encrypt_key is retrievable with
-// this identity/scope (prewarmed before the ready marker). It fetches
-// via the SAME GetEncryptKey the bus-side provider uses, with the SAME
-// authority (opts.SubClient is bound to the resolved --as identity, whose
-// current profile HelloV2 already established as the owner) — so a success here
-// guarantees the bus's own first-event fetch will succeed too. It deliberately
-// never returns or logs the key value: it only checks non-empty, then discards
-// resp.
-func prewarmEncryptKey(ctx context.Context, prober event.EncryptKeyProber, remoteSubscriptionID string) error {
-	req := larkeventv1.NewGetEncryptKeySubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()
-	resp, err := prober.GetEncryptKey(ctx, req)
-	if err != nil {
-		return err // already typed (WrapDoAPIError/classifyFailure); classified transient vs genuine by the caller
-	}
-	if resp == nil || resp.Data == nil || strVal(resp.Data.EncryptKey) == "" {
-		return errPrewarmNoKey
-	}
-	return nil
-}
-
-// refinedPrewarmError turns a prewarm failure into the structured error the
-// consumer exits with instead of going ready. A transient failure
-// (context cancel/deadline, or a typed network error) is returned UNCHANGED —
-// it is retryable and must never be relabeled as a decrypt conflict.
-// A genuine failure becomes a failed_precondition classified
-// decrypt_key_unavailable, guiding the operator to fix scope/identity (or
-// delete+recreate) — the consumer was NOT started.
-func refinedPrewarmError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, cause error) error {
-	if isTransientPrewarmErr(cause) {
-		return cause
-	}
+// refinedDecryptKeyUnavailableError turns the bus's decrypt_key_unavailable
+// Hello rejection into the structured error the consumer exits with instead of
+// going ready. The bus fetches the encrypt_key once at Hello time (under the
+// owner==current gate); when that fails it rejects the Hello before the
+// consumer registers, so there is NO half-registered consumer to roll back.
+// This becomes a failed_precondition guiding the operator to fix scope/identity
+// (or delete+recreate). The bus never returns WHY it failed (no oracle) — only
+// the fixed reason token — so this message is fully local, carrying no key
+// material or raw fetch error.
+func refinedDecryptKeyUnavailableError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string) error {
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
-		"cannot start consuming %s: its subscription encrypt_key is not retrievable (decrypt_key_unavailable), so the event bus could not decrypt its events",
+		"cannot start consuming %s: the event bus could not obtain its subscription encrypt_key (decrypt_key_unavailable), so it could not decrypt this subscription's events",
 		resolved.MaterializedKey).
 		WithParam("--include-resource-data").
 		WithHint("the consumer was NOT started (no half-registered consumer remains). Ensure identity %s holds scope `event:encrypt_key:read` and is the owner of remote_subscription_id=%s (switch --as/--profile if this identity is not the owner), then retry `lark-cli event consume %s --as %s`; or delete and recreate the subscription after human confirmation",
-			identity, remoteSubscriptionID, resolved.MaterializedKey, identity).
-		WithCause(cause)
-}
-
-// isTransientPrewarmErr reports whether a prewarm GetEncryptKey failure was a
-// retryable transient (context cancel/deadline, or a typed network error)
-// rather than a confirmed unavailability.
-func isTransientPrewarmErr(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	var ne *errs.NetworkError
-	return errors.As(err, &ne)
+			identity, remoteSubscriptionID, resolved.MaterializedKey, identity)
 }
 
 // refinedConflictError mirrors cmd/event/subscription/create.go's own

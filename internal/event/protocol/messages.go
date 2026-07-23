@@ -53,6 +53,16 @@ const (
 	CapabilityHelloV2 = "hello_v2"
 )
 
+// RejectReasonDecryptKeyUnavailable is the HelloAck.RejectReason the bus sends
+// when it cannot obtain the encrypt_key for an ENCRYPTED refined consumer at
+// Hello time (owner != current / missing event:encrypt_key:read scope / no key
+// returned / transient fetch failure). The consumer never registers or readies;
+// the consume side turns this reason into a typed failed_precondition guiding
+// the operator to fix scope/identity rather than the single-consumer hint a
+// generic rejection carries. A fixed token — never a raw error, never key
+// material.
+const RejectReasonDecryptKeyUnavailable = "decrypt_key_unavailable"
+
 // SourceStatus is best-effort: hub drops it when consumer's send channel is full.
 type SourceStatus struct {
 	Type   string `json:"type"`
@@ -102,6 +112,15 @@ type Hello struct {
 	// UserOpenID is the open_id of the Identity above (empty when Identity
 	// is "bot" or unset).
 	UserOpenID string `json:"user_open_id,omitempty"`
+
+	// IncludeResourceData is true when this consumer created/reused an
+	// ENCRYPTED remote Subscription (payload_options.include_resource_data=
+	// true). It tells the bus to fetch this subscription's encrypt_key ONCE at
+	// Hello time — under the owner==current gate — and register it with the SDK
+	// decrypt provider BEFORE acking, so later events decrypt with zero
+	// hot-path network. Empty/false is the plaintext path (no key fetch). Only
+	// meaningful alongside a non-empty RemoteSubscriptionID.
+	IncludeResourceData bool `json:"include_resource_data,omitempty"`
 
 	// Capabilities lists protocol/feature markers this Hello's sender
 	// understands, e.g. "hello_v2". This is the chosen capability/version

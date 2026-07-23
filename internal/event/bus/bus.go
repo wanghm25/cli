@@ -71,16 +71,17 @@ type Bus struct {
 	// recording, zero remote calls, zero panics) until wired.
 	lifecycleAction *subscriptionLifecycleAction
 
-	// encryptKeyProvider is the bus-side larkevent.EncryptKeyProvider the
-	// FeishuSource dispatcher decrypts encrypted subscription
-	// envelopes with. Always constructed by NewBus (never nil), but
-	// like lifecycleAction its two remote dependencies (identityGate, the
-	// GetEncryptKey client factory) start nil and are filled in by
-	// SetIdentityProviders/SetSubscriptionClient — until then it serves bot
-	// subscriptions with no key and user subscriptions not at all, always
-	// fail-closed. The key it caches lives ONLY in this object's in-memory SDK
-	// StaticEncryptKeyProvider — never logged, never on the IPC wire, never in
-	// status.
+	// encryptKeyProvider manages per-subscription encrypt_keys. The SDK
+	// dispatcher is wired to its plain static cache
+	// (encryptKeyProvider.dispatcherProvider()), so decryption on the event
+	// path is a pure cache lookup — a miss fails CLOSED with no runtime remote
+	// call. A key enters the cache only via encryptKeyProvider.fetchAndSet,
+	// which handleHello calls ONCE when an encrypted refined consumer
+	// registers. Always constructed by NewBus (never nil); its two remote
+	// dependencies (identityGate, the GetEncryptKey client factory) start nil
+	// and are filled in by SetIdentityProviders/SetSubscriptionClient. The key
+	// it caches lives ONLY in the in-memory SDK StaticEncryptKeyProvider —
+	// never logged, never on the IPC wire, never in status.
 	encryptKeyProvider *encryptKeyProvider
 
 	// pidHandle pins the alive.lock fd to the bus lifetime; OS releases on exit.
@@ -103,7 +104,7 @@ func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logge
 		shutdownCh:         make(chan struct{}, 1),
 		lifecycleExecutor:  newLifecycleExecutor(hub, action, logger),
 		lifecycleAction:    action,
-		encryptKeyProvider: newEncryptKeyProvider(hub, logger),
+		encryptKeyProvider: newEncryptKeyProvider(logger),
 	}
 	// On deleted_v1 the lifecycle action releases the
 	// subscription's cached encrypt_key from the provider. Wired
@@ -276,11 +277,13 @@ func (b *Bus) startSources(ctx context.Context) {
 			fs.OnConnReady = b.identityGate.onConnReady
 		}
 		fs.OnLifecycleEvent = b.lifecycleExecutor.Submit
-		// The dispatcher decrypts encrypted subscription
-		// envelopes via this provider. Non-encrypted events never
+		// The dispatcher decrypts encrypted subscription envelopes via the
+		// plain static cache: a pure lookup, no runtime remote fetch (keys are
+		// pre-loaded at handleHello by encryptKeyProvider.fetchAndSet). A miss
+		// returns ("",false) → SDK fail-closed. Non-encrypted events never
 		// reach it (the SDK only calls EncryptKey for envelopes carrying a
 		// top-level encrypt_info), so wiring it is a no-op for the plaintext path.
-		fs.EncryptKeyProvider = b.encryptKeyProvider
+		fs.EncryptKeyProvider = b.encryptKeyProvider.dispatcherProvider()
 		// A fail-closed SDK decrypt failure surfaces via the SDK
 		// logger; the source extracts the subscription_id and calls this so the
 		// bus can count it + mark the matched consumer degraded. The
@@ -404,6 +407,26 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 	// app_id field to read instead.
 	bc.SetOwnerIdentity(hello.Identity, b.appID, hello.UserOpenID)
 	bc.SetLogger(b.logger)
+
+	// Encrypted refined consumer: fetch the subscription's encrypt_key ONCE
+	// now (under the owner==current gate) and register it with the SDK decrypt
+	// provider BEFORE acking, so the dispatcher decrypts later events with zero
+	// hot-path network. This runs before any hub/bus registration, so a
+	// failure (owner mismatch / missing scope / no key / transient) simply
+	// REJECTS the Hello — the consumer never registers or readies, leaving no
+	// half-registered consumer behind. The reject reason is a fixed token,
+	// never the raw fetch error or any key material.
+	if hello.IncludeResourceData && b.encryptKeyProvider != nil {
+		if err := b.encryptKeyProvider.fetchAndSet(context.Background(), bc.RemoteSubscriptionID(), bc); err != nil {
+			b.logger.Printf("[encrypt-key] rejecting encrypted consumer pid=%d key=%q: key unavailable (%s)",
+				hello.PID, hello.EventKey, encryptKeyFailureClass(err))
+			if werr := bc.writeFrame(protocol.NewHelloAckRejected("v1", protocol.RejectReasonDecryptKeyUnavailable)); werr != nil {
+				b.logger.Printf("WARN: reject hello_ack (decrypt_key_unavailable) write to pid=%d key=%q failed: %v", hello.PID, hello.EventKey, werr)
+			}
+			bc.Close()
+			return
+		}
+	}
 
 	// SingleConsumer EventKeys allow only one consumer per SubscriptionID: reject extras at handshake.
 	exclusive := false

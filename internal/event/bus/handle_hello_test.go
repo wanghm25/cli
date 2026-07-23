@@ -6,6 +6,8 @@ package bus
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -13,9 +15,172 @@ import (
 	"testing"
 	"time"
 
+	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
+
+// --- R2 #15: bus fetches the encrypt_key ONCE at handleHello for an encrypted
+// refined consumer; a fetch failure REJECTS the Hello (decrypt_key_unavailable)
+// so the consumer never registers/readies. ---
+
+// readAckFromClient runs handleHello on a pipe and returns the decoded HelloAck.
+func readAckFromClient(t *testing.T, b *Bus, hello *protocol.Hello) *protocol.HelloAck {
+	t.Helper()
+	server, client := net.Pipe()
+	t.Cleanup(func() { server.Close(); client.Close() })
+	go b.handleHello(server, bufio.NewReader(server), hello)
+	line, err := protocol.ReadFrame(bufio.NewReader(client))
+	if err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	msg, err := protocol.Decode(bytes.TrimRight(line, "\n"))
+	if err != nil {
+		t.Fatalf("decode ack: %v", err)
+	}
+	ack, ok := msg.(*protocol.HelloAck)
+	if !ok {
+		t.Fatalf("got %T, want *HelloAck", msg)
+	}
+	return ack
+}
+
+// newEncryptedHelloBus builds a Bus with a wired encrypt-key provider (fake
+// GetEncryptKey client + static-identity gate) for the handleHello tests.
+func newEncryptedHelloBus(t *testing.T, logger *log.Logger, cli encryptKeyClient, current currentIdentity) *Bus {
+	t.Helper()
+	hub := NewHub()
+	p := newEncryptKeyProvider(logger)
+	p.setNewClient(func(core.Identity, string) (encryptKeyClient, error) { return cli, nil })
+	p.setIdentityGate(gateWith(hub,
+		func() (currentIdentity, error) { return current, nil },
+		func(context.Context, string, string) (string, error) { return "uat-fresh", nil }))
+	return &Bus{
+		appID:              "app_123",
+		hub:                hub,
+		logger:             logger,
+		conns:              make(map[*Conn]struct{}),
+		idleTimer:          time.NewTimer(30 * time.Second),
+		shutdownCh:         make(chan struct{}, 1),
+		encryptKeyProvider: p,
+	}
+}
+
+// Encrypted bot consumer, key fetch succeeds -> ack NOT rejected, consumer
+// registered, key cached in the SDK static provider (dispatcher will hit it).
+func TestHandleHello_EncryptedConsumer_KeyFetchSuccess_RegistersAndCaches(t *testing.T) {
+	b := newEncryptedHelloBus(t, log.New(io.Discard, "", 0), &fakeEncryptKeyClient{key: "K_OK"}, currentIdentity{})
+	hello := &protocol.Hello{
+		PID:                  7001,
+		EventKey:             "im.message.receive_v1/chat-id/oc_1",
+		EventTypes:           []string{"im.message.receive_v1"},
+		Identity:             "bot",
+		RemoteSubscriptionID: "sub_enc_ok",
+		IncludeResourceData:  true,
+	}
+	ack := readAckFromClient(t, b, hello)
+	if ack.Rejected {
+		t.Fatalf("encrypted consumer with a successful key fetch must be accepted, got rejected: %q", ack.RejectReason)
+	}
+	if got := b.hub.ConnCount(); got != 1 {
+		t.Errorf("hub.ConnCount = %d, want 1 (consumer must register on success)", got)
+	}
+	if key, ok := b.encryptKeyProvider.dispatcherProvider().EncryptKey(context.Background(), "sub_enc_ok"); !ok || key != "K_OK" {
+		t.Errorf("cached key = (%q,%v), want (K_OK,true) after a successful Hello-time fetch", key, ok)
+	}
+}
+
+// Encrypted consumer, key fetch FAILS -> Hello REJECTED with
+// decrypt_key_unavailable, consumer NOT registered, no key cached, and the
+// error/key never appears on the wire or in the log (redaction).
+func TestHandleHello_EncryptedConsumer_KeyFetchFailure_RejectsNotRegistered(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	const secretish = "leaky-detail-that-must-not-surface"
+	b := newEncryptedHelloBus(t, logger, &fakeEncryptKeyClient{err: errors.New(secretish)}, currentIdentity{})
+	hello := &protocol.Hello{
+		PID:                  7002,
+		EventKey:             "im.message.receive_v1/chat-id/oc_2",
+		EventTypes:           []string{"im.message.receive_v1"},
+		Identity:             "bot",
+		RemoteSubscriptionID: "sub_enc_fail",
+		IncludeResourceData:  true,
+	}
+	ack := readAckFromClient(t, b, hello)
+	if !ack.Rejected {
+		t.Fatal("encrypted consumer with a failed key fetch must be rejected")
+	}
+	if ack.RejectReason != protocol.RejectReasonDecryptKeyUnavailable {
+		t.Errorf("reject reason = %q, want %q", ack.RejectReason, protocol.RejectReasonDecryptKeyUnavailable)
+	}
+	if got := b.hub.ConnCount(); got != 0 {
+		t.Errorf("hub.ConnCount = %d, want 0 (a rejected consumer must NEVER register)", got)
+	}
+	if _, ok := b.encryptKeyProvider.dispatcherProvider().EncryptKey(context.Background(), "sub_enc_fail"); ok {
+		t.Errorf("a failed fetch must never cache a key")
+	}
+	// Redaction: neither the wire reject reason nor the log carries the raw
+	// fetch-error detail — only the fixed classification.
+	if strings.Contains(ack.RejectReason, secretish) {
+		t.Errorf("reject reason leaked the raw fetch error: %q", ack.RejectReason)
+	}
+	if strings.Contains(buf.String(), secretish) {
+		t.Errorf("bus.log leaked the raw fetch error; log:\n%s", buf.String())
+	}
+}
+
+// Encrypted USER consumer whose owner != current -> the §8 red line rejects the
+// Hello (no fetch, no historical UAT), consumer not registered.
+func TestHandleHello_EncryptedUserConsumer_OwnerMismatch_Rejected(t *testing.T) {
+	// current is a DIFFERENT user than the Hello's owner.
+	fake := &fakeEncryptKeyClient{key: "SHOULD_NOT_FETCH"}
+	b := newEncryptedHelloBus(t, log.New(io.Discard, "", 0), fake,
+		currentIdentity{appID: "app_123", userOpenID: "ou_current"})
+	hello := &protocol.Hello{
+		PID:                  7003,
+		EventKey:             "im.message.receive_v1/chat-id/oc_3",
+		EventTypes:           []string{"im.message.receive_v1"},
+		Identity:             "user",
+		UserOpenID:           "ou_owner",
+		RemoteSubscriptionID: "sub_enc_user",
+		IncludeResourceData:  true,
+	}
+	ack := readAckFromClient(t, b, hello)
+	if !ack.Rejected || ack.RejectReason != protocol.RejectReasonDecryptKeyUnavailable {
+		t.Fatalf("owner!=current encrypted consumer must be rejected with decrypt_key_unavailable, got rejected=%v reason=%q", ack.Rejected, ack.RejectReason)
+	}
+	if got := b.hub.ConnCount(); got != 0 {
+		t.Errorf("hub.ConnCount = %d, want 0", got)
+	}
+	if got := fake.callCount(); got != 0 {
+		t.Errorf("GetEncryptKey calls = %d, want 0 (owner!=current must never fetch)", got)
+	}
+}
+
+// A plaintext consumer (IncludeResourceData=false) never triggers a key fetch —
+// the fetch client would error if called, yet the consumer registers fine.
+func TestHandleHello_PlaintextConsumer_NoKeyFetch(t *testing.T) {
+	b := newEncryptedHelloBus(t, log.New(io.Discard, "", 0),
+		&fakeEncryptKeyClient{err: errors.New("must not be called for a plaintext consumer")}, currentIdentity{})
+	hello := &protocol.Hello{
+		PID:                  7004,
+		EventKey:             "im.message.receive_v1",
+		EventTypes:           []string{"im.message.receive_v1"},
+		Identity:             "bot",
+		RemoteSubscriptionID: "sub_plain",
+		IncludeResourceData:  false, // plaintext
+	}
+	ack := readAckFromClient(t, b, hello)
+	if ack.Rejected {
+		t.Fatalf("plaintext consumer must never be rejected for decryption, got: %q", ack.RejectReason)
+	}
+	if got := b.hub.ConnCount(); got != 1 {
+		t.Errorf("hub.ConnCount = %d, want 1", got)
+	}
+	if _, ok := b.encryptKeyProvider.dispatcherProvider().EncryptKey(context.Background(), "sub_plain"); ok {
+		t.Errorf("plaintext consumer must never cache a key")
+	}
+}
 
 // HelloAck write failure must unregister the conn from hub and bus before returning.
 func TestHandleHello_HelloAckWriteFailureUnregisters(t *testing.T) {

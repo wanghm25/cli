@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1036,77 +1035,22 @@ func TestRunRefinedChain_Suspended_NonDryRun_AppliesReactivateNotError(t *testin
 	}
 }
 
-// ---- prewarm-before-ready ----
+// ---- Hello rejection: decrypt_key_unavailable ----
+//
+// The consume side no longer fetches the encrypt_key itself (no front-end
+// prewarm). The BUS fetches it once at Hello time; if that fails it rejects the
+// Hello with a fixed decrypt_key_unavailable reason. These tests prove the
+// consume side turns that rejection into the right typed error and never
+// readies.
 
-// closeRecorder wraps a net.Conn to observe whether Close was called (the
-// rollback signal for a prewarm failure).
-type closeRecorder struct {
-	net.Conn
-	closed atomic.Bool
-}
-
-func (c *closeRecorder) Close() error {
-	c.closed.Store(true)
-	return c.Conn.Close()
-}
-
-// TestRunRefinedChain_Prewarm_RunsAfterHelloBeforeReady_Success proves the
-// prewarm step runs AFTER hello and BEFORE the consumer starts (in that
-// ordering), and that a successful prewarm lets the chain proceed normally.
-func TestRunRefinedChain_Prewarm_RunsAfterHelloBeforeReady_Success(t *testing.T) {
-	rec := &orderRecorder{}
+// A decrypt_key_unavailable rejection becomes a failed_precondition guiding the
+// operator to fix scope/identity — never the single-consumer hint — and the
+// consumer never emits the ready marker. There is nothing to roll back: the bus
+// rejected before the consumer registered.
+func TestRunRefinedChain_HelloRejectedDecryptKeyUnavailable_TypedError_NotReady(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
-	events := []*protocol.Event{protocol.NewEvent("im.message.created_v1", "e1", "", 1, json.RawMessage(`{"ok":true}`))}
-	go busSide(t, server, events, true)
-
-	deps := refinedDeps{
-		probe: func(context.Context) error { rec.record("probe"); return nil },
-		plan: func(context.Context) (event.ReconcilePlan, error) {
-			rec.record("plan")
-			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
-		},
-		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
-			rec.record("apply")
-			return "sub_enc", true, nil
-		},
-		startBus: func(context.Context) (net.Conn, error) { rec.record("startBus"); return client, nil },
-		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
-			rec.record("hello")
-			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true}, bufio.NewReader(conn), nil
-		},
-		prewarm: func(_ context.Context, remoteSubscriptionID string) error {
-			rec.record("prewarm")
-			if remoteSubscriptionID != "sub_enc" {
-				t.Errorf("prewarm got remoteSubscriptionID=%q, want sub_enc (apply's output)", remoteSubscriptionID)
-			}
-			return nil
-		},
-	}
-	opts := RefinedOptions{Quiet: true, ErrOut: io.Discard, Out: io.Discard, MaxEvents: 1, Identity: core.AsUser, IncludeResourceData: true}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := runRefinedChain(ctx, refinedFixture(), opts, deps); err != nil {
-		t.Fatalf("runRefinedChain: unexpected error: %v", err)
-	}
-	got := strings.Join(rec.snapshot(), ",")
-	want := "probe,plan,apply,startBus,hello,prewarm"
-	if got != want {
-		t.Errorf("call order = %s, want %s (prewarm must run after hello, before consume)", got, want)
-	}
-}
-
-// TestRunRefinedChain_PrewarmFails_NotReady_RollsBack proves a prewarm failure
-// (a genuine key-unavailable): the consumer must NOT emit ready, must return a
-// typed decrypt_key_unavailable failed_precondition, and must roll back its
-// local registration (the deferred conn.Close unregisters it from the bus).
-func TestRunRefinedChain_PrewarmFails_NotReady_RollsBack(t *testing.T) {
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-	rc := &closeRecorder{Conn: client}
 
 	var stderr bytes.Buffer
 	deps := refinedDeps{
@@ -1115,18 +1059,22 @@ func TestRunRefinedChain_PrewarmFails_NotReady_RollsBack(t *testing.T) {
 			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
 		},
 		apply:    func(context.Context, event.ReconcilePlan) (string, bool, error) { return "sub_enc", true, nil },
-		startBus: func(context.Context) (net.Conn, error) { return rc, nil },
+		startBus: func(context.Context) (net.Conn, error) { return client, nil },
 		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
-			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true}, bufio.NewReader(conn), nil
+			// The bus rejects an encrypted consumer whose key fetch failed.
+			return &protocol.HelloAck{
+				Type:         protocol.MsgTypeHelloAck,
+				Rejected:     true,
+				RejectReason: protocol.RejectReasonDecryptKeyUnavailable,
+			}, bufio.NewReader(conn), nil
 		},
-		prewarm: func(context.Context, string) error { return errPrewarmNoKey },
 	}
 	// Quiet=false so the ready marker WOULD be written if the chain reached it.
 	opts := RefinedOptions{Quiet: false, ErrOut: &stderr, Out: io.Discard, Identity: core.AsUser, IncludeResourceData: true}
 
 	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
 	if err == nil {
-		t.Fatal("expected a prewarm failure error, got nil")
+		t.Fatal("expected a decrypt_key_unavailable rejection error, got nil")
 	}
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) || ve.Subtype != errs.SubtypeFailedPrecondition {
@@ -1135,22 +1083,25 @@ func TestRunRefinedChain_PrewarmFails_NotReady_RollsBack(t *testing.T) {
 	if !strings.Contains(ve.Error(), "decrypt_key_unavailable") {
 		t.Errorf("error must be classified decrypt_key_unavailable, got: %v", ve.Error())
 	}
-	if strings.Contains(stderr.String(), "ready") {
-		t.Errorf("consumer must NOT emit the ready marker on prewarm failure; stderr:\n%s", stderr.String())
+	if !strings.Contains(ve.Hint, "event:encrypt_key:read") {
+		t.Errorf("hint must guide the operator to the encrypt_key scope/identity, got: %v", ve.Hint)
 	}
-	if !rc.closed.Load() {
-		t.Errorf("prewarm failure must roll back local registration by closing the bus conn")
+	if strings.Contains(ve.Hint, "only one consumer") {
+		t.Errorf("a decrypt_key_unavailable rejection must NOT reuse the single-consumer hint, got: %v", ve.Hint)
+	}
+	if strings.Contains(stderr.String(), "ready") {
+		t.Errorf("consumer must NOT emit the ready marker on a decrypt_key_unavailable rejection; stderr:\n%s", stderr.String())
 	}
 }
 
-// TestRunRefinedChain_PrewarmTransientError_ReturnedUnchanged proves a
-// transient prewarm failure (network) is surfaced as its original retryable
-// error, NOT relabeled as a decrypt conflict.
-func TestRunRefinedChain_PrewarmTransientError_ReturnedUnchanged(t *testing.T) {
+// A NON-decrypt rejection (e.g. a SingleConsumer conflict) still flows through
+// the generic rejection path with its own recovery hint — a regression guard
+// that the decrypt-specific branch didn't swallow every rejection.
+func TestRunRefinedChain_HelloRejectedOther_UsesGenericRejectionPath(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
-	transient := errs.NewNetworkError(errs.SubtypeNetworkTimeout, "dial timeout")
+
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
 		plan: func(context.Context) (event.ReconcilePlan, error) {
@@ -1159,20 +1110,21 @@ func TestRunRefinedChain_PrewarmTransientError_ReturnedUnchanged(t *testing.T) {
 		apply:    func(context.Context, event.ReconcilePlan) (string, bool, error) { return "sub_enc", true, nil },
 		startBus: func(context.Context) (net.Conn, error) { return client, nil },
 		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
-			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true}, bufio.NewReader(conn), nil
+			return &protocol.HelloAck{
+				Type:         protocol.MsgTypeHelloAck,
+				Rejected:     true,
+				RejectReason: "an EventKey consumer is already running",
+			}, bufio.NewReader(conn), nil
 		},
-		prewarm: func(context.Context, string) error { return transient },
 	}
 	opts := RefinedOptions{Quiet: true, ErrOut: io.Discard, Out: io.Discard, Identity: core.AsUser, IncludeResourceData: true}
 
 	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
-	var ne *errs.NetworkError
-	if !errors.As(err, &ne) {
-		t.Fatalf("transient prewarm error must be surfaced as a NetworkError, got %T: %v", err, err)
+	if err == nil {
+		t.Fatal("expected a rejection error, got nil")
 	}
-	var ve *errs.ValidationError
-	if errors.As(err, &ve) && strings.Contains(err.Error(), "decrypt_key_unavailable") {
-		t.Errorf("a transient prewarm error must NOT be relabeled decrypt_key_unavailable, got: %v", err)
+	if strings.Contains(err.Error(), "decrypt_key_unavailable") {
+		t.Errorf("a non-decrypt rejection must NOT be classified decrypt_key_unavailable, got: %v", err)
 	}
 }
 
