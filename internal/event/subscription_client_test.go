@@ -30,6 +30,9 @@ type fakeSubscriptionService struct {
 	getResp *larkeventv1.GetSubscriptionResp
 	getErr  error
 
+	getEncryptKeyResp *larkeventv1.GetEncryptKeySubscriptionResp
+	getEncryptKeyErr  error
+
 	listResp *larkeventv1.ListSubscriptionResp
 	listErr  error
 
@@ -54,6 +57,11 @@ func (f *fakeSubscriptionService) Create(_ context.Context, _ *larkeventv1.Creat
 func (f *fakeSubscriptionService) Get(_ context.Context, _ *larkeventv1.GetSubscriptionReq, options ...larkcore.RequestOptionFunc) (*larkeventv1.GetSubscriptionResp, error) {
 	f.gotOpts = options
 	return f.getResp, f.getErr
+}
+
+func (f *fakeSubscriptionService) GetEncryptKey(_ context.Context, _ *larkeventv1.GetEncryptKeySubscriptionReq, options ...larkcore.RequestOptionFunc) (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
+	f.gotOpts = options
+	return f.getEncryptKeyResp, f.getEncryptKeyErr
 }
 
 func (f *fakeSubscriptionService) List(_ context.Context, _ *larkeventv1.ListSubscriptionReq, options ...larkcore.RequestOptionFunc) (*larkeventv1.ListSubscriptionResp, error) {
@@ -243,6 +251,74 @@ func TestSubscriptionClient_Create_SuccessReturnsNoError(t *testing.T) {
 	}
 	if got != resp {
 		t.Error("Create returned a different response pointer than the fake produced")
+	}
+}
+
+func TestSubscriptionClient_GetEncryptKey_TransportErrorBecomesTypedError(t *testing.T) {
+	svc := &fakeSubscriptionService{getEncryptKeyErr: errors.New("boom: connection reset")}
+	sc, err := newSubscriptionClient(svc, core.AsBot, "")
+	if err != nil {
+		t.Fatalf("newSubscriptionClient: unexpected error: %v", err)
+	}
+
+	_, err = sc.GetEncryptKey(context.Background(), larkeventv1.NewGetEncryptKeySubscriptionReqBuilder().SubscriptionId("sub_1").Build())
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if _, ok := errs.ProblemOf(err); !ok {
+		t.Fatalf("expected a typed errs.* error (network/internal), got %T: %v", err, err)
+	}
+}
+
+func TestSubscriptionClient_GetEncryptKey_BusinessFailureClassifiedViaErrclass(t *testing.T) {
+	resp := &larkeventv1.GetEncryptKeySubscriptionResp{
+		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":600901,"msg":"synthetic failure for classification test"}`)},
+	}
+	resp.Code = 600901
+	resp.Msg = "synthetic failure for classification test"
+	svc := &fakeSubscriptionService{getEncryptKeyResp: resp}
+	sc, err := newSubscriptionClient(svc, core.AsBot, "")
+	if err != nil {
+		t.Fatalf("newSubscriptionClient: unexpected error: %v", err)
+	}
+
+	_, err = sc.GetEncryptKey(context.Background(), larkeventv1.NewGetEncryptKeySubscriptionReqBuilder().SubscriptionId("sub_1").Build())
+	if err == nil {
+		t.Fatal("expected an error for a non-zero response code, got nil")
+	}
+	problem, ok := errs.ProblemOf(err)
+	if !ok {
+		t.Fatalf("expected a typed errs.* error (via errclass.BuildAPIError), got %T: %v", err, err)
+	}
+	if problem.Code != 600901 {
+		t.Errorf("Code = %d, want 600901", problem.Code)
+	}
+	if problem.Message != "synthetic failure for classification test" {
+		t.Errorf("Message = %q, want %q", problem.Message, "synthetic failure for classification test")
+	}
+}
+
+func TestSubscriptionClient_GetEncryptKey_SuccessReturnsEncryptKey(t *testing.T) {
+	key := "synthetic-encrypt-key-value"
+	resp := &larkeventv1.GetEncryptKeySubscriptionResp{
+		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0,"msg":"success","data":{"encrypt_key":"synthetic-encrypt-key-value"}}`)},
+		Data:    &larkeventv1.GetEncryptKeySubscriptionRespData{EncryptKey: &key},
+	}
+	svc := &fakeSubscriptionService{getEncryptKeyResp: resp}
+	sc, err := newSubscriptionClient(svc, core.AsBot, "")
+	if err != nil {
+		t.Fatalf("newSubscriptionClient: unexpected error: %v", err)
+	}
+
+	got, err := sc.GetEncryptKey(context.Background(), larkeventv1.NewGetEncryptKeySubscriptionReqBuilder().SubscriptionId("sub_1").Build())
+	if err != nil {
+		t.Fatalf("GetEncryptKey: unexpected error: %v", err)
+	}
+	if got != resp {
+		t.Error("GetEncryptKey returned a different response pointer than the fake produced")
+	}
+	if got.Data == nil || got.Data.EncryptKey == nil || *got.Data.EncryptKey != key {
+		t.Errorf("Data.EncryptKey = %v, want %q", got.Data, key)
 	}
 }
 

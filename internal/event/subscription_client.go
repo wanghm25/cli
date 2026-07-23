@@ -21,9 +21,12 @@ import (
 )
 
 // subscriptionService is the subset of the candidate SDK's typed
-// client.Event.V1.Subscription surface that Phase-B `event subscription`
-// commands need (Create/Get/List/Patch/Renew/Reactivate/Delete — GetEncryptKey
-// and ListByIterator are out of scope for this phase, see spec §0.2/§9).
+// client.Event.V1.Subscription surface this CLI needs: Create/Get/List/
+// Patch/Renew/Reactivate/Delete for Phase-B `event subscription` commands
+// (see spec §0.2/§9), plus GetEncryptKey — added as a Module E (message
+// decryption) foundation, see task-E-design-note.md's task E1 — which fetches
+// a subscription's encrypt_key but is not yet called by any command.
+// ListByIterator remains out of scope.
 //
 // It exists purely as a test seam: the concrete *lark.Client's
 // Event.V1.Subscription value satisfies this interface structurally (Go
@@ -34,6 +37,7 @@ import (
 type subscriptionService interface {
 	Create(ctx context.Context, req *larkeventv1.CreateSubscriptionReq, options ...larkcore.RequestOptionFunc) (*larkeventv1.CreateSubscriptionResp, error)
 	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq, options ...larkcore.RequestOptionFunc) (*larkeventv1.GetSubscriptionResp, error)
+	GetEncryptKey(ctx context.Context, req *larkeventv1.GetEncryptKeySubscriptionReq, options ...larkcore.RequestOptionFunc) (*larkeventv1.GetEncryptKeySubscriptionResp, error)
 	List(ctx context.Context, req *larkeventv1.ListSubscriptionReq, options ...larkcore.RequestOptionFunc) (*larkeventv1.ListSubscriptionResp, error)
 	Patch(ctx context.Context, req *larkeventv1.PatchSubscriptionReq, options ...larkcore.RequestOptionFunc) (*larkeventv1.PatchSubscriptionResp, error)
 	Renew(ctx context.Context, req *larkeventv1.RenewSubscriptionReq, options ...larkcore.RequestOptionFunc) (*larkeventv1.RenewSubscriptionResp, error)
@@ -140,6 +144,23 @@ func (c *SubscriptionClient) Create(ctx context.Context, req *larkeventv1.Create
 // Get wraps client.Event.V1.Subscription.Get with the bound identity option.
 func (c *SubscriptionClient) Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error) {
 	resp, err := c.svc.Get(ctx, req, c.opts...)
+	if err != nil {
+		return nil, client.WrapDoAPIError(err)
+	}
+	if !resp.Success() {
+		return resp, c.classifyFailure(resp.ApiResp)
+	}
+	return resp, nil
+}
+
+// GetEncryptKey wraps client.Event.V1.Subscription.GetEncryptKey with the
+// bound identity option. Added as a Module E (message decryption) foundation
+// (task-E-design-note.md's task E1): fetches the given subscription's
+// encrypt_key so a later task's bus-side EncryptKeyProvider can decrypt its
+// events. Requires scope event:encrypt_key:read, which read/write do not
+// imply. Not yet called by any command — later Module E tasks wire it in.
+func (c *SubscriptionClient) GetEncryptKey(ctx context.Context, req *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
+	resp, err := c.svc.GetEncryptKey(ctx, req, c.opts...)
 	if err != nil {
 		return nil, client.WrapDoAPIError(err)
 	}

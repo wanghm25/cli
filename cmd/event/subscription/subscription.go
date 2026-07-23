@@ -97,6 +97,15 @@ Subscription here never starts, stops, or changes a local consumer.`,
 // (spec §3.5/§7).
 var subscriptionReadScopes = []string{"event:subscription:read"}
 
+// subscriptionEncryptKeyReadScopes is the scope required to fetch a
+// subscription's encrypt_key via eventlib.SubscriptionClient.GetEncryptKey
+// (internal/event/subscription_client.go) — event:encrypt_key:read is a
+// distinct scope that neither subscriptionReadScopes nor
+// subscriptionMutationScopes implies (task-E-design-note.md's task E1). This
+// is a Module E (message decryption) foundation const only: nothing wires it
+// into a command's required-scopes check yet.
+var subscriptionEncryptKeyReadScopes = []string{"event:encrypt_key:read"}
+
 // addAsFlag registers the --as flag shared by every subscription
 // subcommand. Per spec §2.8's last paragraph, list/get/update/renew/
 // reactivate/delete carry no EventKey/KeyTemplate context, so --as resolves
