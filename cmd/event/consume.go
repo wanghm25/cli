@@ -39,10 +39,10 @@ type consumeCmdOpts struct {
 	timeout   time.Duration
 	dryRun    bool
 
-	// includeResourceData (design spec §4.7): default false is a no-op
+	// includeResourceData: default false is a no-op
 	// (unchanged behavior — a refined consume's remote Subscription is still
 	// created/reused with resource data disabled). On a refined key, true is
-	// SUPPORTED (task E5): it creates an ENCRYPTED remote Subscription and
+	// SUPPORTED: it creates an ENCRYPTED remote Subscription and
 	// flows through to RunRefined (RefinedOptions.IncludeResourceData). On an
 	// ORDINARY (non-refined) key, true stays a typed invalid_argument (the flag
 	// has no remote-Subscription concept to apply to there) — checked before
@@ -165,7 +165,7 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		// ResolveEventKey's own "base is not registered" wording differs from
 		// the pre-existing "unknown EventKey: <key>" contract (locked by
 		// tests/cli_e2e/event/event_consume_error_test.go); map that one case
-		// back onto it. Every other rejection (R1 bare base key, legacy+suffix,
+		// back onto it. Every other rejection (bare base key, legacy+suffix,
 		// bad template segment, ...) is returned unchanged.
 		if !eventKeyBaseRegistered(eventKey) {
 			return unknownEventKeyErr(eventKey)
@@ -173,14 +173,14 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		return err
 	}
 	if resolved.IsRefined {
-		// Task E5 (spec §4.7): --include-resource-data=true is now SUPPORTED on
+		// --include-resource-data=true is SUPPORTED on
 		// a refined key — it creates an ENCRYPTED remote Subscription. The
-		// former §9 E-gate here is removed; the flag flows through to
+		// flag flows through to
 		// RunRefined (RefinedOptions.IncludeResourceData), which reconciles
 		// against the encryption conflict matrix, generates + injects a fresh
 		// CSPRNG encrypt_key on create, and prewarms the key before ready.
-		// R1 passed (this is a materialized refined key): drive the refined
-		// startup chain (design spec §4.1/§4.2/§4.9) — ProbeBusEligibility
+		// This is a materialized refined key: drive the refined
+		// startup chain — ProbeBusEligibility
 		// (read-only) -> PlanRemoteSubscription (List/Get) -> [--dry-run
 		// exits here] -> ApplyRemoteSubscriptionPlan (the ONLY remote write)
 		// -> StartOrConnectBus -> HelloV2. The legacy branch below
@@ -190,7 +190,7 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 	}
 	keyDef := resolved.Definition
 
-	// §4.7:330 E-gate: --include-resource-data has no remote-Subscription
+	// --include-resource-data has no remote-Subscription
 	// concept to apply to on an ordinary (legacy) EventKey — reject before
 	// identity resolution or any other side effect, mirroring the refined
 	// branch's own before-side-effect placement above.
@@ -326,14 +326,14 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 	return nil
 }
 
-// errIncludeResourceDataNotApplicable implements design spec §4.7:330's
+// errIncludeResourceDataNotApplicable returns the
 // typed rejection: --include-resource-data only ever controls a
 // refined-subscription EventKey's remote Subscription (see `event
 // subscription create --include-resource-data`) — an ordinary (legacy)
 // EventKey has no remote Subscription resource at all, so passing the flag
 // against one is a caller mistake. Subtype is invalid_argument: unlike a
 // refined key (where --include-resource-data=true is now SUPPORTED and creates
-// an encrypted subscription, task E5), an ordinary key can never have a remote
+// an encrypted subscription), an ordinary key can never have a remote
 // Subscription for the flag to apply to, so this rejection is permanent by
 // design — not a temporary gate.
 func errIncludeResourceDataNotApplicable(eventKey string) error {
@@ -345,8 +345,8 @@ func errIncludeResourceDataNotApplicable(eventKey string) error {
 
 // eventKeyBaseRegistered reports whether eventKey itself, or the segment
 // before its first "/", names a registered EventKey definition — mirroring
-// the exact-match-then-split order ResolveEventKey applies internally
-// (design spec §2.3 steps 1-2). It exists solely to distinguish
+// the exact-match-then-split order ResolveEventKey applies internally.
+// It exists solely to distinguish
 // ResolveEventKey's "the base isn't registered at all" failure from every
 // other typed rejection it can return (bare refined base key / legacy key
 // with a path suffix / unknown template path segment / ...), so runConsume
@@ -363,24 +363,24 @@ func eventKeyBaseRegistered(eventKey string) bool {
 }
 
 // runRefinedConsume is cmd/event/consume.go's fork-seam target for a
-// materialized refined EventKey (design spec §4). Unlike the legacy branch,
+// materialized refined EventKey. Unlike the legacy branch,
 // none of the preflight below has run yet at this point in runConsume (the
 // IsRefined check happens before keyDef/identity resolution) — so this
 // resolves the minimal additional values consume.RunRefined needs (identity,
 // an identity-bound SubscriptionClient, the local API client, domain, signal
 // handling) and drives the refined startup chain: ProbeBusEligibility ->
 // PlanRemoteSubscription -> [--dry-run exit] -> ApplyRemoteSubscriptionPlan
-// (the ONLY remote write) -> StartOrConnectBus -> HelloV2 (design note "TASK
-// 15b"). It deliberately mirrors, rather than shares code with, the legacy
+// (the ONLY remote write) -> StartOrConnectBus -> HelloV2.
+// It deliberately mirrors, rather than shares code with, the legacy
 // preflight further down runConsume — the legacy branch must stay
-// byte-identical, and refined's own console-precheck/scopes preflight is out
-// of this task's scope (design note's stage list does not include it).
+// byte-identical, and refined's own console-precheck/scopes preflight is
+// intentionally not part of this seam.
 func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConfig, paramMap map[string]string, resolved eventlib.ResolvedEventKey, o consumeCmdOpts) error {
 	identity, err := resolveIdentity(cmd, f, resolved.Definition)
 	if err != nil {
 		return err
 	}
-	// §2.8 tier 1.5 (write-safety, review finding I1): resolveIdentity calls
+	// Write-safety: resolveIdentity calls
 	// f.ResolveAs + f.CheckIdentity but never f.CheckStrictMode, unlike every
 	// sibling --as write command — cmd/event/subscription/subscription.go's
 	// resolveEffectiveIdentity (same signature/pattern mirrored here
@@ -403,7 +403,7 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 	if err := f.CheckStrictMode(cmd.Context(), identity); err != nil {
 		return err
 	}
-	// §2.8 tier 2 (write-safety, review fix): resolveIdentity only checked
+	// Write-safety: resolveIdentity only checked
 	// the BASE key's AuthTypes; the matched KeyTemplate can be narrower
 	// (e.g. the shipped im.message.created_v1/owner/me template is
 	// user-only even though its base key allows user+bot — see
@@ -411,7 +411,7 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 	// BEFORE any client/subClient construction below and before
 	// consume.RunRefined's Plan/Apply — a template-narrowed identity must
 	// never reach the ONLY remote write this chain performs. Mirrors
-	// cmd/event/subscription/create.go's own tier-2 check (same shared
+	// cmd/event/subscription/create.go's own equivalent check (same shared
 	// func), which guards the sibling write path.
 	if err := eventlib.CheckTemplateAuthTypes(identity, resolved); err != nil {
 		return err

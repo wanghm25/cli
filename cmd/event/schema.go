@@ -203,7 +203,7 @@ func printIndentedJSON(out io.Writer, raw json.RawMessage) {
 }
 
 // ConditionalScope documents a scope that is only required under specific
-// flag/identity combinations (spec §2.6), as opposed to KeyDefinition.Scopes
+// flag/identity combinations, as opposed to KeyDefinition.Scopes
 // which are always required. Currently static: every refined key discloses
 // the same encrypt-key read requirement for --include-resource-data + --as user.
 type ConditionalScope struct {
@@ -212,9 +212,9 @@ type ConditionalScope struct {
 }
 
 // RiskDisclosure statically discloses that refined consume has write-level
-// remote side effects (spec §2.7). The command framework only tracks
+// remote side effects. The command framework only tracks
 // static per-command risk (cmdutil.SetRisk; consume is registered "read")
-// and this task does NOT change that to dynamic per-key risk — this is an
+// and that is not changed to dynamic per-key risk here — this is an
 // additive, informational strong-disclosure surfaced via `schema --json` only.
 type RiskDisclosure struct {
 	OrdinaryEventKey  string `json:"ordinary_event_key"`
@@ -236,7 +236,7 @@ type DryRunInfo struct {
 	Example   string `json:"example"`
 }
 
-// SubscriptionInfo documents refined-key subscription-management affordances (spec §2.6).
+// SubscriptionInfo documents refined-key subscription-management affordances.
 type SubscriptionInfo struct {
 	PayloadOptions PayloadOptions `json:"payload_options"`
 	DryRun         DryRunInfo     `json:"dry_run"`
@@ -245,7 +245,7 @@ type SubscriptionInfo struct {
 // writeSchemaJSON emits the EventKey definition plus resolved schema; jq_root_path tells callers whether fields live at `.` or `.event`.
 //
 // payload embeds *eventlib.KeyDefinition, so refined_subscription/resource_type/
-// key_templates[]/auth_types/scopes (spec §2.6) are already promoted into the
+// key_templates[]/auth_types/scopes are already promoted into the
 // JSON output unchanged for every key — no new code needed for those. Only
 // ConditionalScopes/Risk/Subscription/NextAction are genuinely new here, and
 // they use pointer/slice/string types so `omitempty` actually omits them

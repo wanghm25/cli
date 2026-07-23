@@ -109,7 +109,7 @@ func writeListJSON(f *cmdutil.Factory, all []*eventlib.KeyDefinition) error {
 	// refined-subscription additive fields from KeyDefinition/KeyTemplate —
 	// refined_subscription, resource_type, key_templates[], auth_types) are
 	// already promoted into the JSON output unchanged. DryRunSupported and
-	// NextAction are the only genuinely new fields here (spec §2.5); both are
+	// NextAction are the only genuinely new fields here; both are
 	// omitempty and left zero-valued for non-refined keys, so legacy key JSON
 	// output is byte-for-byte unchanged.
 	type row struct {

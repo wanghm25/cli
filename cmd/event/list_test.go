@@ -105,7 +105,7 @@ func TestRunList_JSONOutput(t *testing.T) {
 	}
 }
 
-// TestListJSON_RefinedSubscriptionAdditiveFields pins spec §2.5: for a
+// TestListJSON_RefinedSubscriptionAdditiveFields pins that for a
 // RefinedSubscription key, `event list --json` additively emits
 // refined_subscription/key_templates[]/auth_types/dry_run_supported/next_action
 // on top of the existing resolved_output_schema.
@@ -202,7 +202,7 @@ func TestListJSON_RefinedSubscriptionAdditiveFields(t *testing.T) {
 	}
 }
 
-// TestListJSON_LegacyKeyUnchanged is the regression half of spec §2.5: a
+// TestListJSON_LegacyKeyUnchanged is the regression half: a
 // non-refined (legacy) EventKey must not gain any of the new refined-only
 // fields in `event list --json` output.
 func TestListJSON_LegacyKeyUnchanged(t *testing.T) {

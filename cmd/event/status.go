@@ -109,7 +109,7 @@ type appStatus struct {
 	Active    int
 	Consumers []protocol.ConsumerInfo
 
-	// --- Task 16 additive: local current_profile_match support (spec §4.6) ---
+	// Local current_profile_match support.
 	//
 	// CurrentIdentityKnown/CurrentAppID/CurrentUserOpenID carry the FRESHLY
 	// resolved current identity (core.LoadMultiAppConfig, never
@@ -197,7 +197,7 @@ func runStatus(cmd *cobra.Command, f *cmdutil.Factory, current, asJSON, failOnOr
 		time.Now(),
 	)
 
-	// --- Task 16 additive (spec §4.6), strictly read-only ---
+	// Strictly read-only.
 	//
 	// Local current_profile_match: always available, no scope, no network —
 	// stamp the freshly-resolved current identity onto the one appStatus row
@@ -287,7 +287,7 @@ func deriveStatuses(seedAppIDs []string, sc busdiscover.Scanner, q busQuerier, n
 	return result
 }
 
-// --- Task 16 additive: local current_profile_match (spec §4.6) -------------
+// --- current_profile_match (local, read-only) ---
 
 // currentIdentityForMatch is the CLI-side "current" identity used to compute
 // each refined consumer's current_profile_match. Mirrors
@@ -305,7 +305,7 @@ type currentIdentityForMatch struct {
 // Factory.Config()'s cache — exactly mirroring
 // internal/event/bus/identity.go's resolveCurrentIdentity, so what `event
 // status` displays as "matching" tracks exactly what the bus's own live
-// delivery gate would do right now (spec §4.4/§4.6). ok=false (unreadable
+// delivery gate would do right now. ok=false (unreadable
 // config, no current app, or no logged-in user under it) means "nothing
 // resolvable to compare against" — callers must treat this as
 // not-applicable, never as a synthetic mismatch.
@@ -337,13 +337,13 @@ func annotateCurrentIdentity(statuses []appStatus, curAppID string, cur currentI
 	}
 }
 
-// consumerProfileMatch reports current_profile_match (spec §4.6) for one
+// consumerProfileMatch reports current_profile_match for one
 // consumer against s's current identity (see appStatus's Current* field doc
 // and loadCurrentIdentityForMatch). applicable=false — NEVER treated as a
 // mismatch — when either side has nothing to compare: the consumer has no
-// owner user at all (OwnerUserOpenID=="", i.e. a bot or legacy/pre-Task-15
-// registration — OwnerAppID alone is populated for every consumer on a
-// Phase-C bus and is deliberately never used as a standalone comparison
+// owner user at all (OwnerUserOpenID=="", i.e. a bot or legacy
+// registration — OwnerAppID alone is populated for every consumer and
+// is deliberately never used as a standalone comparison
 // key), or s isn't the current app / has no resolvable current identity.
 func consumerProfileMatch(s appStatus, c protocol.ConsumerInfo) (match, applicable bool) {
 	if !s.CurrentIdentityKnown || c.OwnerUserOpenID == "" {
@@ -355,8 +355,8 @@ func consumerProfileMatch(s appStatus, c protocol.ConsumerInfo) (match, applicab
 // refinedNextAction returns the read-only advisory action to display next to
 // a real owner/current mismatch (applicable && !match); "" otherwise (either
 // not applicable, or matching — nothing to advise). Never describes the
-// consumer as dead/inactive (spec §4.6 + Task-14 review Minor #1: no
-// liveness signal exists, a live consumer can still carry a stale flag).
+// consumer as dead/inactive (no liveness signal exists, a live
+// consumer can still carry a stale flag).
 func refinedNextAction(match, applicable bool) string {
 	if !applicable || match {
 		return ""
@@ -365,10 +365,10 @@ func refinedNextAction(match, applicable bool) string {
 }
 
 // staleIdentityAdvisory renders the stale_identity flag's advisory text
-// (Task 16 review Fix C). The FRESHLY-computed match/applicable (spec §4.6,
+// for display. The FRESHLY-computed match/applicable (from
 // consumerProfileMatch above) is authoritative for "does it currently
 // match" — the bus-side StaleIdentity flag, by contrast, is only ever set,
-// never cleared except on rebind (Task-14 review Minor #1), so a live
+// never cleared except on rebind, so a live
 // consumer that currently matches can still carry a stale flag left over
 // from an earlier evaluation. Presenting that leftover flag next to a fresh
 // "current_profile_match=true" as if it were a CURRENT mismatch would be
@@ -377,8 +377,8 @@ func refinedNextAction(match, applicable bool) string {
 // other case — a fresh match, or no fresh comparison available at all for
 // this app/consumer — is phrased as an earlier-snapshot advisory instead,
 // never asserting a current mismatch it cannot verify. Never describes the
-// consumer as dead/inactive (spec §4.6 + Task-14 review Minor #1:
-// advisory-only — no liveness signal exists).
+// consumer as dead/inactive (advisory-only — no liveness signal
+// exists).
 func staleIdentityAdvisory(match, applicable bool) string {
 	if applicable && !match {
 		return "stale_identity (owner identity does not match the current profile; informational only — the consumer may still be actively receiving events)"
@@ -389,7 +389,7 @@ func staleIdentityAdvisory(match, applicable bool) string {
 	return "stale_identity (a stale_identity flag was set by an earlier evaluation; current match status could not be freshly confirmed for this app) — informational only"
 }
 
-// --- Task 16 additive: weak remote supplement (spec §4.6) -------------------
+// --- weak remote supplement (read-only) ---
 
 // refinedSubscriptionGetter narrows *eventlib.SubscriptionClient to the one
 // call the remote supplement needs — mirrors
@@ -400,7 +400,7 @@ type refinedSubscriptionGetter interface {
 }
 
 // requiredRemoteSupplementScopes is the single scope status's weak remote
-// read depends on (spec §4.6). Kept as an independent literal rather than
+// read depends on. Kept as an independent literal rather than
 // importing cmd/event/subscription's unexported subscriptionReadScopes
 // (mirrors that package's own get.go scopeRemediationHint comment about the
 // identical asymmetry).
@@ -414,7 +414,7 @@ var getStoredToken = auth.GetStoredToken
 
 // remoteSupplementUAT resolves the user access token to bind into
 // NewSubscriptionClient for the remote supplement WITHOUT ever refreshing it
-// (spec §4.6: "不触发 token refresh"). stored must come from getStoredToken (a
+// (never triggering a token refresh). stored must come from getStoredToken (a
 // pure disk/keychain read, never network) — this function itself makes no
 // calls at all, it only inspects the fields it was handed, which is also the
 // no-refresh proof: there is no code path here that could refresh anything.
@@ -432,7 +432,7 @@ func remoteSupplementUAT(stored *auth.StoredUAToken, nowMillis int64) (uat strin
 }
 
 // resolveRemoteSupplementGetter performs the Factory-touching half of the
-// remote-supplement gate (spec §4.6): it is the ONE call site where `event
+// remote-supplement gate: it is the ONE call site where `event
 // status` resolves its own identity (f.ResolveAs/CheckStrictMode/
 // CheckIdentity — the pattern cmd/event/subscription/subscription.go's
 // resolveEffectiveIdentity uses, minus a --as flag: status defines none, so
@@ -496,7 +496,7 @@ func hasRefinedConsumer(consumers []protocol.ConsumerInfo) bool {
 }
 
 // applyRefinedSupplement is the pure(ish) orchestration for status's weak
-// remote read (spec §4.6): for the ONE appStatus matching curAppID that has
+// remote read: for the ONE appStatus matching curAppID that has
 // at least one refined consumer, it calls resolveGetter (assumed ALREADY
 // gated by every Factory-dependent precondition) AT MOST ONCE and, if
 // non-nil, fills that appStatus's refined consumers via
@@ -518,12 +518,12 @@ func applyRefinedSupplement(ctx context.Context, statuses []appStatus, curAppID 
 
 // supplementRefinedConsumers fills RemoteSubscription/RemoteState on every
 // refined consumer (RemoteSubscriptionID != "") in consumers by calling
-// getter.Get once per remote_subscription_id (spec §4.6). getter is assumed
+// getter.Get once per remote_subscription_id. getter is assumed
 // ALREADY gated by every precondition — this function performs no gating,
 // only the read + mapping, so a fake getter exercises it with no Factory/
 // cmd/keychain/network involved. A nil getter, a Get error, or an
 // empty/malformed response for one consumer degrades ONLY that consumer to
-// local-only (spec: unreachable -> local-only, no fail) — it never aborts
+// local-only (unreachable -> local-only, no fail) — it never aborts
 // the rest of the loop and never returns an error itself.
 func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionGetter, consumers []protocol.ConsumerInfo) {
 	if getter == nil {
@@ -552,7 +552,7 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 		}
 		if d.Suspension != nil && d.Suspension.Code != nil {
 			// Captured verbatim from the response already fetched above —
-			// NOT a new remote call. Feeds the Task 16 review Fix A degraded
+			// NOT a new remote call. Feeds the degraded
 			// advisory (remoteDegradedAdvisory below); this function itself
 			// does no interpretation, only mapping.
 			info.SuspensionCode = *d.Suspension.Code
@@ -562,21 +562,18 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 	}
 }
 
-// --- Task 16 review Fix A (§4.6:321 partial-compliance) ---------------------
+// --- remote degraded advisory (read-only) ---
 //
 // remoteDegradedAdvisory derives a read-only degraded advisory from c's
 // ALREADY-fetched remote-supplement result (c.RemoteState/
-// c.RemoteSubscription, filled by supplementRefinedConsumers above — spec
-// §4.6). Spec §4.6:321 asks the remote supplement to "据此刷新本地
-// degraded/错误状态" (refresh local degraded/error state accordingly), which
-// Task 16 itself deliberately did NOT implement because the remote state
-// string is an open vocabulary with no closed enum in this SDK — guessing at
-// "which states count as unhealthy" would risk fabricating incorrect logic
-// (see this task's own design-note/report history). This function is
-// grounded to EXACTLY the two values that ARE documented outside that open
-// vocabulary:
+// c.RemoteSubscription, filled by supplementRefinedConsumers above).
+// A fuller "refresh local degraded/error state from remote" is deliberately
+// NOT implemented because the remote state string is an open vocabulary with
+// no closed enum in this SDK — guessing at "which states count as unhealthy"
+// would risk fabricating incorrect logic. This function is grounded to
+// EXACTLY the two values that ARE documented outside that open vocabulary:
 //   - "suspended": SDK service/event/v1/model.go's Suspension field doc
-//     ("仅 state=suspended 时返回") and already used as a string-equality
+//     (returned only when state=suspended) and already used as a string-equality
 //     check in shipped code (cmd/event/subscription/update.go's
 //     applyUpdate/errUpdateSuspended).
 //   - "expired": the well-known subscription expiry lifecycle state.
@@ -586,7 +583,7 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 // future — returns "" (no derived advisory; the raw remote_state is still
 // displayed verbatim by the caller, unaffected). DISPLAY-ONLY: reads fields
 // already populated by an earlier, already-gated fetch (or, per
-// RemoteState's own doc, a future Task 18 lifecycle push); this function
+// RemoteState's own doc, a future lifecycle push); this function
 // itself makes no call, no bus/Conn write, nothing — its signature (a single
 // value parameter, no ctx/getter/bus reference) makes that structurally
 // impossible.
@@ -622,10 +619,10 @@ func humanizeDuration(d time.Duration) string {
 }
 
 // writeRefinedSubLine prints the additive, indented sub-line(s) under one
-// refined consumer's table row (spec §4.6). Legacy (non-refined) consumers
+// refined consumer's table row. Legacy (non-refined) consumers
 // get no output at all here — their row stays exactly as it was before this
 // change. stale_identity/degraded_reason are shown as advisory/informational
-// only (spec §4.6 + Task-14 review Minor #1): this NEVER labels the consumer
+// only: this NEVER labels the consumer
 // as dead/inactive, and next_action is read-only (no action is ever taken by
 // this command).
 func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
@@ -644,7 +641,7 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 	if c.RemoteState != "" {
 		parts = append(parts, fmt.Sprintf("remote_state=%s", c.RemoteState))
 	}
-	// Module E (task E7): resource_data / decrypt_state rollup, when this
+	// resource_data / decrypt_state rollup, when this
 	// consumer's subscription is encrypted (decrypt_state != "").
 	if c.ResourceData != "" {
 		parts = append(parts, fmt.Sprintf("resource_data=%s", c.ResourceData))
@@ -663,13 +660,13 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 	if c.DegradedReason != "" {
 		fmt.Fprintf(out, "      advisory: degraded (%s) — informational only\n", c.DegradedReason)
 	}
-	// Task 16 review Fix A: APPEND (never clobber) a degraded advisory
+	// APPEND (never clobber) a degraded advisory
 	// derived from the remote-supplement result, alongside whichever of the
 	// two advisories above may already be printed.
 	if advisory := remoteDegradedAdvisory(c); advisory != "" {
 		fmt.Fprintf(out, "      advisory: %s — informational only (remote-supplement, read-only)\n", advisory)
 	}
-	// Module E (task E7): decryption advisory + read-only next_action for an
+	// decryption advisory + read-only next_action for an
 	// encrypted consumer whose resource data cannot currently be decrypted.
 	if advisory, action := decryptAdvisory(c); advisory != "" {
 		fmt.Fprintf(out, "      advisory: %s — informational only\n", advisory)
@@ -680,7 +677,7 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 }
 
 // decryptAdvisory derives a read-only decryption advisory (+ next_action) from
-// a consumer's decrypt_state/last_decrypt_error (task E7, spec §4.7). Returns
+// a consumer's decrypt_state/last_decrypt_error. Returns
 // ("", "") for a healthy or plaintext consumer (decrypt_state "" or
 // "decrypted"). DISPLAY-ONLY: reads fields already populated by the bus; never
 // a key/ciphertext/plaintext, never an action this command takes itself.
@@ -770,12 +767,12 @@ func writeStatusText(out io.Writer, statuses []appStatus) {
 // to the top level, so every current and future ConsumerInfo field flows
 // through with ZERO per-field mapping code here) and adds three values that
 // are DERIVED/computed rather than raw bus data, so they don't belong on
-// ConsumerInfo itself: current_profile_match/next_action (spec §4.6) —
+// ConsumerInfo itself: current_profile_match/next_action —
 // computed locally by consumerProfileMatch/refinedNextAction because the bus
-// does not know the querying profile — and remote_degraded_advisory (Task 16
-// review Fix A), computed locally by remoteDegradedAdvisory from the
-// consumer's own already-fetched remote_state/remote_subscription (spec
-// §4.6:321's "refresh local degraded/error state", scoped to the two known
+// does not know the querying profile — and remote_degraded_advisory,
+// computed locally by remoteDegradedAdvisory from the
+// consumer's own already-fetched remote_state/remote_subscription
+// (refreshing local degraded/error state, scoped to the two known
 // remote states this SDK documents outside an open vocabulary). Pointer
 // CurrentProfileMatch (not bool) so "not applicable" (nil -> omitted) is
 // distinguishable from a real "false" mismatch. remote_degraded_advisory is
@@ -787,7 +784,7 @@ type consumerView struct {
 	CurrentProfileMatch    *bool  `json:"current_profile_match,omitempty"`
 	NextAction             string `json:"next_action,omitempty"`
 	RemoteDegradedAdvisory string `json:"remote_degraded_advisory,omitempty"`
-	// Module E (task E7): decrypt_state/last_decrypt_error/resource_data flow
+	// decrypt_state/last_decrypt_error/resource_data flow
 	// through automatically from the embedded ConsumerInfo; these two are the
 	// locally-computed advisory + read-only next_action for a decrypt issue,
 	// kept as separate keys (mirroring remote_degraded_advisory) so they never

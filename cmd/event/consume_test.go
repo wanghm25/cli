@@ -244,7 +244,7 @@ func newConsumeCmd(f *cmdutil.Factory, args ...string) *cobra.Command {
 	return cmd
 }
 
-// TestRunConsume_BareRefinedBaseKeyRejected locks design spec §2.3 R1 at the
+// TestRunConsume_BareRefinedBaseKeyRejected locks bare-refined-base-key rejection at the
 // consume entry: a refined-subscription base key with no template segment
 // (im.message.created_v1) must be rejected — typed invalid_argument, hint
 // pointing at `event schema` — before any identity resolution or bus
@@ -260,9 +260,9 @@ func TestRunConsume_BareRefinedBaseKeyRejected(t *testing.T) {
 }
 
 // TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOffline
-// is Task 15b's counterpart to the removed
+// is the counterpart to the removed
 // TestRunConsume_RefinedMaterializedKey_RuntimeNotYetAvailable: a fully
-// materialized refined EventKey (R1 satisfied) is no longer rejected by a
+// materialized refined EventKey is no longer rejected by a
 // hardcoded "not yet available" stub — the fork seam now routes it into the
 // real consume.RunRefined chain (ProbeBusEligibility -> PlanRemoteSubscription
 // -> ...; internal/event/consume/refined_test.go covers that chain's own
@@ -296,11 +296,11 @@ func TestRunConsume_RefinedMaterializedKey_DrivesRealRefinedChain_FailsSafelyOff
 }
 
 // TestRunConsume_OwnerMeTemplate_AsBot_RejectedByTemplateAuthTypesBeforePlanApply
-// is this task's REQUIRED write-safety case (review Fix 1): the shipped
+// is the REQUIRED write-safety case: the shipped
 // catalog's im.message.created_v1/owner/me template declares
 // auth_types:["user"] (events/refined/refined_keys_mock.json) -- narrower
 // than the base key's ["user","bot"] -- so `--as bot` must be rejected with
-// the §2.8 typed error BEFORE the refined chain ever reaches
+// the typed error BEFORE the refined chain ever reaches
 // PlanRemoteSubscription/ApplyRemoteSubscriptionPlan. This Factory
 // (newRefinedConsumeTestFactory) registers zero HTTP stubs, so if the
 // rejection did NOT happen up front and the chain instead reached Plan's
@@ -435,7 +435,7 @@ func TestRunRefinedConsume_StrictModeBotOnly_AsBot_PassesStrictModeCheck_Proceed
 
 // TestRunConsume_LegacyKeyWithSuffixRejected locks that a legacy EventKey
 // rejects any "/"-suffix (exact match only — legacy keys never enter the
-// refined split path, design spec §2.3 step 1) with a message distinct from
+// refined split path) with a message distinct from
 // "unknown EventKey" — contrast
 // TestRunConsume_UnknownEventKeyContractPreserved, which must keep the old
 // wording for a genuinely unregistered base.
@@ -480,18 +480,18 @@ func TestRunConsume_UnknownEventKeyContractPreserved(t *testing.T) {
 	}
 }
 
-// ---- --include-resource-data gap-fill (design spec §4.7:325/328/330, §9:403) ----
+// ---- --include-resource-data flag behavior ----
 //
-// Task 19 shipped `event consume` with NO --include-resource-data flag at
+// `event consume` originally shipped with NO --include-resource-data flag at
 // all: internal/event/consume/refined.go hardcodes IncludeResourceData(false)
 // for its own remote write, so passing --include-resource-data on the CLI
 // produced a generic cobra "unknown flag" error instead of a typed
-// rejection ("无声降级即 bug" — the caller must get an explicit, typed
+// rejection (silent degradation is a bug — the caller must get an explicit, typed
 // explanation of the deferral, not a parse error indistinguishable from a
 // typo). The tests below lock the flag's behavior: it exists, defaults to
-// false (no behavior change), and true is SUPPORTED on a refined key (task
-// E5 — it creates an ENCRYPTED subscription; the former
-// resource_data_encryption_deferred E-gate is retired) while staying a typed
+// false (no behavior change), and true is SUPPORTED on a refined key
+// (it creates an ENCRYPTED subscription; the former
+// resource_data_encryption_deferred gate is retired) while staying a typed
 // invalid_argument on an ordinary key (the flag has no remote-Subscription
 // concept to apply to there).
 
@@ -509,8 +509,8 @@ func TestNewCmdConsume_HasIncludeResourceDataFlag(t *testing.T) {
 }
 
 // TestRunConsume_RefinedKey_IncludeResourceDataTrue_UnGated_ReachesPlan locks
-// task E5's un-gating: --include-resource-data=true against a materialized
-// REFINED EventKey is NO LONGER rejected by the former §9 E-gate
+// the un-gating: --include-resource-data=true against a materialized
+// REFINED EventKey is NO LONGER rejected by the former gate
 // (resource_data_encryption_deferred). Instead it flows into the real refined
 // chain, which — with this Factory (newRefinedConsumeTestFactory) registering
 // zero HTTP stubs — reaches PlanRemoteSubscription's real List call and fails
@@ -562,8 +562,8 @@ func TestRunConsume_RefinedKey_IncludeResourceDataFalse_PassesGate_NonRegression
 }
 
 // TestRunConsume_OrdinaryKey_IncludeResourceDataTrue_TypedInvalidArgument
-// locks design spec §4.7:330 ("对普通 Key 传 --include-resource-data 应
-// typed 拒绝——本期取 typed invalid_argument"): the flag only ever controls a
+// locks that passing --include-resource-data to an ordinary Key is a typed
+// invalid_argument rejection: the flag only ever controls a
 // refined key's remote Subscription (see `event subscription
 // create/update --include-resource-data`); passing true against an
 // ORDINARY (legacy) EventKey is a caller mistake, not a not-yet-supported

@@ -47,7 +47,7 @@ func NewCmdBus(f *cmdutil.Factory) *cobra.Command {
 			tr := transport.New()
 			b := bus.NewBus(cfg.AppID, cfg.AppSecret, domain, tr, logger)
 
-			// Wires the real-time identity gate + BindUser (spec §4.4).
+			// Wires the real-time identity gate + BindUser.
 			// f.Credential.ResolveToken resolves a UAT via the SAME
 			// credential chain every other command uses (respects a
 			// configured extension credential provider, not just the
@@ -69,11 +69,11 @@ func NewCmdBus(f *cmdutil.Factory) *cobra.Command {
 				return result.Token, nil
 			})
 
-			// Wires the *lark.Client Task 18's real lifecycle action needs
-			// for its single Reactivate/Renew/Get call per event (spec
-			// §5.3/§5.4). f.LarkClient() is the SAME primitive every other
+			// Wires the *lark.Client the lifecycle action needs
+			// for its single Reactivate/Renew/Get call per event.
+			// f.LarkClient() is the SAME primitive every other
 			// `event subscription`/`event consume` command builds its
-			// SubscriptionClient from (e.g. cmd/event/consume.go:319) --
+			// SubscriptionClient from --
 			// bound to this SAME cfg.AppID/AppSecret pair the bus itself
 			// was just constructed with (a bus is per-app). A failure here
 			// degrades to summary-only lifecycle handling (no Reactivate/

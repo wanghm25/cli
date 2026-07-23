@@ -52,8 +52,7 @@ func okGetSubscriptionResp(state string, expireTime int, includeResourceData boo
 	}
 }
 
-// --- Task 16: local current_profile_match (spec §4.6, no scope, always
-// available) --------------------------------------------------------------
+// --- local current_profile_match (no scope, always available) ---
 //
 // consumerProfileMatch is a pure function: it takes an appStatus (already
 // annotated with the freshly-resolved current identity — see
@@ -97,8 +96,8 @@ func TestConsumerProfileMatch_FalseWhenOwnerDiffers(t *testing.T) {
 
 // TestConsumerProfileMatch_NotApplicableForBotOrLegacyConsumer is the
 // critical safety guard: OwnerAppID is populated for EVERY consumer on a
-// Phase-C bus, including bot/legacy ones (it's just the bus's own AppID,
-// spec §4.4) — but OwnerUserOpenID=="" must NEVER be compared as a
+// bus, including bot/legacy ones (it's just the bus's own AppID)
+// — but OwnerUserOpenID=="" must NEVER be compared as a
 // "mismatch" against a real current user, or every bot consumer would show
 // up as falsely stale_identity. applicable must be false here regardless of
 // whether OwnerAppID happens to equal the current AppID.
@@ -171,11 +170,11 @@ func TestRefinedNextAction_NonEmptyOnRealMismatch(t *testing.T) {
 		t.Error("expected a non-empty next_action string for a real owner/current mismatch")
 	}
 	if strings.Contains(strings.ToLower(got), "dead") || strings.Contains(strings.ToLower(got), "inactive") {
-		t.Errorf("next_action must not describe the consumer as dead/inactive (advisory-only, spec §4.6): %q", got)
+		t.Errorf("next_action must not describe the consumer as dead/inactive (advisory-only): %q", got)
 	}
 }
 
-// --- writeStatusText: refined sub-line (spec §4.6) --------------------------
+// --- writeStatusText: refined sub-line ---
 
 func refinedConsumer() protocol.ConsumerInfo {
 	return protocol.ConsumerInfo{
@@ -234,7 +233,7 @@ func TestWriteStatusText_RefinedConsumerSubLine_MismatchShowsAdvisoryAndNextActi
 	}
 }
 
-// --- Module E (task E7): decrypt observability display ----------------------
+// --- decrypt observability display ---
 
 func TestDecryptAdvisory_PerState(t *testing.T) {
 	// healthy / plaintext: no advisory.
@@ -410,7 +409,7 @@ func TestWriteStatusJSON_LegacyConsumer_OmitsCurrentProfileMatchKey(t *testing.T
 // (no per-field remapping), so an empty Consumers slice marshals exactly as
 // before.
 
-// --- pure remote-supplement helpers (spec §4.6) -----------------------------
+// --- pure remote-supplement helpers ---
 //
 // remoteSupplementUAT takes an already-resolved *auth.StoredUAToken value
 // directly (never calling auth.GetStoredToken itself) — no keychain, no
@@ -453,8 +452,8 @@ func TestSupplementRefinedConsumers_SkipsLegacyConsumers(t *testing.T) {
 	}
 }
 
-// TestSupplementRefinedConsumers_ErrorLeavesConsumerLocalOnly locks spec
-// §4.6's "unreachable/error -> local-only, no fail" contract: a Get error
+// TestSupplementRefinedConsumers_ErrorLeavesConsumerLocalOnly locks the
+// "unreachable/error -> local-only, no fail" contract: a Get error
 // must never propagate (supplementRefinedConsumers has no error return at
 // all) and must never partially fill the consumer.
 func TestSupplementRefinedConsumers_ErrorLeavesConsumerLocalOnly(t *testing.T) {
@@ -608,19 +607,19 @@ func TestResolveRemoteSupplementGetter_LarkClientError_ReturnsNil(t *testing.T) 
 	}
 }
 
-// --- Task 16 review fix wave ------------------------------------------------
+// --- degraded-advisory + stale-identity phrasing ---
 //
-// Fix A (§4.6:321 partial-compliance): a KNOWN degraded remote_state
+// Degraded advisory: a KNOWN degraded remote_state
 // ("suspended"/"expired") gets a derived, display-only advisory appended
 // alongside any pre-existing bus-side degraded_reason/stale_identity
 // advisory; any OTHER (open-vocabulary / healthy, e.g. "active"/"enabled")
-// remote_state gets none — no guessing. Fix C (style): the stale_identity
+// remote_state gets none — no guessing. Stale-identity phrasing: the stale_identity
 // advisory is phrased as an earlier-snapshot note, never a current-mismatch
 // assertion, when the FRESHLY-computed current_profile_match is true.
 
 // okGetSubscriptionRespSuspended mirrors okGetSubscriptionResp above but
 // additionally sets Suspension.Code, for exercising supplementRefinedConsumers'
-// verbatim SuspensionCode capture (Fix A support). suspensionCode=="" omits
+// verbatim SuspensionCode capture. suspensionCode=="" omits
 // the Suspension object entirely (a suspended response with no suspension
 // details, which must still produce a suspended advisory with no code).
 func okGetSubscriptionRespSuspended(suspensionCode string) *larkeventv1.GetSubscriptionResp {
@@ -640,7 +639,7 @@ func okGetSubscriptionRespSuspended(suspensionCode string) *larkeventv1.GetSubsc
 }
 
 // --- remoteDegradedAdvisory: pure function, no ctx/getter/bus involved at
-// all (the strongest possible proof that Fix A introduces no remote call and
+// all (the strongest possible proof that it introduces no remote call and
 // no bus/Conn write: the function signature has nothing capable of either).
 
 func TestRemoteDegradedAdvisory_Suspended_IncludesCodeWhenPresent(t *testing.T) {
@@ -844,7 +843,7 @@ func TestWriteStatusJSON_LegacyConsumer_OmitsRemoteDegradedAdvisoryKey(t *testin
 }
 
 // --- supplementRefinedConsumers: SuspensionCode capture, still exactly ONE
-// Get call (no extra remote call introduced by Fix A) ----------------------
+// Get call (no extra remote call introduced) ---
 
 func TestSupplementRefinedConsumers_CapturesSuspensionCodeVerbatim(t *testing.T) {
 	consumers := []protocol.ConsumerInfo{refinedConsumer()}
@@ -860,7 +859,7 @@ func TestSupplementRefinedConsumers_CapturesSuspensionCodeVerbatim(t *testing.T)
 	}
 }
 
-// --- Fix C: staleIdentityAdvisory -------------------------------------------
+// --- staleIdentityAdvisory ---
 
 func TestStaleIdentityAdvisory_FreshMatchTrue_EarlierSnapshotWording(t *testing.T) {
 	got := staleIdentityAdvisory(true, true)
@@ -891,9 +890,9 @@ func TestStaleIdentityAdvisory_NotApplicable_NeverAssertsCurrentMismatch(t *test
 }
 
 // TestWriteStatusText_StaleIdentityWithFreshMatch_NoContradictoryMismatchLine
-// is the exact review scenario: current_profile_match=true (FRESH) but
-// StaleIdentity is still set (an earlier evaluation's leftover flag, Task-14
-// review Minor #1). The two lines must never contradict each other, and the
+// exercises the scenario where current_profile_match=true (FRESH) but
+// StaleIdentity is still set (an earlier evaluation's leftover flag).
+// The two lines must never contradict each other, and the
 // consumer must never be described as dead/inactive.
 func TestWriteStatusText_StaleIdentityWithFreshMatch_NoContradictoryMismatchLine(t *testing.T) {
 	var buf bytes.Buffer

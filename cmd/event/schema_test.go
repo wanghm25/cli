@@ -382,7 +382,7 @@ func TestResolveSchemaJSON_CustomWithOverlay(t *testing.T) {
 	}
 }
 
-// TestSchemaJSON_RefinedSubscriptionAdditiveFields pins spec §2.6/§2.7: for a
+// TestSchemaJSON_RefinedSubscriptionAdditiveFields pins that for a
 // RefinedSubscription key, `event schema --json` additively emits
 // refined_subscription/key_templates[]/auth_types/scopes/conditional_scopes/
 // risk/subscription/next_action on top of the existing resolved_output_schema
@@ -506,7 +506,7 @@ func TestSchemaJSON_RefinedSubscriptionAdditiveFields(t *testing.T) {
 	}
 }
 
-// TestSchemaJSON_LegacyKeyUnchanged is the regression half of spec §2.6: a
+// TestSchemaJSON_LegacyKeyUnchanged is the regression half: a
 // non-refined (legacy) EventKey must not gain any of the new refined-only
 // fields in `event schema --json` output, and its existing fields
 // (resolved_output_schema, jq_root_path, scopes, auth_types) must be
