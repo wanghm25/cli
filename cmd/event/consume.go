@@ -143,9 +143,34 @@ no-op there.`,
 		"Preview the refined-subscription remote-write plan (probe + plan only) without applying it, starting the bus, or writing anything remote. No-op for legacy (non-refined) EventKeys, which never write remote state at all.")
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
 		"Include resource data in a refined key's remote Subscription (mirrors 'event subscription create'). false (the default) is a no-op. true creates an ENCRYPTED subscription and requires --as user (resource data is user-only; a bot/app subscription is rejected) plus scope event:encrypt_key:read; the CLI-generated per-subscription encrypt_key is never printed/logged, and the bus must be able to fetch the key when the consumer registers or the consumer refuses to start. Always rejected as invalid_argument on an ordinary (non-refined) key.")
-	cmdutil.SetRisk(cmd, "read")
+	// Static default: "write", not "read". A single risk_level annotation
+	// can't vary by the EventKey argument (unknown until RunE resolves it),
+	// and a refined key's consume startup chain has REAL write side effects
+	// (create/reuse/reactivate a remote Subscription) — so the static tag
+	// (what --help shows and what anything inspecting risk before args are
+	// resolved sees) must reflect this command's worst case, never silently
+	// under-report it as pure "read". runConsume narrows this to the precise
+	// per-invocation value ("read" for an ordinary key) once the EventKey is
+	// actually resolved — see consumeEffectiveRisk.
+	cmdutil.SetRisk(cmd, "write")
 
 	return cmd
+}
+
+// consumeEffectiveRisk reports one invocation's ACTUAL risk once its
+// EventKey has been resolved: "write" for a refined key (its startup chain
+// may create, reuse, or reactivate a remote Subscription even though the
+// command otherwise reads as pure observe); "read" for an ordinary (legacy)
+// key, which never writes remote state at all. Distinct from NewCmdConsume's
+// static risk_level annotation (always "write", the safe default before any
+// argument is known) — runConsume calls cmdutil.SetRisk again with this
+// value so the annotation reflects THIS invocation precisely once that's
+// knowable.
+func consumeEffectiveRisk(isRefined bool) string {
+	if isRefined {
+		return "write"
+	}
+	return "read"
 }
 
 func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consumeCmdOpts) error {
@@ -174,6 +199,10 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		}
 		return err
 	}
+	// Narrow the static "write" default to this invocation's actual risk now
+	// that the EventKey is resolved (see consumeEffectiveRisk / NewCmdConsume's
+	// own comment on why the static tag can't do this by itself).
+	cmdutil.SetRisk(cmd, consumeEffectiveRisk(resolved.IsRefined))
 	if resolved.IsRefined {
 		// --include-resource-data=true is SUPPORTED on
 		// a refined key — it creates an ENCRYPTED remote Subscription. The

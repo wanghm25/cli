@@ -548,6 +548,60 @@ func TestNewCmdConsume_HasIncludeResourceDataFlag(t *testing.T) {
 	}
 }
 
+// ---- structured risk (issue: static "read" contradicted refined's effective write) ----
+//
+// A single risk_level annotation can't vary by the EventKey argument (not
+// known until RunE resolves it), and a refined key's consume startup chain
+// has real write side effects — so NewCmdConsume's static default must be
+// "write" (never silently under-report the worst case), and runConsume
+// narrows it to the precise per-invocation value once the EventKey is
+// actually resolved.
+
+// TestNewCmdConsume_StaticRisk_IsWrite locks the static default: the safe,
+// conservative value --help (and anything inspecting risk before args are
+// resolved) sees.
+func TestNewCmdConsume_StaticRisk_IsWrite(t *testing.T) {
+	f := &cmdutil.Factory{}
+	cmd := NewCmdConsume(f)
+	level, ok := cmdutil.GetRisk(cmd)
+	if !ok || level != "write" {
+		t.Errorf("static risk = %q (ok=%v), want %q", level, ok, "write")
+	}
+}
+
+// TestRunConsume_OrdinaryKey_EffectiveRiskNarrowsToRead locks the dynamic
+// per-invocation refinement: once an ORDINARY (legacy) EventKey is resolved,
+// this invocation's risk narrows to "read" — it never writes remote state.
+// Reuses newRefinedConsumeTestFactory's blocked bus-fork safety net (see its
+// own doc comment): the invocation still fails deep in the unrelated
+// bus-fork path, which is irrelevant here — only the risk annotation matters.
+func TestRunConsume_OrdinaryKey_EffectiveRiskNarrowsToRead(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	f.IOStreams.IsTerminal = true // avoid the background stdin-EOF watcher racing with consume.Run's own errOut writes (unrelated to what this test checks)
+	cmd := newConsumeCmd(f, "im.message.receive_v1", "--as", "bot")
+	_ = cmd.Execute()
+
+	level, ok := cmdutil.GetRisk(cmd)
+	if !ok || level != "read" {
+		t.Errorf("effective risk after an ordinary-key invocation = %q (ok=%v), want %q", level, ok, "read")
+	}
+}
+
+// TestRunConsume_RefinedMaterializedKey_EffectiveRiskStaysWrite locks the
+// OTHER side: a materialized refined EventKey's risk stays "write" — its
+// startup chain may create, reuse, or reactivate a remote Subscription.
+func TestRunConsume_RefinedMaterializedKey_EffectiveRiskStaysWrite(t *testing.T) {
+	f := newRefinedConsumeTestFactory(t)
+	f.IOStreams.IsTerminal = true // same non-interference reasoning as the ordinary-key test above
+	cmd := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a")
+	_ = cmd.Execute() // fails deep in the real refined chain (this Factory has no HTTP stubs); only the risk annotation matters here
+
+	level, ok := cmdutil.GetRisk(cmd)
+	if !ok || level != "write" {
+		t.Errorf("effective risk after a refined-key invocation = %q (ok=%v), want %q", level, ok, "write")
+	}
+}
+
 // TestRunConsume_RefinedKey_IncludeResourceDataTrue_AsBot_RejectedRequiresUser
 // locks that resource data is a user-only capability: --include-resource-data=true
 // on a bot (here auto→bot, since this Factory has no identity hint and default
