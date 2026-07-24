@@ -21,6 +21,7 @@ import (
 	"github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
+	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
@@ -38,6 +39,12 @@ type fakeRefinedGetter struct {
 	listResp  *larkeventv1.ListSubscriptionResp
 	listErr   error
 	listCalls int
+
+	// listPageAt, when non-nil, overrides listResp/listErr and returns the
+	// page for the given 0-indexed call number — used to test
+	// listRemoteSupplementDetails's pagination (a fixed listResp can only
+	// ever serve one page).
+	listPageAt func(call int) *larkeventv1.ListSubscriptionResp
 }
 
 func (f *fakeRefinedGetter) Get(_ context.Context, _ *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error) {
@@ -46,9 +53,16 @@ func (f *fakeRefinedGetter) Get(_ context.Context, _ *larkeventv1.GetSubscriptio
 }
 
 func (f *fakeRefinedGetter) List(_ context.Context, _ *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
+	call := f.listCalls
 	f.listCalls++
+	if f.listPageAt != nil {
+		return f.listPageAt(call), f.listErr
+	}
 	return f.listResp, f.listErr
 }
+
+func strPtr(s string) *string { return &s }
+func boolPtr(b bool) *bool    { return &b }
 
 var errBoom = errors.New("boom: unreachable")
 
@@ -603,6 +617,99 @@ func TestSupplementRefinedConsumers_ListMissingID_StaysLocalOnly(t *testing.T) {
 	}
 }
 
+// --- issue #25b: List above the threshold now paginates (bounded), never
+// misreading a still-unread later page as "these ids don't exist" ---
+
+// TestSupplementRefinedConsumers_TargetIDOnSecondPage_Supplemented locks the
+// core fix: a wanted remote_subscription_id that only appears on page 2 must
+// still be supplemented — never left local-only just because page 1 alone
+// didn't carry it.
+func TestSupplementRefinedConsumers_TargetIDOnSecondPage_Supplemented(t *testing.T) {
+	n := remoteSupplementListThreshold + 1
+	consumers := make([]protocol.ConsumerInfo, 0, n)
+	for i := 0; i < n; i++ {
+		c := refinedConsumer()
+		c.PID = 100 + i
+		c.RemoteSubscriptionID = fmt.Sprintf("sub_%d", i)
+		consumers = append(consumers, c)
+	}
+	// Every id except the last one shows up on page 1; the last one only
+	// appears on page 2.
+	page1Items := make([]*larkeventv1.SubscriptionDetail, 0, n-1)
+	for i := 0; i < n-1; i++ {
+		id, state := fmt.Sprintf("sub_%d", i), "active"
+		page1Items = append(page1Items, &larkeventv1.SubscriptionDetail{SubscriptionId: &id, State: &state})
+	}
+	lastID, lastState := fmt.Sprintf("sub_%d", n-1), "active"
+	page2Items := []*larkeventv1.SubscriptionDetail{{SubscriptionId: &lastID, State: &lastState}}
+
+	getter := &fakeRefinedGetter{listPageAt: func(call int) *larkeventv1.ListSubscriptionResp {
+		if call == 0 {
+			return &larkeventv1.ListSubscriptionResp{Data: &larkeventv1.ListSubscriptionRespData{
+				Items: page1Items, HasMore: boolPtr(true), PageToken: strPtr("p2"),
+			}}
+		}
+		return &larkeventv1.ListSubscriptionResp{Data: &larkeventv1.ListSubscriptionRespData{
+			Items: page2Items, HasMore: boolPtr(false),
+		}}
+	}}
+
+	capped := supplementRefinedConsumers(context.Background(), getter, consumers)
+
+	if capped {
+		t.Error("capped = true, want false (every wanted id was found before any cap)")
+	}
+	for i, c := range consumers {
+		if c.RemoteState != "active" {
+			t.Errorf("consumers[%d].RemoteState = %q, want active (id=%s)", i, c.RemoteState, c.RemoteSubscriptionID)
+		}
+	}
+	if getter.listCalls != 2 {
+		t.Errorf("List called %d times, want exactly 2", getter.listCalls)
+	}
+}
+
+// TestSupplementRefinedConsumers_PageCapReached_DegradesGracefully_NotFalseNotExist
+// locks the "incomplete pagination must never be read as not-exist"
+// principle: when every page reports has_more=true and none of the wanted
+// ids ever turn up, the scan hits the page cap and every consumer stays
+// local-only (the SAME degrade an unreachable Get already produces) — capped
+// must be true so the caller logs it, rather than the supplement silently
+// asserting these subscriptions don't exist.
+func TestSupplementRefinedConsumers_PageCapReached_DegradesGracefully_NotFalseNotExist(t *testing.T) {
+	n := remoteSupplementListThreshold + 1
+	consumers := make([]protocol.ConsumerInfo, 0, n)
+	for i := 0; i < n; i++ {
+		c := refinedConsumer()
+		c.PID = 100 + i
+		c.RemoteSubscriptionID = fmt.Sprintf("sub_missing_%d", i)
+		consumers = append(consumers, c)
+	}
+	// Every page: has_more=true, and never contains any of the wanted ids.
+	getter := &fakeRefinedGetter{listPageAt: func(call int) *larkeventv1.ListSubscriptionResp {
+		otherID, state := fmt.Sprintf("unrelated_%d", call), "active"
+		return &larkeventv1.ListSubscriptionResp{Data: &larkeventv1.ListSubscriptionRespData{
+			Items:     []*larkeventv1.SubscriptionDetail{{SubscriptionId: &otherID, State: &state}},
+			HasMore:   boolPtr(true),
+			PageToken: strPtr(fmt.Sprintf("token-%d", call+1)),
+		}}
+	}}
+
+	capped := supplementRefinedConsumers(context.Background(), getter, consumers)
+
+	if !capped {
+		t.Error("capped = false, want true (every page had has_more=true; none of the wanted ids ever appeared)")
+	}
+	for i, c := range consumers {
+		if c.RemoteSubscription != nil || c.RemoteState != "" {
+			t.Errorf("consumers[%d] must degrade to local-only on a capped scan, got: %+v", i, c)
+		}
+	}
+	if getter.listCalls != eventlib.MaxSubscriptionListPages {
+		t.Errorf("List called %d times, want exactly %d (bounded by the page cap)", getter.listCalls, eventlib.MaxSubscriptionListPages)
+	}
+}
+
 // --- applyRefinedSupplement: orchestration, no Factory/network needed ------
 
 func TestApplyRefinedSupplement_WrongApp_GetterNeverResolved(t *testing.T) {
@@ -662,6 +769,36 @@ func TestApplyRefinedSupplement_Valid_FillsCurrentAppConsumers(t *testing.T) {
 	}
 	if statuses[1].Consumers[0].RemoteSubscription == nil || statuses[1].Consumers[0].RemoteState != "enabled" {
 		t.Errorf("current app consumer not filled: %+v", statuses[1].Consumers[0])
+	}
+}
+
+// TestApplyRefinedSupplement_PaginationCapped_BubblesUpToCaller locks that
+// applyRefinedSupplement's own return value (what runStatus logs a warning
+// from) faithfully bubbles up supplementRefinedConsumers's capped result —
+// the orchestration layer must not swallow it.
+func TestApplyRefinedSupplement_PaginationCapped_BubblesUpToCaller(t *testing.T) {
+	n := remoteSupplementListThreshold + 1
+	consumers := make([]protocol.ConsumerInfo, 0, n)
+	for i := 0; i < n; i++ {
+		c := refinedConsumer()
+		c.PID = 100 + i
+		c.RemoteSubscriptionID = fmt.Sprintf("sub_missing_%d", i)
+		consumers = append(consumers, c)
+	}
+	statuses := []appStatus{{AppID: "cli_a", State: stateRunning, Consumers: consumers}}
+	getter := &fakeRefinedGetter{listPageAt: func(call int) *larkeventv1.ListSubscriptionResp {
+		otherID, state := fmt.Sprintf("unrelated_%d", call), "active"
+		return &larkeventv1.ListSubscriptionResp{Data: &larkeventv1.ListSubscriptionRespData{
+			Items:     []*larkeventv1.SubscriptionDetail{{SubscriptionId: &otherID, State: &state}},
+			HasMore:   boolPtr(true),
+			PageToken: strPtr(fmt.Sprintf("token-%d", call+1)),
+		}}
+	}}
+
+	capped := applyRefinedSupplement(context.Background(), statuses, "cli_a", func() refinedSubscriptionGetter { return getter })
+
+	if !capped {
+		t.Error("capped = false, want true (must bubble up from supplementRefinedConsumers)")
 	}
 }
 

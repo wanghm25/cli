@@ -213,9 +213,12 @@ func runStatus(cmd *cobra.Command, f *cmdutil.Factory, current, asJSON, failOnOr
 	// Any failed precondition silently keeps every consumer local-only —
 	// this must never turn a plain `event status` into a hard failure.
 	ctx := cmd.Context()
-	applyRefinedSupplement(ctx, statuses, cfg.AppID, func() refinedSubscriptionGetter {
+	capped := applyRefinedSupplement(ctx, statuses, cfg.AppID, func() refinedSubscriptionGetter {
 		return resolveRemoteSupplementGetter(ctx, cmd, f, cfg.AppID, cur.userOpenID, time.Now())
 	})
+	if capped {
+		fmt.Fprintln(f.IOStreams.ErrOut, "[event] warning: remote subscription list pagination was capped while supplementing status — some refined consumers may show local-only state even though a matching remote Subscription might still exist beyond the pages read")
+	}
 
 	if asJSON {
 		if err := writeStatusJSON(f.IOStreams.Out, statuses); err != nil {
@@ -394,7 +397,7 @@ func staleIdentityAdvisory(match, applicable bool) string {
 // refinedSubscriptionGetter narrows *eventlib.SubscriptionClient to the two
 // calls the remote supplement needs. Tests substitute a fake with no
 // *lark.Client or network call involved. List is included so the supplement can
-// switch from one Get per id to one List call when many distinct
+// switch from one Get per id to a paginated List scan when many distinct
 // remote_subscription_ids are present.
 type refinedSubscriptionGetter interface {
 	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
@@ -403,12 +406,12 @@ type refinedSubscriptionGetter interface {
 
 // remoteSupplementListThreshold is supplementRefinedConsumers's dedup/List
 // switchover point: at or below this many distinct remote_subscription_ids,
-// one Get per id stays targeted; above it, a single List call (whatever the
-// server's one default-size page returns) is cheaper than that many individual
-// Gets. This is a weak, best-effort supplement — List takes no id filter, so
-// any wanted id not present in that one page simply stays local-only, same as
-// an unreachable/errored Get would; there is no pagination loop chasing full
-// coverage.
+// one Get per id stays targeted; above it, a paginated List scan (see
+// listRemoteSupplementDetails) is cheaper than that many individual Gets.
+// This is still a weak, best-effort supplement — List takes no id filter, so
+// it pages (bounded by eventlib.MaxSubscriptionListPages) collecting only the
+// wanted ids it encounters; any wanted id not found within the pages actually
+// read simply stays local-only, same as an unreachable/errored Get would.
 const remoteSupplementListThreshold = 5
 
 // requiredRemoteSupplementScopes is the single scope status's weak remote
@@ -515,17 +518,24 @@ func hasRefinedConsumer(consumers []protocol.ConsumerInfo) bool {
 // supplementRefinedConsumers. Injecting resolveGetter (rather than a
 // Factory/cmd) keeps this orchestration itself unit-testable with a canned
 // getter-or-nil — no Factory/keychain/network involved.
-func applyRefinedSupplement(ctx context.Context, statuses []appStatus, curAppID string, resolveGetter func() refinedSubscriptionGetter) {
+//
+// capped mirrors supplementRefinedConsumers's own return: true only when the
+// one appStatus actually supplemented hit the List page cap before every
+// wanted remote_subscription_id was accounted for. The caller (runStatus)
+// logs this as an advisory — it is never proof those ids don't exist, only
+// that they weren't found within the pages actually read.
+func applyRefinedSupplement(ctx context.Context, statuses []appStatus, curAppID string, resolveGetter func() refinedSubscriptionGetter) (capped bool) {
 	for i := range statuses {
 		s := &statuses[i]
 		if s.AppID != curAppID || !hasRefinedConsumer(s.Consumers) {
 			continue
 		}
 		if getter := resolveGetter(); getter != nil {
-			supplementRefinedConsumers(ctx, getter, s.Consumers)
+			capped = supplementRefinedConsumers(ctx, getter, s.Consumers)
 		}
 		return // only one appStatus can ever match curAppID
 	}
+	return false
 }
 
 // supplementRefinedConsumers fills RemoteSubscription/RemoteState on every
@@ -542,10 +552,12 @@ func applyRefinedSupplement(ctx context.Context, statuses []appStatus, curAppID 
 // Subscription), so each distinct id is read exactly once and its result is
 // fanned out to every consumer sharing it: at or below
 // remoteSupplementListThreshold distinct ids via one Get per id; above it via
-// a single List call instead of that many individual Gets.
-func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionGetter, consumers []protocol.ConsumerInfo) {
+// a paginated List scan instead of that many individual Gets. capped is true
+// only when that List scan hit the page cap before every wanted id was found
+// — never set on the Get path, which has no pagination concept at all.
+func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionGetter, consumers []protocol.ConsumerInfo) (capped bool) {
 	if getter == nil {
-		return
+		return false
 	}
 
 	// Group consumer INDICES by remote_subscription_id: the dedup key.
@@ -558,12 +570,12 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 		byID[id] = append(byID[id], i)
 	}
 	if len(byID) == 0 {
-		return
+		return false
 	}
 
 	var details map[string]*larkeventv1.SubscriptionDetail
 	if len(byID) > remoteSupplementListThreshold {
-		details = listRemoteSupplementDetails(ctx, getter, byID)
+		details, capped = listRemoteSupplementDetails(ctx, getter, byID)
 	} else {
 		details = getRemoteSupplementDetails(ctx, getter, byID)
 	}
@@ -579,6 +591,7 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 			consumers[i].RemoteState = info.State
 		}
 	}
+	return capped
 }
 
 // getRemoteSupplementDetails fetches each of wantIDs' remote Subscription
@@ -599,32 +612,48 @@ func getRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionG
 	return out
 }
 
-// listRemoteSupplementDetails fetches ALL of wantIDs' remote Subscription
-// snapshots via ONE SubscriptionClient.List call. This is cheaper than
-// individual Gets once there are more than remoteSupplementListThreshold
-// distinct ids. List takes no id filter (only state/target_resource/event_type),
-// so this reads however many the server returns on its single default-size page
-// and keeps only the ones actually asked for; any wanted id NOT present in that
-// one page is simply omitted — same "stays local-only" degrade as an
-// unreachable/errored Get, never a second remote round-trip chasing full
-// coverage (this is a weak,
-// best-effort supplement, not a completeness guarantee).
-func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) map[string]*larkeventv1.SubscriptionDetail {
-	out := make(map[string]*larkeventv1.SubscriptionDetail, len(wantIDs))
-	resp, err := getter.List(ctx, larkeventv1.NewListSubscriptionReqBuilder().Build())
-	if err != nil || resp == nil || resp.Data == nil {
-		return out // unreachable/error -> every id stays local-only, same as today
-	}
-	for _, item := range resp.Data.Items {
-		if item == nil || item.SubscriptionId == nil {
-			continue
+// listRemoteSupplementDetails fetches wantIDs' remote Subscription snapshots
+// by paginating List (via eventlib.WalkSubscriptionPages, bounded by
+// eventlib.MaxSubscriptionListPages) — cheaper than individual Gets once
+// there are more than remoteSupplementListThreshold distinct ids. List takes
+// no id filter (only state/target_resource/event_type), so this pages
+// through an unfiltered scan, stopping as soon as every wanted id has been
+// found, a page reports has_more=false, or the cap is reached.
+//
+// This is still a weak, best-effort supplement, not a completeness
+// guarantee: any wanted id not found within the pages actually read simply
+// stays local-only in the returned map, same as an unreachable/errored Get.
+// capped=true means the cap was reached before every wanted id was
+// accounted for — that is NOT proof the missing ids don't exist, only that
+// they weren't found within the pages read, and the caller must log it
+// rather than silently degrade as if it were a confirmed negative.
+func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) (out map[string]*larkeventv1.SubscriptionDetail, capped bool) {
+	out = make(map[string]*larkeventv1.SubscriptionDetail, len(wantIDs))
+	remaining := len(wantIDs)
+
+	buildReq := func(pageToken string) *larkeventv1.ListSubscriptionReq {
+		b := larkeventv1.NewListSubscriptionReqBuilder()
+		if pageToken != "" {
+			b = b.PageToken(pageToken)
 		}
-		id := *item.SubscriptionId
-		if _, wanted := wantIDs[id]; wanted {
-			out[id] = item
-		}
+		return b.Build()
 	}
-	return out
+
+	capped, err := eventlib.WalkSubscriptionPages(ctx, getter, buildReq, func(item *larkeventv1.SubscriptionDetail) bool {
+		if item.SubscriptionId != nil {
+			if id := *item.SubscriptionId; wantIDs[id] != nil {
+				if _, already := out[id]; !already {
+					out[id] = item
+					remaining--
+				}
+			}
+		}
+		return remaining > 0 // stop early once every wanted id has been found
+	})
+	if err != nil {
+		return out, false // unreachable/error -> whatever was found so far stands, rest stay local-only, same degrade as today
+	}
+	return out, capped
 }
 
 // mapRemoteSubscriptionInfo maps one SDK SubscriptionDetail into the
