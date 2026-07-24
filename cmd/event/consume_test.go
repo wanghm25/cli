@@ -633,6 +633,14 @@ func TestRunConsume_OrdinaryKey_IncludeResourceDataTrue_TypedInvalidArgument(t *
 // misfire on the default (flag-omitted) path.
 func TestRunConsume_OrdinaryKey_NoIncludeResourceDataFlag_UnaffectedNonRegression(t *testing.T) {
 	f := newRefinedConsumeTestFactory(t)
+	// Pin IsTerminal=true so the non-TTY stdin-EOF watcher never starts: that
+	// watcher and consume.Run's own errOut diagnostics both target this
+	// Factory's plain bytes.Buffer from separate goroutines, which is a data
+	// race unrelated to what this test proves. The bus-fork failure asserted
+	// below is reached identically either way (it fails before opts.IsTTY is
+	// ever read), so this keeps the assertions unchanged while removing the
+	// unbounded background reader.
+	f.IOStreams.IsTerminal = true
 	err := newConsumeCmd(f, "im.message.receive_v1", "--as", "bot").Execute()
 
 	if err == nil {
