@@ -37,16 +37,15 @@ import (
 // needed. Deliberately does NOT expose Delete: refined cleanup is nil
 // (a failure after Apply never auto-deletes the remote subscription),
 // so the type this whole chain is built against cannot even call Delete.
+//
+// It also deliberately does NOT expose GetEncryptKey: the consume front-end
+// never fetches an encrypt_key. For an encrypted request it reconciles with
+// WithDeferredEncryptKeyConfirmation and lets the bus fetch and confirm the key
+// once at Hello time (internal/event/bus encryptKeyProvider.fetchAndSet) —
+// omitting the method here makes a front-end key fetch structurally impossible.
 type subscriptionApplyAPI interface {
 	event.SubscriptionCreateAPI
 	Reactivate(ctx context.Context, req *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error)
-	// EncryptKeyProber: PlanRemoteSubscription needs it as the
-	// WithEncryptKeyProber for the encryption conflict matrix when
-	// IncludeResourceData is true (reuse-vs-conflict disambiguation).
-	// *event.SubscriptionClient satisfies it (GetEncryptKey). The consume side
-	// never fetches the key itself — the bus fetches it once at Hello time
-	// (internal/event/bus encryptKeyProvider.fetchAndSet).
-	event.EncryptKeyProber
 }
 
 // RefinedOptions holds RunRefined's own parameters — deliberately separate
@@ -78,7 +77,8 @@ type RefinedOptions struct {
 
 	// IncludeResourceData: true creates an ENCRYPTED
 	// remote Subscription — Plan reconciles against the encryption conflict
-	// matrix (WithEncryptKeyProber), Apply generates a fresh CSPRNG encrypt_key
+	// matrix deferring key confirmation to the bus (the front-end never fetches
+	// the key), Apply generates a fresh CSPRNG encrypt_key
 	// and submits it atomically with the Create, and the HelloV2 carries the
 	// flag so the bus fetches that key once at registration (rejecting the
 	// Hello with decrypt_key_unavailable if it cannot, so the consumer never
@@ -137,15 +137,16 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 			return ProbeBusEligibility(ctx, tr, appID, opts.RemoteAPIClient, opts.ErrOut)
 		},
 		plan: func(ctx context.Context) (event.ReconcilePlan, error) {
-			// An encrypted request (IncludeResourceData=true) must
-			// reconcile against the encryption conflict matrix — supply
-			// the EncryptKeyProber so an active include_resource_data=true match
-			// is disambiguated (reuse vs conflict) exactly as `event
-			// subscription create` does. The plaintext path passes no option and
+			// An encrypted request (IncludeResourceData=true) defers key
+			// confirmation to the bus Hello — the authoritative, fail-closed key
+			// gate — so an active include_resource_data=true match plans a reuse
+			// WITHOUT the consume front-end ever calling GetEncryptKey. (Unlike
+			// `event subscription create`, which classifies at Plan time because
+			// it has no later key gate.) The plaintext path passes no option and
 			// is byte-for-byte unchanged.
 			var reconcileOpts []event.ReconcileOption
 			if opts.IncludeResourceData {
-				reconcileOpts = append(reconcileOpts, event.WithEncryptKeyProber(opts.SubClient))
+				reconcileOpts = append(reconcileOpts, event.WithDeferredEncryptKeyConfirmation())
 			}
 			plan, err := event.ReconcileExisting(ctx, opts.SubClient, eventType, targetResource, opts.Identity, opts.IncludeResourceData, reconcileOpts...)
 			if err != nil {

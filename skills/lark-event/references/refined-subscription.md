@@ -116,16 +116,16 @@ To fully tear down a refined subscription: stop the local consumer **and** delet
 
 **Key lifecycle in the bus.** The front-end never hands the key to the bus (IPC never carries a key). The bus fetches its own copy via `GetEncryptKey(subscription_id)` using the current gated user's UAT (resource data is user-only, so the bus never fetches a key as bot; owner≠current is never fetched, and a historical owner's UAT is never loaded), caches it in memory for the bus lifetime only (never on disk), and releases it on `deleted_v1`. A refined `consume` **prewarms** the key after Hello registration and before `ready`: if the key is not retrievable (missing scope, foreign/mismatched identity, or the subscription is gone), the consumer does **not** report `ready` — it returns a typed `decrypt_key_unavailable` `failed_precondition` (next_action: fix scope/identity or delete+recreate) and rolls back its registration, leaving no half-registered consumer. There is no user-facing `get-encrypt-key` command — key retrieval is entirely bus-internal.
 
-**Conflict matrix (encryption dimension), at create/consume reconcile:**
+**Conflict matrix (encryption dimension).** `create` resolves every row at reconcile time (it probes `GetEncryptKey`, since it has no later key gate to defer to). `consume` resolves the `include_resource_data` mismatch rows at reconcile but **defers the key-retrievability decision (the last two rows) to the bus Hello** — its front-end never calls `GetEncryptKey`; the bus's Hello-time fetch is the single authoritative, fail-closed key gate.
 
 | Local intent | Remote state | Action |
 |---|---|---|
 | no resource data | `include_resource_data=false` | reuse |
 | no resource data | plaintext OR encrypted resource data | conflict → human decision |
 | encrypted | `include_resource_data=false` | conflict → human decision |
-| encrypted | plaintext resource data | unsupported → human decision |
+| encrypted | plaintext resource data | unsupported → human decision (create); consume defers to the bus Hello |
 | encrypted | encrypted + key retrievable | reuse |
-| encrypted | encrypted + key NOT retrievable | not ready → fix scope/identity |
+| encrypted | encrypted + key NOT retrievable | create: conflict → fix scope/identity; consume: reuse, then the bus Hello rejects (`decrypt_key_unavailable`) if the key is unretrievable |
 
 **Rotation / enable / disable = delete + recreate.** `encrypt` is Create-only: it can never be added, changed, or removed afterward. `event subscription update --include-resource-data=true` is therefore refused with a typed `failed_precondition` guiding you to delete + recreate (or create a separate new subscription) after human confirmation. There is no in-place rotate/update-key.
 

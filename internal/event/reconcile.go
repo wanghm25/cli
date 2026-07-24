@@ -74,19 +74,38 @@ type EncryptKeyProber interface {
 // call site never reaches (it always passes false).
 type ReconcileOption func(*reconcileConfig)
 
-// reconcileConfig carries the (currently sole) optional dependency
-// ReconcileOption values can set.
+// reconcileConfig carries the optional dependencies ReconcileOption values can
+// set for the encryption conflict matrix. Exactly one of these applies to an
+// active, include_resource_data=true match; which one is chosen by the caller's
+// nature (a management action that must classify now, vs a consumer that has an
+// authoritative bus-side key gate to fall back on).
 type reconcileConfig struct {
-	encryptProber EncryptKeyProber
+	encryptProber               EncryptKeyProber
+	deferEncryptKeyConfirmation bool
 }
 
 // WithEncryptKeyProber supplies the EncryptKeyProber ReconcileExisting uses
 // to resolve the encryption conflict matrix — see EncryptKeyProber's
-// own doc comment for exactly when it is invoked. Callers whose local
+// own doc comment for exactly when it is invoked. It suits a management action
+// (`event subscription create`) that must classify reuse-vs-conflict at Plan
+// time because it has no later key gate to defer to. Callers whose local
 // request has requestedIncludeResourceData=false never need this option:
 // the branch it configures is unreachable for them.
 func WithEncryptKeyProber(prober EncryptKeyProber) ReconcileOption {
 	return func(c *reconcileConfig) { c.encryptProber = prober }
+}
+
+// WithDeferredEncryptKeyConfirmation tells ReconcileExisting to treat an
+// active, include_resource_data=true match as a reuse WITHOUT probing its
+// encrypt_key. It suits `event consume`, whose bus fetches and confirms the key
+// once at Hello time (the authoritative, fail-closed key gate: an unretrievable
+// key rejects the Hello with decrypt_key_unavailable). The consume front-end
+// therefore never calls GetEncryptKey itself — key availability is confirmed
+// solely by the bus. Mutually exclusive with WithEncryptKeyProber; supplying
+// neither on a requestedIncludeResourceData=true match is a fail-closed
+// internal error.
+func WithDeferredEncryptKeyConfirmation() ReconcileOption {
+	return func(c *reconcileConfig) { c.deferEncryptKeyConfirmation = true }
 }
 
 // ReconcilePlan is the outcome of reconciling a create request against
@@ -128,13 +147,13 @@ type ReconcilePlan struct {
 // opts is the encryption-conflict-matrix extension point: a caller whose
 // requestedIncludeResourceData is true — meaning it
 // wants an ENCRYPTED subscription, since this CLI's own fail-closed policy
-// never offers a "plaintext resource_data" request — should pass
-// WithEncryptKeyProber so an active,
-// include_resource_data=true match can be disambiguated (see
-// EncryptKeyProber's doc comment). A caller with requestedIncludeResourceData
-// == false needs no option at all: internal/event/consume/refined.go's
-// existing call site passes none and is completely
-// unaffected by this extension.
+// never offers a "plaintext resource_data" request — must pass exactly one of
+// WithEncryptKeyProber (classify an active include_resource_data=true match
+// now, for a management action like create) or
+// WithDeferredEncryptKeyConfirmation (reuse without probing and let the bus
+// Hello confirm the key, for consume). A caller with
+// requestedIncludeResourceData == false needs no option at all: the plaintext
+// call site passes none and is completely unaffected by this extension.
 func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, targetResource string, identity core.Identity, requestedIncludeResourceData bool, opts ...ReconcileOption) (*ReconcilePlan, error) {
 	cfg := reconcileConfig{}
 	for _, opt := range opts {
@@ -188,20 +207,28 @@ func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, t
 		// ENCRYPTED). An existing match reporting include_resource_data=true
 		// is ambiguous on its own -- it may or may not have been created
 		// with an encrypt_key, and ordinary List/Get never reveals that --
-		// so this cannot be decided from `match` alone; see
-		// probeEncryptedActiveMatch.
-		if cfg.encryptProber == nil {
-			// Defensive fail-closed: every caller able to reach
-			// requestedIncludeResourceData=true today (create.go's
-			// encrypted-create path) always supplies a prober. Silently
-			// reusing here without confirming the key is retrievable would
-			// defeat the entire conflict matrix, so a missing prober is
-			// treated as an internal error rather than as "assume
-			// compatible".
+		// so how it is resolved depends on the caller's option:
+		switch {
+		case cfg.encryptProber != nil:
+			// Management action (create): classify reuse-vs-conflict NOW by
+			// probing the key; it has no later key gate to defer to. See
+			// probeEncryptedActiveMatch.
+			return probeEncryptedActiveMatch(ctx, cfg.encryptProber, match)
+		case cfg.deferEncryptKeyConfirmation:
+			// Consumer (consume): reuse WITHOUT probing. The bus fetches and
+			// confirms the key once at Hello time — the authoritative,
+			// fail-closed key gate (an unretrievable key rejects the Hello with
+			// decrypt_key_unavailable, not a front-end conflict) — so the
+			// consume front-end never calls GetEncryptKey.
+			return &ReconcilePlan{Action: PlanActionReuse, Existing: match}, nil
+		default:
+			// Defensive fail-closed: a requestedIncludeResourceData=true caller
+			// must pick one of the two options above. Silently reusing here
+			// without either would defeat the conflict matrix, so a misconfig is
+			// an internal error rather than "assume compatible".
 			return nil, errs.NewInternalError(errs.SubtypeUnknown,
-				"reconcile: requestedIncludeResourceData=true requires WithEncryptKeyProber to classify an existing include_resource_data=true match; none was supplied")
+				"reconcile: requestedIncludeResourceData=true requires WithEncryptKeyProber (classify now) or WithDeferredEncryptKeyConfirmation (defer to the bus) to resolve an existing include_resource_data=true match; neither was supplied")
 		}
-		return probeEncryptedActiveMatch(ctx, cfg.encryptProber, match)
 	case "suspended":
 		return &ReconcilePlan{Action: PlanActionSuspended, Existing: match}, nil
 	default:

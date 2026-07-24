@@ -55,6 +55,25 @@ func refinedFixture() event.ResolvedEventKey {
 }
 
 func strPtr(s string) *string { return &s }
+func boolPtr(b bool) *bool     { return &b }
+
+// activeEncryptedListResp is a List response with a single active,
+// include_resource_data=true match under the given authority type — the remote
+// shape a consume reconcile classifies as an encrypted reuse.
+func activeEncryptedListResp(id, authorityType string) *larkeventv1.ListSubscriptionResp {
+	return &larkeventv1.ListSubscriptionResp{
+		Data: &larkeventv1.ListSubscriptionRespData{
+			Items: []*larkeventv1.SubscriptionDetail{{
+				SubscriptionId: strPtr(id),
+				EventType:      strPtr("im.message.created_v1"),
+				TargetResource: strPtr("im.message?chat_id=oc_aaa"),
+				Authority:      &larkeventv1.Authority{Type: strPtr(authorityType), OpenId: strPtr("ou_aaa")},
+				State:          strPtr("active"),
+				PayloadOptions: &larkeventv1.PayloadOptions{IncludeResourceData: boolPtr(true)},
+			}},
+		},
+	}
+}
 
 // ---- fakeStatusBusTransport: a minimal local "bus" that only answers status_query ----
 
@@ -636,6 +655,38 @@ func TestBuildRefinedCreateBody_AtomicEncrypt(t *testing.T) {
 	plain := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "")
 	if plain.PayloadOptions == nil || plain.PayloadOptions.Encrypt != nil {
 		t.Fatalf("plaintext body must carry no encrypt block, got %+v", plain.PayloadOptions)
+	}
+}
+
+// TestProdRefinedDeps_Plan_EncryptedActiveMatch_ReusesWithZeroGetEncryptKeyCalls
+// locks #25a: for an encrypted (IncludeResourceData=true) consume, the plan
+// stage reuses an active include_resource_data=true match WITHOUT the front-end
+// ever calling GetEncryptKey — key confirmation is deferred to the bus Hello.
+func TestProdRefinedDeps_Plan_EncryptedActiveMatch_ReusesWithZeroGetEncryptKeyCalls(t *testing.T) {
+	resolved := refinedFixture()
+	fake := &fakeApplyAPI{
+		listResp: activeEncryptedListResp("sub_enc", "user"),
+		// If the front-end ever probed, this would be its response — it must
+		// stay untouched.
+		getEncryptKeyResp: &larkeventv1.GetEncryptKeySubscriptionResp{
+			Data: &larkeventv1.GetEncryptKeySubscriptionRespData{EncryptKey: strPtr("SHOULD_NOT_BE_FETCHED")},
+		},
+	}
+	opts := RefinedOptions{Identity: core.AsUser, IncludeResourceData: true, SubClient: fake}
+	deps := prodRefinedDeps(failDialTransport{}, "cli_x", "test-profile", "", resolved, opts)
+
+	plan, err := deps.plan(context.Background())
+	if err != nil {
+		t.Fatalf("plan err = %v, want nil", err)
+	}
+	if plan.Action != event.PlanActionReuse {
+		t.Errorf("plan.Action = %q, want %q", plan.Action, event.PlanActionReuse)
+	}
+	if fake.getEncryptKeyCalls != 0 {
+		t.Errorf("front-end GetEncryptKey calls = %d, want 0 (key confirmation is deferred to the bus Hello)", fake.getEncryptKeyCalls)
+	}
+	if fake.listCalls != 1 {
+		t.Errorf("List calls = %d, want 1 (plan reconciles remote state once)", fake.listCalls)
 	}
 }
 

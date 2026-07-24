@@ -409,3 +409,25 @@ func TestReconcileExisting_EncryptedBothTrue_NoProberSupplied_FailsClosed(t *tes
 		t.Errorf("must never silently reuse without a supplied EncryptKeyProber, got plan: %+v", plan)
 	}
 }
+
+// TestReconcileExisting_EncryptedBothTrue_DeferredConfirmation_ReusesWithoutProbing
+// locks the consume path: WithDeferredEncryptKeyConfirmation reuses an active,
+// include_resource_data=true match WITHOUT probing its key — the bus Hello is
+// the authoritative key gate, so the front-end never calls GetEncryptKey. (No
+// prober is supplied at all here; the deferred branch must not require one.)
+func TestReconcileExisting_EncryptedBothTrue_DeferredConfirmation_ReusesWithoutProbing(t *testing.T) {
+	fake := &fakeLister{resp: listResp([]*larkeventv1.SubscriptionDetail{
+		activeSub("sub_enc", true, "user"),
+	})}
+
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, true, WithDeferredEncryptKeyConfirmation())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionReuse {
+		t.Errorf("Action = %q, want %q (deferred confirmation reuses without probing)", plan.Action, PlanActionReuse)
+	}
+	if plan.Existing == nil || strVal(plan.Existing.SubscriptionId) != "sub_enc" {
+		t.Errorf("Existing = %+v, want sub_enc", plan.Existing)
+	}
+}
