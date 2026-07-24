@@ -54,3 +54,24 @@ func fetchUserInfo(ctx context.Context, httpClient *http.Client, brand core.Lark
 	}
 	return &userInfo{OpenID: result.Data.OpenID, Name: result.Data.Name}, nil
 }
+
+// VerifyUATOpenID positively resolves which user a user access token belongs to
+// by calling user_info, returning that token's own open_id. Callers use it to
+// fail closed when a resolved UAT cannot be shown to belong to the user they
+// expected (for example after the active profile/user switched). It uses the
+// same HTTP client the rest of credential resolution does, so proxy/TLS
+// configuration is honored, and it never returns or logs the token itself.
+func (p *CredentialProvider) VerifyUATOpenID(ctx context.Context, brand core.LarkBrand, uat string) (string, error) {
+	if p == nil || p.httpClient == nil {
+		return "", fmt.Errorf("credential: no HTTP client configured to verify a user access token")
+	}
+	hc, err := p.httpClient()
+	if err != nil {
+		return "", err
+	}
+	info, err := fetchUserInfo(ctx, hc, brand, uat)
+	if err != nil {
+		return "", err
+	}
+	return info.OpenID, nil
+}

@@ -4,6 +4,8 @@
 package event
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,21 +16,28 @@ import (
 	"github.com/larksuite/cli/internal/core"
 )
 
-// --- R2 #5/#6/#10: resolveUAT must be bound to the requested userOpenID ---
+// --- resolveUAT must be bound to the requested userOpenID ---
 //
 // verifyUATBelongsToUser rejects a UAT that provably belongs to another user
-// (the profile-switch race), while never false-rejecting when the requested
-// user's token is unknown (extension credential providers keep nothing in the
-// keychain). The keychain lookup is stubbed via getStoredUAToken so these
-// exercise the pure decision logic without touching the OS keychain.
+// (the profile-switch race). When the keychain holds the requested user's own
+// token it compares directly (the fast path); when nothing is stored (e.g. an
+// extension credential provider) it positively proves the token's open_id and
+// fails CLOSED unless that open_id matches — never accepting an unverifiable
+// token. The keychain lookup and the positive verifier are both stubbed so
+// these exercise the pure decision logic without touching the OS keychain or a
+// live user_info call.
 
 func TestVerifyUATBelongsToUser(t *testing.T) {
 	cases := []struct {
-		name       string
-		userOpenID string
-		token      string
-		stored     *auth.StoredUAToken // what getStoredUAToken returns for (appID,userOpenID)
-		wantErr    bool
+		name         string
+		userOpenID   string
+		token        string
+		stored       *auth.StoredUAToken // what getStoredUAToken returns for (appID,userOpenID)
+		provedOpenID string              // what proveOpenID returns on the no-stored path
+		proveErr     error               // proveOpenID failure on the no-stored path
+		noVerifier   bool                // pass a nil proveOpenID (nothing can prove ownership)
+		wantErr      bool
+		wantSentinel error // optional: assert errors.Is on the rejection
 	}{
 		{
 			name:       "matching stored token is accepted",
@@ -38,18 +47,47 @@ func TestVerifyUATBelongsToUser(t *testing.T) {
 			wantErr:    false,
 		},
 		{
-			name:       "wrong-user token is rejected (profile-switch race)",
-			userOpenID: "ou_alice",
-			token:      "tok-bob", // resolved another user's token
-			stored:     &auth.StoredUAToken{AppId: "app1", UserOpenId: "ou_alice", AccessToken: "tok-alice"},
-			wantErr:    true,
+			name:         "wrong-user stored token is rejected (profile-switch race)",
+			userOpenID:   "ou_alice",
+			token:        "tok-bob", // resolved another user's token
+			stored:       &auth.StoredUAToken{AppId: "app1", UserOpenId: "ou_alice", AccessToken: "tok-alice"},
+			wantErr:      true,
+			wantSentinel: errUATUserMismatch,
 		},
 		{
-			name:       "no stored token for the user is NOT rejected (extension provider path)",
-			userOpenID: "ou_alice",
-			token:      "tok-from-extension",
-			stored:     nil,
-			wantErr:    false,
+			name:         "no stored token + proven matching open_id is accepted (extension provider path)",
+			userOpenID:   "ou_alice",
+			token:        "tok-from-extension",
+			stored:       nil,
+			provedOpenID: "ou_alice",
+			wantErr:      false,
+		},
+		{
+			name:         "no stored token + proven DIFFERENT open_id is rejected",
+			userOpenID:   "ou_alice",
+			token:        "tok-bob",
+			stored:       nil,
+			provedOpenID: "ou_bob",
+			wantErr:      true,
+			wantSentinel: errUATUserMismatch,
+		},
+		{
+			name:         "no stored token + verification failure is rejected (fail-closed)",
+			userOpenID:   "ou_alice",
+			token:        "tok-unknown",
+			stored:       nil,
+			proveErr:     errors.New("user_info API returned HTTP 401"),
+			wantErr:      true,
+			wantSentinel: errUATUnverifiable,
+		},
+		{
+			name:         "no stored token + no way to verify is rejected (fail-closed)",
+			userOpenID:   "ou_alice",
+			token:        "tok-unknown",
+			stored:       nil,
+			noVerifier:   true,
+			wantErr:      true,
+			wantSentinel: errUATUnverifiable,
 		},
 		{
 			name:       "empty userOpenID skips verification",
@@ -70,12 +108,32 @@ func TestVerifyUATBelongsToUser(t *testing.T) {
 				return tc.stored
 			}
 
-			err := verifyUATBelongsToUser("app1", tc.userOpenID, tc.token)
+			var proveCalls int
+			var proveOpenID func(context.Context, string) (string, error)
+			if !tc.noVerifier {
+				proveOpenID = func(_ context.Context, token string) (string, error) {
+					proveCalls++
+					if token != tc.token {
+						t.Errorf("proveOpenID token = %q, want %q", token, tc.token)
+					}
+					return tc.provedOpenID, tc.proveErr
+				}
+			}
+
+			err := verifyUATBelongsToUser(context.Background(), "app1", tc.userOpenID, tc.token, proveOpenID)
 			if tc.wantErr && err == nil {
-				t.Fatal("verifyUATBelongsToUser = nil, want a mismatch rejection")
+				t.Fatal("verifyUATBelongsToUser = nil, want a rejection")
 			}
 			if !tc.wantErr && err != nil {
 				t.Fatalf("verifyUATBelongsToUser = %v, want nil", err)
+			}
+			if tc.wantSentinel != nil && !errors.Is(err, tc.wantSentinel) {
+				t.Errorf("verifyUATBelongsToUser err = %v, want errors.Is(%v)", err, tc.wantSentinel)
+			}
+			// The stored fast path must NOT call the positive verifier (extra
+			// API calls are confined to the no-stored path).
+			if tc.stored != nil && proveCalls != 0 {
+				t.Errorf("proveOpenID calls = %d on the stored fast path, want 0", proveCalls)
 			}
 		})
 	}

@@ -6,6 +6,7 @@ package event
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,24 +34,49 @@ var getStoredUAToken = auth.GetStoredToken
 // gate resolved as current. Deliberately names no token value.
 var errUATUserMismatch = errors.New("event bus: resolved user access token does not belong to the requested user (the active profile/user may have switched); refusing to use another user's token")
 
+// errUATUnverifiable is verifyUATBelongsToUser's fail-closed rejection when a
+// resolved UAT's owner cannot be positively proven (no way to resolve its
+// open_id, or the resolution itself failed). "Cannot prove ownership" fails
+// closed, not open. Names no token value.
+var errUATUnverifiable = errors.New("event bus: could not prove the resolved user access token belongs to the requested user; refusing to use an unverifiable token")
+
 // verifyUATBelongsToUser confirms a freshly resolved UAT actually belongs to
 // userOpenID. ResolveToken re-resolves the active account by appID alone, so a
 // profile / active-user switch between the identity gate's resolveCurrent and
-// this mint could otherwise return a DIFFERENT user's token (review
-// #5/#6/#10). The keychain stores each user's UAT under (appID, userOpenID):
-// when a token IS stored for the requested user and the resolved token differs,
-// it provably belongs to someone else and is rejected. A missing stored token
-// (e.g. an extension credential provider that keeps nothing in the keychain,
-// which owns its own identity binding) cannot be disproven here and falls back
-// to the fresh owner==current gate the caller already applied — never a
-// false reject. Never compares or logs the token value beyond an equality
-// check against the same user's own stored copy.
-func verifyUATBelongsToUser(appID, userOpenID, token string) error {
+// this mint could otherwise return a DIFFERENT user's token. Verification is
+// positive and fail-closed:
+//   - The keychain stores each user's UAT under (appID, userOpenID). When a
+//     token IS stored for the requested user, a resolved token that differs
+//     provably belongs to someone else and is rejected; an exact match is
+//     accepted (the fast path).
+//   - With NO stored copy to compare against (e.g. an extension credential
+//     provider that keeps nothing in the keychain), the token is not trusted
+//     blindly: proveOpenID resolves the token's own open_id (any valid UAT can
+//     call user_info) and it must equal userOpenID. A mismatch, a resolution
+//     failure, or no way to resolve it at all is rejected — ownership that
+//     cannot be proven fails closed.
+//
+// Never compares or logs the token value beyond an equality check against the
+// same user's own stored copy, and never logs the resolved open_id.
+func verifyUATBelongsToUser(ctx context.Context, appID, userOpenID, token string, proveOpenID func(context.Context, string) (string, error)) error {
 	if userOpenID == "" || token == "" {
 		return nil
 	}
-	stored := getStoredUAToken(appID, userOpenID)
-	if stored != nil && stored.AccessToken != token {
+	if stored := getStoredUAToken(appID, userOpenID); stored != nil {
+		if stored.AccessToken != token {
+			return errUATUserMismatch
+		}
+		return nil
+	}
+	// No stored copy: positively prove the token's owner instead of trusting it.
+	if proveOpenID == nil {
+		return errUATUnverifiable
+	}
+	gotOpenID, err := proveOpenID(ctx, token)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errUATUnverifiable, err)
+	}
+	if gotOpenID != userOpenID {
 		return errUATUserMismatch
 	}
 	return nil
@@ -94,17 +120,21 @@ func NewCmdBus(f *cmdutil.Factory) *cobra.Command {
 			// the active account itself by appID. The identity gate resolves
 			// current=(appID,userOpenID) FIRST and passes userOpenID here, so
 			// a profile / active-user switch between those two steps could mint
-			// a DIFFERENT user's token. verifyUATBelongsToUser closes that race
-			// (review #5/#6/#10): the keychain stores each user's UAT under
-			// (appID, userOpenID), so a resolved token that provably belongs to
-			// another user is rejected — no wrong-user UAT ever reaches
+			// a DIFFERENT user's token. verifyUATBelongsToUser closes that race:
+			// the keychain stores each user's UAT under (appID, userOpenID), and
+			// when nothing is stored it positively resolves the token's own
+			// open_id (via user_info) and fails closed unless it matches — so no
+			// wrong-user or unprovable UAT ever reaches
 			// Renew/Reactivate/Get/BindUser or the Hello-time encrypt_key fetch.
+			proveOpenID := func(ctx context.Context, token string) (string, error) {
+				return f.Credential.VerifyUATOpenID(ctx, cfg.Brand, token)
+			}
 			b.SetIdentityProviders(func(ctx context.Context, appID, userOpenID string) (string, error) {
 				result, err := f.Credential.ResolveToken(ctx, credential.NewTokenSpec(core.AsUser, appID))
 				if err != nil {
 					return "", err
 				}
-				if err := verifyUATBelongsToUser(appID, userOpenID, result.Token); err != nil {
+				if err := verifyUATBelongsToUser(ctx, appID, userOpenID, result.Token, proveOpenID); err != nil {
 					return "", err
 				}
 				return result.Token, nil
