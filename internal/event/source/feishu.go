@@ -293,7 +293,7 @@ func headerEventID(base *larkevent.EventV2Base) string {
 	return base.Header.EventID
 }
 
-// formatLifecycleAuthority normalizes the OpenAPI management-side
+// FormatLifecycleAuthority normalizes the OpenAPI management-side
 // Authority{Type,OpenId,UnionId,AppId} (all pointers) through the SAME
 // vocabulary formatSubscriptionAuthority already implements for the
 // push-envelope's Authority{Type,PrincipalID} shape — reusing it here (rather
@@ -302,7 +302,12 @@ func headerEventID(base *larkevent.EventV2Base) string {
 // directly. OpenId is preferred over UnionId when a "user" authority carries
 // both (OpenId is this CLI's canonical user identifier elsewhere, e.g.
 // cmd/event/subscription's own formatAuthority).
-func formatLifecycleAuthority(a *larkeventv1.Authority) string {
+//
+// Exported so bus/lifecycle's own action code (reconcileWithGet's Get-response
+// projection) can normalize a SubscriptionDetail.Authority through the exact
+// same vocabulary a lifecycle event's own After.Authority already uses,
+// rather than re-deriving it.
+func FormatLifecycleAuthority(a *larkeventv1.Authority) string {
 	if a == nil || a.Type == nil {
 		return ""
 	}
@@ -333,7 +338,7 @@ func normalizeLifecycleEvent(eventType, eventID string, subscriptionID, targetRe
 	if state != nil {
 		le.State = *state
 	}
-	le.Authority = formatLifecycleAuthority(authority)
+	le.Authority = FormatLifecycleAuthority(authority)
 	if suspension != nil && suspension.Code != nil {
 		le.SuspensionCode = *suspension.Code
 	}

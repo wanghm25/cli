@@ -7,6 +7,8 @@ import (
 	"context"
 
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
+
+	"github.com/larksuite/cli/internal/event/source"
 )
 
 // --- activated --------------------------------------------------------------
@@ -234,6 +236,18 @@ func (a *SubscriptionAction) handleDeleted(le LifecycleEvent, conns []Conn) erro
 // remoteDegradedAdvisory: only "suspended"/"expired" are special-cased;
 // everything else, including "active" or any future open-vocabulary value, is
 // left alone rather than guessed at).
+//
+// An "active" result is NOT, by itself, proof this consumer's own local
+// listening intent is still honored: the remote Subscription could have been
+// updated (target_resource/authority/include_resource_data) without ever
+// producing an observed updated_v1 (e.g. this bus was offline when it fired).
+// So "active" additionally projects the fetched Subscription into the same
+// 3-dimension shape classifyUpdateCompatibility already compares an
+// updated_v1's After snapshot through, and reuses that identical compare
+// against lead's stored intent — degraded is cleared ONLY when active AND
+// compatible; active-but-incompatible degrades exactly like updated_v1's own
+// incompatible row (same reason, same next_action), never silently clearing
+// a real conflict just because the state happens to read "active".
 func (a *SubscriptionAction) reconcileWithGet(ctx context.Context, le LifecycleEvent, res eligibilityResult) error {
 	if len(res.conns) == 0 {
 		return nil
@@ -260,21 +274,33 @@ func (a *SubscriptionAction) reconcileWithGet(ctx context.Context, le LifecycleE
 	}
 
 	var state, suspensionCode string
+	var subscription *larkeventv1.SubscriptionDetail
 	if resp != nil && resp.Data != nil && resp.Data.Subscription != nil {
-		d := resp.Data.Subscription
-		if d.State != nil {
-			state = *d.State
+		subscription = resp.Data.Subscription
+		if subscription.State != nil {
+			state = *subscription.State
 		}
-		if d.Suspension != nil && d.Suspension.Code != nil {
-			suspensionCode = *d.Suspension.Code
+		if subscription.Suspension != nil && subscription.Suspension.Code != nil {
+			suspensionCode = *subscription.Suspension.Code
 		}
 	}
+	// Only consulted by the "active" branch below — computed once against
+	// lead (mirrors handleUpdated's own "classify once, apply to every eligible
+	// conn" pattern, since every conn sharing one remote_subscription_id is
+	// expected to share the same local listening intent).
+	compatible := classifyUpdateCompatibility(projectSubscriptionCompatibility(subscription), lead) == updateCompatible
+
 	for _, c := range res.conns {
 		c.SetLifecycleSummary(le.EventType, le.EventID, state)
 		switch state {
 		case "active":
 			c.SetSuspensionReason("")
-			c.ClearActionDegraded()
+			if compatible {
+				c.ClearActionDegraded()
+			} else {
+				c.SetDegraded(ReasonRemoteSubscriptionConflict)
+				c.SetNextAction(NextActionGet)
+			}
 		case "suspended":
 			c.SetSuspensionReason(suspensionCode)
 			c.SetDegraded(ReasonRemoteSubscriptionSuspended)
@@ -288,4 +314,30 @@ func (a *SubscriptionAction) reconcileWithGet(ctx context.Context, le LifecycleE
 		}
 	}
 	return nil
+}
+
+// projectSubscriptionCompatibility turns a Get response's Subscription
+// snapshot into the same {Authority,TargetResource,IncludeResourceData,
+// PayloadOptionsPresent} shape classifyUpdateCompatibility already compares
+// an updated_v1 event's After snapshot through — using the SAME authority
+// normalization (source.FormatLifecycleAuthority) an actual lifecycle event
+// would carry — so reconcileWithGet's "active" branch can reuse that
+// identical 3-dimension compare rather than re-deriving it or trusting
+// state=="active" alone. d==nil (a malformed/empty Get response) projects to
+// the zero value: every dimension reads as "absent", which
+// classifyUpdateCompatibility already treats as "unclear" rather than a
+// confirmed match — never silently "compatible".
+func projectSubscriptionCompatibility(d *larkeventv1.SubscriptionDetail) LifecycleEvent {
+	if d == nil {
+		return LifecycleEvent{}
+	}
+	le := LifecycleEvent{Authority: source.FormatLifecycleAuthority(d.Authority)}
+	if d.TargetResource != nil {
+		le.TargetResource = *d.TargetResource
+	}
+	if d.PayloadOptions != nil && d.PayloadOptions.IncludeResourceData != nil {
+		le.PayloadOptionsPresent = true
+		le.IncludeResourceData = *d.PayloadOptions.IncludeResourceData
+	}
+	return le
 }

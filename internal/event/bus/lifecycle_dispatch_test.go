@@ -105,6 +105,26 @@ func buildGetResp(state, suspensionCode string) *larkeventv1.GetSubscriptionResp
 	return &larkeventv1.GetSubscriptionResp{Data: &larkeventv1.GetSubscriptionRespData{Subscription: b.Build()}}
 }
 
+// buildGetRespActive constructs a state="active" GetSubscriptionResp that
+// ALSO carries target_resource/authority/payload_options.include_resource_data
+// -- the 3 dimensions issue #23's reconcileWithGet compatibility check
+// projects and compares against the lead conn's own stored intent.
+// authorityUserOpenID=="" builds an "app" authority; non-empty builds
+// "user:<id>" (mirrors lifecycle.AuthorityMatchesOwner's own vocabulary).
+func buildGetRespActive(targetResource, authorityUserOpenID string, includeResourceData bool) *larkeventv1.GetSubscriptionResp {
+	authorityBuilder := larkeventv1.NewAuthorityBuilder().Type("app")
+	if authorityUserOpenID != "" {
+		authorityBuilder = larkeventv1.NewAuthorityBuilder().Type("user").OpenId(authorityUserOpenID)
+	}
+	d := larkeventv1.NewSubscriptionDetailBuilder().
+		State("active").
+		TargetResource(targetResource).
+		Authority(authorityBuilder.Build()).
+		PayloadOptions(larkeventv1.NewPayloadOptionsBuilder().IncludeResourceData(includeResourceData).Build()).
+		Build()
+	return &larkeventv1.GetSubscriptionResp{Data: &larkeventv1.GetSubscriptionRespData{Subscription: d}}
+}
+
 // newLifecycleDispatchTestConn builds a *Conn registered on hub with BOTH a
 // remote_subscription_id AND an owner identity fixed -- lifecycle_test.go's
 // newConnWithRemoteSub only sets the former, identity_test.go's
@@ -756,6 +776,149 @@ func TestSubscriptionLifecycleAction_Updated_UnclearAuthority_SingleGetReconcile
 	}
 	if got := deps.client.renewCount(); got != 0 {
 		t.Errorf("Renew call count = %d, want 0", got)
+	}
+}
+
+// =========================================================================
+// reconcileWithGet's "active" branch (issue #23): state=="active" alone is
+// not proof this consumer's own local intent is still honored -- the Get
+// response is additionally projected into the same 3-dimension shape
+// classifyUpdateCompatibility already compares an updated_v1 After snapshot
+// through, and compared against the lead conn's stored intent.
+// =========================================================================
+
+// TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveCompatible_ClearsDegraded
+// locks the positive case: a Get response reporting active AND agreeing with
+// this consumer's stored target_resource/authority/include_resource_data on
+// all 3 dimensions clears a prior degraded state.
+func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveCompatible_ClearsDegraded(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	c.SetDegraded(lifecycle.ReasonRemoteSubscriptionConflict) // simulate an earlier degraded evaluation
+	hub.RegisterAndIsFirst(c)
+	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_1", "ou_alice", true)
+
+	// Authority=="" on the event forces classifyUpdateCompatibility to
+	// "unclear", triggering the single Get reconcile this test exercises.
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := deps.client.getCount(); got != 1 {
+		t.Fatalf("Get call count = %d, want 1", got)
+	}
+	if got := c.DegradedReason(); got != "" {
+		t.Errorf("DegradedReason() = %q, want \"\" (Get confirmed active AND all 3 dimensions compatible)", got)
+	}
+}
+
+// TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleTargetResource_StaysDegraded
+// locks the negative case for target_resource: the Get response reports
+// active, but its target_resource disagrees with this consumer's own stored
+// intent -- state=="active" must NOT by itself clear degraded.
+func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleTargetResource_StaysDegraded(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	hub.RegisterAndIsFirst(c)
+	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_DIFFERENT", "ou_alice", true)
+
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q (Get's own target_resource disagrees)", got, lifecycle.ReasonRemoteSubscriptionConflict)
+	}
+	if got := c.NextAction(); got != lifecycle.NextActionGet {
+		t.Errorf("NextAction() = %q, want %q (same guidance updated_v1's own incompatible path uses)", got, lifecycle.NextActionGet)
+	}
+}
+
+// TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleIncludeResourceData_StaysDegraded
+// locks the negative case for include_resource_data.
+func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleIncludeResourceData_StaysDegraded(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true) // this consumer's own ENCRYPTED intent
+	hub.RegisterAndIsFirst(c)
+	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_1", "ou_alice", false) // Get reports plaintext
+
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q (Get's own include_resource_data disagrees)", got, lifecycle.ReasonRemoteSubscriptionConflict)
+	}
+}
+
+// TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleAuthority_StaysDegraded
+// locks the negative case for authority.
+func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleAuthority_StaysDegraded(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	hub.RegisterAndIsFirst(c)
+	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_1", "ou_SOMEONE_ELSE", true)
+
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q (Get's own authority disagrees)", got, lifecycle.ReasonRemoteSubscriptionConflict)
+	}
+}
+
+// TestSubscriptionLifecycleAction_ReconcileWithGet_Suspended_Unchanged locks
+// that the suspended branch is untouched by the active-only compatibility
+// check above — it never even looks at target_resource/authority/
+// include_resource_data.
+func TestSubscriptionLifecycleAction_ReconcileWithGet_Suspended_Unchanged(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	hub.RegisterAndIsFirst(c)
+	deps.client.getResp = buildGetResp("suspended", "some_future_unrecognized_code")
+
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "some_future_unrecognized_code"}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := c.DegradedReason(); got == "" {
+		t.Error("DegradedReason() = \"\", want non-empty (still suspended per the reconcile)")
+	}
+	if got := c.SuspensionReason(); got != "some_future_unrecognized_code" {
+		t.Errorf("SuspensionReason() = %q, want %q", got, "some_future_unrecognized_code")
+	}
+}
+
+// TestSubscriptionLifecycleAction_ReconcileWithGet_Expired_Unchanged locks
+// that the expired branch is likewise untouched.
+func TestSubscriptionLifecycleAction_ReconcileWithGet_Expired_Unchanged(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	hub.RegisterAndIsFirst(c)
+	deps.client.getResp = buildGetResp("expired", "")
+
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpired {
+		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionExpired)
+	}
+	if got := c.NextAction(); got != lifecycle.NextActionRebuild {
+		t.Errorf("NextAction() = %q, want %q", got, lifecycle.NextActionRebuild)
 	}
 }
 
