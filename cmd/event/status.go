@@ -41,32 +41,18 @@ uptime, and active consumers. Use --current for only the current profile's
 app. Use --json for machine-readable output. Use --fail-on-orphan to exit 2
 when any orphan bus is detected (for health checks).
 
-REFINED CONSUMERS: additive, read-only fields on top of the legacy output —
-refined_subscription, remote_subscription_id, owner{identity, app_id,
-user_open_id}, current_profile_match, stale_identity, remote_state,
-last_lifecycle_event, suspension_reason, last_action/last_action_error,
-degraded_reason, next_action. For an ENCRYPTED subscription
-(--include-resource-data): resource_data (decrypted/unavailable), decrypt_state
-(decrypted/decrypt_key_unavailable/decrypt_failed), and last_decrypt_error
-{class, count, time} — advisory only, never a key or ciphertext. Legacy
-consumer output is unchanged.
-
 SCOPE: the local view (bus in-memory state) needs no scope and is always
 shown. For a refined consumer, remote_state/expire_time/
 include_resource_data are additionally supplemented from a live 'subscription
-get' call, but ONLY as a weak, optional dependency: it requires
-event:subscription:read on the CURRENT app + CURRENT identity's already-valid
-(never refreshed) token; a missing scope, no token, or an unreachable remote
-all silently fall back to the local-only view — this never fails the
-command.
+get' call, but ONLY as a weak, optional dependency: it requires event:subscription:read; 
+a missing scope silently fall back to the local-only view — this never fails the command.
 
 OUTPUT: current_profile_match/stale_identity are advisory/informational
 only — they never mean "this consumer is dead"; no liveness signal exists
 here. next_action is read-only guidance, never an action this command takes
 itself.
 
-SAFETY: strictly read-only end to end — never refreshes a token, never calls
-BindUser, never writes anything remote, regardless of flags.`,
+SAFETY: strictly read-only end to end.`,
 		Example: `  lark-cli event status --json
   lark-cli event status --current --json
   lark-cli event status --fail-on-orphan`,
@@ -802,16 +788,16 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 func decryptAdvisory(c protocol.ConsumerInfo) (advisory, nextAction string) {
 	switch c.DecryptState {
 	case "decrypt_key_unavailable":
-		return "resource data cannot be decrypted: the subscription's encrypt_key is unavailable to the current identity (decrypt_key_unavailable)",
-			"verify this identity holds scope event:encrypt_key:read and owns the subscription (switch --as/profile if it is not the owner), or delete + recreate the subscription after human confirmation"
+		return "resource data is unavailable to the current identity (decrypt_key_unavailable)",
+			"verify this identity is --as user, owns the subscription, and holds scope event:encrypt_key:read; otherwise switch --as/profile or delete + recreate the subscription after human confirmation"
 	case "decrypt_failed":
 		detail := ""
 		if c.LastDecryptError != nil {
 			detail = fmt.Sprintf(" (last_decrypt_error: class=%s count=%d time=%s)",
 				c.LastDecryptError.Class, c.LastDecryptError.Count, orDash(c.LastDecryptError.Time))
 		}
-		return fmt.Sprintf("resource data decryption is failing%s", detail),
-			"if this persists, confirm the subscription was created by this CLI (its key is CLI-generated) and delete + recreate it after human confirmation"
+		return fmt.Sprintf("resource data is unavailable%s", detail),
+			"if this persists, delete + recreate the subscription after human confirmation"
 	default:
 		return "", ""
 	}

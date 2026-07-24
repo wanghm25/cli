@@ -143,7 +143,7 @@ func TestApplyUpdate_BeforeEncryptedTrue_RequestFalse_ReturnsFailedPrecondition_
 	if ve.Param != "--include-resource-data" {
 		t.Errorf("Param = %q, want --include-resource-data", ve.Param)
 	}
-	for _, want := range []string{"include_resource_data", "encryption", "delete", "sub_1"} {
+	for _, want := range []string{"include_resource_data", "delete", "sub_1"} {
 		if !strings.Contains(ve.Error()+ve.Hint, want) {
 			t.Errorf("error+hint = %q / %q, want it to mention %q", ve.Error(), ve.Hint, want)
 		}
@@ -482,9 +482,9 @@ func TestRunUpdate_IncludeResourceDataTrue_RejectsSwitchWithDeleteRecreateGuidan
 	if ve.Param != "--include-resource-data" {
 		t.Errorf("Param = %q, want --include-resource-data", ve.Param)
 	}
-	// New guidance: cannot change include_resource_data / encryption in place.
+	// New guidance: cannot change include_resource_data in place.
 	msg := ve.Error()
-	for _, want := range []string{"include_resource_data", "encryption"} {
+	for _, want := range []string{"include_resource_data"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("Error() = %q, want it to mention %q", msg, want)
 		}

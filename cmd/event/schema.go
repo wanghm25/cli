@@ -213,11 +213,11 @@ type ConditionalScope struct {
 	When  string `json:"when"`
 }
 
-// RiskDisclosure statically discloses that refined consume has write-level
-// remote side effects. The command framework only tracks
-// static per-command risk (cmdutil.SetRisk; consume is registered "read")
-// and that is not changed to dynamic per-key risk here — this is an
-// additive, informational strong-disclosure surfaced via `schema --json` only.
+// RiskDisclosure discloses the per-key risk semantics that a static command
+// annotation cannot express by itself: ordinary EventKeys are read-only, while a
+// refined EventKey has write-level startup side effects. NewCmdConsume registers
+// the conservative static command risk as "write"; runConsume narrows it to
+// "read" for an ordinary key once the EventKey is resolved.
 type RiskDisclosure struct {
 	OrdinaryEventKey  string `json:"ordinary_event_key"`
 	Effective         string `json:"effective"`

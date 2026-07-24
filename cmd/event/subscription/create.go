@@ -73,35 +73,29 @@ allowed identities; it never silently falls back to another identity.
 
 SCOPE: requires BOTH event:subscription:read and event:subscription:write;
 --include-resource-data=true ALSO requires --as user and event:encrypt_key:read
-(resource data is a user-only capability, and this command's reconcile step
-probes GetEncryptKey to classify an existing include_resource_data=true match —
-see SAFETY below). Every mutation always reads remote state first (to detect an
-existing subscription and analyze impact) before it may create anything.
+(resource data is user-only). Every mutation always reads remote state first
+(to detect an existing subscription and analyze impact) before it may create
+anything.
 
 OUTPUT: {operation, action: "created"|"reused", remote_subscription_id,
 subscription{...}, next_action}. A conflicting active subscription
-(different payload_options, or an unconfirmed/unavailable encryption state)
-or a suspended one is never silently overwritten — both return a typed
+(different payload_options) or a suspended one is never silently overwritten
+— both return a typed
 failed_precondition guiding you to 'get' or 'reactivate' instead.
 
 NEXT STEP: creating a subscription does not start listening — run 'event
 consume <refined EventKey>' afterwards.
 
-SAFETY: --include-resource-data=true creates an ENCRYPTED subscription: the
-CLI generates a fresh, high-entropy per-subscription encrypt_key via the OS
-CSPRNG in memory and submits it atomically with the Create request (one
-request carries both include_resource_data=true and encrypt.encrypt_key;
-there is no separate "plaintext resource_data" mode). This is fail-closed:
-a failed create never falls back to a plaintext subscription, and the key
-is never logged, persisted, printed, or returned — there is no --encrypt-key
-flag; the CLI is the sole generator. An existing remote subscription with a
-conflicting include_resource_data or unconfirmed/unavailable encryption
-state is a typed failed_precondition (human decision: verify it, or delete
-and recreate) — never silently resolved. Use --dry-run to preview the plan
-(parse/identity/scope preflight + a remote read + impact analysis, which MAY
-probe whether an existing match's key is retrievable but never generates
-one) without creating, reusing, changing anything, or generating a key;
-create never requires --yes (additive and pre-checked for conflicts).`,
+SAFETY: --include-resource-data=true includes resource data in delivered
+events. Resource data is delivered encrypted by the platform and decrypted by
+the CLI before output; users and agents do not manage keys or decryption. A
+failed create never falls back to a subscription without resource data. An
+existing remote subscription with a conflicting include_resource_data setting
+is a typed failed_precondition (human decision: verify it, or delete and
+recreate) — never silently resolved. Use --dry-run to preview the plan
+(parse/identity/scope preflight + a remote read + impact analysis) without
+creating, reusing, or changing anything; create never requires --yes
+(additive and pre-checked for conflicts).`,
 		Example: `  lark-cli event schema im.message.created_v1 --json                                          # find key_templates[].example first
   lark-cli event subscription create im.message.created_v1/chat-id/oc_xxx --dry-run --as bot --json
   lark-cli event subscription create im.message.created_v1/chat-id/oc_xxx --as bot --json
@@ -113,7 +107,7 @@ create never requires --yes (additive and pre-checked for conflicts).`,
 	}
 
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
-		"Include resource data in delivered events. Requires --as user (resource data is a user-only capability; a bot/app subscription is rejected). true creates an ENCRYPTED subscription: the CLI generates a per-subscription encrypt_key (OS CSPRNG, in-memory only, never printed/logged/persisted — there is no --encrypt-key flag) and submits it atomically with the Create request; a failed create never falls back to a plaintext subscription. Requires scope event:encrypt_key:read in addition to event:subscription:{read,write}.")
+		"Include resource data in delivered events. Requires --as user and scope event:encrypt_key:read; the platform delivers resource data encrypted and the CLI decrypts it before output.")
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the plan (identity/scope preflight + remote read + impact analysis) without creating, reusing, or changing anything")
 	cmd.Flags().BoolVar(&o.asJSON, "json", false, "Emit the result as JSON (for AI / scripts)")
@@ -547,7 +541,7 @@ func conflictError(resolved eventlib.ResolvedEventKey, identity core.Identity, p
 	id := strVal(plan.Existing.SubscriptionId)
 	hint := fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before creating a differently-configured one", id, identity, id)
 	if includeResourceData {
-		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s; encryption cannot be changed in place (Create-only), so after human confirmation either delete it and create a new encrypted subscription, or verify this identity/app holds scope `event:encrypt_key:read` and can actually retrieve the existing subscription's key", id, identity, id)
+		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s; include_resource_data cannot be changed in place, so after human confirmation either keep the existing subscription, ensure this identity has scope `event:encrypt_key:read`, or delete it and create a new one with the desired resource-data setting", id, identity, id)
 	}
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"an active subscription already exists for %s with a conflicting configuration (remote_subscription_id=%s)",

@@ -69,30 +69,15 @@ Use 'event schema <EventKey>' for parameter details.
 
 REFINED EVENTKEYS: a key with refined_subscription:true ('event schema <key>
 --json') must be materialized with a resource selector before it can be
-consumed, e.g. 'im.message.created_v1/chat-id/oc_xxx' (see
+consumed, e.g. 'im.message.example_v1/chat-id/oc_xxx' (see
 key_templates[].example in its schema). The bare base key is rejected with a
 hint pointing at 'event schema'.
-
-IDENTITY: --as user|bot|auto. For a refined key the resolved identity must
-be one the MATCHED template accepts specifically, which can be narrower than
-the key's own declared identities (e.g. an 'owner/me' template only accepts
-'user' even though its base key allows user+bot) — a mismatch is a typed
-error naming the allowed identities, never a silent switch.
 
 SCOPE: a refined key's consume additionally requires BOTH
 event:subscription:read and event:subscription:write on the resolved
 identity's token (it reads remote state before it may create, reuse, or
 reactivate a Subscription). A legacy key only needs its own declared scopes
 (see 'event schema <key>').
-
-OUTPUT: stdout is always business-event NDJSON only. For a refined key,
-diagnostic lines (remote_subscription_id, whether this run created it, the
-ready marker) go to stderr — never stdout.
-
-NEXT STEP: manage the remote Subscription this run created/reused via
-'lark-cli event subscription get|update|renew|reactivate|delete
-<remote_subscription_id>'; run 'lark-cli event status' to see its current
-remote_state.
 
 SAFETY: for a refined key, consuming has write-level side effects (create,
 reuse, or reactivate a remote Subscription) even though this command reads
@@ -103,26 +88,21 @@ reused by the next matching consume/create — delete it explicitly via
 'event subscription delete' if you no longer want it to exist.
 
 INCLUDE-RESOURCE-DATA: --include-resource-data (default false) mirrors the
-same-named flag on 'event subscription create'. false (the default) is a
-no-op: a refined consume's remote Subscription is still created/reused with
-resource data disabled, exactly as before. Passing
---include-resource-data=true on a refined key creates an ENCRYPTED remote
-Subscription and REQUIRES --as user (resource data is a user-only capability;
---as bot/auto→bot is rejected as invalid_argument): the CLI generates a
-per-subscription encrypt_key (OS CSPRNG, in-memory only, never
-printed/logged/persisted — there is no --encrypt-key flag) and submits it
-atomically with the Create; the bus then fetches the key via GetEncryptKey to
-decrypt events. This additionally requires scope event:encrypt_key:read on the
-resolved identity — the bus fetches the key once when the consumer registers
-and refuses to ready it (typed decrypt_key_unavailable, no half-registered
-consumer) if it cannot. Passing --include-resource-data=true on an ORDINARY
+same-named flag on 'event subscription create'. Passing
+--include-resource-data=true on a refined key includes resource data in
+delivered events and REQUIRES --as user (resource data is user-only;
+--as bot/auto→bot is rejected as invalid_argument). Resource data is delivered
+encrypted by the platform and decrypted by the CLI before output; agents do not
+need to manage keys or decryption. This additionally requires scope
+event:encrypt_key:read on the resolved identity. Passing
+--include-resource-data=true on an ORDINARY
 (non-refined) key is always rejected as typed invalid_argument: the flag only
 ever controls a refined key's remote Subscription, so it can never silently
 no-op there.`,
 		Example: `  lark-cli event consume im.message.receive_v1 --as bot                        # legacy key: unlimited stream
-  lark-cli event schema im.message.created_v1 --json                            # refined key: find its templates first
-  lark-cli event consume im.message.created_v1/chat-id/oc_xxx --dry-run --as bot  # preview the refined plan, zero writes
-  lark-cli event consume im.message.created_v1/chat-id/oc_xxx --as bot          # apply the plan, then stream`,
+  lark-cli event schema im.message.example_v1 --json                            # refined key: find its templates first
+  lark-cli event consume im.message.example_v1/chat-id/oc_xxx --dry-run --as bot  # preview the refined plan, zero writes
+  lark-cli event consume im.message.example_v1/chat-id/oc_xxx --as bot          # apply the plan, then stream`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runConsume(cmd, f, args[0], o)
@@ -142,7 +122,7 @@ no-op there.`,
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the refined-subscription remote-write plan (probe + plan only) without applying it, starting the bus, or writing anything remote. No-op for legacy (non-refined) EventKeys, which never write remote state at all.")
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
-		"Include resource data in a refined key's remote Subscription (mirrors 'event subscription create'). false (the default) is a no-op. true creates an ENCRYPTED subscription and requires --as user (resource data is user-only; a bot/app subscription is rejected) plus scope event:encrypt_key:read; the CLI-generated per-subscription encrypt_key is never printed/logged, and the bus must be able to fetch the key when the consumer registers or the consumer refuses to start. Always rejected as invalid_argument on an ordinary (non-refined) key.")
+		"Include resource data in delivered events for a refined key. Requires --as user and scope event:encrypt_key:read; the platform delivers resource data encrypted and the CLI decrypts it before output. Always rejected as invalid_argument on an ordinary (non-refined) key.")
 	// Static default: "write", not "read". A single risk_level annotation
 	// can't vary by the EventKey argument (unknown until RunE resolves it),
 	// and a refined key's consume startup chain has REAL write side effects
@@ -462,7 +442,7 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 	}
 	// Write-safety: resolveIdentity only checked
 	// the BASE key's AuthTypes; the matched KeyTemplate can be narrower
-	// (e.g. the shipped im.message.created_v1/owner/me template is
+	// (e.g. the shipped im.message.example_v1/owner/me template is
 	// user-only even though its base key allows user+bot — see
 	// eventlib.CheckTemplateAuthTypes's own doc comment). This must run
 	// BEFORE any client/subClient construction below and before
@@ -622,7 +602,7 @@ func preflightEncryptKeyScope(ctx context.Context, f *cmdutil.Factory, appID str
 		"missing required scope for --include-resource-data=true (as %s): %s", identity, strings.Join(missing, ", ")).
 		WithIdentity(string(identity)).
 		WithMissingScopes(missing...).
-		WithHint("grant/re-authorize scope `event:encrypt_key:read` for identity %s, then retry `lark-cli event consume %s --include-resource-data=true --as %s` — without it, this run would create (or reuse) an encrypted remote Subscription this consumer could never decrypt", identity, materializedKey, identity)
+		WithHint("grant/re-authorize scope `event:encrypt_key:read` for identity %s, then retry `lark-cli event consume %s --include-resource-data=true --as %s`; this scope is required for resource data delivery", identity, materializedKey, identity)
 }
 
 // resolveIdentityUAT resolves the user access token SubscriptionClient needs

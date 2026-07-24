@@ -77,10 +77,9 @@ reactivate <remote_subscription_id>' first) and to report impact for
 --dry-run.
 
 ALLOWED VALUES: --include-resource-data true|false (required — no default is
-silently applied). --include-resource-data=true is refused: encryption is set
-only at create time and cannot be added, changed, or removed by update, so
-switching include_resource_data / encryption on an existing
-Subscription is not supported here — a typed failed_precondition guides you to
+silently applied). Changing include_resource_data on an existing Subscription
+is refused: resource-data delivery is decided when the Subscription is created
+and cannot be toggled by update. A typed failed_precondition guides you to
 delete + recreate (after a human confirms) instead.
 
 OUTPUT: {operation, remote_subscription_id, subscription{...}, next_action}.
@@ -102,7 +101,7 @@ confirmed. Use --dry-run to preview the plan without changing anything.`,
 	}
 
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
-		"New value for whether to include resource data in delivered events (required: pass explicitly). true is refused: encryption is set only at create time, so switching include_resource_data / encryption on an existing subscription is not supported via update — delete + recreate (after a human confirms) instead.")
+		"New value for whether to include resource data in delivered events (required: pass explicitly). Changing this on an existing subscription is not supported via update; delete + recreate after human confirmation instead.")
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the plan (identity/scope preflight + remote read + impact analysis) without updating anything")
 	cmd.Flags().BoolVar(&o.yes, "yes", false, "Confirm this high-risk write (required unless --dry-run); only pass this after a human has confirmed")
@@ -287,9 +286,9 @@ func doPatchSubscription(ctx context.Context, svc updateSubscriptionAPI, remoteS
 // of its own.
 func errUpdateCannotSwitchEncryption(remoteSubscriptionID string, desiredForRecreate bool) error {
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
-		"cannot change include_resource_data or encryption on an existing subscription via update").
+		"cannot change include_resource_data on an existing subscription via update").
 		WithParam("--include-resource-data").
-		WithHint("encryption is set only when a subscription is created and can never be added, changed, or removed afterward; to switch include_resource_data or enable/disable/rotate encryption a human must confirm, then delete this subscription and create a new one (or create a separate new subscription) — e.g. `lark-cli event subscription delete %s` then `lark-cli event subscription create <refined-event-key> --include-resource-data=%t`", remoteSubscriptionID, desiredForRecreate)
+		WithHint("resource-data delivery is decided when a subscription is created and cannot be toggled afterward; after human confirmation, delete this subscription and create a new one (or create a separate new subscription) — e.g. `lark-cli event subscription delete %s` then `lark-cli event subscription create <refined-event-key> --include-resource-data=%t`", remoteSubscriptionID, desiredForRecreate)
 }
 
 // errUpdateSuspended implements the suspended guard: Patch is
@@ -344,7 +343,7 @@ const updateLocalImpactNote = "`event subscription update` only changes payload_
 
 func updateDryRunNextAction(remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, requestedIncludeResourceData bool) string {
 	if switchingOffEncryption(before, requestedIncludeResourceData) {
-		return fmt.Sprintf("this update would be rejected: include_resource_data/encryption cannot be switched off via update; a human must confirm, then run `lark-cli event subscription delete %s` and create a new plaintext subscription instead", remoteSubscriptionID)
+		return fmt.Sprintf("this update would be rejected: include_resource_data cannot be switched off via update; a human must confirm, then run `lark-cli event subscription delete %s` and create a new subscription with --include-resource-data=false instead", remoteSubscriptionID)
 	}
 	if before.Remote.State == "suspended" {
 		return fmt.Sprintf("this update would be rejected while suspended; run `lark-cli event subscription reactivate %s --as %s` first", remoteSubscriptionID, identity)
