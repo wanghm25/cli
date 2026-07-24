@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
@@ -104,6 +105,14 @@ type Hub struct {
 	// lock/atomic — it changes at most once in practice (bus construction,
 	// before Run starts accepting events).
 	currentResolver func() (currentIdentity, error)
+
+	// crossCheckDropped counts events dropped by Publish's refined
+	// cross-check (refinedCrossCheckMismatch): a remote_subscription_id match
+	// that, on closer inspection, disagreed with the matched consumer's own
+	// stored intent on event_type/target_resource/authority. Distinct from
+	// per-consumer DroppedCount (backpressure evictions) — this is a
+	// routing-integrity signal, expected to stay at 0 in normal operation.
+	crossCheckDropped atomic.Int64
 }
 
 func NewHub() *Hub {
@@ -321,6 +330,12 @@ type publishMatch struct {
 // unconditionally — including for refined-native events, which legacy
 // consumers still receive via event_type compat delivery.
 //
+// A matched refined consumer additionally passes refinedCrossCheckMismatch
+// before delivery: additive defense-in-depth on top of the
+// remote_subscription_id match above, never a replacement for it — see that
+// function's own doc comment for exactly what it checks and why an absent
+// dimension is always skipped rather than treated as a mismatch.
+//
 // A fresh *protocol.Event is allocated per subscriber so each consumer sees
 // its own monotonically-increasing Seq (assigned via Conn.NextSeq) — sharing
 // a single msg struct across subscribers would alias Seq and defeat the
@@ -406,6 +421,17 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 		}
 		s := m.sub
 
+		if m.refined {
+			if reason := refinedCrossCheckMismatch(raw, s); reason != "" {
+				h.crossCheckDropped.Add(1)
+				if lg := h.logger.Load(); lg != nil {
+					lg.Printf("WARN: refined event dropped: remote_subscription_id=%s cross_check_mismatch=%s",
+						raw.RemoteSubscriptionID, reason)
+				}
+				continue
+			}
+		}
+
 		if currentResolver != nil && s.OwnerUserOpenID() != "" {
 			if !identityResolved {
 				identityCur, identityErr = currentResolver()
@@ -466,11 +492,67 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 	}
 }
 
+// refinedCrossCheckMismatch implements the additive defense-in-depth
+// cross-check for a refined consumer already matched by remote_subscription_id
+// equality: that match alone routed raw to s, so this ONLY ever looks for a
+// CONFIRMED disagreement on a dimension both raw and s actually carry — it
+// must NEVER drop for a dimension either side simply doesn't expose (an
+// absent/empty value is always skipped, never treated as a mismatch).
+// Returns "" (no mismatch — deliver) or a short fixed classification
+// ("event_type" / "target_resource" / "authority") naming which dimension
+// disagreed, so a drop's log line and counter stay consistent.
+//
+// event_type is always checkable: raw.EventType and s.EventTypes() are both
+// always populated (refined or not), and a real remote Subscription is
+// permanently bound to one event_type at Create time — so a mismatch here
+// under an already-matched remote_subscription_id would be a genuine
+// anomaly, not a normal/expected state.
+//
+// target_resource/authority are only cross-checked when raw itself carries
+// them (Resource/Authority are populated only for a refined-native RawEvent)
+// AND s exposes the corresponding stored intent: TargetResource() is
+// *Conn-only (a bare Subscriber — a test fake, never a real registration —
+// has no target_resource concept and is never held to it); authority reuses
+// lifecycle.AuthorityMatchesOwner, the SAME "user:<open_id>"/"app" compare
+// the updated_v1 lifecycle compatibility check already establishes, so the
+// two never drift out of sync.
+func refinedCrossCheckMismatch(raw *event.RawEvent, s Subscriber) string {
+	matched := false
+	for _, et := range s.EventTypes() {
+		if et == raw.EventType {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return "event_type"
+	}
+
+	if raw.Resource != "" {
+		if c, ok := s.(*Conn); ok && c.TargetResource() != "" && raw.Resource != c.TargetResource() {
+			return "target_resource"
+		}
+	}
+
+	if raw.Authority != "" && !lifecycle.AuthorityMatchesOwner(raw.Authority, s.OwnerUserOpenID()) {
+		return "authority"
+	}
+
+	return ""
+}
+
 // ConnCount returns the current number of registered subscribers.
 func (h *Hub) ConnCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.subscribers)
+}
+
+// CrossCheckDroppedCount returns how many events Publish's refined
+// cross-check (refinedCrossCheckMismatch) has dropped so far (0 in normal
+// operation — see crossCheckDropped's own doc comment).
+func (h *Hub) CrossCheckDroppedCount() int64 {
+	return h.crossCheckDropped.Load()
 }
 
 // EventKeyCount returns total subscribers for the given EventKey, aggregating

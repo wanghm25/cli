@@ -184,6 +184,10 @@ func TestHub_Publish_FourQuadrantRouting(t *testing.T) {
 func TestHub_Publish_SetsV2FieldsForRefinedEvent(t *testing.T) {
 	h := NewHub()
 	refinedR1 := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
+	// Give this consumer an owner matching the raw event's own Authority
+	// below ("user:ou_abc123"): Publish's refined cross-check compares them,
+	// and this test's subject is v2 field mapping, not that cross-check.
+	refinedR1.ownerUserOpenID = "ou_abc123"
 	h.RegisterAndIsFirst(refinedR1)
 
 	h.Publish(&event.RawEvent{
@@ -208,6 +212,179 @@ func TestHub_Publish_SetsV2FieldsForRefinedEvent(t *testing.T) {
 	}
 	if evt.SubscriptionEventID != "sub-evt-1" {
 		t.Errorf("SubscriptionEventID = %q, want %q", evt.SubscriptionEventID, "sub-evt-1")
+	}
+}
+
+// --- refined cross-check: additive defense-in-depth on top of the
+// remote_subscription_id match above, never a replacement for it ---
+
+// TestHub_Publish_RefinedCrossCheck_EventTypeMismatch_DroppedAndCounted locks
+// the strongest signal: even though remote_subscription_id matched, an
+// event_type that disagrees with what this consumer registered for is a
+// genuine anomaly — drop it, and count it so it's observable.
+func TestHub_Publish_RefinedCrossCheck_EventTypeMismatch_DroppedAndCounted(t *testing.T) {
+	h := NewHub()
+	refinedR1 := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
+	h.RegisterAndIsFirst(refinedR1)
+
+	h.Publish(&event.RawEvent{
+		EventID:              "evt-1",
+		EventType:            "im.message.OTHER_v1", // disagrees with refinedR1's own EventTypes()
+		RemoteSubscriptionID: "R1",
+		Payload:              json.RawMessage(`{}`),
+	})
+
+	mustNotReceive(t, refinedR1.sendCh, "refined R1 consumer (event_type cross-check mismatch must drop)")
+	if got := h.CrossCheckDroppedCount(); got != 1 {
+		t.Errorf("CrossCheckDroppedCount() = %d, want 1", got)
+	}
+}
+
+// TestHub_Publish_RefinedCrossCheck_TargetResourceMismatch_Dropped locks the
+// target_resource dimension: TargetResource() is *Conn-only (this consumer's
+// own stored listening intent from HelloV2), so a real *Conn is needed here.
+func TestHub_Publish_RefinedCrossCheck_TargetResourceMismatch_Dropped(t *testing.T) {
+	h := NewHub()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	c := NewConn(server, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "")
+	c.SetRemoteSubscriptionID("R1")
+	c.SetListenIntent("im.message?chat_id=oc_1", false)
+	c.sendCh = make(chan interface{}, 1)
+	h.RegisterAndIsFirst(c)
+
+	h.Publish(&event.RawEvent{
+		EventID:              "evt-1",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		Resource:             "im.message?chat_id=oc_DIFFERENT", // disagrees with c's own TargetResource()
+		Payload:              json.RawMessage(`{}`),
+	})
+
+	mustNotReceive(t, c.sendCh, "conn (target_resource cross-check mismatch must drop)")
+	if got := h.CrossCheckDroppedCount(); got != 1 {
+		t.Errorf("CrossCheckDroppedCount() = %d, want 1", got)
+	}
+}
+
+// TestHub_Publish_RefinedCrossCheck_AuthorityMismatch_Dropped locks the
+// authority dimension: raw.Authority ("user:<open_id>"/"app") must match this
+// consumer's OWN owner identity (lifecycle.AuthorityMatchesOwner) — the same
+// vocabulary/comparison the updated_v1 lifecycle compatibility check uses.
+func TestHub_Publish_RefinedCrossCheck_AuthorityMismatch_Dropped(t *testing.T) {
+	h := NewHub()
+	refinedR1 := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
+	refinedR1.ownerUserOpenID = "ou_the_real_owner"
+	h.RegisterAndIsFirst(refinedR1)
+
+	h.Publish(&event.RawEvent{
+		EventID:              "evt-1",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		Authority:            "user:ou_SOMEONE_ELSE", // disagrees with refinedR1's own owner
+		Payload:              json.RawMessage(`{}`),
+	})
+
+	mustNotReceive(t, refinedR1.sendCh, "refined R1 consumer (authority cross-check mismatch must drop)")
+	if got := h.CrossCheckDroppedCount(); got != 1 {
+		t.Errorf("CrossCheckDroppedCount() = %d, want 1", got)
+	}
+}
+
+// TestHub_Publish_RefinedCrossCheck_AllDimensionsMatch_Delivered proves the
+// cross-check is not merely permissive by omission: it actively compares all
+// 3 dimensions and still delivers when every one of them agrees.
+func TestHub_Publish_RefinedCrossCheck_AllDimensionsMatch_Delivered(t *testing.T) {
+	h := NewHub()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	c := NewConn(server, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "")
+	c.SetRemoteSubscriptionID("R1")
+	c.SetListenIntent("im.message?chat_id=oc_1", false)
+	c.SetOwnerIdentity("user", "cli_app", "ou_abc123")
+	c.sendCh = make(chan interface{}, 1)
+	h.RegisterAndIsFirst(c)
+
+	h.Publish(&event.RawEvent{
+		EventID:              "evt-1",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		Resource:             "im.message?chat_id=oc_1",
+		Authority:            "user:ou_abc123",
+		Payload:              json.RawMessage(`{}`),
+	})
+
+	mustReceiveEvent(t, c.sendCh, "conn (every dimension agrees)")
+	if got := h.CrossCheckDroppedCount(); got != 0 {
+		t.Errorf("CrossCheckDroppedCount() = %d, want 0", got)
+	}
+}
+
+// TestHub_Publish_RefinedCrossCheck_RawMissingExtraFields_Delivered is the
+// hard safety rule: raw carrying no target_resource/authority at all (e.g. an
+// older/minimal producer) must NEVER be treated as a mismatch on those
+// dimensions — only event_type is always checked. This consumer's OWN stored
+// target_resource/owner are populated (and would, if compared, disagree with
+// nothing raw even offers) — the point is those dimensions are skipped
+// entirely, not coincidentally satisfied.
+func TestHub_Publish_RefinedCrossCheck_RawMissingExtraFields_Delivered(t *testing.T) {
+	h := NewHub()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	c := NewConn(server, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "")
+	c.SetRemoteSubscriptionID("R1")
+	c.SetListenIntent("im.message?chat_id=oc_1", false)
+	c.SetOwnerIdentity("user", "cli_app", "ou_abc123")
+	c.sendCh = make(chan interface{}, 1)
+	h.RegisterAndIsFirst(c)
+
+	h.Publish(&event.RawEvent{
+		EventID:              "evt-1",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		// Resource and Authority both intentionally left empty.
+		Payload: json.RawMessage(`{}`),
+	})
+
+	mustReceiveEvent(t, c.sendCh, "conn (raw carries no target_resource/authority to cross-check)")
+	if got := h.CrossCheckDroppedCount(); got != 0 {
+		t.Errorf("CrossCheckDroppedCount() = %d, want 0", got)
+	}
+}
+
+// TestHub_Publish_RefinedCrossCheck_MultiConsumerFanOutUnaffected proves the
+// cross-check is evaluated PER-SUBSCRIBER, not as a single whole-Publish gate:
+// two consumers sharing the SAME remote_subscription_id, one with a genuine
+// owner mismatch and one without, must be judged independently — the
+// mismatched one's drop must never affect the other's delivery.
+func TestHub_Publish_RefinedCrossCheck_MultiConsumerFanOutUnaffected(t *testing.T) {
+	h := NewHub()
+	good := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
+	good.ownerUserOpenID = "ou_abc123"
+	bad := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
+	bad.pid = 2
+	bad.ownerUserOpenID = "ou_SOMEONE_ELSE"
+	h.RegisterAndIsFirst(good)
+	h.RegisterAndIsFirst(bad)
+
+	h.Publish(&event.RawEvent{
+		EventID:              "evt-1",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		Authority:            "user:ou_abc123",
+		Payload:              json.RawMessage(`{}`),
+	})
+
+	mustReceiveEvent(t, good.sendCh, "good consumer (owner matches — unaffected by bad's mismatch)")
+	mustNotReceive(t, bad.sendCh, "bad consumer (owner mismatch must drop)")
+	if got := h.CrossCheckDroppedCount(); got != 1 {
+		t.Errorf("CrossCheckDroppedCount() = %d, want 1 (only the mismatched consumer)", got)
 	}
 }
 

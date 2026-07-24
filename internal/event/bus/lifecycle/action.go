@@ -114,10 +114,24 @@ func classifyUpdateCompatibility(le LifecycleEvent, lead Conn) string {
 // already establish. authority=="" (unclear) must never reach here —
 // classifyUpdateCompatibility's own switch guards that.
 func authorityMatchesConn(authority string, lead Conn) bool {
-	if lead.OwnerUserOpenID() == "" {
+	return AuthorityMatchesOwner(authority, lead.OwnerUserOpenID())
+}
+
+// AuthorityMatchesOwner reports whether authority (an already-normalized
+// "user:<open_id>" / "app" wire-vocabulary string — see
+// source.FormatLifecycleAuthority / RawEvent.Authority) matches an owner's
+// own fixed identity, expressed as ownerUserOpenID ("" for a bot or legacy
+// owner — the same discriminator OwnerUserOpenID() uses everywhere else in
+// this codebase). Exported so a host package (e.g. the hub's own
+// delivery-time cross-check) can reuse this exact comparison — the one
+// place either "user:"+id or "app" is spelled out — rather than
+// re-deriving it and risking the two copies drifting apart. authority=="" is
+// unclear and must never reach here; callers gate on that themselves.
+func AuthorityMatchesOwner(authority, ownerUserOpenID string) bool {
+	if ownerUserOpenID == "" {
 		return authority == "app"
 	}
-	return authority == "user:"+lead.OwnerUserOpenID()
+	return authority == "user:"+ownerUserOpenID
 }
 
 // errIdentityGateUnconfigured/errSubscriptionClientUnconfigured are returned
