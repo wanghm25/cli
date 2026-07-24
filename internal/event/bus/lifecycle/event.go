@@ -17,21 +17,19 @@ import (
 // create an import cycle.
 type LifecycleEvent = source.LifecycleEvent
 
-// Event type strings, mirrored from source/feishu.go's identically-named,
-// identically-valued but UNEXPORTED constants (lifecycleEventTypeActivated
-// et al.) — this package cannot reference those directly since they're
-// private to package source, and re-exporting them there is out of scope for
-// this change. These 6 strings are SDK facts, stable across this whole
-// feature — if they ever change, both copies must be updated together.
+// Event type strings, derived from source/feishu.go's exported constants
+// (the single source of truth — see that package's own doc comment) so the
+// two packages can never drift apart. Kept as local (mostly unexported)
+// names purely so the rest of this package can write them unqualified.
 const (
-	lifecycleEventTypeActivated          = "event.subscription.activated_v1"
-	lifecycleEventTypeUpdated            = "event.subscription.updated_v1"
-	lifecycleEventTypeSuspended          = "event.subscription.suspended_v1"
-	lifecycleEventTypeExpirationReminder = "event.subscription.expiration_reminder_v1"
-	lifecycleEventTypeExpired            = "event.subscription.expired_v1"
+	lifecycleEventTypeActivated          = source.LifecycleEventTypeActivated
+	lifecycleEventTypeUpdated            = source.LifecycleEventTypeUpdated
+	lifecycleEventTypeSuspended          = source.LifecycleEventTypeSuspended
+	lifecycleEventTypeExpirationReminder = source.LifecycleEventTypeExpirationReminder
+	lifecycleEventTypeExpired            = source.LifecycleEventTypeExpired
 	// LifecycleEventTypeDeleted is exported because the deleted_v1 path (the
 	// encrypt-key release) is verified from the host package's tests.
-	LifecycleEventTypeDeleted = "event.subscription.deleted_v1"
+	LifecycleEventTypeDeleted = source.LifecycleEventTypeDeleted
 )
 
 // suspensionCodeAuthorityRevoked is the ONLY confirmed stable suspension.code

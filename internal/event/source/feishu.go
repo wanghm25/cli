@@ -241,6 +241,20 @@ const (
 	lifecycleEventTypeDeleted            = "event.subscription.deleted_v1"
 )
 
+// Exported aliases of the 6 constants above — the single source of truth
+// internal/event/bus/lifecycle's own event-type constants are derived from,
+// so the two packages can never drift apart. This package's own code keeps
+// using the unexported names above unchanged; these exist purely for the
+// other package's import.
+const (
+	LifecycleEventTypeActivated          = lifecycleEventTypeActivated
+	LifecycleEventTypeUpdated            = lifecycleEventTypeUpdated
+	LifecycleEventTypeSuspended          = lifecycleEventTypeSuspended
+	LifecycleEventTypeExpirationReminder = lifecycleEventTypeExpirationReminder
+	LifecycleEventTypeExpired            = lifecycleEventTypeExpired
+	LifecycleEventTypeDeleted            = lifecycleEventTypeDeleted
+)
+
 // registerLifecycleHandlers registers the 6 typed subscription lifecycle
 // handlers on d, BEFORE cli.Start (called from buildDispatcher/Start).
 // businessEventTypes is the set already registered via OnCustomizedEvent
