@@ -490,6 +490,39 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 	}
 	b.mu.Unlock()
 
+	// Bind a user consumer that joined an ALREADY-ready WS now — before acking —
+	// and fail closed if the bind fails. onConnReady only binds the consumers
+	// present when the WS first became ready (or on each reconnect), so a
+	// consumer registering afterwards — the common "new consume against an
+	// already-running bus" path — would otherwise never be BindUser'd. Because
+	// the WS is already up we can bind here and, on failure, REJECT the Hello:
+	// the consumer must never ack as "ready" while it would silently receive no
+	// events. This runs after the hub + b.conns registration above, so a failed
+	// bind's bc.Close() unwinds both via onClose. The asymmetry with the FIRST
+	// consumer is deliberate: at the first consumer's Hello the WS is not ready
+	// yet, so it cannot bind here and necessarily binds later via onConnReady —
+	// which must not reject an already-acked consumer and so degrades instead.
+	// Bots/legacy consumers (empty owner user_open_id) are never identity-gated.
+	// When the WS is not yet ready, do nothing here and let the next onConnReady
+	// bind this now-registered consumer, avoiding a premature
+	// connection_not_ready degraded on a brand-new consumer.
+	if b.identityGate != nil && bc.OwnerUserOpenID() != "" && b.identityGate.ready() {
+		if err := b.identityGate.bindConsumer(context.Background(), bc); err != nil {
+			// bindConsumer already recorded WHY on the Conn (the status surface
+			// shows it); keep this WARN and the wire reason key-free and
+			// cause-agnostic — no UAT/open_id/key, and no oracle for which check
+			// failed.
+			b.logger.Printf("WARN: rejecting user consumer pid=%d key=%q: identity bind failed",
+				hello.PID, hello.EventKey)
+			if werr := bc.writeFrame(protocol.NewHelloAckRejected("v1", protocol.RejectReasonBindFailed)); werr != nil {
+				b.logger.Printf("WARN: reject hello_ack (identity_bind_failed) write to pid=%d key=%q failed: %v",
+					hello.PID, hello.EventKey, werr)
+			}
+			bc.Close()
+			return
+		}
+	}
+
 	ack := protocol.NewHelloAck("v1", firstForKey)
 	// writeFrame shares writeMu with every other write; bc.Close on failure unwinds hub+bus registration via onClose.
 	if err := bc.writeFrame(ack); err != nil {
@@ -504,19 +537,6 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 		hello.PID, hello.EventKey, hello.EventTypes, firstForKey)
 
 	bc.Start()
-
-	// Bind a user consumer that joined an already-ready WS. onConnReady only
-	// binds the consumers present when the WS first became ready (or on each
-	// reconnect), so a consumer registering afterwards — the common
-	// "new consume against an already-running bus" path — would otherwise never
-	// be BindUser'd. Bots/legacy consumers (no owner user_open_id) are never
-	// identity-gated, mirroring how onConnReady filters them via userConns.
-	// Only bind when the WS is already ready: if it is not, do nothing and let
-	// the next onConnReady bind this now-registered consumer, avoiding a
-	// premature connection_not_ready degraded on a brand-new consumer.
-	if b.identityGate != nil && bc.OwnerUserOpenID() != "" && b.identityGate.ready() {
-		_ = b.identityGate.bindConsumer(context.Background(), bc)
-	}
 }
 
 // handleStatusQuery replies with status and closes.

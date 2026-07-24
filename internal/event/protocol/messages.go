@@ -63,6 +63,15 @@ const (
 // material.
 const RejectReasonDecryptKeyUnavailable = "decrypt_key_unavailable"
 
+// RejectReasonBindFailed is the HelloAck.RejectReason the bus sends when it
+// cannot bind a user consumer that joined an ALREADY-ready WS connection at
+// Hello time (owner != current identity / UAT unavailable / the BindUser call
+// failed). The consumer never registers or readies, so it can never appear
+// "ready" while silently missing every event it would otherwise receive. A
+// single fixed token — never the specific failure cause (no oracle), and never
+// a UAT, open_id, or key.
+const RejectReasonBindFailed = "identity_bind_failed"
+
 // SourceStatus is best-effort: hub drops it when consumer's send channel is full.
 type SourceStatus struct {
 	Type   string `json:"type"`
