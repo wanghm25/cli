@@ -110,6 +110,15 @@ func gateWith(h *Hub, resolveCurrent func() (currentIdentity, error), resolveUAT
 	return newIdentityGate(h, resolveCurrent, resolveUAT, nil)
 }
 
+// matchingUserGate builds a gate whose current identity == the given user owner
+// and mints a fixed fresh UAT — the common setup for a user encrypted-consumer
+// fetch now that resource data is user-only (bot owners never reach a fetch).
+func matchingUserGate(appID, userOpenID string) *identityGate {
+	return gateWith(NewHub(),
+		func() (currentIdentity, error) { return currentIdentity{appID: appID, userOpenID: userOpenID}, nil },
+		func(context.Context, string, string) (string, error) { return "uat-fresh", nil })
+}
+
 // ---- invariant: the dispatcher provider is a pure static cache -------------
 
 // The provider handed to the SDK dispatcher is the plain StaticEncryptKeyProvider:
@@ -145,32 +154,27 @@ func TestEncryptKeyProvider_DispatcherProvider_IsPureStaticCache_NoFetchOnMiss(t
 
 // ---- fetchAndSet: the ONE way a key enters the cache (Hello time) ----------
 
-func TestEncryptKeyProvider_FetchAndSet_Bot_FetchesAsBotNoUAT_Caches(t *testing.T) {
+// Resource data is user-only: a bot/legacy owner (OwnerUserOpenID=="") reaching
+// fetchAndSet is rejected fail-closed with NO fetch and NO cache — the bus
+// never fetches an encrypt_key as bot.
+func TestEncryptKeyProvider_FetchAndSet_BotOwner_Unsupported_FailClosed(t *testing.T) {
 	c := ekOwnerConn(t, "sub-1", "bot", "cli_x", "") // bot: OwnerUserOpenID==""
 	fake := &fakeEncryptKeyClient{key: "BOT_KEY"}
 	fac := &ekFactory{cli: fake}
 	p := newEncryptKeyProvider()
 	p.setNewClient(fac.make)
 
-	if err := p.fetchAndSet(context.Background(), "sub-1", c); err != nil {
-		t.Fatalf("fetchAndSet err = %v, want nil", err)
+	if err := p.fetchAndSet(context.Background(), "sub-1", c); !errors.Is(err, errEncryptKeyBotUnsupported) {
+		t.Fatalf("fetchAndSet err = %v, want errEncryptKeyBotUnsupported", err)
 	}
-	if got := fake.callCount(); got != 1 {
-		t.Fatalf("GetEncryptKey calls = %d, want 1", got)
+	if got := fake.callCount(); got != 0 {
+		t.Errorf("GetEncryptKey calls = %d, want 0 (a bot owner must never fetch)", got)
 	}
-	// Cached: the dispatcher provider now hits with zero further fetch.
-	if key, ok := p.dispatcherProvider().EncryptKey(context.Background(), "sub-1"); !ok || key != "BOT_KEY" {
-		t.Errorf("cached key = (%q,%v), want (BOT_KEY,true)", key, ok)
+	if len(fac.asSeen) != 0 {
+		t.Errorf("newClient calls = %v, want none (no client built for a bot owner)", fac.asSeen)
 	}
-	// Bot identity, no UAT ever.
-	if len(fac.asSeen) != 1 || fac.asSeen[0] != core.AsBot {
-		t.Errorf("factory identity = %v, want [bot]", fac.asSeen)
-	}
-	if us := fac.uats(); len(us) != 1 || us[0] != "" {
-		t.Errorf("factory uat = %v, want [\"\"] for bot", us)
-	}
-	if c.DecryptState() != decryptStateDecrypted {
-		t.Errorf("decrypt_state = %q, want decrypted", c.DecryptState())
+	if _, ok := p.dispatcherProvider().EncryptKey(context.Background(), "sub-1"); ok {
+		t.Errorf("a bot owner must never cache a key")
 	}
 }
 
@@ -243,10 +247,11 @@ func TestEncryptKeyProvider_FetchAndSet_UserOwnerMismatch_NoFetch_NoHistoricalUA
 }
 
 func TestEncryptKeyProvider_FetchAndSet_GenuineFailure_ReturnsError_NoCache(t *testing.T) {
-	c := ekOwnerConn(t, "sub-1", "bot", "cli_x", "")
+	c := ekOwnerConn(t, "sub-1", "user", "cli_x", "ou_me")
 	fake := &fakeEncryptKeyClient{err: errors.New("permission denied: missing event:encrypt_key:read")}
 	fac := &ekFactory{cli: fake}
 	p := newEncryptKeyProvider()
+	p.setIdentityGate(matchingUserGate("cli_x", "ou_me"))
 	p.setNewClient(fac.make)
 
 	if err := p.fetchAndSet(context.Background(), "sub-1", c); err == nil {
@@ -258,10 +263,11 @@ func TestEncryptKeyProvider_FetchAndSet_GenuineFailure_ReturnsError_NoCache(t *t
 }
 
 func TestEncryptKeyProvider_FetchAndSet_EmptyKey_ReturnsError(t *testing.T) {
-	c := ekOwnerConn(t, "sub-1", "bot", "cli_x", "")
+	c := ekOwnerConn(t, "sub-1", "user", "cli_x", "ou_me")
 	fake := &fakeEncryptKeyClient{key: ""} // success, but no key
 	fac := &ekFactory{cli: fake}
 	p := newEncryptKeyProvider()
+	p.setIdentityGate(matchingUserGate("cli_x", "ou_me"))
 	p.setNewClient(fac.make)
 
 	if err := p.fetchAndSet(context.Background(), "sub-1", c); !errors.Is(err, errEncryptKeyEmpty) {
@@ -270,8 +276,9 @@ func TestEncryptKeyProvider_FetchAndSet_EmptyKey_ReturnsError(t *testing.T) {
 }
 
 func TestEncryptKeyProvider_FetchAndSet_NoClientConfigured_Error(t *testing.T) {
-	c := ekOwnerConn(t, "sub-1", "bot", "cli_x", "")
+	c := ekOwnerConn(t, "sub-1", "user", "cli_x", "ou_me")
 	p := newEncryptKeyProvider() // no setNewClient
+	p.setIdentityGate(matchingUserGate("cli_x", "ou_me"))
 
 	if err := p.fetchAndSet(context.Background(), "sub-1", c); !errors.Is(err, errEncryptKeyNoClient) {
 		t.Fatalf("fetchAndSet err = %v, want errEncryptKeyNoClient", err)
@@ -305,12 +312,13 @@ func TestEncryptKeyProvider_FetchAndSet_EmptySubID_Error(t *testing.T) {
 // A blocking GetEncryptKey is bounded by the fetch timeout (a hung remote must
 // not hang the Hello handler forever).
 func TestEncryptKeyProvider_FetchAndSet_Timeout_Bounded(t *testing.T) {
-	c := ekOwnerConn(t, "sub-1", "bot", "cli_x", "")
+	c := ekOwnerConn(t, "sub-1", "user", "cli_x", "ou_me")
 	block := make(chan struct{})
 	defer close(block)
 	fake := &fakeEncryptKeyClient{key: "K", block: block}
 	fac := &ekFactory{cli: fake}
 	p := newEncryptKeyProvider()
+	p.setIdentityGate(matchingUserGate("cli_x", "ou_me"))
 	p.setNewClient(fac.make)
 	p.fetchTimeout = 20 * time.Millisecond
 
@@ -362,10 +370,11 @@ func TestEncryptKeyFailureClass_KeyFreeTokens(t *testing.T) {
 func TestEncryptKeyProvider_KeyNeverLogged(t *testing.T) {
 	const secret = "SUPER_SECRET_ENCRYPT_KEY_do_not_log"
 
-	okConn := ekOwnerConn(t, "sub-ok", "bot", "cli_x", "")
-	failConn := ekOwnerConn(t, "sub-fail", "bot", "cli_x", "")
+	okConn := ekOwnerConn(t, "sub-ok", "user", "cli_x", "ou_me")
+	failConn := ekOwnerConn(t, "sub-fail", "user", "cli_x", "ou_me")
 
 	p := newEncryptKeyProvider()
+	p.setIdentityGate(matchingUserGate("cli_x", "ou_me"))
 
 	// Success path caches the secret.
 	p.setNewClient(func(as core.Identity, uat string) (encryptKeyClient, error) {

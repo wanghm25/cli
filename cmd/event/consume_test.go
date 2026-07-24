@@ -548,33 +548,27 @@ func TestNewCmdConsume_HasIncludeResourceDataFlag(t *testing.T) {
 	}
 }
 
-// TestRunConsume_RefinedKey_IncludeResourceDataTrue_UnGated_ReachesPlan locks
-// the un-gating: --include-resource-data=true against a materialized
-// REFINED EventKey is NO LONGER rejected by the former gate
-// (resource_data_encryption_deferred). Instead it flows into the real refined
-// chain, which — with this Factory (newRefinedConsumeTestFactory) registering
-// zero HTTP stubs — reaches PlanRemoteSubscription's real List call and fails
-// there (surfacing "/open-apis/event/v1/subscriptions"), exactly like the
-// --include-resource-data=false non-regression case below.
-func TestRunConsume_RefinedKey_IncludeResourceDataTrue_UnGated_ReachesPlan(t *testing.T) {
+// TestRunConsume_RefinedKey_IncludeResourceDataTrue_AsBot_RejectedRequiresUser
+// locks that resource data is a user-only capability: --include-resource-data=true
+// on a bot (here auto→bot, since this Factory has no identity hint and default
+// auto resolves to bot) is a typed invalid_argument fired BEFORE any remote
+// call — it must never reach PlanRemoteSubscription's List. The USER path
+// staying un-gated and reaching Plan is covered by
+// TestRunRefinedConsume_IncludeResourceDataTrue_EncryptKeyScopePresent_PassesPreflight_ReachesPlan.
+func TestRunConsume_RefinedKey_IncludeResourceDataTrue_AsBot_RejectedRequiresUser(t *testing.T) {
 	f := newRefinedConsumeTestFactory(t)
 	err := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a", "--include-resource-data=true").Execute()
 
-	if err == nil {
-		t.Fatal("expected an error (this Factory registers no HTTP stubs), got nil")
-	}
-	// The E-gate is retired: true must no longer trip a failed_precondition on
-	// --include-resource-data, nor claim the resource_data_encryption_deferred reason.
-	var ve *errs.ValidationError
-	if errors.As(err, &ve) && ve.Subtype == errs.SubtypeFailedPrecondition && ve.Param == "--include-resource-data" {
-		t.Fatalf("--include-resource-data=true must no longer be gated, got: %v", err)
+	ve := assertInvalidArgumentParam(t, err, "--include-resource-data")
+	if !strings.Contains(ve.Message, "--as user") {
+		t.Errorf("Message = %q, want it to require --as user", ve.Message)
 	}
 	if strings.Contains(err.Error(), "resource_data_encryption_deferred") {
-		t.Fatalf("the E-deferred gate must be retired, got: %v", err)
+		t.Fatalf("the old E-deferred gate must be retired, got: %v", err)
 	}
-	// It now drives the real refined chain, reaching PlanRemoteSubscription's List.
-	if !strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
-		t.Errorf("--include-resource-data=true must now reach PlanRemoteSubscription's real List call, got: %v", err)
+	// The user-only gate rejects before any remote List call.
+	if strings.Contains(err.Error(), "/open-apis/event/v1/subscriptions") {
+		t.Errorf("--include-resource-data=true + bot must reject BEFORE any remote List call, got: %v", err)
 	}
 }
 

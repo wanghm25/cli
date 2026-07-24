@@ -107,16 +107,18 @@ same-named flag on 'event subscription create'. false (the default) is a
 no-op: a refined consume's remote Subscription is still created/reused with
 resource data disabled, exactly as before. Passing
 --include-resource-data=true on a refined key creates an ENCRYPTED remote
-Subscription: the CLI generates a per-subscription encrypt_key (OS CSPRNG,
-in-memory only, never printed/logged/persisted — there is no --encrypt-key
-flag) and submits it atomically with the Create; the bus then fetches the key
-via GetEncryptKey to decrypt events. This additionally requires scope
-event:encrypt_key:read on the resolved identity — the bus fetches the key once
-when the consumer registers and refuses to ready it (typed
-decrypt_key_unavailable, no half-registered consumer) if it cannot.
-Passing --include-resource-data=true on an ORDINARY (non-refined) key is
-always rejected as typed invalid_argument: the flag only ever controls a
-refined key's remote Subscription, so it can never silently no-op there.`,
+Subscription and REQUIRES --as user (resource data is a user-only capability;
+--as bot/auto→bot is rejected as invalid_argument): the CLI generates a
+per-subscription encrypt_key (OS CSPRNG, in-memory only, never
+printed/logged/persisted — there is no --encrypt-key flag) and submits it
+atomically with the Create; the bus then fetches the key via GetEncryptKey to
+decrypt events. This additionally requires scope event:encrypt_key:read on the
+resolved identity — the bus fetches the key once when the consumer registers
+and refuses to ready it (typed decrypt_key_unavailable, no half-registered
+consumer) if it cannot. Passing --include-resource-data=true on an ORDINARY
+(non-refined) key is always rejected as typed invalid_argument: the flag only
+ever controls a refined key's remote Subscription, so it can never silently
+no-op there.`,
 		Example: `  lark-cli event consume im.message.receive_v1 --as bot                        # legacy key: unlimited stream
   lark-cli event schema im.message.created_v1 --json                            # refined key: find its templates first
   lark-cli event consume im.message.created_v1/chat-id/oc_xxx --dry-run --as bot  # preview the refined plan, zero writes
@@ -140,7 +142,7 @@ refined key's remote Subscription, so it can never silently no-op there.`,
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the refined-subscription remote-write plan (probe + plan only) without applying it, starting the bus, or writing anything remote. No-op for legacy (non-refined) EventKeys, which never write remote state at all.")
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
-		"Include resource data in a refined key's remote Subscription (mirrors 'event subscription create'). false (the default) is a no-op. true creates an ENCRYPTED subscription (CLI-generated per-subscription encrypt_key, never printed/logged; requires scope event:encrypt_key:read); the bus must be able to fetch the key when the consumer registers or the consumer refuses to start. Always rejected as invalid_argument on an ordinary (non-refined) key.")
+		"Include resource data in a refined key's remote Subscription (mirrors 'event subscription create'). false (the default) is a no-op. true creates an ENCRYPTED subscription and requires --as user (resource data is user-only; a bot/app subscription is rejected) plus scope event:encrypt_key:read; the CLI-generated per-subscription encrypt_key is never printed/logged, and the bus must be able to fetch the key when the consumer registers or the consumer refuses to start. Always rejected as invalid_argument on an ordinary (non-refined) key.")
 	cmdutil.SetRisk(cmd, "read")
 
 	return cmd
@@ -357,6 +359,18 @@ func errIncludeResourceDataNotApplicable(eventKey string) error {
 		WithHint("drop --include-resource-data for this EventKey, or pass a materialized refined EventKey instead if you need resource-data control (see `lark-cli event schema %s --json` key_templates)", eventKey)
 }
 
+// errIncludeResourceDataRequiresUser rejects --include-resource-data=true on a
+// non-user identity for a refined key: resource data is a user-only platform
+// capability, so a bot/app subscription cannot carry it. Typed invalid_argument
+// (a caller mistake, not a transient state), fired before the encrypt_key scope
+// preflight and before any remote write.
+func errIncludeResourceDataRequiresUser(materializedKey string, identity core.Identity) error {
+	return errs.NewValidationError(errs.SubtypeInvalidArgument,
+		"--include-resource-data requires --as user for %s: resource data is only supported for a user subscription, not %s", materializedKey, identity).
+		WithParam("--include-resource-data").
+		WithHint("re-run with --as user, or drop --include-resource-data to consume %s without resource data", materializedKey)
+}
+
 // eventKeyBaseRegistered reports whether eventKey itself, or the segment
 // before its first "/", names a registered EventKey definition — mirroring
 // the exact-match-then-split order ResolveEventKey applies internally.
@@ -429,6 +443,13 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 	// func), which guards the sibling write path.
 	if err := eventlib.CheckTemplateAuthTypes(identity, resolved); err != nil {
 		return err
+	}
+	// include_resource_data is a user-only platform capability: a bot/app
+	// subscription cannot carry it. Reject before the encrypt_key scope
+	// preflight and before Plan/Apply (the ONLY remote write this chain
+	// performs) so an encrypted bot subscription is never attempted.
+	if o.includeResourceData && identity != core.AsUser {
+		return errIncludeResourceDataRequiresUser(resolved.MaterializedKey, identity)
 	}
 	// Scope preflight: --include-resource-data=true needs
 	// event:encrypt_key:read to ever consume the encrypted Subscription

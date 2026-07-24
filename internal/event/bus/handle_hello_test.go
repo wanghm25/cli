@@ -66,15 +66,18 @@ func newEncryptedHelloBus(t *testing.T, logger *log.Logger, cli encryptKeyClient
 	}
 }
 
-// Encrypted bot consumer, key fetch succeeds -> ack NOT rejected, consumer
-// registered, key cached in the SDK static provider (dispatcher will hit it).
+// Encrypted USER consumer (owner==current), key fetch succeeds -> ack NOT
+// rejected, consumer registered, key cached in the SDK static provider
+// (dispatcher will hit it). Resource data is user-only, so the owner is a user.
 func TestHandleHello_EncryptedConsumer_KeyFetchSuccess_RegistersAndCaches(t *testing.T) {
-	b := newEncryptedHelloBus(t, log.New(io.Discard, "", 0), &fakeEncryptKeyClient{key: "K_OK"}, currentIdentity{})
+	b := newEncryptedHelloBus(t, log.New(io.Discard, "", 0), &fakeEncryptKeyClient{key: "K_OK"},
+		currentIdentity{appID: "app_123", userOpenID: "ou_me"})
 	hello := &protocol.Hello{
 		PID:                  7001,
 		EventKey:             "im.message.receive_v1/chat-id/oc_1",
 		EventTypes:           []string{"im.message.receive_v1"},
-		Identity:             "bot",
+		Identity:             "user",
+		UserOpenID:           "ou_me",
 		RemoteSubscriptionID: "sub_enc_ok",
 		IncludeResourceData:  true,
 	}
@@ -97,12 +100,14 @@ func TestHandleHello_EncryptedConsumer_KeyFetchFailure_RejectsNotRegistered(t *t
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
 	const secretish = "leaky-detail-that-must-not-surface"
-	b := newEncryptedHelloBus(t, logger, &fakeEncryptKeyClient{err: errors.New(secretish)}, currentIdentity{})
+	b := newEncryptedHelloBus(t, logger, &fakeEncryptKeyClient{err: errors.New(secretish)},
+		currentIdentity{appID: "app_123", userOpenID: "ou_me"})
 	hello := &protocol.Hello{
 		PID:                  7002,
 		EventKey:             "im.message.receive_v1/chat-id/oc_2",
 		EventTypes:           []string{"im.message.receive_v1"},
-		Identity:             "bot",
+		Identity:             "user",
+		UserOpenID:           "ou_me",
 		RemoteSubscriptionID: "sub_enc_fail",
 		IncludeResourceData:  true,
 	}
@@ -154,6 +159,32 @@ func TestHandleHello_EncryptedUserConsumer_OwnerMismatch_Rejected(t *testing.T) 
 	}
 	if got := fake.callCount(); got != 0 {
 		t.Errorf("GetEncryptKey calls = %d, want 0 (owner!=current must never fetch)", got)
+	}
+}
+
+// Defensive backstop: resource data is user-only, so an encrypted BOT Hello
+// (which create/consume already reject up front) must be rejected by the bus
+// with decrypt_key_unavailable — NO fetch as bot, consumer not registered.
+func TestHandleHello_EncryptedBotConsumer_Unsupported_Rejected(t *testing.T) {
+	fake := &fakeEncryptKeyClient{key: "SHOULD_NOT_FETCH"}
+	b := newEncryptedHelloBus(t, log.New(io.Discard, "", 0), fake, currentIdentity{})
+	hello := &protocol.Hello{
+		PID:                  7005,
+		EventKey:             "im.message.receive_v1/chat-id/oc_5",
+		EventTypes:           []string{"im.message.receive_v1"},
+		Identity:             "bot", // bot: no owner user_open_id
+		RemoteSubscriptionID: "sub_enc_bot",
+		IncludeResourceData:  true,
+	}
+	ack := readAckFromClient(t, b, hello)
+	if !ack.Rejected || ack.RejectReason != protocol.RejectReasonDecryptKeyUnavailable {
+		t.Fatalf("encrypted bot consumer must be rejected with decrypt_key_unavailable, got rejected=%v reason=%q", ack.Rejected, ack.RejectReason)
+	}
+	if got := b.hub.ConnCount(); got != 0 {
+		t.Errorf("hub.ConnCount = %d, want 0 (a rejected consumer must never register)", got)
+	}
+	if got := fake.callCount(); got != 0 {
+		t.Errorf("GetEncryptKey calls = %d, want 0 (the bus must never fetch a key as bot)", got)
 	}
 }
 

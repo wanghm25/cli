@@ -1236,7 +1236,9 @@ func TestRunCreate_IncludeResourceDataTrue_MissingEncryptKeyReadScope_ReturnsPer
 	cmd := NewCmdCreate(f)
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
-	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "bot", "--include-resource-data=true"})
+	// --as user: resource data is user-only, so the scope preflight (not the
+	// user-only gate) is what must fire here.
+	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "user", "--include-resource-data=true"})
 
 	err := cmd.Execute()
 	var permErr *errs.PermissionError
@@ -1265,12 +1267,43 @@ func TestRunCreate_IncludeResourceDataTrue_AllScopesGranted_PassesScopePreflight
 	cmd := NewCmdCreate(f)
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
-	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "bot", "--include-resource-data=true"})
+	// --as user: resource data is user-only, so the encrypted create path is
+	// exercised as a user (the user-only gate passes; scope preflight passes too).
+	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "user", "--include-resource-data=true"})
 
 	err := cmd.Execute()
 	var permErr *errs.PermissionError
 	if errors.As(err, &permErr) {
 		t.Fatalf("all three scopes were granted, must not report a permission error, got: %v", err)
+	}
+}
+
+// TestRunCreate_IncludeResourceDataTrue_AsBot_RejectedRequiresUser locks #17:
+// resource data is a user-only capability, so --include-resource-data=true with
+// --as bot is a typed invalid_argument fired BEFORE any remote call or scope
+// preflight (a bare Factory suffices — the gate runs before credentials are
+// touched, mirroring TestRunCreate_AsBotOnOwnerMeTemplate).
+func TestRunCreate_IncludeResourceDataTrue_AsBot_RejectedRequiresUser(t *testing.T) {
+	registerCreateFixtures(t)
+	f := &cmdutil.Factory{}
+	cmd := NewCmdCreate(f)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "bot", "--include-resource-data=true"})
+
+	err := cmd.Execute()
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeInvalidArgument {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeInvalidArgument)
+	}
+	if ve.Param != "--include-resource-data" {
+		t.Errorf("Param = %q, want --include-resource-data", ve.Param)
+	}
+	if !strings.Contains(ve.Message, "--as user") {
+		t.Errorf("Message = %q, want it to require --as user", ve.Message)
 	}
 }
 

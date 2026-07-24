@@ -124,10 +124,11 @@ func (p *encryptKeyProvider) Remove(subID string) {
 // owner==current identity gate and registers it in the SDK static cache, so
 // the dispatcher decrypts later events for this subscription with zero
 // network. owner is the just-built consumer whose owner identity was fixed
-// from its HelloV2 — bot (OwnerUserOpenID()=="") fetches as core.AsBot with no
-// UAT and no gate; a user owner must pass owner==current, then a FRESH,
-// open_id-verified UAT is minted for the current identity (NEVER a historical
-// owner's UAT).
+// from its HelloV2. Resource data is a user-only capability: a user owner must
+// pass owner==current, then a FRESH, open_id-verified UAT is minted for the
+// current identity (NEVER a historical owner's UAT). A bot/legacy owner has no
+// retrievable key and is rejected fail-closed (create/consume already refuse an
+// encrypted bot subscription up front).
 //
 // Returns nil only once a usable key is cached. Any error (owner mismatch /
 // missing gate|client / GetEncryptKey failure / empty key) means the caller
@@ -182,18 +183,19 @@ func (p *encryptKeyProvider) fetchAndSet(ctx context.Context, subID string, owne
 }
 
 // resolveOwnerIdentity turns owner's fixed registration identity into the
-// (identity, uat) GetEncryptKey must run as — the identity must match the
-// Subscription's own authority:
-//   - bot/legacy owner (OwnerUserOpenID()=="") -> core.AsBot, no UAT, no gate
-//     (bot consumers are NEVER identity-gated — the same precedent as
-//     onConnReady/eligibleConns).
+// (identity, uat) GetEncryptKey must run as. Resource data is a user-only
+// capability, so only a user owner can be served:
 //   - user owner -> owner==current gate (reuse ownerMatchesCurrent /
 //     resolveCurrent). owner != current returns errEncryptKeyOwnerMismatch
 //     WITHOUT loading ANY UAT (never a historical owner's UAT). Otherwise a
 //     FRESH, open_id-verified UAT is minted for the current identity.
+//   - bot/legacy owner (OwnerUserOpenID()=="") -> errEncryptKeyBotUnsupported,
+//     fail-closed with NO fetch. An encrypted bot/app subscription is rejected
+//     by create/consume before it can exist; this is the defensive backstop so
+//     the bus never fetches a key as bot.
 func (p *encryptKeyProvider) resolveOwnerIdentity(ctx context.Context, owner *Conn) (core.Identity, string, error) {
 	if owner.OwnerUserOpenID() == "" {
-		return core.AsBot, "", nil
+		return "", "", errEncryptKeyBotUnsupported
 	}
 	if p.gate == nil {
 		return "", "", errEncryptKeyNoGate
@@ -217,12 +219,13 @@ func (p *encryptKeyProvider) resolveOwnerIdentity(ctx context.Context, owner *Co
 // the delivery/lifecycle gates: owner != current never fetches and never loads
 // a historical UAT.
 var (
-	errEncryptKeyNoSubID       = errors.New("encrypt-key: empty remote_subscription_id")
-	errEncryptKeyNoOwner       = errors.New("encrypt-key: no owner consumer")
-	errEncryptKeyNoGate        = errors.New("encrypt-key: no identity gate configured for a user subscription")
-	errEncryptKeyOwnerMismatch = errors.New("encrypt-key: subscription owner does not match current identity")
-	errEncryptKeyNoClient      = errors.New("encrypt-key: no subscription client configured")
-	errEncryptKeyEmpty         = errors.New("encrypt-key: GetEncryptKey returned no key")
+	errEncryptKeyNoSubID        = errors.New("encrypt-key: empty remote_subscription_id")
+	errEncryptKeyNoOwner        = errors.New("encrypt-key: no owner consumer")
+	errEncryptKeyNoGate         = errors.New("encrypt-key: no identity gate configured for a user subscription")
+	errEncryptKeyOwnerMismatch  = errors.New("encrypt-key: subscription owner does not match current identity")
+	errEncryptKeyNoClient       = errors.New("encrypt-key: no subscription client configured")
+	errEncryptKeyEmpty          = errors.New("encrypt-key: GetEncryptKey returned no key")
+	errEncryptKeyBotUnsupported = errors.New("encrypt-key: resource data is user-only; a bot/app subscription has no retrievable encrypt_key")
 )
 
 // encryptKeyFailureClass maps a fetchAndSet error to a short, key-free
@@ -234,6 +237,8 @@ func encryptKeyFailureClass(err error) string {
 	switch {
 	case errors.Is(err, errEncryptKeyOwnerMismatch):
 		return "owner_mismatch"
+	case errors.Is(err, errEncryptKeyBotUnsupported):
+		return "resource_data_requires_user"
 	case errors.Is(err, errEncryptKeyNoGate):
 		return "no_identity_gate"
 	case errors.Is(err, errEncryptKeyNoClient):

@@ -72,11 +72,11 @@ its base key allows user+bot. A mismatch is a typed error naming the
 allowed identities; it never silently falls back to another identity.
 
 SCOPE: requires BOTH event:subscription:read and event:subscription:write;
---include-resource-data=true ALSO requires event:encrypt_key:read (this
-command's reconcile step probes GetEncryptKey to classify an existing
-include_resource_data=true match — see SAFETY below). Every mutation always
-reads remote state first (to detect an existing subscription and analyze
-impact) before it may create anything.
+--include-resource-data=true ALSO requires --as user and event:encrypt_key:read
+(resource data is a user-only capability, and this command's reconcile step
+probes GetEncryptKey to classify an existing include_resource_data=true match —
+see SAFETY below). Every mutation always reads remote state first (to detect an
+existing subscription and analyze impact) before it may create anything.
 
 OUTPUT: {operation, action: "created"|"reused", remote_subscription_id,
 subscription{...}, next_action}. A conflicting active subscription
@@ -113,7 +113,7 @@ create never requires --yes (additive and pre-checked for conflicts).`,
 	}
 
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
-		"Include resource data in delivered events. true creates an ENCRYPTED subscription: the CLI generates a per-subscription encrypt_key (OS CSPRNG, in-memory only, never printed/logged/persisted — there is no --encrypt-key flag) and submits it atomically with the Create request; a failed create never falls back to a plaintext subscription. Requires scope event:encrypt_key:read in addition to event:subscription:{read,write}.")
+		"Include resource data in delivered events. Requires --as user (resource data is a user-only capability; a bot/app subscription is rejected). true creates an ENCRYPTED subscription: the CLI generates a per-subscription encrypt_key (OS CSPRNG, in-memory only, never printed/logged/persisted — there is no --encrypt-key flag) and submits it atomically with the Create request; a failed create never falls back to a plaintext subscription. Requires scope event:encrypt_key:read in addition to event:subscription:{read,write}.")
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the plan (identity/scope preflight + remote read + impact analysis) without creating, reusing, or changing anything")
 	cmd.Flags().BoolVar(&o.asJSON, "json", false, "Emit the result as JSON (for AI / scripts)")
@@ -169,6 +169,13 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 	// key-level pass does not imply a template-level pass.
 	if err := checkTemplateAuthTypes(identity, resolved); err != nil {
 		return err
+	}
+
+	// include_resource_data is a user-only platform capability: a bot/app
+	// subscription cannot carry it. Reject before any remote call (and before
+	// generating a key) so an encrypted bot subscription is never attempted.
+	if o.includeResourceData && identity != core.AsUser {
+		return errIncludeResourceDataRequiresUser(identity)
 	}
 
 	cfg, err := f.Config()
@@ -229,6 +236,17 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 // unchanged, only the implementation moved.
 func checkTemplateAuthTypes(identity core.Identity, resolved eventlib.ResolvedEventKey) error {
 	return eventlib.CheckTemplateAuthTypes(identity, resolved)
+}
+
+// errIncludeResourceDataRequiresUser rejects --include-resource-data=true on a
+// non-user identity: resource data is a user-only platform capability, so a
+// bot/app subscription cannot carry it. Typed invalid_argument (a caller
+// mistake, not a transient state) fired before any remote call.
+func errIncludeResourceDataRequiresUser(identity core.Identity) error {
+	return errs.NewValidationError(errs.SubtypeInvalidArgument,
+		"include_resource_data requires --as user: resource data is only supported for a user subscription, not %s", identity).
+		WithParam("--include-resource-data").
+		WithHint("re-run with --as user, or drop --include-resource-data to create a subscription without resource data")
 }
 
 // errCreateRequiresRefinedKey rejects a syntactically valid, registered

@@ -73,7 +73,7 @@ Some EventKeys aren't consumed directly — `list`/`schema` are still the source
 5. Manage the remote resource independently of the local consumer via `lark-cli event subscription list|get|create|update|renew|reactivate|delete`, keyed by `remote_subscription_id` (from `create`'s or `list`'s output) — this is a *separate* control plane from the local `event consume` process.
 6. Stop chain: `event stop` (or SIGTERM/stdin-close) only stops the LOCAL streaming process; `event subscription delete <remote_subscription_id> --yes` only removes the REMOTE resource. Neither implies the other — see the reference below for the full teardown sequence.
 
-Full details (templates, TTL/renew, the `--as` identity gate and `stale_identity`, the automatic lifecycle recovery behavior, the management-plane command/scope/confirmation table, and `--include-resource-data` encryption — mechanism, key lifecycle, `event:encrypt_key:read` scope, conflict matrix, rotation-via-recreate, and redaction) are in [`references/refined-subscription.md`](references/refined-subscription.md) — read it before using any `event subscription` command or any refined (templated) EventKey.
+Full details (templates, TTL/renew, the `--as` identity gate and `stale_identity`, the automatic lifecycle recovery behavior, the management-plane command/scope/confirmation table, and `--include-resource-data` encryption — user-identity-only, mechanism, key lifecycle, `event:encrypt_key:read` scope, conflict matrix, rotation-via-recreate, and redaction) are in [`references/refined-subscription.md`](references/refined-subscription.md) — read it before using any `event subscription` command or any refined (templated) EventKey.
 
 ## Subprocess contract
 
