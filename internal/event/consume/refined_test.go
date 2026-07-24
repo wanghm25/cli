@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -484,6 +485,11 @@ type fakeApplyAPI struct {
 	listResp *larkeventv1.ListSubscriptionResp
 	listErr  error
 
+	// listPageAt, when non-nil, overrides listResp/listErr and returns the
+	// page for the given 0-indexed call number — used to test the plan
+	// stage's pagination (a fixed listResp can only ever serve one page).
+	listPageAt func(call int) *larkeventv1.ListSubscriptionResp
+
 	createResp *larkeventv1.CreateSubscriptionResp
 	createErr  error
 
@@ -500,7 +506,11 @@ type fakeApplyAPI struct {
 }
 
 func (f *fakeApplyAPI) List(context.Context, *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
+	call := f.listCalls
 	f.listCalls++
+	if f.listPageAt != nil {
+		return f.listPageAt(call), f.listErr
+	}
 	return f.listResp, f.listErr
 }
 
@@ -687,6 +697,48 @@ func TestProdRefinedDeps_Plan_EncryptedActiveMatch_ReusesWithZeroGetEncryptKeyCa
 	}
 	if fake.listCalls != 1 {
 		t.Errorf("List calls = %d, want 1 (plan reconciles remote state once)", fake.listCalls)
+	}
+}
+
+// TestProdRefinedDeps_Plan_PaginationCapped_WarnsOnErrOut locks the
+// production wiring for the refined consume startup chain's plan stage: when
+// the List scan hits the page cap without finding a match, it must warn on
+// ErrOut rather than silently proceeding as if that were a confirmed
+// not-exist, while still returning the same PlanActionCreate a genuine
+// not-found would.
+func TestProdRefinedDeps_Plan_PaginationCapped_WarnsOnErrOut(t *testing.T) {
+	resolved := refinedFixture()
+	fake := &fakeApplyAPI{
+		listPageAt: func(call int) *larkeventv1.ListSubscriptionResp {
+			// Every page: has_more=true, no matching authority item — an
+			// unbounded scan would run forever.
+			return &larkeventv1.ListSubscriptionResp{Data: &larkeventv1.ListSubscriptionRespData{
+				Items: []*larkeventv1.SubscriptionDetail{{
+					SubscriptionId: strPtr("sub_other"),
+					Authority:      &larkeventv1.Authority{Type: strPtr("app")},
+					State:          strPtr("active"),
+				}},
+				HasMore:   boolPtr(true),
+				PageToken: strPtr(fmt.Sprintf("token-%d", call+1)),
+			}}
+		},
+	}
+	var stderr bytes.Buffer
+	opts := RefinedOptions{ErrOut: &stderr, Identity: core.AsUser, SubClient: fake}
+	deps := prodRefinedDeps(failDialTransport{}, "cli_x", "test-profile", "", resolved, opts)
+
+	plan, err := deps.plan(context.Background())
+	if err != nil {
+		t.Fatalf("plan err = %v, want nil", err)
+	}
+	if plan.Action != event.PlanActionCreate {
+		t.Errorf("plan.Action = %q, want %q", plan.Action, event.PlanActionCreate)
+	}
+	if !plan.PaginationCapped {
+		t.Fatal("plan.PaginationCapped = false, want true")
+	}
+	if !strings.Contains(stderr.String(), "warning") {
+		t.Errorf("ErrOut = %q, want a warning about the capped pagination scan", stderr.String())
 	}
 }
 

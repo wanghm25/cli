@@ -152,6 +152,13 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 			if err != nil {
 				return event.ReconcilePlan{}, err
 			}
+			if plan.PaginationCapped {
+				errOut := opts.ErrOut
+				if errOut == nil {
+					errOut = os.Stderr //nolint:forbidigo // library-caller fallback, mirrors EnsureBus's own default
+				}
+				fmt.Fprintln(errOut, event.PaginationCappedWarning(eventType, targetResource))
+			}
 			return *plan, nil
 		},
 		apply: func(ctx context.Context, plan event.ReconcilePlan) (string, bool, error) {

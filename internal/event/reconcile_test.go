@@ -6,6 +6,7 @@ package event
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
@@ -32,6 +33,40 @@ func listResp(items []*larkeventv1.SubscriptionDetail) *larkeventv1.ListSubscrip
 
 func strPtr(s string) *string { return &s }
 func boolPtr(b bool) *bool    { return &b }
+
+// pagedListResp builds one page of a ListSubscriptionResp, explicit about
+// has_more/page_token (unlike listResp above, which always leaves both nil —
+// i.e. an implicit "no more pages" single-page response).
+func pagedListResp(items []*larkeventv1.SubscriptionDetail, hasMore bool, nextToken string) *larkeventv1.ListSubscriptionResp {
+	d := &larkeventv1.ListSubscriptionRespData{Items: items, HasMore: boolPtr(hasMore)}
+	if nextToken != "" {
+		d.PageToken = strPtr(nextToken)
+	}
+	return &larkeventv1.ListSubscriptionResp{Data: d}
+}
+
+// pagedLister is a network-free SubscriptionLister test seam that serves a
+// response per call via pageAt (0-indexed by call order) — unlike fakeLister
+// above (one fixed response), this lets a test drive WalkSubscriptionPages/
+// ReconcileExisting across multiple pages, including an unbounded has_more
+// sequence for the page-cap test. cancel/cancelAfterCall optionally cancel a
+// context.CancelFunc right after serving a given call, to test ctx
+// cancellation mid-pagination.
+type pagedLister struct {
+	pageAt          func(call int) *larkeventv1.ListSubscriptionResp
+	calls           int
+	cancel          context.CancelFunc
+	cancelAfterCall int
+}
+
+func (p *pagedLister) List(_ context.Context, _ *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
+	call := p.calls
+	p.calls++
+	if p.cancel != nil && call == p.cancelAfterCall {
+		p.cancel()
+	}
+	return p.pageAt(call), nil
+}
 
 func activeSub(id string, includeResourceData bool, authorityType string) *larkeventv1.SubscriptionDetail {
 	return &larkeventv1.SubscriptionDetail{
@@ -158,6 +193,126 @@ func TestReconcileExisting_TransportError_PropagatesUnchanged(t *testing.T) {
 	_, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want it passed through unchanged (%v)", err, sentinel)
+	}
+}
+
+// ---- ReconcileExisting: pagination (issue: only scanning List's first page
+// could misjudge Create when a real authority match sits on a later page) ----
+
+// TestReconcileExisting_AuthorityMatchOnSecondPage_ReturnsReuseAction locks
+// the core fix: a match on page 2 must be found (never misjudged as Create)
+// even though page 1 alone has no match and reports has_more=true.
+func TestReconcileExisting_AuthorityMatchOnSecondPage_ReturnsReuseAction(t *testing.T) {
+	page1 := pagedListResp([]*larkeventv1.SubscriptionDetail{
+		activeSub("sub_other", false, "app"), // wrong authority type for AsUser -- not a match
+	}, true, "page-2-token")
+	page2 := pagedListResp([]*larkeventv1.SubscriptionDetail{
+		activeSub("sub_1", false, "user"),
+	}, false, "")
+	fake := &pagedLister{pageAt: func(call int) *larkeventv1.ListSubscriptionResp {
+		if call == 0 {
+			return page1
+		}
+		return page2
+	}}
+
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionReuse {
+		t.Errorf("Action = %q, want %q", plan.Action, PlanActionReuse)
+	}
+	if plan.Existing == nil || strVal(plan.Existing.SubscriptionId) != "sub_1" {
+		t.Errorf("Existing = %+v, want sub_1 (found on page 2)", plan.Existing)
+	}
+	if plan.PaginationCapped {
+		t.Error("PaginationCapped = true, want false (match found well before the cap)")
+	}
+	if fake.calls != 2 {
+		t.Errorf("List called %d times, want exactly 2 (stop as soon as page 2's match is found)", fake.calls)
+	}
+}
+
+// TestReconcileExisting_NoMatchAllPages_HasMoreFalse_ReturnsCreate_NotCapped
+// locks the "genuinely not found" case: every page was actually read
+// (has_more=false ends it for real), so PaginationCapped must stay false —
+// this is a confirmed not-found, not an unconfirmed one.
+func TestReconcileExisting_NoMatchAllPages_HasMoreFalse_ReturnsCreate_NotCapped(t *testing.T) {
+	page1 := pagedListResp([]*larkeventv1.SubscriptionDetail{activeSub("sub_other", false, "app")}, true, "page-2-token")
+	page2 := pagedListResp(nil, false, "")
+	fake := &pagedLister{pageAt: func(call int) *larkeventv1.ListSubscriptionResp {
+		if call == 0 {
+			return page1
+		}
+		return page2
+	}}
+
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionCreate {
+		t.Errorf("Action = %q, want %q", plan.Action, PlanActionCreate)
+	}
+	if plan.PaginationCapped {
+		t.Error("PaginationCapped = true, want false (has_more=false genuinely exhausted every page)")
+	}
+	if fake.calls != 2 {
+		t.Errorf("List called %d times, want exactly 2", fake.calls)
+	}
+}
+
+// TestReconcileExisting_PageCapReached_ReturnsCreate_PaginationCapped locks
+// the bound: an unbounded has_more=true sequence that never matches and
+// never ends must still terminate (never hang/loop forever), defaulting to
+// Create but flagging PaginationCapped so the caller logs it instead of
+// silently treating the scan as a confirmed not-found.
+func TestReconcileExisting_PageCapReached_ReturnsCreate_PaginationCapped(t *testing.T) {
+	fake := &pagedLister{pageAt: func(call int) *larkeventv1.ListSubscriptionResp {
+		return pagedListResp([]*larkeventv1.SubscriptionDetail{activeSub("sub_other", false, "app")}, true, fmt.Sprintf("token-%d", call+1))
+	}}
+
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionCreate {
+		t.Errorf("Action = %q, want %q (an unconfirmed scan still defaults to Create)", plan.Action, PlanActionCreate)
+	}
+	if !plan.PaginationCapped {
+		t.Error("PaginationCapped = false, want true (the scan never found has_more=false or a match)")
+	}
+	if fake.calls != MaxSubscriptionListPages {
+		t.Errorf("List called %d times, want exactly %d (bounded by the page cap)", fake.calls, MaxSubscriptionListPages)
+	}
+}
+
+// TestReconcileExisting_CtxCancelMidPagination_ReturnsError_NoCreate locks
+// ctx-awareness: a caller cancelling mid-scan must get an error (never a
+// silently-returned Create plan) and no further List call.
+func TestReconcileExisting_CtxCancelMidPagination_ReturnsError_NoCreate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &pagedLister{
+		pageAt: func(call int) *larkeventv1.ListSubscriptionResp {
+			return pagedListResp(nil, true, fmt.Sprintf("token-%d", call+1))
+		},
+		cancel:          cancel,
+		cancelAfterCall: 0, // cancel right after the first page is served
+	}
+
+	plan, err := ReconcileExisting(ctx, fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	if err == nil {
+		t.Fatalf("expected an error from ctx cancellation mid-pagination, got plan: %+v", plan)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want it to wrap context.Canceled", err)
+	}
+	if plan != nil {
+		t.Errorf("plan = %+v, want nil on a cancellation error (never a Create)", plan)
+	}
+	if fake.calls != 1 {
+		t.Errorf("List called %d times, want exactly 1 (cancellation caught before a second call)", fake.calls)
 	}
 }
 

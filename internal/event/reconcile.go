@@ -128,6 +128,16 @@ type ReconcilePlan struct {
 	Action         string
 	Existing       *larkeventv1.SubscriptionDetail
 	ConflictFields []errs.InvalidParam
+
+	// PaginationCapped is true only when Action==PlanActionCreate AND the
+	// underlying List scan hit MaxSubscriptionListPages before finding an
+	// authority match or exhausting has_more. It is never set alongside
+	// Reuse/Conflict/Suspended -- those all require a match, and a match
+	// always stops the scan early rather than via the cap. Reaching the cap
+	// is NOT proof no matching remote Subscription exists, only that none was
+	// found within the pages actually read -- callers must log this rather
+	// than treat a capped scan as a confirmed negative.
+	PaginationCapped bool
 }
 
 // ReconcileExisting is the read-only half: it lists remote
@@ -135,6 +145,13 @@ type ReconcilePlan struct {
 // (if any) whose authority matches the effective identity, and classifies
 // it per the state table. It never writes — safe to call from --dry-run or
 // a plan-only preflight (the PlanRemoteSubscription stage).
+//
+// The List scan pages via WalkSubscriptionPages (bounded by
+// MaxSubscriptionListPages, ctx-aware) rather than reading only the first
+// page: an authority match on a later page is found exactly the same as one
+// on the first, so a caller never misjudges Create against a match it simply
+// didn't page far enough to see. See ReconcilePlan.PaginationCapped for what
+// happens when the cap is reached with no match yet found.
 //
 // Authority matching is by type only ("user" vs "app"), not by open_id: the
 // caller is expected to always issue List using the effective identity's
@@ -160,26 +177,35 @@ func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, t
 		opt(&cfg)
 	}
 
-	req := larkeventv1.NewListSubscriptionReqBuilder().
-		EventType(eventType).
-		TargetResource(targetResource).
-		Build()
-	resp, err := svc.List(ctx, req)
-	if err != nil {
-		return nil, err
+	buildReq := func(pageToken string) *larkeventv1.ListSubscriptionReq {
+		b := larkeventv1.NewListSubscriptionReqBuilder().
+			EventType(eventType).
+			TargetResource(targetResource)
+		if pageToken != "" {
+			b = b.PageToken(pageToken)
+		}
+		return b.Build()
 	}
 
 	var match *larkeventv1.SubscriptionDetail
-	if resp != nil && resp.Data != nil {
-		for _, item := range resp.Data.Items {
-			if item != nil && AuthorityMatchesIdentity(item.Authority, identity) {
-				match = item
-				break
-			}
+	capped, err := WalkSubscriptionPages(ctx, svc, buildReq, func(item *larkeventv1.SubscriptionDetail) bool {
+		if AuthorityMatchesIdentity(item.Authority, identity) {
+			match = item
+			return false // stop -- found our authority match
 		}
+		return true
+	})
+	if err != nil {
+		return nil, err
 	}
 	if match == nil {
-		return &ReconcilePlan{Action: PlanActionCreate}, nil
+		// No authority match within the pages actually read. If the page cap
+		// was hit first, PaginationCapped tells the caller to log that
+		// rather than treat it as confirmed truth; the safe default action
+		// is still Create either way (an unconfirmed "not found" behaves the
+		// same as a genuine one: the server's own unique-key enforcement is
+		// the backstop against a real duplicate).
+		return &ReconcilePlan{Action: PlanActionCreate, PaginationCapped: capped}, nil
 	}
 
 	switch strVal(match.State) {

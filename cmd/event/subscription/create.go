@@ -201,6 +201,9 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 		if err != nil {
 			return err
 		}
+		if plan.PaginationCapped {
+			fmt.Fprintln(f.IOStreams.ErrOut, eventlib.PaginationCappedWarning(resolved.Definition.EventType, resolved.TargetResource))
+		}
 		result := buildDryRunResult(resolved, identity, plan, o.includeResourceData)
 		if o.asJSON {
 			output.PrintJson(f.IOStreams.Out, result)
@@ -213,6 +216,9 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 	outcome, err := createOrReuseSubscription(ctx, client, resolved, identity, o.includeResourceData)
 	if err != nil {
 		return err
+	}
+	if outcome.PaginationCapped {
+		fmt.Fprintln(f.IOStreams.ErrOut, eventlib.PaginationCappedWarning(resolved.Definition.EventType, resolved.TargetResource))
 	}
 	result := buildCreateResult(resolved, identity, outcome)
 	if o.asJSON {
@@ -364,6 +370,15 @@ var newEncryptKeyFunc = eventlib.NewEncryptKey
 type createOutcome struct {
 	Action string // "created" | "reused"
 	Detail *larkeventv1.SubscriptionDetail
+
+	// PaginationCapped is true when the reconcile List scan that led to this
+	// outcome hit the page cap before finding a match (see
+	// eventlib.ReconcilePlan.PaginationCapped). This is only ever possible
+	// alongside Action=="created" — a "reused" outcome always comes from an
+	// early, uncapped match — and is not itself a failure: runCreate logs it
+	// as an advisory rather than silently proceeding as if the scan had
+	// confirmed no conflicting subscription exists.
+	PaginationCapped bool
 }
 
 // createOrReuseSubscription is the write-capable half: it
@@ -412,7 +427,7 @@ func createOrReuseSubscription(ctx context.Context, svc createSubscriptionAPI, r
 
 	detail, createErr := doCreateSubscription(ctx, svc, eventType, targetResource, includeResourceData, encryptKey)
 	if createErr == nil {
-		return &createOutcome{Action: "created", Detail: detail}, nil
+		return &createOutcome{Action: "created", Detail: detail, PaginationCapped: plan.PaginationCapped}, nil
 	}
 
 	plan2, listErr := reconcileExisting(ctx, svc, eventType, targetResource, identity, includeResourceData)

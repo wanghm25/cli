@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"strings"
@@ -357,6 +358,41 @@ func TestCreateOrReuseSubscription_NotFound_CallsCreateExactlyOnce(t *testing.T)
 	}
 	if fake.createCalls != 1 {
 		t.Errorf("createCalls = %d, want 1", fake.createCalls)
+	}
+}
+
+// TestCreateOrReuseSubscription_PaginationCapped_PropagatesToOutcome locks
+// the #20 fix's wiring into `event subscription create`: when the reconcile
+// List scan hits the page cap without finding a match, the resulting
+// "created" outcome must carry PaginationCapped=true so runCreate can warn
+// instead of silently treating the capped scan as a confirmed not-found.
+func TestCreateOrReuseSubscription_PaginationCapped_PropagatesToOutcome(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	fake := &fakeCreateAPI{
+		listFunc: func(call int) (*larkeventv1.ListSubscriptionResp, error) {
+			// Every page: has_more=true, no matching authority item — an
+			// unbounded scan would run forever.
+			return okListResp([]*larkeventv1.SubscriptionDetail{
+				activeDetail("sub_other", false, "app"), // "app" authority never matches AsUser
+			}, true, fmt.Sprintf("token-%d", call)), nil
+		},
+		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) {
+			return okCreateResp(activeDetail("sub_new", false, "user")), nil
+		},
+	}
+
+	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Action != "created" {
+		t.Errorf("Action = %q, want created (a capped scan still defaults to create)", outcome.Action)
+	}
+	if !outcome.PaginationCapped {
+		t.Error("PaginationCapped = false, want true")
+	}
+	if len(fake.listCalls) != eventlib.MaxSubscriptionListPages {
+		t.Errorf("List called %d times, want exactly %d (bounded by the page cap)", len(fake.listCalls), eventlib.MaxSubscriptionListPages)
 	}
 }
 
