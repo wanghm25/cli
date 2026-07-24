@@ -504,6 +504,19 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 		hello.PID, hello.EventKey, hello.EventTypes, firstForKey)
 
 	bc.Start()
+
+	// Bind a user consumer that joined an already-ready WS. onConnReady only
+	// binds the consumers present when the WS first became ready (or on each
+	// reconnect), so a consumer registering afterwards — the common
+	// "new consume against an already-running bus" path — would otherwise never
+	// be BindUser'd. Bots/legacy consumers (no owner user_open_id) are never
+	// identity-gated, mirroring how onConnReady filters them via userConns.
+	// Only bind when the WS is already ready: if it is not, do nothing and let
+	// the next onConnReady bind this now-registered consumer, avoiding a
+	// premature connection_not_ready degraded on a brand-new consumer.
+	if b.identityGate != nil && bc.OwnerUserOpenID() != "" && b.identityGate.ready() {
+		_ = b.identityGate.bindConsumer(context.Background(), bc)
+	}
 }
 
 // handleStatusQuery replies with status and closes.

@@ -133,6 +133,23 @@ func (g *identityGate) onConnReady(ctx context.Context, connID string, bindUser 
 	}
 }
 
+// ready reports whether a WS connection has already become ready — i.e. a
+// (connID, bindUser) pair has been memoized by a prior onConnReady. A consumer
+// that registers AFTER the WS is ready is not covered by onConnReady's own loop
+// (that loop only iterates the consumers present when the WS became ready), so
+// handleHello uses this to decide whether to bind such a consumer immediately.
+// When no connection has ever been ready this returns false, so handleHello
+// leaves the consumer for the next onConnReady rather than eagerly marking a
+// brand-new consumer connection_not_ready.
+func (g *identityGate) ready() bool {
+	if g == nil {
+		return false
+	}
+	g.connMu.Lock()
+	defer g.connMu.Unlock()
+	return g.connID != ""
+}
+
 // bindConsumer performs the per-consumer bind sequence: owner==
 // current check -> resolveUAT -> bindUser -> SetBoundConnID. Factored out of
 // onConnReady's own loop body so a lifecycle action — e.g.

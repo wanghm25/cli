@@ -737,6 +737,180 @@ func TestHandleHello_LegacyHello_OwnerFieldsDefaultEmpty(t *testing.T) {
 	}
 }
 
+// --- #24: handleHello binds a user consumer that joins an already-ready WS ---
+//
+// onConnReady only binds the consumers registered at the moment the WS became
+// ready (or on each reconnect). A user consumer that Hello's against an
+// already-running bus is therefore never BindUser'd by onConnReady alone —
+// handleHello must bind it when the WS is already ready, while leaving it for
+// the next onConnReady when it is not (never prematurely degraded).
+
+// newBindTestBus builds a Bus with a wired identity gate (and its hub) for the
+// handleHello-bind tests — no encrypt-key provider (plaintext consumers only).
+func newBindTestBus(t *testing.T, gate *identityGate) *Bus {
+	t.Helper()
+	return &Bus{
+		appID:        "app1",
+		hub:          gate.hub,
+		logger:       discardTestLogger(),
+		conns:        make(map[*Conn]struct{}),
+		idleTimer:    time.NewTimer(30 * time.Second),
+		shutdownCh:   make(chan struct{}, 1),
+		identityGate: gate,
+	}
+}
+
+// runHelloToCompletion runs handleHello and blocks until it fully returns —
+// AFTER the post-ack bind — so the bind's effect is observable without racing.
+func runHelloToCompletion(t *testing.T, b *Bus, hello *protocol.Hello) {
+	t.Helper()
+	server, client := net.Pipe()
+	t.Cleanup(func() { server.Close(); client.Close() })
+	done := make(chan struct{})
+	go func() {
+		b.handleHello(server, bufio.NewReader(server), hello)
+		close(done)
+	}()
+	if _, err := protocol.ReadFrame(bufio.NewReader(client)); err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleHello did not return within 3s")
+	}
+}
+
+// A user consumer registered while the WS is ALREADY ready is bound right away.
+func TestHandleHello_UserConsumer_WSAlreadyReady_BindsImmediately(t *testing.T) {
+	h := NewHub()
+	uat := &fakeUATResolver{uat: "uat-for-alice"}
+	fb := &fakeBindUser{}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
+	// Simulate the WS becoming ready BEFORE this consumer exists: memoizes the
+	// (connID, bindUser) pair but binds nothing (no user conns registered yet).
+	gate.onConnReady(context.Background(), "conn-1", fb.bind)
+
+	b := newBindTestBus(t, gate)
+	runHelloToCompletion(t, b, &protocol.Hello{
+		PID: 5101, EventKey: "im.message.receive_v1", EventTypes: []string{"im.message.receive_v1"},
+		Identity: "user", UserOpenID: "ou_alice",
+	})
+
+	sub, found := findSubscriberByPID(h, 5101)
+	if !found {
+		t.Fatal("user consumer not registered")
+	}
+	if got := sub.(*Conn).BoundConnID(); got != "conn-1" {
+		t.Errorf("BoundConnID() = %q, want %q (must bind on an already-ready WS)", got, "conn-1")
+	}
+	if fb.callCount() != 1 {
+		t.Errorf("bindUser call count = %d, want 1", fb.callCount())
+	}
+	if fb.callCount() == 1 && fb.calls[0] != "uat-for-alice" {
+		t.Errorf("bindUser uat = %q, want %q", fb.calls[0], "uat-for-alice")
+	}
+}
+
+// A user consumer registered BEFORE the WS is ready must NOT be prematurely
+// degraded — and the next onConnReady must then bind it.
+func TestHandleHello_UserConsumer_WSNotReady_NotDegraded_LaterOnConnReadyBinds(t *testing.T) {
+	h := NewHub()
+	uat := &fakeUATResolver{uat: "uat-for-alice"}
+	fb := &fakeBindUser{}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
+
+	b := newBindTestBus(t, gate)
+	runHelloToCompletion(t, b, &protocol.Hello{
+		PID: 5102, EventKey: "im.message.receive_v1", EventTypes: []string{"im.message.receive_v1"},
+		Identity: "user", UserOpenID: "ou_alice",
+	})
+
+	sub, found := findSubscriberByPID(h, 5102)
+	if !found {
+		t.Fatal("user consumer not registered")
+	}
+	c := sub.(*Conn)
+	if got := c.BoundConnID(); got != "" {
+		t.Errorf("BoundConnID() = %q, want \"\" (WS not ready yet)", got)
+	}
+	if got := c.DegradedReason(); got != "" {
+		t.Errorf("DegradedReason() = %q, want \"\" (a brand-new consumer must not be prematurely degraded when the WS is not up)", got)
+	}
+	if fb.callCount() != 0 {
+		t.Errorf("bindUser call count = %d, want 0 before the WS is ready", fb.callCount())
+	}
+
+	// The WS becomes ready: onConnReady binds the now-registered consumer.
+	gate.onConnReady(context.Background(), "conn-1", fb.bind)
+	if got := c.BoundConnID(); got != "conn-1" {
+		t.Errorf("BoundConnID() after onConnReady = %q, want %q", got, "conn-1")
+	}
+	if fb.callCount() != 1 {
+		t.Errorf("bindUser call count after onConnReady = %d, want 1", fb.callCount())
+	}
+}
+
+// A bot consumer joining an already-ready WS is NEVER bound, stale-marked, or
+// degraded — bots are never identity-gated.
+func TestHandleHello_BotConsumer_WSReady_NeverBound(t *testing.T) {
+	h := NewHub()
+	uat := &fakeUATResolver{uat: "uat-unused"}
+	fb := &fakeBindUser{}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
+	gate.onConnReady(context.Background(), "conn-1", fb.bind)
+
+	b := newBindTestBus(t, gate)
+	runHelloToCompletion(t, b, &protocol.Hello{
+		PID: 5103, EventKey: "im.message.receive_v1", EventTypes: []string{"im.message.receive_v1"},
+		Identity: "bot", // bot: no owner user_open_id
+	})
+
+	sub, found := findSubscriberByPID(h, 5103)
+	if !found {
+		t.Fatal("bot consumer not registered")
+	}
+	c := sub.(*Conn)
+	if got := c.BoundConnID(); got != "" {
+		t.Errorf("bot BoundConnID() = %q, want \"\" (bots are never bound)", got)
+	}
+	if c.StaleIdentity() {
+		t.Error("bot consumer must never be marked stale_identity")
+	}
+	if got := c.DegradedReason(); got != "" {
+		t.Errorf("bot DegradedReason() = %q, want \"\"", got)
+	}
+	if fb.callCount() != 0 {
+		t.Errorf("bindUser call count = %d, want 0 for a bot consumer", fb.callCount())
+	}
+}
+
+// A consumer already bound by handleHello must not be re-bound when onConnReady
+// re-runs for the SAME connID (idempotence across the two bind drivers).
+func TestHandleHello_UserConsumer_NoDoubleBind_WhenOnConnReadyReruns(t *testing.T) {
+	h := NewHub()
+	uat := &fakeUATResolver{uat: "uat-for-alice"}
+	fb := &fakeBindUser{}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
+	gate.onConnReady(context.Background(), "conn-1", fb.bind)
+
+	b := newBindTestBus(t, gate)
+	runHelloToCompletion(t, b, &protocol.Hello{
+		PID: 5104, EventKey: "im.message.receive_v1", EventTypes: []string{"im.message.receive_v1"},
+		Identity: "user", UserOpenID: "ou_alice",
+	})
+	if fb.callCount() != 1 {
+		t.Fatalf("bindUser call count after handleHello = %d, want 1", fb.callCount())
+	}
+
+	// onConnReady re-runs for the same connID (e.g. a spurious ready callback):
+	// the consumer is already bound on conn-1, so no duplicate Bind.
+	gate.onConnReady(context.Background(), "conn-1", fb.bind)
+	if fb.callCount() != 1 {
+		t.Errorf("bindUser call count after onConnReady rerun (same connID) = %d, want 1 (no double bind)", fb.callCount())
+	}
+}
+
 // TestHandleHello_SingleConsumerRejectsSecond: a SingleConsumer EventKey accepts
 // the first consumer and rejects the second for the same SubscriptionID.
 func TestHandleHello_SingleConsumerRejectsSecond(t *testing.T) {
