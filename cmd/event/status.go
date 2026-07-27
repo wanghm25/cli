@@ -17,6 +17,7 @@ import (
 	"github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/event/app"
 	"github.com/larksuite/cli/internal/event/busctl"
 	"github.com/larksuite/cli/internal/event/busdiscover"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
@@ -174,32 +175,24 @@ func runStatus(cmd *cobra.Command, f *cmdutil.Factory, current, asJSON, failOnOr
 	} else {
 		scanner = busdiscover.Default()
 	}
-	statuses := deriveStatuses(
-		seedList,
-		scanner,
-		&transportQuerier{tr: tr},
-		time.Now(),
-	)
 
-	// Strictly read-only.
-	//
-	// Local current_profile_match: always available, no scope, no network —
-	// stamp the freshly-resolved current identity onto the one appStatus row
-	// that is actually "current" (cfg.AppID) so writeStatusText/
-	// writeStatusJSON can compute each refined consumer's
-	// owner-vs-current match. Every other (foreign, merely scanned) app is
-	// untouched.
-	cur, curOK := loadCurrentIdentityForMatch()
-	annotateCurrentIdentity(statuses, cfg.AppID, cur, curOK)
-
-	// Remote supplement: WEAK, optional, current-app-only (see
-	// resolveRemoteSupplementGetter's doc for the full precondition chain).
-	// Any failed precondition silently keeps every consumer local-only —
-	// this must never turn a plain `event status` into a hard failure.
-	ctx := cmd.Context()
-	capped := applyRefinedSupplement(ctx, statuses, cfg.AppID, func() refinedSubscriptionGetter {
-		return resolveRemoteSupplementGetter(ctx, cmd, f, cfg.AppID, cur.userOpenID, time.Now())
-	})
+	// Strictly read-only. The StatusUseCase owns the orchestration ORDER —
+	// derive the per-app bus state, annotate the current identity used for
+	// owner-vs-current matching, then apply the weak remote supplement — while
+	// this command supplies the steps (over its bus scanner/querier/remote
+	// getter) and renders the result. capped is the supplement's advisory:
+	// a page cap was hit before every wanted id was found, never a hard failure.
+	plane := &statusPlane{
+		ctx:      cmd.Context(),
+		cmd:      cmd,
+		f:        f,
+		appID:    cfg.AppID,
+		seedList: seedList,
+		scanner:  scanner,
+		querier:  &transportQuerier{tr: tr},
+	}
+	capped := app.NewStatusUseCase().Collect(plane)
+	statuses := plane.statuses
 	if capped {
 		fmt.Fprintln(f.IOStreams.ErrOut, "[event] warning: remote subscription list pagination was capped while supplementing status — some refined consumers may show local-only state even though a matching remote Subscription might still exist beyond the pages read")
 	}
@@ -212,6 +205,51 @@ func runStatus(cmd *cobra.Command, f *cmdutil.Factory, current, asJSON, failOnOr
 		writeStatusText(f.IOStreams.Out, statuses)
 	}
 	return exitForOrphan(statuses, failOnOrphan)
+}
+
+// statusPlane is cmd/event's app.StatusPlane implementation. It holds the
+// resolved status inputs and the derived status set, wiring each orchestration
+// step to deriveStatuses / annotateCurrentIdentity / applyRefinedSupplement so
+// the StatusUseCase sequences them without depending on the appStatus model or
+// the Factory. The freshly-resolved current identity is captured by
+// AnnotateCurrentIdentity and reused by Supplement (its userOpenID keys the weak
+// remote-supplement getter), exactly as the inlined orchestration did.
+type statusPlane struct {
+	ctx      context.Context
+	cmd      *cobra.Command
+	f        *cmdutil.Factory
+	appID    string
+	seedList []string
+	scanner  busdiscover.Scanner
+	querier  busQuerier
+
+	statuses []appStatus
+	cur      currentIdentityForMatch
+}
+
+func (p *statusPlane) Derive() {
+	p.statuses = deriveStatuses(p.seedList, p.scanner, p.querier, time.Now())
+}
+
+func (p *statusPlane) AnnotateCurrentIdentity() {
+	// Local current_profile_match: always available, no scope, no network —
+	// stamp the freshly-resolved current identity onto the one appStatus row
+	// that is actually "current" (appID) so writeStatusText/writeStatusJSON can
+	// compute each refined consumer's owner-vs-current match. Every other
+	// (foreign, merely scanned) app is untouched. cur is retained for Supplement.
+	cur, curOK := loadCurrentIdentityForMatch()
+	p.cur = cur
+	annotateCurrentIdentity(p.statuses, p.appID, cur, curOK)
+}
+
+func (p *statusPlane) Supplement() bool {
+	// Remote supplement: WEAK, optional, current-app-only (see
+	// resolveRemoteSupplementGetter's doc for the full precondition chain). Any
+	// failed precondition silently keeps every consumer local-only — this must
+	// never turn a plain `event status` into a hard failure.
+	return applyRefinedSupplement(p.ctx, p.statuses, p.appID, func() refinedSubscriptionGetter {
+		return resolveRemoteSupplementGetter(p.ctx, p.cmd, p.f, p.appID, p.cur.userOpenID, time.Now())
+	})
 }
 
 // deriveStatuses classifies each AppID as running/orphan/not_running from socket + process-scan inputs; scanner errors are non-fatal.
