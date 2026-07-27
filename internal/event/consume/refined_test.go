@@ -28,6 +28,25 @@ import (
 	"github.com/larksuite/cli/internal/event/testutil"
 )
 
+// These tests build self-contained fixtures instead of importing the events
+// catalog, so they seed im.message.created_v1's filter capability directly
+// through the registry API — the same capability the business layer registers
+// in a real run.
+func init() {
+	event.RegisterFilterMeta("im.message.created_v1", event.FilterMeta{
+		Supported:     true,
+		LogicOps:      []string{"and", "or"},
+		Operators:     []string{"eq", "in", "contains"},
+		MaxDepth:      2,
+		MaxConditions: 10,
+		MaxBytes:      1024,
+		Operands: []event.FilterOperandMeta{
+			{Key: "sender", Operators: []string{"eq"}, InputValueType: "open_id"},
+			{Key: "message_type", Operators: []string{"eq", "in"}, ListValueMax: 10},
+		},
+	})
+}
+
 // ---- fixtures ----
 
 // refinedFixture builds a self-contained event.ResolvedEventKey (as

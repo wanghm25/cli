@@ -12,8 +12,25 @@ import (
 	"github.com/larksuite/cli/errs"
 )
 
-// seededFilterMeta is the demo capability used across the validation tests.
-func seededFilterMeta() FilterMeta { return FilterMetaFor("im.message.created_v1") }
+// seededFilterMeta is the demo capability used across the validation tests. It
+// mirrors a representative IM message capability (sender eq/open_id,
+// message_type eq/in with a list) and is constructed inline so the validation
+// tests exercise the generic engine without depending on any business layer's
+// registration.
+func seededFilterMeta() FilterMeta {
+	return FilterMeta{
+		Supported:     true,
+		LogicOps:      []string{logicAnd, logicOr},
+		Operators:     []string{opEq, opIn, opContains},
+		MaxDepth:      filterMaxDepth,
+		MaxConditions: filterMaxConditions,
+		MaxBytes:      filterMaxBytes,
+		Operands: []FilterOperandMeta{
+			{Key: "sender", Operators: []string{opEq}, InputValueType: "open_id"},
+			{Key: "message_type", Operators: []string{opEq, opIn}, ListValueMax: filterListValueCap},
+		},
+	}
+}
 
 // containsFilterMeta declares an operand that allows contains, which the seeded
 // demo operands do not, so the contains happy-path and R7 can be exercised.

@@ -6,26 +6,35 @@ package event
 import "testing"
 
 func TestFilterMetaFor(t *testing.T) {
-	supported := FilterMetaFor("im.message.created_v1")
-	if !supported.Supported {
-		t.Fatal("im.message.created_v1 should support filtering")
-	}
-	if _, ok := supported.Operand("sender"); !ok {
-		t.Error("sender operand should be declared")
-	}
-	if _, ok := supported.Operand("message_type"); !ok {
-		t.Error("message_type operand should be declared")
-	}
-	if _, ok := supported.Operand("not_declared"); ok {
-		t.Error("undeclared operand must not resolve")
+	// An event_type with no registered capability is fail-closed: the zero
+	// FilterMeta reports unsupported.
+	if FilterMetaFor("does.not.exist").Supported {
+		t.Error("unregistered event_type must yield an unsupported zero FilterMeta")
 	}
 
-	unsupported := FilterMetaFor("im.message.receive_v1")
-	if unsupported.Supported {
-		t.Error("im.message.receive_v1 must not support filtering (fail-closed default)")
+	// A registered capability round-trips through the registry: FilterMetaFor
+	// returns exactly what RegisterFilterMeta recorded, operands included.
+	const eventType = "test.filter.roundtrip_v1"
+	RegisterFilterMeta(eventType, FilterMeta{
+		Supported: true,
+		Operators: []string{opEq, opIn},
+		Operands: []FilterOperandMeta{
+			{Key: "sender", Operators: []string{opEq}, InputValueType: "open_id"},
+			{Key: "message_type", Operators: []string{opEq, opIn}},
+		},
+	})
+
+	got := FilterMetaFor(eventType)
+	if !got.Supported {
+		t.Fatal("registered event_type should support filtering")
 	}
-	unknown := FilterMetaFor("does.not.exist")
-	if unknown.Supported {
-		t.Error("unknown event_type must yield an unsupported zero FilterMeta")
+	if _, ok := got.Operand("sender"); !ok {
+		t.Error("sender operand should be declared")
+	}
+	if _, ok := got.Operand("message_type"); !ok {
+		t.Error("message_type operand should be declared")
+	}
+	if _, ok := got.Operand("not_declared"); ok {
+		t.Error("undeclared operand must not resolve")
 	}
 }

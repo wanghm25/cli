@@ -22,6 +22,26 @@ import (
 	eventlib "github.com/larksuite/cli/internal/event"
 )
 
+// The subscription tests build minimal catalog fixtures instead of importing the
+// full events catalog, so they seed im.message.created_v1's filter capability
+// directly through the registry API — the same capability the business layer
+// registers in a real run. Only this event_type is seeded, so keys without a
+// filter capability (e.g. im.message.receive_v1) stay fail-closed.
+func init() {
+	eventlib.RegisterFilterMeta("im.message.created_v1", eventlib.FilterMeta{
+		Supported:     true,
+		LogicOps:      []string{"and", "or"},
+		Operators:     []string{"eq", "in", "contains"},
+		MaxDepth:      2,
+		MaxConditions: 10,
+		MaxBytes:      1024,
+		Operands: []eventlib.FilterOperandMeta{
+			{Key: "sender", Operators: []string{"eq"}, InputValueType: "open_id"},
+			{Key: "message_type", Operators: []string{"eq", "in"}, ListValueMax: 10},
+		},
+	})
+}
+
 // fakeTokenResolver is a network-free stand-in for credential.DefaultTokenResolver,
 // mirroring shortcuts/common/runner_scope_test.go's scopeCheckTokenResolver so
 // resolveUATAndCheckScopes is exercised without a real credential chain.

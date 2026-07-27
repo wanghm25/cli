@@ -45,31 +45,23 @@ func (m FilterMeta) Operand(key string) (FilterOperandMeta, bool) {
 	return FilterOperandMeta{}, false
 }
 
-// filterMetaByEventType is the single embedded source of per-event_type filter
-// capability. It is seeded with a mock mirroring the platform demo.
-//
-// meta-swap: replace this seeded map with the fetch_meta-driven capability
-// (projecting the platform operand descriptors, including their value shape,
-// down to input_value_type) once that meta ships. Callers and validation are
-// unchanged — only this table's source changes.
-var filterMetaByEventType = map[string]FilterMeta{
-	"im.message.created_v1": {
-		Supported:     true,
-		LogicOps:      []string{logicAnd, logicOr},
-		Operators:     []string{opEq, opIn, opContains},
-		MaxDepth:      filterMaxDepth,
-		MaxConditions: filterMaxConditions,
-		MaxBytes:      filterMaxBytes,
-		Operands: []FilterOperandMeta{
-			{Key: "sender", Operators: []string{opEq}, InputValueType: "open_id"},
-			{Key: "message_type", Operators: []string{opEq, opIn}, ListValueMax: filterListValueCap},
-		},
-	},
+// filterMetaRegistry holds the per-event_type filter capability, keyed by
+// event_type. It is populated at startup by the business layers that own each
+// event_type, each calling RegisterFilterMeta. The generic layer keeps only the
+// registry mechanism and validation — never a specific event_type's capability.
+var filterMetaRegistry = map[string]FilterMeta{}
+
+// RegisterFilterMeta records the filter capability an event_type accepts. The
+// business layer that owns an event_type calls it (typically from an init) to
+// declare that event_type's operands and operators. A later registration for
+// the same event_type replaces the earlier one.
+func RegisterFilterMeta(eventType string, meta FilterMeta) {
+	filterMetaRegistry[eventType] = meta
 }
 
 // FilterMetaFor returns the filter capability for an event_type. An event_type
-// with no declared capability yields the zero FilterMeta (Supported == false),
+// with no registered capability yields the zero FilterMeta (Supported == false),
 // so a filter against it is rejected fail-closed.
 func FilterMetaFor(eventType string) FilterMeta {
-	return filterMetaByEventType[eventType]
+	return filterMetaRegistry[eventType]
 }
