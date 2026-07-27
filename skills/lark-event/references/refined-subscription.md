@@ -2,7 +2,7 @@
 
 > **Prerequisite:** Read [`../SKILL.md`](../SKILL.md) first for the `event consume` essentials (commands, subprocess contract, jq usage, `--as` identity switching).
 >
-> **Heads-up for AI agents**: a refined EventKey (`event schema <key> --json` shows `refined_subscription:true`) is **not** consumable as-is. It must first be **materialized** with a resource selector, e.g. `im.message.created_v1/chat-id/oc_9f3b1c2d8a`, using one of the key's `key_templates[].example` values. Passing the bare base key to `event consume` or `event subscription create` is always rejected (typed `invalid_argument`, hint points at `event schema <base> --json`). Also unlike a legacy key, `consume`'s risk is `effective:"write"` for a refined key — it may create/reuse/reactivate a remote resource before it starts streaming — so run `--dry-run` first.
+> **Heads-up for AI agents**: a refined EventKey (`event schema <key> --json` shows `refined_subscription:true`) is **not** consumable as-is. It must first be **materialized** with a resource selector, e.g. `im.message.example_v1/chat-id/oc_9f3b1c2d8a`, using one of the key's `key_templates[].example` values. Passing the bare base key to `event consume` or `event subscription create` is always rejected (typed `invalid_argument`, hint points at `event schema <base> --json`). Also unlike a legacy key, `consume`'s risk is `effective:"write"` for a refined key — it may create/reuse/reactivate a remote resource before it starts streaming — so run `--dry-run` first.
 
 ## 1. Discover: `list` / `schema` are the source of truth
 
@@ -11,7 +11,7 @@
 | `event list --json` | `refined_subscription:true`, `key_templates[]`, `auth_types`, `dry_run_supported:true`, `next_action` |
 | `event schema <base> --json` | all of the above, plus full `key_templates[]`, `conditional_scopes`, `risk{effective:"write", dry_run_recommended:true}`, `subscription{payload_options, dry_run.example}`, `next_action` |
 
-`event schema` only accepts the bare **base** key (e.g. `im.message.created_v1`) — that is where `key_templates` lives. It does not accept an already-materialized key.
+`event schema` only accepts the bare **base** key (e.g. `im.message.example_v1`) — that is where `key_templates` lives. It does not accept an already-materialized key.
 
 `key_templates[]` field reference:
 
@@ -24,15 +24,15 @@
 | `fixed_value` | only present on a fixed-value template (e.g. `owner/me` — the value segment must be literally `me`) |
 | `auth_types` | identities **this specific template** accepts — can be a narrower subset than the base key's own `auth_types` |
 
-Today the only shipped refined base key is `im.message.created_v1` (mock catalog; more base keys/templates arrive later from a metadata source with no change to any command below). It has two templates:
+Refined base keys are discovered with `event list` (the `REFINED` column); more base keys/templates arrive later from a metadata source with no change to any command below. The examples below use an illustrative key `im.message.example_v1` (substitute a real base key from `event list`), which has two templates:
 
-- `im.message.created_v1/chat-id/{chat_id}` → example `im.message.created_v1/chat-id/oc_9f3b1c2d8a` — user + bot
-- `im.message.created_v1/owner/me` → fixed value `me` — user only
+- `im.message.example_v1/chat-id/{chat_id}` → example `im.message.example_v1/chat-id/oc_9f3b1c2d8a` — user + bot
+- `im.message.example_v1/owner/me` → fixed value `me` — user only
 
 ## 2. Materialize → dry-run → consume/create
 
-1. `event schema im.message.created_v1 --json` → read `key_templates`.
-2. Pick one, e.g. `im.message.created_v1/chat-id/oc_9f3b1c2d8a`.
+1. `event schema im.message.example_v1 --json` → read `key_templates`.
+2. Pick one, e.g. `im.message.example_v1/chat-id/oc_9f3b1c2d8a`.
 3. Preview with zero writes:
    - `event consume <materialized-key> --dry-run --as user|bot|auto` — parses, resolves identity, runs `ProbeBusEligibility` (read-only local/remote-connection check) and a `List`/`Get`-only plan, then prints the plan to **stderr** and exits; **stdout stays empty**, nothing is written remotely.
    - `event subscription create <materialized-key> --dry-run --json` — the management-plane's own richer JSON preview (`remote_before`, `planned_change`, `next_action`).
@@ -51,7 +51,7 @@ Every remote Subscription carries a server TTL (`expire_time`, unix seconds — 
 
 ## 4. Identity gate (`--as user|bot|auto`)
 
-- `--as auto` resolves to one identity via the normal CLI default-as chain (see `lark-shared`). For `consume`/`subscription create` on a refined key, the resolved identity must **also** fall inside the **matched template's** `auth_types` — not just the base key's — e.g. `owner/me` only accepts `user` even though `im.message.created_v1` itself allows `user`+`bot`. A mismatch is a typed `failed_precondition` naming the allowed identities; it is never a silent fallback to another identity.
+- `--as auto` resolves to one identity via the normal CLI default-as chain (see `lark-shared`). For `consume`/`subscription create` on a refined key, the resolved identity must **also** fall inside the **matched template's** `auth_types` — not just the base key's — e.g. `owner/me` only accepts `user` even though `im.message.example_v1` itself allows `user`+`bot`. A mismatch is a typed `failed_precondition` naming the allowed identities; it is never a silent fallback to another identity.
 - **Owner vs. current** (applies to `consume`'s background lifecycle handling only, not the management plane): the first successful `consume` for a materialized key + authority fixes an "owner" identity (`app_id` + `user_open_id`) at Hello time. Every later background action (BindUser, lifecycle recovery) re-resolves "current" identity fresh from disk and compares `owner_app_id`+`owner_user_open_id` — the access token itself is never part of the comparison.
   - Match → delivery / BindUser / lifecycle recovery proceed normally.
   - Mismatch → the consumer is flagged `stale_identity` (informational only, surfaced by `event status`): no events are delivered to it, no historical UAT is loaded, nothing remote changes. Switch back to the owning profile to resume delivery.
@@ -136,7 +136,7 @@ To fully tear down a refined subscription: stop the local consumer **and** delet
 
 ## Gotchas
 
-- **Bare base key rejected (R1)**: `event consume im.message.created_v1` or `event subscription create im.message.created_v1` (no template segment) always fails `invalid_argument`, pointing at `event schema im.message.created_v1 --json`. Only a materialized key (e.g. a `key_templates[].example` value) works.
+- **Bare base key rejected (R1)**: `event consume im.message.example_v1` or `event subscription create im.message.example_v1` (no template segment) always fails `invalid_argument`, pointing at `event schema im.message.example_v1 --json`. Only a materialized key (e.g. a `key_templates[].example` value) works.
 - **A legacy key never accepts a path suffix**: `im.message.receive_v1/foo/bar` is not a refined-style path — legacy keys only ever match exactly.
 - **Selector value URL discipline**: a selector value is percent-decoded exactly once; an unescaped `/` inside it is rejected outright (it would silently change how the key is segmented) — percent-encode a literal `/` as `%2F`.
 - **`create`'s conflict is about `payload_options`, not caller intent**: two `create` calls for the same `event_type` + `target_resource` + identity but a different `--include-resource-data` (including plaintext-vs-encrypted, or encrypted-but-key-not-retrievable) collide as `failed_precondition`, never a silent overwrite — see the encryption conflict matrix under "Resource data & encryption" above.
