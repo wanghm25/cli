@@ -177,6 +177,8 @@ The response shape is similar to `create`, and usually echoes:
 
 Query reactions for multiple messages in one request.
 
+`batch_query` covers only the reaction fragments returned for each query. When complete reactions for one message are required, use `im reactions list` and exhaust its pagination instead of treating an empty or partial batch fragment as complete.
+
 ```bash
 lark-cli im reactions batch_query \
   --params '{"user_id_type":"open_id"}' \

@@ -6,33 +6,29 @@ This skill maps to shortcut: `lark-cli im +feed-shortcut-list`. Underlying API: 
 
 ## What it does
 
-Lists **one page** of the **current user's** feed shortcuts.
+Lists the **current user's** feed shortcuts.
 
 - Only **CHAT-type** shortcuts are exposed via OpenAPI today (others in the IDL are not yet whitelisted).
-- The shortcut is a **thin one-page wrapper** — there is no built-in auto-pagination. Callers drive their own loop when they actually need to paginate.
+- Pagination controls are defined by the concrete command's `--help`.
 - Server-side page size is controlled by the service; in normal use one page usually covers the list.
-- Pagination tokens are opaque. If a token is rejected because the shortcut list changed, restart by omitting `--page-token`.
+- Pagination tokens are opaque and can become invalid when the shortcut list changes.
 
 ## Commands
 
 ```bash
-# First page (the only call most users ever need — --page-token omitted)
+# List shortcuts
 lark-cli im +feed-shortcut-list --as user
 
-# Continue from the previous response's page_token
-lark-cli im +feed-shortcut-list --as user --page-token <token-from-previous-response>
-
 # Skip detail enrichment when only IDs are needed; avoids the extra im:chat:read lookup
-lark-cli im +feed-shortcut-list --as user --no-detail -q '.data.shortcuts[].feed_card_id'
+lark-cli im +feed-shortcut-list --as user --no-detail
 ```
 
-> If you need to walk every page, write the loop yourself: read `data.page_token` from each response and pass it back in until `has_more=false`. The shortcut intentionally does not auto-walk because page-token errors require the caller to decide whether to restart from the first page.
+> If the task requires every shortcut, inspect the concrete command's `--help` before executing. If a continuation token is rejected after the shortcut list changes, restart from the beginning.
 
 ## Parameters
 
 | Parameter | Required | Description |
 |------|------|------|
-| `--page-token <token>` | no | Opaque pagination token from the previous response. **Omit it for the first page.** |
 | `--no-detail` | no (default `false`) | Skip fetching each entry's full info object. By default enrichment is enabled: CHAT-type entries call `im.chats.batch_query`, need `im:chat:read`, and attach the object under the `detail` field. Pass `--no-detail` to skip the extra call and scope. |
 | `--as user` | yes | Server only accepts user_access_token for this API |
 

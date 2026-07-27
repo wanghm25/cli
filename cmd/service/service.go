@@ -338,6 +338,7 @@ func buildMethodCommand(ctx context.Context, f *cmdutil.Factory, spec methodComm
 	paramsOnly := opts.binder.paramsOnlyHelp()
 	cmd.Long = methodLong(m.Description, spec.schemaPath, paramsOnly)
 	setMethodHelpData(cmd, spec.serviceName, m.ID, spec.schemaPath, paramsOnly)
+	imcontract.AnnotateHelpContract(cmd, spec.contractKey)
 
 	// Group flags for the grouped --help renderer (typed param flags are grouped
 	// as API Parameters by the binder). tagFlagGroup is a no-op for flags not

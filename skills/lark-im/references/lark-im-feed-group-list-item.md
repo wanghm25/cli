@@ -23,9 +23,9 @@ Because chat-name resolution always runs, this shortcut needs **two** user scope
 # First page, enriched with chat names
 lark-cli im +feed-group-list-item --as user --feed-group-id ofg_xxx
 
-# Auto-paginate through everything within a time window
+# List items within a time window
 lark-cli im +feed-group-list-item --as user --feed-group-id ofg_xxx \
-  --page-all --start-time 1767196800000 --end-time 1767200000000
+  --start-time 1767196800000 --end-time 1767200000000
 ```
 
 ## Flags
@@ -33,14 +33,10 @@ lark-cli im +feed-group-list-item --as user --feed-group-id ofg_xxx \
 | Flag | Required | Description |
 |---|---|---|
 | `--feed-group-id` | Yes | Feed group ID (`ofg_xxx`); path parameter |
-| `--page-size` | No | Records per page, 1–50 (default 50) |
-| `--page-token` | No | Continuation token for a specific page |
-| `--page-all` | No | Auto-paginate and merge all pages |
-| `--page-limit` | No | Max pages when `--page-all` is set, 1–1000 (default 20) |
 | `--start-time` | No | Update-time window start (Unix milliseconds as a decimal string) |
 | `--end-time` | No | Update-time window end (Unix milliseconds as a decimal string) |
 
-When `--page-token` is set explicitly, it wins over `--page-all` (you get exactly that page).
+For pagination controls, inspect this concrete command's `--help`.
 
 ## Output
 

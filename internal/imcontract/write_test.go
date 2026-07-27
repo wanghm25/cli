@@ -168,7 +168,7 @@ func TestModerationAcceptedUnverified(t *testing.T) {
 	if completion["status"] != "accepted_unverified" || completion["final_state_verified"] != false {
 		t.Fatalf("completion = %#v", completion)
 	}
-	if got.Hint != hintAcceptedUnverified {
+	if got.Hint != "" {
 		t.Fatalf("hint = %q", got.Hint)
 	}
 }
@@ -221,6 +221,67 @@ func TestReplaySafety(t *testing.T) {
 	p, _ = errs.ProblemOf(got)
 	if !p.Retryable || p.Hint != "specify --item-type explicitly" {
 		t.Fatalf("preflight problem was rewritten: %#v", p)
+	}
+}
+
+func TestBatchPartialRecoveryMatrix(t *testing.T) {
+	tests := []struct {
+		name      string
+		command   ContractKey
+		request   map[string]any
+		response  map[string]any
+		fact      *Fact
+		wantScope string
+	}{
+		{
+			name:    "pending always forbids retry",
+			command: "im +flag-cancel",
+			response: map[string]any{"results": []any{
+				map[string]any{"flag_type": "message", "status": "ok"},
+			}},
+			fact:      &Fact{Kind: FactFlagFeedLayerPending},
+			wantScope: "none",
+		},
+		{
+			name:    "whole request recovery",
+			command: "im +feed-shortcut-create",
+			request: map[string]any{"shortcuts": []any{
+				map[string]any{"feed_card_id": "oc_a"},
+			}},
+			response: map[string]any{"failed_shortcuts": []any{
+				map[string]any{"shortcut": map[string]any{"feed_card_id": "oc_a"}},
+			}},
+			wantScope: "whole_request",
+		},
+		{
+			name:      "failed items only recovery",
+			command:   "im messages urgent_app",
+			request:   map[string]any{"user_id_list": []any{"ou_a", "ou_b"}},
+			response:  map[string]any{"invalid_user_id_list": []any{"ou_b"}},
+			wantScope: "failed_items_only",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			contract, _ := Lookup(tc.command)
+			session := NewSession(contract)
+			if tc.request != nil {
+				if err := session.ObserveRequest(tc.request); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.fact != nil {
+				session.RecordFact(*tc.fact)
+			}
+			result, err := session.FinalizeSuccess(tc.response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			completion := result.Data.(map[string]any)["completion"].(Completion)
+			if completion.RetryScope != tc.wantScope || result.Hint != "" {
+				t.Fatalf("completion=%#v hint=%q", completion, result.Hint)
+			}
+		})
 	}
 }
 
@@ -456,7 +517,7 @@ func TestCompletionIsClosedOverRequestedItems(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := completion(tc.requested, tc.failed, tc.pending)
+			got := completion(tc.requested, tc.failed, tc.pending, PartialRecoveryFailedItemsOnly)
 			if got.RequestedCount != got.SucceededCount+got.FailedCount+got.PendingCount {
 				t.Fatalf("non-exclusive counts: %#v", got)
 			}

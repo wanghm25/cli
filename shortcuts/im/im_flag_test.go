@@ -1574,9 +1574,11 @@ func TestFlagCancelExecuteSummarizesPartialFailure(t *testing.T) {
 	}
 
 	var envelope struct {
-		OK bool `json:"ok"`
+		OK   bool   `json:"ok"`
+		Hint string `json:"hint"`
 		Data struct {
-			Results []map[string]any `json:"results"`
+			Results    []map[string]any      `json:"results"`
+			Completion imcontract.Completion `json:"completion"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(out), &envelope); err != nil {
@@ -1587,6 +1589,11 @@ func TestFlagCancelExecuteSummarizesPartialFailure(t *testing.T) {
 	}
 	if envelope.OK {
 		t.Fatalf("stdout ok = true, want false for partial failure")
+	}
+	if envelope.Data.Completion.RetryScope != "whole_request" ||
+		envelope.Data.Completion.FailedCount != 1 ||
+		envelope.Hint != "" {
+		t.Fatalf("completion = %#v, hint = %q", envelope.Data.Completion, envelope.Hint)
 	}
 	if errOut := rt.Factory.IOStreams.ErrOut.(*bytes.Buffer).String(); errOut != "" {
 		t.Fatalf("stderr = %q, want empty for partial failure result envelope", errOut)
@@ -1617,7 +1624,8 @@ func TestFlagCancelExecuteSkippedFeedLayerProducesPendingLedger(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	var envelope struct {
-		OK bool `json:"ok"`
+		OK   bool   `json:"ok"`
+		Hint string `json:"hint"`
 		Data struct {
 			Completion imcontract.Completion `json:"completion"`
 		} `json:"data"`
@@ -1628,7 +1636,9 @@ func TestFlagCancelExecuteSkippedFeedLayerProducesPendingLedger(t *testing.T) {
 	}
 	if envelope.OK || envelope.Data.Completion.PendingCount != 1 ||
 		len(envelope.Data.Completion.PendingItems) != 1 ||
-		envelope.Data.Completion.PendingItems[0] != "feed" {
+		envelope.Data.Completion.PendingItems[0] != "feed" ||
+		envelope.Data.Completion.RetryScope != "none" ||
+		envelope.Hint != "" {
 		t.Fatalf("pending completion = %#v", envelope.Data.Completion)
 	}
 	if errOut := rt.Factory.IOStreams.ErrOut.(*bytes.Buffer).String(); errOut != "" {
@@ -1795,8 +1805,14 @@ func TestExecuteListAllPages(t *testing.T) {
 		t.Fatalf("ParseFlags() error = %v", err)
 	}
 	setRuntimeField(t, rt, "Cmd", cmd)
+	contract, _ := imcontract.Lookup("im +flag-list")
+	session, err := imcontract.NewReadSession(contract, imcontract.ReadOptions{FullRead: true})
+	if err != nil {
+		t.Fatalf("NewReadSession() error = %v", err)
+	}
+	setRuntimeField(t, rt, "readSession", session)
 
-	err := executeListAllPages(rt)
+	err = executeListAllPages(rt)
 	if err != nil {
 		t.Fatalf("executeListAllPages() error = %v", err)
 	}
@@ -1888,8 +1904,14 @@ func TestExecuteListAllPages_PageLimit(t *testing.T) {
 		t.Fatalf("ParseFlags() error = %v", err)
 	}
 	setRuntimeField(t, rt, "Cmd", cmd)
+	contract, _ := imcontract.Lookup("im +flag-list")
+	session, err := imcontract.NewReadSession(contract, imcontract.ReadOptions{FullRead: true})
+	if err != nil {
+		t.Fatalf("NewReadSession() error = %v", err)
+	}
+	setRuntimeField(t, rt, "readSession", session)
 
-	err := executeListAllPages(rt)
+	err = executeListAllPages(rt)
 	if err != nil {
 		t.Fatalf("executeListAllPages() error = %v", err)
 	}
@@ -1897,14 +1919,8 @@ func TestExecuteListAllPages_PageLimit(t *testing.T) {
 	if callCount != 3 {
 		t.Fatalf("expected 3 API calls (page limit), got %d", callCount)
 	}
-	stderr := rt.IO().ErrOut.(*bytes.Buffer).String()
-	for _, want := range []string{"reached page limit (3)", "has_more=true", "result is incomplete", "up to 1000", "page_token returned in stdout"} {
-		if !strings.Contains(stderr, want) {
-			t.Fatalf("stderr = %q, want %q", stderr, want)
-		}
-	}
-	if strings.Contains(stderr, "token_3") {
-		t.Fatalf("stderr must not expose the continuation token, got %q", stderr)
+	if stderr := rt.IO().ErrOut.(*bytes.Buffer).String(); stderr != "" {
+		t.Fatalf("stderr = %q, want structured recovery guidance in stdout", stderr)
 	}
 
 	var envelope map[string]any
@@ -1920,6 +1936,13 @@ func TestExecuteListAllPages_PageLimit(t *testing.T) {
 	}
 	if _, exists := data["truncated"]; exists {
 		t.Fatalf("output schema must remain unchanged; unexpected truncated field in %#v", data)
+	}
+	meta, _ := envelope["meta"].(map[string]any)
+	if meta["complete"] != false || meta["stop_reason"] != "page_limit" {
+		t.Fatalf("meta = %#v, want incomplete page-limit result", meta)
+	}
+	if hint, _ := envelope["hint"].(string); !strings.Contains(hint, "--page-limit 0") {
+		t.Fatalf("hint = %q, want exhaustive-read recovery", hint)
 	}
 }
 
@@ -1945,24 +1968,35 @@ func TestExecuteListAllPages_RepeatedTokenDoesNotReportPageLimit(t *testing.T) {
 	cmd := &cobra.Command{Use: "test"}
 	cmd.Flags().Int("page-size", 50, "")
 	cmd.Flags().Int("page-limit", 10, "")
+	cmd.Flags().Bool("page-all", true, "")
 	cmd.Flags().Bool("enrich-feed-thread", false, "")
 	if err := cmd.ParseFlags(nil); err != nil {
 		t.Fatalf("ParseFlags() error = %v", err)
 	}
 	setRuntimeField(t, rt, "Cmd", cmd)
+	contract, _ := imcontract.Lookup("im +flag-list")
+	session, err := imcontract.NewReadSession(contract, imcontract.ReadOptions{FullRead: true})
+	if err != nil {
+		t.Fatalf("NewReadSession() error = %v", err)
+	}
+	setRuntimeField(t, rt, "readSession", session)
 
-	if err := executeListAllPages(rt); err != nil {
+	if err = executeListAllPages(rt); err != nil {
 		t.Fatalf("executeListAllPages() error = %v", err)
 	}
 	if callCount != 2 {
 		t.Fatalf("API calls = %d, want 2 before repeated-token stop", callCount)
 	}
-	stderr := rt.IO().ErrOut.(*bytes.Buffer).String()
-	if !strings.Contains(stderr, "page_token did not change") {
-		t.Fatalf("stderr = %q, want non-advancing token warning", stderr)
+	if stderr := rt.IO().ErrOut.(*bytes.Buffer).String(); stderr != "" {
+		t.Fatalf("stderr = %q, want structured repeated-token result in stdout", stderr)
 	}
-	if strings.Contains(stderr, "reached page limit") {
-		t.Fatalf("stderr = %q, repeated token must not be reported as a page-limit stop", stderr)
+	var envelope map[string]any
+	if err := json.Unmarshal(rt.IO().Out.(*bytes.Buffer).Bytes(), &envelope); err != nil {
+		t.Fatalf("decode stdout: %v", err)
+	}
+	meta, _ := envelope["meta"].(map[string]any)
+	if envelope["ok"] != false || meta["stop_reason"] != "repeated_token" {
+		t.Fatalf("envelope = %#v, want attributed incomplete read", envelope)
 	}
 }
 

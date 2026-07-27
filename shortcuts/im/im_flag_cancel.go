@@ -44,7 +44,7 @@ var ImFlagCancel = common.Shortcut{
 			POST("/open-apis/im/v1/flags/cancel").
 			Body(map[string]any{"flag_items": items})
 		if len(items) > 1 {
-			d.Desc("double-cancel: tries both message and feed layers (best-effort); feed-layer skipped if chat_type undeterminable")
+			d.Desc("double-cancel: tries both message and feed layers; an unresolved feed layer is reported as pending")
 		}
 		return d
 	},
@@ -128,7 +128,7 @@ func buildCancelItemsForPreview(rt *common.RuntimeContext) ([]any, bool, error) 
 //  1. If --flag-type is explicitly provided, do a single targeted delete.
 //  2. Otherwise, perform double-cancel: remove both message layer and feed layer.
 //     - Message layer is always included (uses known message_id with ItemTypeDefault)
-//     - Feed layer is best-effort: if chat_type cannot be determined, skip with warning
+//     - Feed layer is best-effort: if chat_type cannot be determined, record it as pending
 //     - Each layer is independent; failure to cancel one doesn't block the other
 func buildCancelItems(rt *common.RuntimeContext) ([]flagItem, error) {
 	id, err := flagMessageID(rt)

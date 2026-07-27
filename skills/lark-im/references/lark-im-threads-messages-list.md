@@ -17,12 +17,6 @@ lark-cli im +threads-messages-list --thread omt_xxx
 # Reverse chronological order (latest first)
 lark-cli im +threads-messages-list --thread omt_xxx --order desc
 
-# Control page size
-lark-cli im +threads-messages-list --thread omt_xxx --page-size 20
-
-# Pagination
-lark-cli im +threads-messages-list --thread omt_xxx --page-token <PAGE_TOKEN>
-
 # Output format options
 lark-cli im +threads-messages-list --thread omt_xxx --format pretty
 lark-cli im +threads-messages-list --thread omt_xxx --format table
@@ -43,8 +37,6 @@ lark-cli im +threads-messages-list --thread omt_xxx --dry-run
 | `--no-reactions` | No | Skip auto-fetching the `reactions` block |
 | `--download-resources` | No | Download message resources (image/file/audio/video/media + post-embedded, excluding stickers) into `./lark-im-resources/` and attach a `resources` block. Off by default |
 | `--order <order>` | No | Sort order: `asc` (default) / `desc` |
-| `--page-size <n>` | No | Number of items per page (default 50, range 1-500) |
-| `--page-token <token>` | No | Pagination token for the next page |
 | `--format <fmt>` | No | Output format: `json` (default) / `pretty` / `table` / `ndjson` / `csv` |
 | `--as <identity>` | No | Identity type: `user` (default) / `bot` |
 | `--dry-run` | No | Print the request only, do not execute it |
@@ -57,20 +49,7 @@ lark-cli im +threads-messages-list --thread omt_xxx --dry-run
 
 ### 2. No time filtering support
 
-Thread messages do not support `start_time` / `end_time` filtering because of Feishu API limitations. Use pagination and sort order to control the scope.
-
-### 3. Pagination (`has_more` / `page_token`)
-
-- When the result includes `has_more=true`, use `page_token` to fetch the next page
-- If you need the complete thread, keep paginating; if you only need an overview, the first page is often enough
-
-### 4. Recommended expansion strategy
-
-| Scenario | Recommended Parameters |
-|------|---------|
-| Quickly inspect recent replies | `--order desc --page-size 10` |
-| Read the full thread in chronological order | `--order asc --page-size 50`, then paginate as needed |
-| Just confirm whether replies exist | `--order desc --page-size 1` |
+Thread messages do not support `start_time` / `end_time` filtering because of Feishu API limitations. Use sort order to control ordering, and inspect this concrete command's `--help` when the task requires the complete thread.
 
 ## Usage Scenarios
 
@@ -82,16 +61,6 @@ lark-cli im +chat-messages-list --chat-id oc_xxx
 
 # Step 2: Extract thread_id from the JSON output and fetch thread replies
 lark-cli im +threads-messages-list --thread omt_xxx
-```
-
-### Scenario 2: Paginate through a long thread
-
-```bash
-# First page
-lark-cli im +threads-messages-list --thread omt_xxx
-
-# If has_more=true is returned, continue with page_token
-lark-cli im +threads-messages-list --thread omt_xxx --page-token <PAGE_TOKEN>
 ```
 
 ## Resource Rendering

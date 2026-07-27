@@ -1,0 +1,151 @@
+// Copyright (c) 2026 Lark Technologies Pte. Ltd.
+// SPDX-License-Identifier: MIT
+
+// Package catalog defines the static IM command completion contract catalog.
+package catalog
+
+import "time"
+
+type ContractKey string
+
+type StrategyKind string
+
+const (
+	EntityReadKind                 StrategyKind = "entity_read"
+	CollectionReadKind             StrategyKind = "collection_read"
+	SearchReadKind                 StrategyKind = "search_read"
+	MaterializeReadKind            StrategyKind = "materialize_read"
+	AuthoritativeAckKind           StrategyKind = "authoritative_ack"
+	RequiredResultKind             StrategyKind = "required_result"
+	BatchPartialKind               StrategyKind = "batch_partial"
+	RequiredResultBatchPartialKind StrategyKind = "required_result_batch_partial"
+	ResponseSetAssertionKind       StrategyKind = "response_set_assertion"
+	ExemptionKind                  StrategyKind = "exemption"
+)
+
+func (k StrategyKind) IsWrite() bool {
+	switch k {
+	case AuthoritativeAckKind, RequiredResultKind, BatchPartialKind,
+		RequiredResultBatchPartialKind, ResponseSetAssertionKind, ExemptionKind:
+		return true
+	default:
+		return false
+	}
+}
+
+func (k StrategyKind) IsRead() bool {
+	switch k {
+	case EntityReadKind, CollectionReadKind, SearchReadKind, MaterializeReadKind:
+		return true
+	default:
+		return false
+	}
+}
+
+type ReplayMode string
+
+const (
+	ReplayForbidden          ReplayMode = "forbidden"
+	ReplaySafe               ReplayMode = "safe"
+	ReplaySameIdempotencyKey ReplayMode = "same_idempotency_key"
+)
+
+type PartialRecoveryMode string
+
+const (
+	PartialRecoveryWholeRequest    PartialRecoveryMode = "whole_request"
+	PartialRecoveryFailedItemsOnly PartialRecoveryMode = "failed_items_only"
+)
+
+type AssertionMode string
+
+const (
+	AssertRequestedPresent AssertionMode = "requested_present"
+	AssertRequestedAbsent  AssertionMode = "requested_absent"
+)
+
+type RequiredShape uint8
+
+const (
+	RequiredTopString RequiredShape = iota + 1
+	RequiredTopObject
+	RequiredNestedString
+)
+
+type EvidenceShape uint8
+
+const (
+	EvidenceStrings EvidenceShape = iota + 1
+	EvidenceObjects
+	EvidenceNestedObjects
+	EvidenceFeedObjects
+	EvidenceNestedFeedObjects
+	EvidenceStatusObjects
+)
+
+type RequiredSpec struct {
+	Shape RequiredShape
+	Field string
+	Child string
+}
+
+type EvidenceSpec struct {
+	Shape     EvidenceShape
+	Field     string
+	IDField   string
+	Container string
+}
+
+type Strategy struct {
+	Kind         StrategyKind
+	Required     RequiredSpec
+	Request      EvidenceSpec
+	Failures     []EvidenceSpec
+	Pending      []EvidenceSpec
+	ResponseSets []EvidenceSpec
+	Assertion    AssertionMode
+	ResultLedger *EvidenceSpec
+	// CollectionField is only used by the two fixed IM search strategies to
+	// determine whether an exhausted search returned no candidates. It is not
+	// a general response path or field extractor.
+	CollectionField string
+	ReadHint        string
+}
+
+type HelpPolicy string
+
+const (
+	HelpCompleteness   HelpPolicy = "completeness"
+	HelpAcceptanceOnly HelpPolicy = "acceptance_only"
+	HintBatchReactions            = "This result covers only the returned reaction fragments; use `im reactions list` to exhaust one message's reactions."
+)
+
+func (p HelpPolicy) Text() string {
+	switch p {
+	case HelpCompleteness:
+		return "Completeness: use --page-all --page-limit 0 for exhaustive output; only meta.complete=true proves completion."
+	case HelpAcceptanceOnly:
+		return "Guarantee: success confirms request acceptance only; independently query the final moderator state before claiming completion."
+	default:
+		return ""
+	}
+}
+
+type Exemption struct {
+	Reason string
+	Owner  string
+	Expiry string
+}
+
+func (e Exemption) ExpiryTime() (time.Time, error) {
+	return time.Parse("2006-01-02", e.Expiry)
+}
+
+type Contract struct {
+	Key             ContractKey
+	Strategy        Strategy
+	ReplayMode      ReplayMode
+	PartialRecovery PartialRecoveryMode
+	HelpPolicy      HelpPolicy
+	Exemption       *Exemption
+}

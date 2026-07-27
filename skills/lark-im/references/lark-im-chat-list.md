@@ -17,12 +17,6 @@ lark-cli im +chat-list
 # Sort by recent activity (most recently active first)
 lark-cli im +chat-list --sort active_time
 
-# Limit page size
-lark-cli im +chat-list --page-size 50
-
-# Pagination
-lark-cli im +chat-list --page-token "xxx"
-
 # Drop muted chats (user identity only)
 lark-cli im +chat-list --exclude-muted
 
@@ -49,8 +43,6 @@ lark-cli im +chat-list --as user --types p2p
 | `--user-id-type <type>` | No | `open_id` (default), `union_id`, `user_id` | ID type used for `owner_id` in the response |
 | `--types <strings>` | No | `group`, `p2p` (comma-separated or repeated) | Chat types to include. Omitted = groups only (backward compatible). `p2p` requires user identity (`--as user`); under `--as bot`, `--types=p2p` alone is rejected and `--types=p2p,group` is silently downgraded to `group` |
 | `--sort <field>` | No | `create_time` (default, ascending), `active_time` (descending) | Result ordering |
-| `--page-size <n>` | No | 1-100, default 20 | Number of results per page |
-| `--page-token <token>` | No | - | Pagination token from the previous response |
 | `--exclude-muted` | No | User identity only | Drop chats the current user has muted (do-not-disturb). Under `--as bot`, the flag is silently inactive; see "Filtering muted chats" below |
 | `--format json` | No | - | Output as JSON |
 | `--dry-run` | No | - | Preview the request without executing it |
@@ -139,24 +131,12 @@ lark-cli im +chat-list --sort active_time --page-size 10
 lark-cli im +chat-list --sort active_time --exclude-muted
 ```
 
-### Scenario 3: Iterate all my chats programmatically
-
-```bash
-TOKEN=""
-while :; do
-  RESP=$(lark-cli im +chat-list --page-size 100 --page-token "$TOKEN" --format json)
-  echo "$RESP" | jq -r '.data.chats[].chat_id'
-  HAS_MORE=$(echo "$RESP" | jq -r '.data.has_more')
-  [ "$HAS_MORE" = "true" ] || break
-  TOKEN=$(echo "$RESP" | jq -r '.data.page_token')
-done
-```
+If the task requires every visible chat, inspect this concrete command's `--help` before executing.
 
 ## Common Errors and Troubleshooting
 
 | Symptom | Root Cause | Solution |
 |---------|---------|---------|
-| `--page-size must be an integer between 1 and 100` | page-size is out of range or not an integer | Use an integer between 1 and 100 |
 | Permission denied (99991672) | The bot app does not have `im:chat:read` TAT permission enabled | Enable the permission for the app in the Open Platform console |
 | Permission denied (99991679) with `--as user` | UAT is not authorized for `im:chat:read` | Run `lark-cli auth login --scope "im:chat:read"` |
 | `Bot ability is not activated` (232025) | The app does not have bot capability enabled | Enable bot capability in the Open Platform console |

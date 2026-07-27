@@ -23,11 +23,8 @@ lark-cli im +chat-messages-list --chat-id oc_xxx --start "2026-03-10T00:00:00+08
 # Specify a time range (date only)
 lark-cli im +chat-messages-list --chat-id oc_xxx --start 2026-03-10 --end 2026-03-11
 
-# Control sort order and page size (max 50)
-lark-cli im +chat-messages-list --chat-id oc_xxx --order asc --page-size 20
-
-# Pagination
-lark-cli im +chat-messages-list --chat-id oc_xxx --page-token "xxx"
+# Control sort order
+lark-cli im +chat-messages-list --chat-id oc_xxx --order asc
 
 # JSON output
 lark-cli im +chat-messages-list --chat-id oc_xxx --format json
@@ -42,8 +39,6 @@ lark-cli im +chat-messages-list --chat-id oc_xxx --format json
 | `--start <time>` | No | Start time (ISO 8601 or date only) |
 | `--end <time>` | No | End time (ISO 8601 or date only) |
 | `--order <order>` | No | Sort order: `asc` / `desc` (default `desc`) |
-| `--page-size <n>` | No | Page size (default 50, max 50) |
-| `--page-token <token>` | No | Pagination token |
 | `--no-reactions` | No | Skip auto-fetching the `reactions` block |
 | `--download-resources` | No | Download message resources (image/file/audio/video/media + post-embedded, excluding stickers) into `./lark-im-resources/` and attach a `resources` block. Off by default; no extra requests when omitted |
 
@@ -77,8 +72,8 @@ lark-cli im +threads-messages-list --thread omt_xxx
 
 | Scenario | Recommendation |
 |------|------|
-| You need context | Call `im +threads-messages-list --order desc --page-size 10` for the discovered thread_id to inspect recent replies |
-| The user asks for the "full discussion" | Use `im +threads-messages-list --order asc --page-size 50`, then paginate if needed |
+| You need context | Call `im +threads-messages-list --order desc` for the discovered thread_id to inspect recent replies |
+| The user asks for the "full discussion" | Inspect the thread command's `--help` for full-read controls, then read in chronological order |
 | You only need an overview | Skip thread expansion |
 
 ## Output Fields
@@ -104,20 +99,7 @@ Each message contains:
 | `mentions` | Array of @mentions in the message; each item contains `{id, key, name}`. Present only when the message contains @mentions |
 | `thread_id` | Thread ID (`omt_xxx`) if the message has replies in a thread. Present only when replies exist |
 
-## Pagination (`has_more` / `page_token`)
-
-`im +chat-messages-list` returns `has_more` and `page_token` when more data is available. Use `--page-token` to continue:
-
-```bash
-lark-cli im +chat-messages-list --chat-id oc_xxx --page-token <PAGE_TOKEN>
-```
-
-You can also fall back to the generic API:
-
-```bash
-lark-cli api GET /open-apis/im/v1/messages \
-  --params 'container_id_type=chat&container_id=oc_xxx&page_size=50&page_token=<PAGE_TOKEN>'
-```
+If the task requires the complete conversation, inspect this concrete command's `--help` before executing.
 
 ## Common Errors and Troubleshooting
 
@@ -147,9 +129,9 @@ lark-cli api GET /open-apis/im/v1/messages \
 7. **Application/bot identity + named group history:** If the user says "使用应用身份/以 bot 身份" and asks to list or read historical messages for a named group, use bot identity for both steps:
    ```bash
    lark-cli im +chat-search --as bot --query "<chat name keyword>" --format json
-   lark-cli im +chat-messages-list --as bot --chat-id <chat_id> --page-size 50 --format json
+   lark-cli im +chat-messages-list --as bot --chat-id <chat_id> --format json
    ```
-   Do not use `im +messages-search --as bot`; `+messages-search` is user-only. Continue with `--page-token` if `has_more=true`.
+   Do not use `im +messages-search --as bot`; `+messages-search` is user-only. Inspect `+chat-messages-list --help` first when the task requires complete history.
 
 ## References
 

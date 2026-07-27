@@ -11,12 +11,10 @@ import (
 )
 
 const (
-	hintReplayForbidden    = "The write result is unknown. Do not replay the original request."
-	hintReplaySafe         = "The write result is unknown. Retrying the original request is safe."
-	hintSameKey            = "The write result is unknown. Retry only with the same idempotency key."
-	hintPartial            = "Continue only with completion.failed_items after correcting their errors. Do not replay completion.succeeded_items or completion.pending_items."
-	hintAcceptedUnverified = "The request was accepted, but the final moderator state was not verified."
-	hintUnsafeEvidence     = "The server response could not be safely mapped to the original request. Do not retry the write based on this response."
+	hintReplayForbidden = "The write result is unknown. Do not replay the original request."
+	hintReplaySafe      = "The write result is unknown. Retrying the original request is safe."
+	hintSameKey         = "The write result is unknown. Retry only with the same idempotency key."
+	hintUnsafeEvidence  = "The server response could not be safely mapped to the original request. Do not retry the write based on this response."
 )
 
 func invalidRequiredResult(field string) error {
@@ -51,15 +49,15 @@ func requiredResultPresent(data any, spec requiredSpec) bool {
 	if !ok {
 		return false
 	}
-	switch spec.shape {
+	switch spec.Shape {
 	case requiredTopString:
-		return nonEmptyString(root[spec.field]) != ""
+		return nonEmptyString(root[spec.Field]) != ""
 	case requiredTopObject:
-		object, ok := root[spec.field].(map[string]any)
+		object, ok := root[spec.Field].(map[string]any)
 		return ok && len(object) > 0
 	case requiredNestedString:
-		object, ok := root[spec.field].(map[string]any)
-		return ok && nonEmptyString(object[spec.child]) != ""
+		object, ok := root[spec.Field].(map[string]any)
+		return ok && nonEmptyString(object[spec.Child]) != ""
 	default:
 		return false
 	}
@@ -103,18 +101,18 @@ func finalizeBatch(s *Session, data any) (Result, error) {
 	}
 	requested := append([]ledgerItem{}, s.requested...)
 	failed := make([]ledgerItem, 0)
-	for _, spec := range s.contract.Strategy.failures {
+	for _, spec := range s.contract.Strategy.Failures {
 		evidence := extract(root, spec)
-		if err := validateEvidence(evidence, requested, spec.field, true); err != nil {
+		if err := validateEvidence(evidence, requested, spec.Field, true); err != nil {
 			return Result{}, err
 		}
 		failed = append(failed, evidence.items...)
 	}
 
 	responsePending := make([]ledgerItem, 0)
-	for _, spec := range s.contract.Strategy.pending {
+	for _, spec := range s.contract.Strategy.Pending {
 		evidence := extract(root, spec)
-		if err := validateEvidence(evidence, requested, spec.field, true); err != nil {
+		if err := validateEvidence(evidence, requested, spec.Field, true); err != nil {
 			return Result{}, err
 		}
 		responsePending = append(responsePending, evidence.items...)
@@ -125,9 +123,9 @@ func finalizeBatch(s *Session, data any) (Result, error) {
 		syntheticPending = append(syntheticPending, ledgerItem{key: "feed", value: "feed"})
 	}
 
-	if spec := s.contract.Strategy.resultLedger; spec != nil {
+	if spec := s.contract.Strategy.ResultLedger; spec != nil {
 		evidence := extract(root, *spec)
-		if err := validateEvidence(evidence, nil, spec.field, false); err != nil {
+		if err := validateEvidence(evidence, nil, spec.Field, false); err != nil {
 			return Result{}, err
 		}
 		requested = append(requested, evidence.items...)
@@ -138,25 +136,24 @@ func finalizeBatch(s *Session, data any) (Result, error) {
 	// represents a logical sub-request performed by a shortcut.
 	requested = append(requested, syntheticPending...)
 	pending := append(responsePending, syntheticPending...)
-	ledger := completion(requested, failed, pending)
+	ledger := completion(requested, failed, pending, s.contract.PartialRecovery)
 	root["completion"] = ledger
 	result := Result{OK: ledger.Status == "complete", Data: root}
 	if !result.OK {
 		result.ExitCode = output.ExitAPI
-		result.Hint = hintPartial
 	}
 	return result, nil
 }
 
 func statusFailures(root map[string]any, spec evidenceSpec) []ledgerItem {
-	values, _ := root[spec.field].([]any)
+	values, _ := root[spec.Field].([]any)
 	failed := make([]ledgerItem, 0)
 	for _, value := range values {
 		object, _ := value.(map[string]any)
 		if fmt.Sprint(object["status"]) != "failed" {
 			continue
 		}
-		item, ok := stringItem(object[spec.idField])
+		item, ok := stringItem(object[spec.IDField])
 		if ok {
 			failed = append(failed, item)
 		}
@@ -171,9 +168,9 @@ func finalizeAssertion(s *Session, data any) (Result, error) {
 	}
 	actual := make(map[string]struct{})
 	responseSetPresent := false
-	for _, spec := range s.contract.Strategy.responseSets {
+	for _, spec := range s.contract.Strategy.ResponseSets {
 		evidence := extract(root, spec)
-		if err := validateEvidence(evidence, nil, spec.field, false); err != nil {
+		if err := validateEvidence(evidence, nil, spec.Field, false); err != nil {
 			return Result{}, err
 		}
 		responseSetPresent = responseSetPresent || evidence.present
@@ -187,17 +184,16 @@ func finalizeAssertion(s *Session, data any) (Result, error) {
 	failed := make([]ledgerItem, 0)
 	for _, item := range s.requested {
 		_, exists := actual[item.key]
-		if (s.contract.Strategy.assertion == AssertRequestedPresent && !exists) ||
-			(s.contract.Strategy.assertion == AssertRequestedAbsent && exists) {
+		if (s.contract.Strategy.Assertion == AssertRequestedPresent && !exists) ||
+			(s.contract.Strategy.Assertion == AssertRequestedAbsent && exists) {
 			failed = append(failed, item)
 		}
 	}
-	ledger := completion(s.requested, failed, nil)
+	ledger := completion(s.requested, failed, nil, PartialRecoveryFailedItemsOnly)
 	root["completion"] = ledger
 	result := Result{OK: ledger.Status == "complete", Data: root}
 	if !result.OK {
 		result.ExitCode = output.ExitAPI
-		result.Hint = hintPartial
 	}
 	return result, nil
 }

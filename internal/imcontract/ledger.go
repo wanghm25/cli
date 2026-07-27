@@ -35,10 +35,10 @@ type extraction struct {
 }
 
 func extract(root map[string]any, spec evidenceSpec) extraction {
-	if root == nil || spec.field == "" {
+	if root == nil || spec.Field == "" {
 		return extraction{}
 	}
-	raw, present := root[spec.field]
+	raw, present := root[spec.Field]
 	if !present {
 		return extraction{}
 	}
@@ -63,7 +63,7 @@ func extract(root map[string]any, spec evidenceSpec) extraction {
 }
 
 func extractItem(value any, spec evidenceSpec) (ledgerItem, bool) {
-	switch spec.shape {
+	switch spec.Shape {
 	case evidenceStrings:
 		return stringItem(value)
 	case evidenceObjects:
@@ -71,13 +71,13 @@ func extractItem(value any, spec evidenceSpec) (ledgerItem, bool) {
 		if !ok {
 			return ledgerItem{}, false
 		}
-		return stringItem(object[spec.idField])
+		return stringItem(object[spec.IDField])
 	case evidenceNestedObjects:
-		object, ok := nestedObject(value, spec.container)
+		object, ok := nestedObject(value, spec.Container)
 		if !ok {
 			return ledgerItem{}, false
 		}
-		return stringItem(object[spec.idField])
+		return stringItem(object[spec.IDField])
 	case evidenceFeedObjects:
 		object, ok := value.(map[string]any)
 		if !ok {
@@ -85,7 +85,7 @@ func extractItem(value any, spec evidenceSpec) (ledgerItem, bool) {
 		}
 		return feedItem(object)
 	case evidenceNestedFeedObjects:
-		object, ok := nestedObject(value, spec.container)
+		object, ok := nestedObject(value, spec.Container)
 		if !ok {
 			return ledgerItem{}, false
 		}
@@ -99,7 +99,7 @@ func extractItem(value any, spec evidenceSpec) (ledgerItem, bool) {
 		if status != "ok" && status != "failed" {
 			return ledgerItem{}, false
 		}
-		return stringItem(object[spec.idField])
+		return stringItem(object[spec.IDField])
 	default:
 		return ledgerItem{}, false
 	}
@@ -173,7 +173,7 @@ func uniqueItems(items []ledgerItem) []ledgerItem {
 	return out
 }
 
-func completion(requested, failed, pending []ledgerItem) Completion {
+func completion(requested, failed, pending []ledgerItem, recovery PartialRecoveryMode) Completion {
 	requested = uniqueItems(requested)
 	requestedSet := make(map[string]struct{}, len(requested))
 	for _, item := range requested {
@@ -218,7 +218,12 @@ func completion(requested, failed, pending []ledgerItem) Completion {
 	retryScope := "none"
 	if len(failed) > 0 || len(pending) > 0 {
 		status = "partial"
-		if len(failed) > 0 {
+		switch {
+		case len(pending) > 0:
+			retryScope = "none"
+		case recovery == PartialRecoveryWholeRequest:
+			retryScope = "whole_request"
+		default:
 			retryScope = "failed_items_only"
 		}
 	}

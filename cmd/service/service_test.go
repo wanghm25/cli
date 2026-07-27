@@ -1203,7 +1203,7 @@ func TestGeneratedIMModerationAlwaysReportsAcceptedUnverified(t *testing.T) {
 	}
 	completion := env["data"].(map[string]any)["completion"].(map[string]any)
 	if completion["status"] != "accepted_unverified" || completion["final_state_verified"] != false ||
-		env["hint"] != "The request was accepted, but the final moderator state was not verified." {
+		env["hint"] != nil {
 		t.Fatalf("unexpected envelope: %#v", env)
 	}
 }

@@ -491,6 +491,8 @@ func TestImFeedShortcutCreateExecuteCallsAPI(t *testing.T) {
 		t.Fatalf("Set chat-id error = %v", err)
 	}
 	setRuntimeField(t, rt, "Cmd", cmd)
+	contract, _ := imcontract.Lookup("im +feed-shortcut-create")
+	setRuntimeField(t, rt, "contractSession", imcontract.NewSession(contract))
 
 	err := ImFeedShortcutCreate.Execute(context.Background(), rt)
 	var pfErr *output.PartialFailureError
@@ -525,6 +527,20 @@ func TestImFeedShortcutCreateExecuteCallsAPI(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("stdout = %s, want %q", out, want)
 		}
+	}
+	var envelope struct {
+		Hint string `json:"hint"`
+		Data struct {
+			Completion imcontract.Completion `json:"completion"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &envelope); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, out)
+	}
+	if envelope.Data.Completion.RetryScope != "whole_request" ||
+		envelope.Data.Completion.FailedCount != 1 ||
+		envelope.Hint != "" {
+		t.Fatalf("completion = %#v, hint = %q", envelope.Data.Completion, envelope.Hint)
 	}
 }
 
@@ -659,6 +675,53 @@ func TestImFeedShortcutRemoveExecuteCallsRemovePath(t *testing.T) {
 	// Remove must not send is_header — that's a create-only field.
 	if strings.Contains(string(gotBody), "is_header") {
 		t.Fatalf("Execute() body = %s, should NOT contain is_header", gotBody)
+	}
+}
+
+func TestImFeedShortcutRemovePartialFailureUsesWholeRequestRecovery(t *testing.T) {
+	rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return shortcutJSONResponse(200, map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"failed_shortcuts": []any{
+					map[string]any{
+						"reason": float64(2),
+						"shortcut": map[string]any{
+							"feed_card_id": "oc_abc",
+							"type":         float64(1),
+						},
+					},
+				},
+			},
+		}), nil
+	}))
+	cmd := newFeedShortcutRemoveCmd(t)
+	if err := cmd.Flags().Set("chat-id", "oc_abc"); err != nil {
+		t.Fatalf("Set chat-id error = %v", err)
+	}
+	setRuntimeField(t, rt, "Cmd", cmd)
+	contract, _ := imcontract.Lookup("im +feed-shortcut-remove")
+	setRuntimeField(t, rt, "contractSession", imcontract.NewSession(contract))
+
+	err := ImFeedShortcutRemove.Execute(context.Background(), rt)
+	var partialErr *output.PartialFailureError
+	if !errors.As(err, &partialErr) {
+		t.Fatalf("Execute() error = %T %v, want partial failure", err, err)
+	}
+	var envelope struct {
+		Hint string `json:"hint"`
+		Data struct {
+			Completion imcontract.Completion `json:"completion"`
+		} `json:"data"`
+	}
+	out := rt.Factory.IOStreams.Out.(*bytes.Buffer).Bytes()
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, out)
+	}
+	if envelope.Data.Completion.RetryScope != "whole_request" ||
+		envelope.Data.Completion.FailedCount != 1 ||
+		envelope.Hint != "" {
+		t.Fatalf("completion = %#v, hint = %q", envelope.Data.Completion, envelope.Hint)
 	}
 }
 

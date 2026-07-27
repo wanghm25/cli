@@ -26,7 +26,7 @@ func (s *Session) Contract() Contract {
 }
 
 func (s *Session) ObserveRequest(body map[string]any) error {
-	if spec := s.contract.Strategy.request; spec.field != "" {
+	if spec := s.contract.Strategy.Request; spec.Field != "" {
 		evidence := extract(body, spec)
 		if !evidence.present || evidence.selectedCount == 0 ||
 			evidence.rejectedCount != 0 ||
@@ -34,7 +34,7 @@ func (s *Session) ObserveRequest(body map[string]any) error {
 			return errs.NewValidationError(
 				errs.SubtypeInvalidArgument,
 				"IM write request field %q has an unsupported shape",
-				spec.field,
+				spec.Field,
 			)
 		}
 		s.requested = uniqueItems(append(s.requested, evidence.items...))
@@ -74,8 +74,8 @@ func (s *Session) FinalizeSuccess(data any) (Result, error) {
 	case AuthoritativeAckKind:
 		return Result{OK: true, Data: data}, nil
 	case RequiredResultKind:
-		if !requiredResultPresent(data, s.contract.Strategy.required) {
-			return Result{}, s.FinalizeError(invalidRequiredResult(requiredLabel(s.contract.Strategy.required)))
+		if !requiredResultPresent(data, s.contract.Strategy.Required) {
+			return Result{}, s.FinalizeError(invalidRequiredResult(requiredLabel(s.contract.Strategy.Required)))
 		}
 		return Result{OK: true, Data: data}, nil
 	case BatchPartialKind:
@@ -88,8 +88,8 @@ func (s *Session) FinalizeSuccess(data any) (Result, error) {
 		if !result.OK {
 			return result, nil
 		}
-		if !requiredResultPresent(data, s.contract.Strategy.required) {
-			return Result{}, s.FinalizeError(invalidRequiredResult(requiredLabel(s.contract.Strategy.required)))
+		if !requiredResultPresent(data, s.contract.Strategy.Required) {
+			return Result{}, s.FinalizeError(invalidRequiredResult(requiredLabel(s.contract.Strategy.Required)))
 		}
 		return result, nil
 	case ResponseSetAssertionKind:
@@ -104,7 +104,7 @@ func (s *Session) FinalizeSuccess(data any) (Result, error) {
 			"final_state_verified": false,
 			"retry_scope":          "none",
 		}
-		return Result{OK: true, Data: m, Hint: hintAcceptedUnverified}, nil
+		return Result{OK: true, Data: m}, nil
 	default:
 		return Result{}, errs.NewInternalError(
 			errs.SubtypeInvalidResponse,
@@ -115,10 +115,10 @@ func (s *Session) FinalizeSuccess(data any) (Result, error) {
 }
 
 func requiredLabel(spec requiredSpec) string {
-	if spec.child == "" {
-		return spec.field
+	if spec.Child == "" {
+		return spec.Field
 	}
-	return spec.field + "/" + spec.child
+	return spec.Field + "/" + spec.Child
 }
 
 func (s *Session) FinalizeError(err error) error {

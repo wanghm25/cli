@@ -17,7 +17,6 @@ const (
 	hintStartPage      = "This read started from a supplied page token and does not prove the collection was exhausted from the beginning."
 	hintServerTruncate = "The server truncated the result. Narrow the query range before retrying."
 	hintSearchEmpty    = "The search was exhausted, but an empty search result does not prove that the resource does not exist."
-	hintBatchReactions = "This result covers only the returned reaction fragments; use `im reactions list` to exhaust one message's reactions."
 )
 
 type ReadOptions struct {
@@ -72,7 +71,7 @@ func (s *ReadSession) Finalize(data any) (ReadResult, error) {
 		return ReadResult{
 			OK:   true,
 			Data: data,
-			Hint: s.contract.Strategy.readHint,
+			Hint: s.contract.Strategy.ReadHint,
 		}, nil
 	case CollectionReadKind, SearchReadKind:
 		if !s.observed {
@@ -95,7 +94,7 @@ func (s *ReadSession) Finalize(data any) (ReadResult, error) {
 	}
 	if s.contract.Strategy.Kind == SearchReadKind &&
 		s.status.StopReason == client.StopReasonExhausted &&
-		searchCollectionEmpty(data, s.contract.Strategy.collectionField) {
+		searchCollectionEmpty(data, s.contract.Strategy.CollectionField) {
 		result.Hint = joinHints(result.Hint, hintSearchEmpty)
 	}
 	return result, nil
