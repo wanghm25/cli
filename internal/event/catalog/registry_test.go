@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Lark Technologies Pte. Ltd.
 // SPDX-License-Identifier: MIT
 
-package event
+package catalog
 
 import (
 	"context"
@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/larksuite/cli/internal/event/model"
 )
 
 func mustPanic(t *testing.T, substring string) {
@@ -43,8 +45,8 @@ func customSchema() SchemaDef {
 	return SchemaDef{Custom: &SchemaSpec{Type: reflect.TypeOf(emptyOut{})}}
 }
 
-func customProcess() func(context.Context, APIClient, *RawEvent, map[string]string) (json.RawMessage, error) {
-	return func(context.Context, APIClient, *RawEvent, map[string]string) (json.RawMessage, error) {
+func customProcess() func(context.Context, model.APIClient, *model.RawEvent, map[string]string) (json.RawMessage, error) {
+	return func(context.Context, model.APIClient, *model.RawEvent, map[string]string) (json.RawMessage, error) {
 		return nil, nil
 	}
 }

@@ -66,8 +66,8 @@ func ParseAndValidateFilter(raw string, meta FilterMeta) (*Filter, error) {
 	if err != nil {
 		return nil, newFilterError("filter could not be serialized").WithCause(err)
 	}
-	if len(canonical) > meta.maxBytes() {
-		return nil, newFilterError("filter exceeds the maximum size of %d bytes", meta.maxBytes())
+	if len(canonical) > meta.EffectiveMaxBytes() {
+		return nil, newFilterError("filter exceeds the maximum size of %d bytes", meta.EffectiveMaxBytes())
 	}
 	return f, nil
 }
@@ -102,8 +102,8 @@ func (v *filterValidator) walkNode(cc *larkeventv1.CompositeCondition, depth int
 // walkComposite validates a composite node: nesting depth, logic_op, and each
 // child in order.
 func (v *filterValidator) walkComposite(cc *larkeventv1.CompositeCondition, depth int) (*FilterNode, error) {
-	if depth > v.meta.maxDepth() {
-		return nil, newFilterError("filter nesting exceeds the maximum of %d levels", v.meta.maxDepth())
+	if depth > v.meta.EffectiveMaxDepth() {
+		return nil, newFilterError("filter nesting exceeds the maximum of %d levels", v.meta.EffectiveMaxDepth())
 	}
 	if cc.LogicOp == nil {
 		return nil, newFilterError("a composite filter requires a logic_op")
@@ -130,8 +130,8 @@ func (v *filterValidator) walkComposite(cc *larkeventv1.CompositeCondition, dept
 // walkLeaf validates one leaf condition against the operand's capability.
 func (v *filterValidator) walkLeaf(c *larkeventv1.Contidion) (*FilterNode, error) {
 	v.condCount++
-	if v.condCount > v.meta.maxConditions() {
-		return nil, newFilterError("filter exceeds the maximum of %d conditions", v.meta.maxConditions())
+	if v.condCount > v.meta.EffectiveMaxConditions() {
+		return nil, newFilterError("filter exceeds the maximum of %d conditions", v.meta.EffectiveMaxConditions())
 	}
 	if c.Operand == nil || *c.Operand == "" {
 		return nil, newFilterError("a filter condition requires an operand")
@@ -167,7 +167,7 @@ func (v *filterValidator) walkLeaf(c *larkeventv1.Contidion) (*FilterNode, error
 		if len(c.ListValue) == 0 {
 			return nil, newFilterError("the in operator requires a non-empty list_value")
 		}
-		if max := opMeta.listValueMax(); len(c.ListValue) > max {
+		if max := opMeta.EffectiveListValueMax(); len(c.ListValue) > max {
 			return nil, newFilterError("filter list_value exceeds the maximum of %d items", max)
 		}
 		if opMeta.InputValueType == inputValueTypeOpenID {
@@ -191,36 +191,6 @@ func (v *filterValidator) walkLeaf(c *larkeventv1.Contidion) (*FilterNode, error
 		cond.Value = *c.Value
 	}
 	return &FilterNode{Condition: cond}, nil
-}
-
-// maxDepth / maxConditions / maxBytes fall back to the package caps when a
-// capability omits a limit, so a mis-seeded meta can never widen a hard cap.
-func (m FilterMeta) maxDepth() int {
-	if m.MaxDepth > 0 && m.MaxDepth <= filterMaxDepth {
-		return m.MaxDepth
-	}
-	return filterMaxDepth
-}
-
-func (m FilterMeta) maxConditions() int {
-	if m.MaxConditions > 0 && m.MaxConditions <= filterMaxConditions {
-		return m.MaxConditions
-	}
-	return filterMaxConditions
-}
-
-func (m FilterMeta) maxBytes() int {
-	if m.MaxBytes > 0 && m.MaxBytes <= filterMaxBytes {
-		return m.MaxBytes
-	}
-	return filterMaxBytes
-}
-
-func (o FilterOperandMeta) listValueMax() int {
-	if o.ListValueMax > 0 && o.ListValueMax <= filterListValueCap {
-		return o.ListValueMax
-	}
-	return filterListValueCap
 }
 
 // looksLikeOpenID reports whether s has the shape of an open_id ("ou_" followed

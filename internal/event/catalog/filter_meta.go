@@ -1,16 +1,17 @@
 // Copyright (c) 2026 Lark Technologies Pte. Ltd.
 // SPDX-License-Identifier: MIT
 
-package event
+package catalog
 
 // Default filter limits shared by every Filter-supporting event_type. The
 // platform caps operator list_value length at 10; a canonical filter payload
-// must fit in 1 KiB.
+// must fit in 1 KiB. They are exported so the SDK-coupled filter validator in
+// package event (which cannot live here) clamps against the same hard caps.
 const (
-	filterMaxDepth      = 2
-	filterMaxConditions = 10
-	filterMaxBytes      = 1024
-	filterListValueCap  = 10
+	FilterMaxDepth      = 2
+	FilterMaxConditions = 10
+	FilterMaxBytes      = 1024
+	FilterListValueCap  = 10
 )
 
 // FilterMeta describes the server-side filter capability of one event_type: the
@@ -32,7 +33,7 @@ type FilterOperandMeta struct {
 	Key            string   // operand name, e.g. "sender" / "message_type"
 	Operators      []string // subset of FilterMeta.Operators allowed for this operand
 	InputValueType string   // projected value shape, e.g. "open_id"; "" if unconstrained
-	ListValueMax   int      // per-operand list_value cap (<= filterListValueCap); 0 if the operand takes no list
+	ListValueMax   int      // per-operand list_value cap (<= FilterListValueCap); 0 if the operand takes no list
 }
 
 // Operand returns the operand meta for key.
@@ -43,6 +44,39 @@ func (m FilterMeta) Operand(key string) (FilterOperandMeta, bool) {
 		}
 	}
 	return FilterOperandMeta{}, false
+}
+
+// EffectiveMaxDepth / EffectiveMaxConditions / EffectiveMaxBytes fall back to
+// the package caps when a capability omits a limit, so a mis-seeded meta can
+// never widen a hard cap.
+func (m FilterMeta) EffectiveMaxDepth() int {
+	if m.MaxDepth > 0 && m.MaxDepth <= FilterMaxDepth {
+		return m.MaxDepth
+	}
+	return FilterMaxDepth
+}
+
+func (m FilterMeta) EffectiveMaxConditions() int {
+	if m.MaxConditions > 0 && m.MaxConditions <= FilterMaxConditions {
+		return m.MaxConditions
+	}
+	return FilterMaxConditions
+}
+
+func (m FilterMeta) EffectiveMaxBytes() int {
+	if m.MaxBytes > 0 && m.MaxBytes <= FilterMaxBytes {
+		return m.MaxBytes
+	}
+	return FilterMaxBytes
+}
+
+// EffectiveListValueMax is the per-operand list_value cap, clamped to the
+// package cap for the same mis-seed protection as the FilterMeta limits.
+func (o FilterOperandMeta) EffectiveListValueMax() int {
+	if o.ListValueMax > 0 && o.ListValueMax <= FilterListValueCap {
+		return o.ListValueMax
+	}
+	return FilterListValueCap
 }
 
 // filterMetaRegistry holds the per-event_type filter capability, keyed by
