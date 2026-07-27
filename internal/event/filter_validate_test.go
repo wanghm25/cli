@@ -112,6 +112,38 @@ func TestParseAndValidateFilter_Unsupported(t *testing.T) {
 	}
 }
 
+// TestParseAndValidateFilter_TrailingContentRejected locks that input carrying
+// anything after one complete JSON object is rejected. A trailing `]`/`}` is
+// the case a dec.More()-based check misses (More reads them as an array/object
+// terminator), alongside a second value or plain garbage; a clean single object
+// stays accepted.
+func TestParseAndValidateFilter_TrailingContentRejected(t *testing.T) {
+	const valid = `{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"eq","value":"text"}}]}}`
+
+	// Sanity: the base filter alone is a single valid object and is accepted.
+	if _, err := ParseAndValidateFilter(valid, seededFilterMeta()); err != nil {
+		t.Fatalf("base filter must be accepted unchanged: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"trailing close bracket", valid + "]"},
+		{"trailing close brace", valid + "}"},
+		{"trailing garbage", valid + " nonsense"},
+		{"trailing second object", valid + " " + valid},
+		{"trailing comma value", valid + ",1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := assertRejected(t, tc.raw, seededFilterMeta())
+			if !strings.Contains(p.Message, "single JSON object") {
+				t.Errorf("message = %q, want it to mention a single JSON object", p.Message)
+			}
+		})
+	}
+}
+
 // TestParseAndValidateFilter_RuleViolations pins one rejection per DSL rule and
 // limit. All use the seeded demo capability unless noted.
 func TestParseAndValidateFilter_RuleViolations(t *testing.T) {

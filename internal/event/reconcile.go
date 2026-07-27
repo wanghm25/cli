@@ -287,6 +287,15 @@ func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, t
 				"reconcile: requestedIncludeResourceData=true requires WithEncryptKeyProber (classify now) or WithDeferredEncryptKeyConfirmation (defer to the bus) to resolve an existing include_resource_data=true match; neither was supplied")
 		}
 	case "suspended":
+		// Filter is a reuse dimension on the suspended path too. A suspended
+		// match is reactivated and reused by the caller; reactivating one whose
+		// remote filter differs from the requested filter would bind the caller
+		// to the wrong event stream, so a filter mismatch is a conflict a human
+		// resolves (via update or a new subscription), never a silent
+		// reactivate-reuse — the same fail-closed rule the active path enforces.
+		if !Equal(cfg.requestedFilter, FilterFromSDK(match.Filter)) {
+			return filterConflictPlan(match), nil
+		}
 		return &ReconcilePlan{Action: PlanActionSuspended, Existing: match}, nil
 	default:
 		// "expired", "deleted", "", or any other/unknown state: inert:
@@ -337,8 +346,14 @@ func probeEncryptedActiveMatch(ctx context.Context, prober EncryptKeyProber, req
 	}, nil
 }
 
-// filterConflictPlan builds the PlanActionConflict returned when an active
-// match's remote filter differs from the requested filter. The reason names
+// FilterConflictField is the ConflictFields name used for a server-side filter
+// mismatch. Callers surfacing a conflict use ConflictOnFilter to detect this
+// dimension so they can steer recovery to the non-destructive update path (a
+// filter is changeable in place) rather than delete-and-recreate.
+const FilterConflictField = "filter"
+
+// filterConflictPlan builds the PlanActionConflict returned when a remote
+// match's filter differs from the requested filter. The reason names
 // only the dimension, never the filter contents or values on either side, so
 // no filter payload can leak into an error string.
 func filterConflictPlan(match *larkeventv1.SubscriptionDetail) *ReconcilePlan {
@@ -346,10 +361,23 @@ func filterConflictPlan(match *larkeventv1.SubscriptionDetail) *ReconcilePlan {
 		Action:   PlanActionConflict,
 		Existing: match,
 		ConflictFields: []errs.InvalidParam{{
-			Name:   "filter",
+			Name:   FilterConflictField,
 			Reason: "the requested event filter does not match the existing subscription's filter",
 		}},
 	}
+}
+
+// ConflictOnFilter reports whether a conflict's fields include the server-side
+// filter dimension. A filter difference is resolvable in place with
+// `event subscription update`, so a caller can steer such a conflict to that
+// non-destructive path instead of delete-and-recreate.
+func ConflictOnFilter(fields []errs.InvalidParam) bool {
+	for _, f := range fields {
+		if f.Name == FilterConflictField {
+			return true
+		}
+	}
+	return false
 }
 
 // AuthorityMatchesIdentity reports whether a, an already-observed remote

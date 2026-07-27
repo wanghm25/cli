@@ -5,6 +5,7 @@ package event
 
 import (
 	"encoding/json"
+	"io"
 	"slices"
 	"strings"
 
@@ -37,7 +38,13 @@ func ParseAndValidateFilter(raw string, meta FilterMeta) (*Filter, error) {
 	if err := dec.Decode(&sf); err != nil {
 		return nil, newFilterError("filter is not valid JSON or contains an unknown field").WithCause(err)
 	}
-	if dec.More() {
+	// Require the input to be exactly one JSON value. A second decode must hit
+	// io.EOF; anything else — a second value, or trailing bytes such as a stray
+	// `]`/`}` or garbage (which dec.More() reads as end-of-array/object and so
+	// fails to catch) — means the input was not a single JSON object. The raw
+	// content is never echoed back.
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
 		return nil, newFilterError("filter must be a single JSON object")
 	}
 	if sf.CompositeCondition == nil {

@@ -745,3 +745,58 @@ func TestReconcileExisting_EncryptedDeferred_FilterMismatch_ReturnsConflict(t *t
 		t.Errorf("ConflictFields = %+v, want one entry naming filter", plan.ConflictFields)
 	}
 }
+
+// ---- ReconcileExisting: suspended-path filter reuse dimension ----
+//
+// A suspended match is reactivated and reused by the caller. Reactivating one
+// whose remote filter differs from the requested filter would bind the caller
+// to the wrong event stream, so the same fail-closed filter compare the active
+// path uses applies here too: a mismatch is a conflict (never a silent
+// reactivate-reuse), an equal filter leaves the reuse-eligible suspended plan.
+
+// suspendedFilteredSub is a suspended authority match carrying remote filter f.
+func suspendedFilteredSub(id, reason string, f *Filter) *larkeventv1.SubscriptionDetail {
+	sub := suspendedSub(id, reason)
+	sub.Filter = FilterToSDK(f)
+	return sub
+}
+
+func TestReconcileExisting_Suspended_FilterMismatch_ReturnsConflict(t *testing.T) {
+	fake := &fakeLister{resp: listResp([]*larkeventv1.SubscriptionDetail{
+		suspendedFilteredSub("sub_1", "authority_revoked", sampleFilter()),
+	})}
+
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, WithRequestedFilter(filterAlt()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionConflict {
+		t.Fatalf("Action = %q, want %q (an incompatible suspended sub must not be silently reactivated/reused)", plan.Action, PlanActionConflict)
+	}
+	if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Name != "filter" {
+		t.Fatalf("ConflictFields = %+v, want one entry naming filter", plan.ConflictFields)
+	}
+	// Never-leak: the reason must name only the dimension, not any filter contents.
+	if strings.Contains(plan.ConflictFields[0].Reason, "message_type") ||
+		strings.Contains(plan.ConflictFields[0].Reason, "ou_abc") ||
+		strings.Contains(plan.ConflictFields[0].Reason, "text") {
+		t.Errorf("Reason must not leak filter contents: %q", plan.ConflictFields[0].Reason)
+	}
+}
+
+func TestReconcileExisting_Suspended_FilterEqual_ReturnsSuspended(t *testing.T) {
+	fake := &fakeLister{resp: listResp([]*larkeventv1.SubscriptionDetail{
+		suspendedFilteredSub("sub_1", "authority_revoked", sampleFilter()),
+	})}
+
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, WithRequestedFilter(sampleFilter()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionSuspended {
+		t.Errorf("Action = %q, want %q (an equal filter is compatible; reactivate-reuse stays OK)", plan.Action, PlanActionSuspended)
+	}
+	if plan.Existing == nil || strVal(plan.Existing.SubscriptionId) != "sub_1" {
+		t.Errorf("Existing = %+v, want sub_1", plan.Existing)
+	}
+}
