@@ -260,16 +260,35 @@ func TestApplyUpdate_ClearFilter_PatchesWhenFilterPresent(t *testing.T) {
 	}
 }
 
+// TestApplyUpdate_ClearFilter_NoOpWhenAlreadyEmpty locks that clearing an
+// already-unfiltered subscription is a no-op (no Patch) and that its message
+// says the subscription already has no filter — not the --filter no-op's
+// "already has the requested filter" wording — mirroring the same
+// --clear-filter/--filter distinction updateDryRunNextAction already makes
+// for the --dry-run no-op case.
 func TestApplyUpdate_ClearFilter_NoOpWhenAlreadyEmpty(t *testing.T) {
 	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))} // no filter
+	var buf bytes.Buffer
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
-		updateOpts{clearFilter: true})
+	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
+		updateOpts{clearFilter: true, asJSON: true})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if fake.patchCalls != 0 {
 		t.Errorf("patchCalls = %d, want 0 (clearing an already-unfiltered subscription is a no-op)", fake.patchCalls)
+	}
+
+	var generic map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &generic); err != nil {
+		t.Fatalf("json.Unmarshal: %v; raw: %s", err, buf.Bytes())
+	}
+	nextAction, _ := generic["next_action"].(string)
+	if !strings.Contains(nextAction, "already has no filter") {
+		t.Errorf("next_action = %q, want it to say the subscription already has no filter", nextAction)
+	}
+	if strings.Contains(nextAction, "requested filter") {
+		t.Errorf(`next_action = %q, must not use the --filter no-op's "requested filter" wording for a --clear-filter no-op`, nextAction)
 	}
 }
 
@@ -494,6 +513,35 @@ func TestRunUpdate_NoFilterFlag_RejectedBeforeNetwork(t *testing.T) {
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
 	cmd.SetArgs([]string{"sub_1"}) // neither --filter nor --clear-filter
+
+	err := cmd.Execute()
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeInvalidArgument {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeInvalidArgument)
+	}
+	if ve.Param != "--filter" {
+		t.Errorf("Param = %q, want --filter", ve.Param)
+	}
+}
+
+// TestRunUpdate_BlankFilterValue_RejectedBeforeNetwork locks that --filter
+// given an explicit but blank value (e.g. --filter "$UNSET_VAR" expanding to
+// "" in a script) is rejected as a caller mistake, purely locally, before any
+// identity/scope/network step — like its sibling mutual-exclusion checks
+// above, it reaches the scope preflight (and Get/Patch) only past this check,
+// so a zero-value *cmdutil.Factory proves no network call was attempted.
+// Left unrejected, this would fall through to ParseAndValidateFilter, which
+// accepts "" as a valid empty filter with no error — silently clearing a
+// currently-filtered subscription instead of surfacing the caller's mistake.
+func TestRunUpdate_BlankFilterValue_RejectedBeforeNetwork(t *testing.T) {
+	f := &cmdutil.Factory{}
+	cmd := NewCmdUpdate(f)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"sub_1", "--filter", ""})
 
 	err := cmd.Execute()
 	var ve *errs.ValidationError

@@ -145,6 +145,17 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 			"specify --filter <json> or --clear-filter").
 			WithParam("--filter").
 			WithHint("pass --filter <json> to set a server-side filter, or --clear-filter to remove the current one; see `lark-cli event schema <key> --json` for the filter shape")
+	case filterSet && strings.TrimSpace(o.filter) == "":
+		// A blank --filter (e.g. from an unset variable interpolated into the
+		// command line, --filter "$UNSET_VAR") is a caller mistake, not a
+		// request to clear the filter — ParseAndValidateFilter would otherwise
+		// accept "" as the empty filter and silently widen delivery on a
+		// currently-filtered subscription. Rejected here, before any
+		// identity/scope/network work.
+		return errs.NewValidationError(errs.SubtypeInvalidArgument,
+			"--filter was given a blank value").
+			WithParam("--filter").
+			WithHint("pass --filter <json> with a non-empty filter, or use --clear-filter to remove the current filter instead")
 	}
 
 	ctx := cmd.Context()
@@ -233,10 +244,16 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 
 	if noChange {
 		// The requested filter already matches the current one — report the
-		// unchanged subscription without issuing a Patch (for --clear-filter
-		// this is the "already has no filter" case).
+		// unchanged subscription without issuing a Patch. Mirrors
+		// updateDryRunNextAction's noop wording: a --clear-filter no-op says
+		// the subscription already has no filter; a --filter no-op says it
+		// already has the requested filter.
+		already := "already has the requested filter"
+		if o.clearFilter {
+			already = "already has no filter"
+		}
 		result := buildMutationResult("update", before,
-			fmt.Sprintf("no change: remote_subscription_id=%s already has the requested filter; run `lark-cli event subscription get %s --as %s --json` to confirm", remoteSubscriptionID, remoteSubscriptionID, identity))
+			fmt.Sprintf("no change: remote_subscription_id=%s %s; run `lark-cli event subscription get %s --as %s --json` to confirm", remoteSubscriptionID, already, remoteSubscriptionID, identity))
 		if o.asJSON {
 			output.PrintJson(out, result)
 			return nil
