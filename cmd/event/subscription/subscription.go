@@ -96,15 +96,13 @@ Subscription here never starts, stops, or changes a local consumer.`,
 var subscriptionReadScopes = []string{"event:subscription:read"}
 
 // subscriptionEncryptKeyReadScopes is the scope required to fetch a
-// subscription's encrypt_key via eventlib.SubscriptionClient.GetEncryptKey
-// (internal/event/subscription_client.go) — event:encrypt_key:read is a
-// distinct scope that neither subscriptionReadScopes nor
-// subscriptionMutationScopes implies.
+// subscription's encrypt_key via the platform/lark gateway's GetEncryptKey —
+// event:encrypt_key:read is a distinct scope that neither subscriptionReadScopes
+// nor subscriptionMutationScopes implies.
 // create.go's createRequiredScopes wires this in for
-// --include-resource-data=true: that path's reconcile step probes
-// GetEncryptKey (eventlib.ReconcileExisting's WithEncryptKeyProber) to
-// classify an existing include_resource_data=true match, so it needs this
-// scope on top of subscriptionMutationScopes.
+// --include-resource-data=true: under the ManagementCreate policy the Planner
+// probes GetEncryptKey to classify an existing include_resource_data=true match,
+// so it needs this scope on top of subscriptionMutationScopes.
 var subscriptionEncryptKeyReadScopes = []string{"event:encrypt_key:read"}
 
 // addAsFlag registers the --as flag shared by every subscription

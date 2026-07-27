@@ -5,18 +5,18 @@ package subscription
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
 	"github.com/spf13/cobra"
-
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	eventlib "github.com/larksuite/cli/internal/event"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/output"
 )
 
@@ -46,7 +46,7 @@ type createOpts struct {
 // --include-resource-data=true — creates an ENCRYPTED subscription for
 // --include-resource-data=true
 // (a fresh CSPRNG-generated per-subscription encrypt_key, submitted
-// atomically with the Create request; see doCreateSubscription), and
+// atomically with the Create request by the subscription Controller), and
 // reconciles against remote state before ever writing:
 // not-exist -> create, active+compatible -> idempotent reuse,
 // active+conflicting (including the encryption dimension) -> typed
@@ -198,42 +198,80 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 	if err != nil {
 		return err
 	}
-	client, err := eventlib.NewSubscriptionClient(sdk, identity, uat)
+	gateway, err := larkgw.NewSubscriptionGateway(sdk, identity, uat)
+	if err != nil {
+		return err
+	}
+
+	return applyCreate(ctx, subown.NewController(gateway), f.IOStreams.Out, resolved, identity, o, reqFilter)
+}
+
+// createController is the subset of *subown.Controller create's flow drives:
+// Plan (the read-only Observe+classify a --dry-run renders and a real run acts
+// on) and Apply (the single remote write). Declared as an interface so tests
+// substitute a fake Controller (or a real one over a fake gateway) with no
+// *lark.Client or network call.
+type createController interface {
+	Plan(ctx context.Context, policy subown.Policy, req subown.Request) (subown.SubscriptionPlan, error)
+	Apply(ctx context.Context, plan subown.SubscriptionPlan, policy subown.Policy, req subown.Request) (subown.ApplyReceipt, error)
+}
+
+// applyCreate is create's testable core: Observe+Plan against remote state, then
+// either render the --dry-run preview, act on a writable plan (create/reuse), or
+// map a non-writable plan (conflict/suspended/indeterminate) to a typed error.
+// It never itself builds a request body or calls the SDK — the Controller and
+// the platform/lark gateway own all of that.
+func applyCreate(ctx context.Context, controller createController, out io.Writer, resolved eventlib.ResolvedEventKey, identity core.Identity, o createOpts, reqFilter *eventlib.Filter) error {
+	req := subown.Request{
+		EventType:           resolved.Definition.EventType,
+		TargetResource:      resolved.TargetResource,
+		Identity:            identity,
+		IncludeResourceData: o.includeResourceData,
+		Filter:              reqFilter,
+	}
+
+	plan, err := controller.Plan(ctx, subown.ManagementCreate, req)
 	if err != nil {
 		return err
 	}
 
 	if o.dryRun {
-		plan, err := reconcileExisting(ctx, client, resolved.Definition.EventType, resolved.TargetResource, identity, o.includeResourceData, reqFilter)
-		if err != nil {
-			return err
-		}
-		if plan.PaginationCapped {
-			fmt.Fprintln(f.IOStreams.ErrOut, eventlib.PaginationCappedWarning(resolved.Definition.EventType, resolved.TargetResource))
-		}
 		result := buildDryRunResult(resolved, identity, plan, o.includeResourceData)
 		if o.asJSON {
-			output.PrintJson(f.IOStreams.Out, result)
+			output.PrintJson(out, result)
 			return nil
 		}
-		writeCreateDryRunText(f.IOStreams.Out, result)
+		writeCreateDryRunText(out, result)
 		return nil
 	}
 
-	outcome, err := createOrReuseSubscription(ctx, client, resolved, identity, o.includeResourceData, reqFilter)
-	if err != nil {
-		return err
-	}
-	if outcome.PaginationCapped {
-		fmt.Fprintln(f.IOStreams.ErrOut, eventlib.PaginationCappedWarning(resolved.Definition.EventType, resolved.TargetResource))
-	}
-	result := buildCreateResult(resolved, identity, outcome)
-	if o.asJSON {
-		output.PrintJson(f.IOStreams.Out, result)
+	switch plan.Action {
+	case subown.ActionBlock:
+		return blockError(resolved, identity, plan, o.includeResourceData)
+	case subown.ActionIndeterminate:
+		return indeterminateError(resolved, identity)
+	case subown.ActionCreate, subown.ActionReuse:
+		receipt, err := controller.Apply(ctx, plan, subown.ManagementCreate, req)
+		if err != nil {
+			// The Controller's bounded reconcile-after-a-failed-create pass may
+			// have found a raced remote state that now blocks — surface it as the
+			// same typed conflict/suspended error a first-pass block would.
+			var blocked *subown.PlanBlockedError
+			if errors.As(err, &blocked) {
+				return blockError(resolved, identity, blocked.Plan, o.includeResourceData)
+			}
+			return err
+		}
+		result := buildCreateResult(resolved, identity, receipt)
+		if o.asJSON {
+			output.PrintJson(out, result)
+			return nil
+		}
+		writeCreateText(out, result)
 		return nil
+	default:
+		return errs.NewInternalError(errs.SubtypeUnknown, "unexpected subscription plan action %q", plan.Action)
 	}
-	writeCreateText(f.IOStreams.Out, result)
-	return nil
 }
 
 // checkTemplateAuthTypes enforces the second, stricter
@@ -276,14 +314,13 @@ func errCreateRequiresRefinedKey(eventKeyArg string) error {
 // createRequiredScopes returns the scopes create's preflight
 // (resolveUATAndCheckScopes) must check for this request: the usual
 // subscriptionMutationScopes, plus event:encrypt_key:read when
-// includeResourceData is true (create's
-// reconcile probes GetEncryptKey via WithEncryptKeyProber to classify an
-// existing include_resource_data=true match, which needs that scope; see
-// reconcileExisting below). Always builds a fresh slice rather than
-// `append`-ing onto subscriptionMutationScopes directly — that package-level
-// var is shared by dry-run's default scope reporting and any future sibling
-// command, so mutating (or risking an aliasing reallocation into) its
-// backing array here would be a subtle, hard-to-spot bug.
+// includeResourceData is true (create's ManagementCreate policy probes
+// GetEncryptKey to classify an existing include_resource_data=true match, which
+// needs that scope). Always builds a fresh slice rather than `append`-ing onto
+// subscriptionMutationScopes directly — that package-level var is shared by
+// dry-run's default scope reporting and any future sibling command, so mutating
+// (or risking an aliasing reallocation into) its backing array here would be a
+// subtle, hard-to-spot bug.
 func createRequiredScopes(includeResourceData bool) []string {
 	if !includeResourceData {
 		return subscriptionMutationScopes
@@ -294,263 +331,18 @@ func createRequiredScopes(includeResourceData bool) []string {
 	return scopes
 }
 
-// ---- remote reconciliation ----
-//
-// The reconcile classification itself — the state table, authority
-// matching, and the ReconcilePlan shape — moved to
-// internal/event/reconcile.go, EXPORTED, so it can be shared
-// with the refined `event consume` startup chain's PlanRemoteSubscription
-// stage instead of staying package-private here. The
-// aliases/thin wrapper below keep this package's own names
-// (reconcilePlan/planAction*/reconcileExisting) so create_test.go and this
-// file's own createOrReuseSubscription/outcomeFromPlan/buildDryRunResult
-// below are unchanged — only the underlying implementation moved.
+// ---- typed errors for non-writable plans ----
 
-// createSubscriptionAPI is the subset of *eventlib.SubscriptionClient this
-// command calls: List (to reconcile against the unique key event_type +
-// target_resource + authority before ever writing), Create, and
-// GetEncryptKey (the encryption conflict-matrix probe reconcileExisting
-// wires in below for an encrypted request — eventlib.EncryptKeyProber's
-// method, added here so the SAME svc value satisfies both
-// eventlib.SubscriptionLister and eventlib.EncryptKeyProber without a
-// separate adapter type). It is the test seam — see listSubscriptionsAPI
-// (list.go) for the rationale; tests substitute a fake implementing these
-// three methods, so every branch below is exercised without a real
-// *lark.Client or network call. It is a strict superset of
-// eventlib.SubscriptionCreateAPI (defined alongside the reconcile logic this
-// now calls into) — kept as its own declaration here, rather than an alias,
-// so this file's exported-to-tests shape doesn't change.
-type createSubscriptionAPI interface {
-	List(ctx context.Context, req *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error)
-	Create(ctx context.Context, req *larkeventv1.CreateSubscriptionReq) (*larkeventv1.CreateSubscriptionResp, error)
-	GetEncryptKey(ctx context.Context, req *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error)
-}
-
-// reconcilePlan is a local alias for eventlib.ReconcilePlan — see the block
-// doc comment above.
-type reconcilePlan = eventlib.ReconcilePlan
-
-const (
-	planActionCreate    = eventlib.PlanActionCreate
-	planActionReuse     = eventlib.PlanActionReuse
-	planActionConflict  = eventlib.PlanActionConflict
-	planActionSuspended = eventlib.PlanActionSuspended
-)
-
-// reconcileExisting forwards to eventlib.ReconcileExisting — see the block
-// doc comment above for why this thin wrapper exists instead of every call
-// site here naming eventlib.ReconcileExisting directly. See
-// eventlib.ReconcileExisting's own doc comment for the full state-table and
-// authority-matching rationale (unchanged by the move).
-//
-// When requestedIncludeResourceData is true (the caller
-// wants an ENCRYPTED subscription), this also supplies svc itself as the
-// eventlib.WithEncryptKeyProber option — svc already satisfies
-// eventlib.EncryptKeyProber structurally (createSubscriptionAPI declares the
-// same GetEncryptKey method), so ReconcileExisting can resolve the
-// encryption conflict matrix for an active, include_resource_data=true
-// match. requestedIncludeResourceData=false takes the plaintext path with
-// no encryption probe.
-//
-// requestedFilter is the requested server-side filter, forwarded as
-// eventlib.WithRequestedFilter so a filter that differs from an existing active
-// subscription's blocks reuse as a conflict; a nil/empty requestedFilter is
-// compared as "no filter", so an unfiltered request against an unfiltered match
-// still reuses.
-func reconcileExisting(ctx context.Context, svc createSubscriptionAPI, eventType, targetResource string, identity core.Identity, requestedIncludeResourceData bool, requestedFilter *eventlib.Filter) (*reconcilePlan, error) {
-	opts := []eventlib.ReconcileOption{eventlib.WithRequestedFilter(requestedFilter)}
-	if requestedIncludeResourceData {
-		opts = append(opts, eventlib.WithEncryptKeyProber(svc))
+// blockError maps an ActionBlock plan to create's typed failed_precondition. A
+// block carrying conflict fields is a configuration conflict (the active/suspended
+// match disagrees on include_resource_data or filter); a block with no conflict
+// fields is a suspended match create refuses to overwrite. The two render
+// different guidance (get/delete vs reactivate).
+func blockError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan, includeResourceData bool) error {
+	if len(plan.ConflictFields) > 0 {
+		return conflictError(resolved, identity, plan, includeResourceData)
 	}
-	return eventlib.ReconcileExisting(ctx, svc, eventType, targetResource, identity, requestedIncludeResourceData, opts...)
-}
-
-// newEncryptKeyFunc generates a fresh per-subscription encrypt_key for an
-// encrypted create. Indirected through a package-level var — rather than
-// calling
-// eventlib.NewEncryptKey directly at its one production call site
-// (doCreateSubscription, via createOrReuseSubscription) — solely so tests
-// can substitute a counting spy and assert this is invoked exactly zero
-// times on the --dry-run path (a hard invariant: dry-run generates no
-// key), a property that is otherwise awkward to prove directly. Production
-// code must never reassign this outside tests.
-var newEncryptKeyFunc = eventlib.NewEncryptKey
-
-// createOutcome is the result of a completed (non-dry-run) create request:
-// either a freshly created Subscription, or an idempotently reused existing
-// one — the two cases createOrReuseSubscription can return without error.
-// Every other reconcilePlan.Action (conflict/suspended) becomes a typed
-// error instead, never a createOutcome.
-type createOutcome struct {
-	Action string // "created" | "reused"
-	Detail *larkeventv1.SubscriptionDetail
-
-	// PaginationCapped is true when the reconcile List scan that led to this
-	// outcome hit the page cap before finding a match (see
-	// eventlib.ReconcilePlan.PaginationCapped). This is only ever possible
-	// alongside Action=="created" — a "reused" outcome always comes from an
-	// early, uncapped match — and is not itself a failure: runCreate logs it
-	// as an advisory rather than silently proceeding as if the scan had
-	// confirmed no conflicting subscription exists.
-	PaginationCapped bool
-}
-
-// createOrReuseSubscription is the write-capable half: it
-// reconciles against remote state, then acts on the plan — Create when
-// nothing blocks it, idempotent reuse when a compatible active match
-// exists, or a typed failure (never a write) for conflict/suspended.
-//
-// If Create itself fails, this reconciles once more via a fresh List (on a
-// duplicate or transport timeout, re-List to reconcile) before
-// giving up — a single bounded pass, not a retry loop: List-before-Create is
-// an optimization, not a substitute for the server's own unique-key
-// enforcement. If the second reconcile still finds nothing blocking (or
-// itself fails), the ORIGINAL Create error is what is returned — it is never
-// swallowed in favor of a less informative one. This bounded retry NEVER
-// changes includeResourceData between the two reconcile calls, and never
-// re-attempts Create itself (fail-closed: a failed encrypted create
-// must not silently fall back to a plaintext subscription, nor generate and
-// submit a second key).
-//
-// When includeResourceData is true, a fresh encrypt_key is
-// generated (newEncryptKeyFunc) ONLY once the plan has actually decided to
-// create (never on a reuse/conflict/suspended outcome, and never — by
-// construction, since this function is only reached from runCreate's
-// non-dry-run branch — during --dry-run), and is submitted to
-// doCreateSubscription in the SAME call that carries includeResourceData,
-// so the two are always atomic.
-func createOrReuseSubscription(ctx context.Context, svc createSubscriptionAPI, resolved eventlib.ResolvedEventKey, identity core.Identity, includeResourceData bool, requestedFilter *eventlib.Filter) (*createOutcome, error) {
-	eventType := resolved.Definition.EventType
-	targetResource := resolved.TargetResource
-
-	plan, err := reconcileExisting(ctx, svc, eventType, targetResource, identity, includeResourceData, requestedFilter)
-	if err != nil {
-		return nil, err
-	}
-	if plan.Action != planActionCreate {
-		return outcomeFromPlan(plan, resolved, identity, includeResourceData)
-	}
-
-	var encryptKey string
-	if includeResourceData {
-		encryptKey, err = newEncryptKeyFunc()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	detail, createErr := doCreateSubscription(ctx, svc, eventType, targetResource, includeResourceData, encryptKey, requestedFilter)
-	if createErr == nil {
-		return &createOutcome{Action: "created", Detail: detail, PaginationCapped: plan.PaginationCapped}, nil
-	}
-
-	plan2, listErr := reconcileExisting(ctx, svc, eventType, targetResource, identity, includeResourceData, requestedFilter)
-	if listErr != nil || plan2.Action == planActionCreate {
-		// The reconcile-after-failure found nothing new (or itself failed):
-		// the original Create error is the most useful thing to surface.
-		// Deliberately never retries doCreateSubscription/newEncryptKeyFunc
-		// here — see this function's own doc comment.
-		return nil, createErr
-	}
-	return outcomeFromPlan(plan2, resolved, identity, includeResourceData)
-}
-
-// outcomeFromPlan converts a non-"create" plan into either a success
-// (idempotent reuse) or a typed error (conflict/suspended) — shared by both
-// the first reconcile and the post-Create-failure reconcile in
-// createOrReuseSubscription. includeResourceData is threaded through purely
-// so conflictError can enrich its Hint with encryption-specific guidance
-// when this conflict was reached via an encrypted request.
-func outcomeFromPlan(plan *reconcilePlan, resolved eventlib.ResolvedEventKey, identity core.Identity, includeResourceData bool) (*createOutcome, error) {
-	switch plan.Action {
-	case planActionReuse:
-		return &createOutcome{Action: "reused", Detail: plan.Existing}, nil
-	case planActionConflict:
-		return nil, conflictError(resolved, identity, plan, includeResourceData)
-	case planActionSuspended:
-		return nil, suspendedError(resolved, identity, plan)
-	default:
-		return nil, errs.NewInternalError(errs.SubtypeUnknown, "unexpected reconcile plan action %q", plan.Action)
-	}
-}
-
-// doCreateSubscription issues the actual Create call and unwraps its
-// response. Any error svc.Create returns (transport or already-classified
-// typed business failure — SubscriptionClient.Create) is passed
-// through unchanged; the caller (createOrReuseSubscription) decides whether
-// to reconcile-and-retry.
-//
-// encryptKey, when non-empty, is injected via
-// PayloadOptionsEncryptBuilder into the SAME CreatePayloadOptions as
-// includeResourceData, in the SAME request this function builds — the
-// atomicity requirement (include_resource_data=true and encrypt.encrypt_key
-// must be submitted together) and the fact that Encrypt is a
-// Create-only field (Patch has no encrypt) both mean this is the ONLY place
-// in this command that ever sets it. Callers must never log encryptKey —
-// see newEncryptKeyFunc's own doc comment.
-func doCreateSubscription(ctx context.Context, svc createSubscriptionAPI, eventType, targetResource string, includeResourceData bool, encryptKey string, requestedFilter *eventlib.Filter) (*larkeventv1.SubscriptionDetail, error) {
-	if includeResourceData && encryptKey == "" {
-		// Defensive fail-closed (atomic, no
-		// plaintext-fallback path): the sole caller
-		// (createOrReuseSubscription) always generates a key before reaching
-		// here whenever includeResourceData is true, and returns its own
-		// error early if generation itself fails — so this should be
-		// unreachable in practice. Refuse rather than ever submitting an
-		// include_resource_data=true Create with no encrypt_key.
-		return nil, errs.NewInternalError(errs.SubtypeUnknown,
-			"refusing to create an include_resource_data=true subscription without an encrypt_key")
-	}
-	body := buildCreateSubscriptionBody(eventType, targetResource, includeResourceData, encryptKey, requestedFilter)
-	req := larkeventv1.NewCreateSubscriptionReqBuilder().Body(body).Build()
-
-	resp, err := svc.Create(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	var detail *larkeventv1.SubscriptionDetail
-	if resp != nil && resp.Data != nil {
-		detail = resp.Data.Subscription
-	}
-	if detail == nil {
-		return nil, errs.NewInternalError(errs.SubtypeInvalidResponse,
-			"subscription create reported success but returned no subscription data")
-	}
-	return detail, nil
-}
-
-// buildCreateSubscriptionBody constructs the Create request body, always
-// setting includeResourceData and (when non-empty) encryptKey on the SAME
-// CreatePayloadOptions within the SAME returned body value — the
-// atomicity requirement is structural here, not merely a matter of call
-// ordering: there is no code path that could build/send them separately.
-//
-// This is split out of doCreateSubscription (rather than inlined) so this
-// package's own tests can assert the atomicity property directly against a
-// plain, fully-inspectable *larkeventv1.CreateSubscriptionReqBody value.
-// *larkeventv1.CreateSubscriptionReq itself (what
-// NewCreateSubscriptionReqBuilder().Body(body).Build() produces) is NOT
-// similarly inspectable from this package: its builder stores body into an
-// internal, unexported apiReq field for the SDK's own transport to read,
-// never into CreateSubscriptionReq's own same-named exported Body field. A
-// test capturing the built *CreateSubscriptionReq itself therefore cannot
-// read back what it carried; testing this function directly is the reliable
-// way to assert the request's actual content.
-func buildCreateSubscriptionBody(eventType, targetResource string, includeResourceData bool, encryptKey string, requestedFilter *eventlib.Filter) *larkeventv1.CreateSubscriptionReqBody {
-	payloadOptions := larkeventv1.NewCreatePayloadOptionsBuilder().IncludeResourceData(includeResourceData)
-	if encryptKey != "" {
-		payloadOptions = payloadOptions.Encrypt(larkeventv1.NewPayloadOptionsEncryptBuilder().EncryptKey(encryptKey).Build())
-	}
-	builder := larkeventv1.NewCreateSubscriptionReqBodyBuilder().
-		EventType(eventType).
-		TargetResource(targetResource).
-		PayloadOptions(payloadOptions.Build())
-	// Only send filter when one was requested. Omitting the field entirely
-	// (rather than sending an empty {"filter":{}}) is how create says "no
-	// server-side filter"; the empty/clear form is an update-only concept.
-	if !requestedFilter.IsEmpty() {
-		builder = builder.Filter(eventlib.FilterToSDK(requestedFilter))
-	}
-	return builder.Build()
+	return suspendedError(resolved, identity, plan)
 }
 
 // conflictError implements the "active but conflicting" case and
@@ -563,11 +355,11 @@ func buildCreateSubscriptionBody(eventType, targetResource string, includeResour
 // an encrypted request's conflict is only ever resolved by a human — verify
 // the existing subscription (and this identity's event:encrypt_key:read
 // scope), or delete and recreate.
-func conflictError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan *reconcilePlan, includeResourceData bool) error {
-	id := strVal(plan.Existing.SubscriptionId)
+func conflictError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan, includeResourceData bool) error {
+	id := planBeforeID(plan)
 	var hint string
 	switch {
-	case eventlib.ConflictOnFilter(plan.ConflictFields):
+	case subown.ConflictOnFilter(plan.ConflictFields):
 		// A filter difference is resolvable in place — change it with `update`
 		// rather than deleting a possibly-shared subscription. Guide inspect ->
 		// preview -> apply -> re-run; the filter values are never named here.
@@ -587,11 +379,11 @@ func conflictError(resolved eventlib.ResolvedEventKey, identity core.Identity, p
 
 // suspendedError implements the "suspended" case: do not overwrite;
 // guide the caller to `reactivate` instead of creating a duplicate.
-func suspendedError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan *reconcilePlan) error {
-	id := strVal(plan.Existing.SubscriptionId)
+func suspendedError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) error {
+	id := planBeforeID(plan)
 	reason := ""
-	if plan.Existing.Suspension != nil {
-		reason = strVal(plan.Existing.Suspension.Code)
+	if plan.Before != nil {
+		reason = plan.Before.SuspensionReason
 	}
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"a suspended subscription already exists for %s (remote_subscription_id=%s, suspension_reason=%s); it is not automatically overwritten",
@@ -600,11 +392,32 @@ func suspendedError(resolved eventlib.ResolvedEventKey, identity core.Identity, 
 		WithHint("run `lark-cli event subscription reactivate %s --as %s` to resume delivery instead of creating a duplicate", id, identity)
 }
 
+// indeterminateError implements the "the remote scan was inconclusive" case (the
+// paginated List hit the page cap without a definitive answer). Rather than
+// silently creating — which risks a duplicate against a match beyond the pages
+// read — create fails closed with actionable guidance.
+func indeterminateError(resolved eventlib.ResolvedEventKey, identity core.Identity) error {
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"could not determine whether a matching subscription already exists for %s: the remote subscription list scan reached its %d-page cap before finding a match or exhausting all results, so creating now could duplicate an existing subscription",
+		resolved.MaterializedKey, eventlib.MaxSubscriptionListPages).
+		WithParam("event_key").
+		WithHint("re-run `lark-cli event subscription list --as %s --json` to inspect existing subscriptions (the scan was NOT confirmed absence, only \"no match within the pages read\"); if none matches, retry create", identity)
+}
+
+// planBeforeID renders the existing match's remote_subscription_id, or "" when a
+// plan carries no Before.
+func planBeforeID(plan subown.SubscriptionPlan) string {
+	if plan.Before == nil {
+		return ""
+	}
+	return plan.Before.ID.String()
+}
+
 // ---- JSON output shapes ----
 
 // createDryRunResult is `event subscription create --dry-run`'s JSON shape.
 // Populated purely from parse/identity/scope preflight
-// (already done by the time runCreate reaches this) plus one remote List —
+// (already done by the time applyCreate reaches this) plus one remote List —
 // never a Create.
 type createDryRunResult struct {
 	Operation      string           `json:"operation"`
@@ -628,8 +441,8 @@ type createPreflight struct {
 }
 
 // plannedChange describes what a real (non-dry-run) run would do, per
-// reconcilePlan — including outcomes that would themselves be a typed
-// failure (conflict/suspended): dry-run always reports the plan
+// the subscription plan — including outcomes that would themselves be a typed
+// failure (conflict/suspended/indeterminate): dry-run always reports the plan
 // informationally rather than failing on it (only the preflight steps
 // themselves — identity/template/scope — are real dry-run failures).
 type plannedChange struct {
@@ -645,24 +458,34 @@ type localImpact struct {
 	Note                  string `json:"note"`
 }
 
-// rowFromSDKDetail renders one SDK SubscriptionDetail (create still holds these
-// from the reconcile/create path on the legacy subscription_client, which PR2b
-// retires into the gateway) as the shared subscriptionRow, routing it through
-// the gateway's SDK->domain projection so there is exactly one row source fed by
-// the domain RemoteSubscription — no second SDK-typed row mapper in this package.
-func rowFromSDKDetail(d *larkeventv1.SubscriptionDetail) subscriptionRow {
-	return mapRemoteSubscription(larkgw.ProjectSubscription(d))
+// legacyPlanAction maps a subscription plan action to the stable
+// planned_change.action vocabulary this command's JSON has always used
+// ("create"/"reuse"/"conflict"/"suspended"), plus "indeterminate" for the
+// inconclusive-scan outcome. A Block splits into "conflict" (a configuration
+// conflict, carrying conflict fields) or "suspended" (a suspended match).
+func legacyPlanAction(plan subown.SubscriptionPlan) string {
+	switch plan.Action {
+	case subown.ActionBlock:
+		if len(plan.ConflictFields) > 0 {
+			return "conflict"
+		}
+		return "suspended"
+	case subown.ActionIndeterminate:
+		return "indeterminate"
+	default:
+		return string(plan.Action)
+	}
 }
 
-func buildDryRunResult(resolved eventlib.ResolvedEventKey, identity core.Identity, plan *reconcilePlan, includeResourceData bool) *createDryRunResult {
+func buildDryRunResult(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan, includeResourceData bool) *createDryRunResult {
 	var remoteBefore *subscriptionRow
-	if plan.Existing != nil {
-		row := rowFromSDKDetail(plan.Existing)
+	if plan.Before != nil {
+		row := mapRemoteSubscription(*plan.Before)
 		remoteBefore = &row
 	}
-	pc := plannedChange{Action: plan.Action, ConflictFields: plan.ConflictFields}
-	if plan.Existing != nil {
-		pc.RemoteSubscriptionID = strVal(plan.Existing.SubscriptionId)
+	pc := plannedChange{Action: legacyPlanAction(plan), ConflictFields: plan.ConflictFields}
+	if plan.Before != nil {
+		pc.RemoteSubscriptionID = plan.Before.ID.String()
 	}
 
 	return &createDryRunResult{
@@ -686,17 +509,19 @@ func buildDryRunResult(resolved eventlib.ResolvedEventKey, identity core.Identit
 	}
 }
 
-func dryRunNextAction(plan *reconcilePlan, resolved eventlib.ResolvedEventKey, identity core.Identity) string {
+func dryRunNextAction(plan subown.SubscriptionPlan, resolved eventlib.ResolvedEventKey, identity core.Identity) string {
 	switch plan.Action {
-	case planActionReuse:
-		return fmt.Sprintf("run without --dry-run to idempotently reuse remote_subscription_id=%s, then `lark-cli event consume %s --as %s`", strVal(plan.Existing.SubscriptionId), resolved.MaterializedKey, identity)
-	case planActionConflict:
-		id := strVal(plan.Existing.SubscriptionId)
+	case subown.ActionReuse:
+		return fmt.Sprintf("run without --dry-run to idempotently reuse remote_subscription_id=%s, then `lark-cli event consume %s --as %s`", planBeforeID(plan), resolved.MaterializedKey, identity)
+	case subown.ActionBlock:
+		id := planBeforeID(plan)
+		if len(plan.ConflictFields) == 0 {
+			return fmt.Sprintf("run `lark-cli event subscription reactivate %s --as %s` instead of creating a duplicate", id, identity)
+		}
 		return fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect the conflicting remote_subscription_id=%s before deciding how to proceed", id, identity, id)
-	case planActionSuspended:
-		id := strVal(plan.Existing.SubscriptionId)
-		return fmt.Sprintf("run `lark-cli event subscription reactivate %s --as %s` instead of creating a duplicate", id, identity)
-	default: // planActionCreate
+	case subown.ActionIndeterminate:
+		return fmt.Sprintf("run `lark-cli event subscription list --as %s --json` to inspect existing subscriptions before running create — the scan reached its page cap without a definitive answer", identity)
+	default: // ActionCreate
 		return fmt.Sprintf("run without --dry-run to create the subscription, then `lark-cli event consume %s --as %s`", resolved.MaterializedKey, identity)
 	}
 }
@@ -713,12 +538,19 @@ type createResult struct {
 	NextAction           string          `json:"next_action"`
 }
 
-func buildCreateResult(resolved eventlib.ResolvedEventKey, identity core.Identity, outcome *createOutcome) *createResult {
-	row := rowFromSDKDetail(outcome.Detail)
+func buildCreateResult(resolved eventlib.ResolvedEventKey, identity core.Identity, receipt subown.ApplyReceipt) *createResult {
+	action := "created"
+	if receipt.Action == subown.ActionReuse {
+		action = "reused"
+	}
+	var row subscriptionRow
+	if receipt.After != nil {
+		row = mapRemoteSubscription(*receipt.After)
+	}
 	return &createResult{
 		Operation:            "create",
-		Action:               outcome.Action,
-		RemoteSubscriptionID: row.RemoteSubscriptionID,
+		Action:               action,
+		RemoteSubscriptionID: receipt.RemoteID.String(),
 		Subscription:         row,
 		NextAction:           createNextAction(resolved, identity),
 	}

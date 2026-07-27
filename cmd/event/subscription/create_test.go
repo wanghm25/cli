@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"reflect"
 	"strings"
@@ -16,7 +15,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
 	"github.com/larksuite/cli/errs"
@@ -24,6 +22,9 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
 	eventlib "github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/model"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 )
 
 // ---- fixtures ----
@@ -75,9 +76,7 @@ func registerCreateFixtures(t *testing.T) {
 }
 
 // resolveCreatedChatID registers the fixtures and resolves the chat-id
-// template, failing the test on any error (every reconcile/outcome test
-// needs a valid ResolvedEventKey as a starting point, not the resolver's own
-// behavior). Callers must not also call
+// template, failing the test on any error. Callers must not also call
 // registerCreateFixtures directly — eventlib.RegisterKey panics on a
 // duplicate key.
 func resolveCreatedChatID(t *testing.T) eventlib.ResolvedEventKey {
@@ -90,8 +89,7 @@ func resolveCreatedChatID(t *testing.T) eventlib.ResolvedEventKey {
 	return r
 }
 
-// resolveCreatedOwnerMe is resolveCreatedChatID's owner/me counterpart; see
-// its doc comment for the "do not also call registerCreateFixtures" caveat.
+// resolveCreatedOwnerMe is resolveCreatedChatID's owner/me counterpart.
 func resolveCreatedOwnerMe(t *testing.T) eventlib.ResolvedEventKey {
 	t.Helper()
 	registerCreateFixtures(t)
@@ -102,78 +100,10 @@ func resolveCreatedOwnerMe(t *testing.T) eventlib.ResolvedEventKey {
 	return r
 }
 
-// ---- fake createSubscriptionAPI ----
-
-// fakeCreateAPI is a network-free stand-in for *eventlib.SubscriptionClient's
-// List+Create — the createSubscriptionAPI test seam. Hook functions (rather
-// than plain fields, cf. fakeListAPI/fakeGetAPI) so tests can vary the
-// response by call count, which the "Create fails, reconcile via a second
-// List" cases need.
-type fakeCreateAPI struct {
-	listFunc  func(call int) (*larkeventv1.ListSubscriptionResp, error)
-	listCalls []*larkeventv1.ListSubscriptionReq
-
-	createFunc  func() (*larkeventv1.CreateSubscriptionResp, error)
-	createCalls int
-
-	// getEncryptKeyFunc/getEncryptKeyCalls back the fake GetEncryptKey below
-	// — the seam the encryption conflict-matrix's probe
-	// (eventlib.ReconcileExisting's WithEncryptKeyProber) depends on. A nil
-	// getEncryptKeyFunc defaults to "no usable key" (okEncryptKeyResp(""))
-	// rather than success-with-a-key, so a test that forgets to set it up
-	// fails toward the safe (conflict) outcome, not a silent reuse.
-	getEncryptKeyFunc  func() (*larkeventv1.GetEncryptKeySubscriptionResp, error)
-	getEncryptKeyCalls int
-}
-
-func (f *fakeCreateAPI) List(_ context.Context, req *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
-	f.listCalls = append(f.listCalls, req)
-	if f.listFunc == nil {
-		return okListResp(nil, false, ""), nil
-	}
-	return f.listFunc(len(f.listCalls))
-}
-
-func (f *fakeCreateAPI) Create(_ context.Context, _ *larkeventv1.CreateSubscriptionReq) (*larkeventv1.CreateSubscriptionResp, error) {
-	f.createCalls++
-	if f.createFunc == nil {
-		return okCreateResp(&larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_new")}), nil
-	}
-	return f.createFunc()
-}
-
-func (f *fakeCreateAPI) GetEncryptKey(_ context.Context, _ *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
-	f.getEncryptKeyCalls++
-	if f.getEncryptKeyFunc == nil {
-		return okEncryptKeyResp(""), nil
-	}
-	return f.getEncryptKeyFunc()
-}
-
-// okEncryptKeyResp builds a synthetic, always-successful
-// GetEncryptKeySubscriptionResp carrying key (which may be "" to model "no
-// usable key returned").
-func okEncryptKeyResp(key string) *larkeventv1.GetEncryptKeySubscriptionResp {
-	return &larkeventv1.GetEncryptKeySubscriptionResp{
-		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
-		Data:    &larkeventv1.GetEncryptKeySubscriptionRespData{EncryptKey: strPtr(key)},
-	}
-}
-
-// fixedList returns a fakeCreateAPI.listFunc that always returns the same
-// response, for tests that only need one List behavior regardless of call
-// count.
-func fixedList(resp *larkeventv1.ListSubscriptionResp, err error) func(int) (*larkeventv1.ListSubscriptionResp, error) {
-	return func(int) (*larkeventv1.ListSubscriptionResp, error) { return resp, err }
-}
-
-func okCreateResp(d *larkeventv1.SubscriptionDetail) *larkeventv1.CreateSubscriptionResp {
-	return &larkeventv1.CreateSubscriptionResp{
-		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
-		Data:    &larkeventv1.CreateSubscriptionRespData{Subscription: d},
-	}
-}
-
+// activeDetail / suspendedDetail are SDK-typed SubscriptionDetail fixtures kept
+// here because sibling tests (delete_test.go/update_test.go/subscription_test.go)
+// depend on them. create's own flow now works on the domain projection, for which
+// activeRemote / suspendedRemote below are the fixtures.
 func activeDetail(id string, includeResourceData bool, authorityType string) *larkeventv1.SubscriptionDetail {
 	return &larkeventv1.SubscriptionDetail{
 		SubscriptionId: strPtr(id),
@@ -196,241 +126,162 @@ func suspendedDetail(id, reason string) *larkeventv1.SubscriptionDetail {
 	}
 }
 
-// ---- reconcileExisting ----
+// activeRemote / suspendedRemote are the domain-projected (platform/lark)
+// fixtures create's Observe -> Plan -> Apply flow actually sees.
+func activeRemote(id string, includeResourceData bool, authorityType string) larkgw.RemoteSubscription {
+	ird := includeResourceData
+	return larkgw.RemoteSubscription{
+		ID:                    model.RemoteSubscriptionID(id),
+		EventType:             "im.message.created_v1",
+		TargetResource:        "im.message?chat_id=oc_aaa",
+		Authority:             model.RemoteAuthority{Type: authorityType, OpenID: "ou_aaa"},
+		State:                 "active",
+		PayloadOptionsPresent: true,
+		IncludeResourceData:   &ird,
+		Filter:                &eventlib.Filter{},
+	}
+}
 
-func TestReconcileExisting_NotFound_ReturnsCreateAction(t *testing.T) {
-	fake := &fakeCreateAPI{listFunc: fixedList(okListResp(nil, false, ""), nil)}
+func suspendedRemote(id, reason string) larkgw.RemoteSubscription {
+	return larkgw.RemoteSubscription{
+		ID:               model.RemoteSubscriptionID(id),
+		EventType:        "im.message.created_v1",
+		TargetResource:   "im.message?chat_id=oc_aaa",
+		Authority:        model.RemoteAuthority{Type: "user", OpenID: "ou_aaa"},
+		State:            "suspended",
+		SuspensionReason: reason,
+		Filter:           &eventlib.Filter{},
+	}
+}
 
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
+func remotePtr(s larkgw.RemoteSubscription) *larkgw.RemoteSubscription { return &s }
+
+// ---- fake gateway (subown.Gateway) ----
+
+// fakeCreateGateway is a network-free stand-in for the subown.Gateway surface.
+// walkFunc lets a test vary the List result by call (the Controller's
+// reconcile-after-a-failed-create pass reads a second time); createSpec captures
+// the exact spec create built (for the atomic-encrypt-key assertion).
+type fakeCreateGateway struct {
+	walkItems  []larkgw.RemoteSubscription
+	walkCapped bool
+	walkErr    error
+	walkFunc   func(call int) ([]larkgw.RemoteSubscription, bool, error)
+	walkCalls  int
+
+	createSpec  *larkgw.CreateSpec
+	createResp  *larkgw.RemoteSubscription
+	createErr   error
+	createCalls int
+
+	reactivateResp  *larkgw.RemoteSubscription
+	reactivateErr   error
+	reactivateCalls int
+
+	encryptKey         string
+	encryptErr         error
+	getEncryptKeyCalls int
+}
+
+func (g *fakeCreateGateway) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, visit func(larkgw.RemoteSubscription) bool) (bool, error) {
+	call := g.walkCalls
+	g.walkCalls++
+	items, capped, err := g.walkItems, g.walkCapped, g.walkErr
+	if g.walkFunc != nil {
+		items, capped, err = g.walkFunc(call)
+	}
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		return false, err
 	}
-	if plan.Action != planActionCreate {
-		t.Errorf("Action = %q, want %q", plan.Action, planActionCreate)
+	for _, it := range items {
+		if !visit(it) {
+			return false, nil
+		}
 	}
-	if plan.Existing != nil {
-		t.Errorf("Existing = %+v, want nil", plan.Existing)
-	}
+	return capped, nil
 }
 
-func TestReconcileExisting_ActiveCompatible_ReturnsReuseAction(t *testing.T) {
-	fake := &fakeCreateAPI{listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-		activeDetail("sub_1", false, "user"),
-	}, false, ""), nil)}
-
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func (g *fakeCreateGateway) Create(_ context.Context, spec larkgw.CreateSpec) (*larkgw.RemoteSubscription, error) {
+	g.createCalls++
+	s := spec
+	g.createSpec = &s
+	if g.createErr != nil {
+		return nil, g.createErr
 	}
-	if plan.Action != planActionReuse {
-		t.Errorf("Action = %q, want %q", plan.Action, planActionReuse)
-	}
-	if plan.Existing == nil || strVal(plan.Existing.SubscriptionId) != "sub_1" {
-		t.Errorf("Existing = %+v, want sub_1", plan.Existing)
-	}
+	return g.createResp, nil
 }
 
-func TestReconcileExisting_ActiveConflicting_ReturnsConflictActionWithFields(t *testing.T) {
-	fake := &fakeCreateAPI{listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-		activeDetail("sub_1", true, "user"), // existing has include_resource_data=true
-	}, false, ""), nil)}
-
-	// requested include_resource_data=false (the only value that can reach
-	// this point once the encryption check rejects true) mismatches the existing true.
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func (g *fakeCreateGateway) Reactivate(_ context.Context, id string) (*larkgw.RemoteSubscription, error) {
+	g.reactivateCalls++
+	if g.reactivateErr != nil {
+		return nil, g.reactivateErr
 	}
-	if plan.Action != planActionConflict {
-		t.Fatalf("Action = %q, want %q", plan.Action, planActionConflict)
-	}
-	if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Name != "include_resource_data" {
-		t.Errorf("ConflictFields = %+v, want one entry naming include_resource_data", plan.ConflictFields)
-	}
-	if plan.ConflictFields[0].Reason == "" {
-		t.Error("ConflictFields[0].Reason must not be empty")
-	}
+	return g.reactivateResp, nil
 }
 
-func TestReconcileExisting_Suspended_ReturnsSuspendedAction(t *testing.T) {
-	fake := &fakeCreateAPI{listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-		suspendedDetail("sub_1", "authority_revoked"),
-	}, false, ""), nil)}
-
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if plan.Action != planActionSuspended {
-		t.Errorf("Action = %q, want %q", plan.Action, planActionSuspended)
-	}
+func (g *fakeCreateGateway) GetEncryptKey(_ context.Context, _ string) (string, error) {
+	g.getEncryptKeyCalls++
+	return g.encryptKey, g.encryptErr
 }
 
-func TestReconcileExisting_ExpiredOrDeleted_TreatedAsNew(t *testing.T) {
-	for _, state := range []string{"expired", "deleted", "", "some_future_state"} {
-		t.Run(state, func(t *testing.T) {
-			fake := &fakeCreateAPI{listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-				{
-					SubscriptionId: strPtr("sub_old"),
-					EventType:      strPtr("im.message.created_v1"),
-					TargetResource: strPtr("im.message?chat_id=oc_aaa"),
-					Authority:      &larkeventv1.Authority{Type: strPtr("user"), OpenId: strPtr("ou_aaa")},
-					State:          strPtr(state),
-				},
-			}, false, ""), nil)}
-
-			plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if plan.Action != planActionCreate {
-				t.Errorf("Action = %q, want %q (state %q treated as inert/not-found)", plan.Action, planActionCreate, state)
-			}
-		})
-	}
+// countingKeyGen is a spy key generator: it counts calls and returns a fixed key.
+func countingKeyGen(calls *int, key string) func() (string, error) {
+	return func() (string, error) { *calls++; return key, nil }
 }
 
-func TestReconcileExisting_AuthorityMismatch_IgnoresOtherIdentityItems(t *testing.T) {
-	// An "app" authority item must not be treated as a match for a "user"
-	// identity's reconcile — never reuse/conflict against another identity's
-	// subscription.
-	fake := &fakeCreateAPI{listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-		activeDetail("sub_app", false, "app"),
-	}, false, ""), nil)}
+// ---- applyCreate flow (real Controller over a fake gateway) ----
 
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if plan.Action != planActionCreate {
-		t.Errorf("Action = %q, want %q (the only match belongs to a different authority)", plan.Action, planActionCreate)
-	}
-}
-
-// TestReconcileExisting_BotIdentityMatchesAppAuthority_ReturnsReuseAction is
-// the positive counterpart of the mismatch test above: a bot identity's own
-// "app" authority item must be recognized as a match (the reuse/conflict
-// classification is identity-symmetric, not just implemented for "user").
-func TestReconcileExisting_BotIdentityMatchesAppAuthority_ReturnsReuseAction(t *testing.T) {
-	fake := &fakeCreateAPI{listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-		activeDetail("sub_app", false, "app"),
-	}, false, ""), nil)}
-
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsBot, false, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if plan.Action != planActionReuse {
-		t.Errorf("Action = %q, want %q", plan.Action, planActionReuse)
-	}
-	if plan.Existing == nil || strVal(plan.Existing.SubscriptionId) != "sub_app" {
-		t.Errorf("Existing = %+v, want sub_app", plan.Existing)
-	}
-}
-
-func TestReconcileExisting_TransportError_PropagatesUnchanged(t *testing.T) {
-	sentinel := errors.New("boom: connection reset")
-	fake := &fakeCreateAPI{listFunc: fixedList(nil, sentinel)}
-
-	_, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
-	if !errors.Is(err, sentinel) {
-		t.Errorf("err = %v, want it passed through unchanged (%v)", err, sentinel)
-	}
-}
-
-// ---- createOrReuseSubscription ----
-
-func TestCreateOrReuseSubscription_NotFound_CallsCreateExactlyOnce(t *testing.T) {
+func TestApplyCreate_NotFound_Creates(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: fixedList(okListResp(nil, false, ""), nil),
-		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) {
-			return okCreateResp(activeDetail("sub_new", false, "user")), nil
-		},
-	}
+	gw := &fakeCreateGateway{createResp: remotePtr(activeRemote("sub_new", false, "user"))}
+	var buf bytes.Buffer
 
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{asJSON: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if outcome.Action != "created" {
-		t.Errorf("Action = %q, want created", outcome.Action)
+	if gw.createCalls != 1 {
+		t.Errorf("createCalls = %d, want 1", gw.createCalls)
 	}
-	if fake.createCalls != 1 {
-		t.Errorf("createCalls = %d, want 1", fake.createCalls)
+	var result createResult
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if result.Action != "created" {
+		t.Errorf("action = %q, want created", result.Action)
+	}
+	if result.RemoteSubscriptionID != "sub_new" {
+		t.Errorf("remote_subscription_id = %q, want sub_new", result.RemoteSubscriptionID)
 	}
 }
 
-// TestCreateOrReuseSubscription_PaginationCapped_PropagatesToOutcome locks
-// the #20 fix's wiring into `event subscription create`: when the reconcile
-// List scan hits the page cap without finding a match, the resulting
-// "created" outcome must carry PaginationCapped=true so runCreate can warn
-// instead of silently treating the capped scan as a confirmed not-found.
-func TestCreateOrReuseSubscription_PaginationCapped_PropagatesToOutcome(t *testing.T) {
+func TestApplyCreate_ActiveCompatible_ReusesWithoutCreate(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: func(call int) (*larkeventv1.ListSubscriptionResp, error) {
-			// Every page: has_more=true, no matching authority item — an
-			// unbounded scan would run forever.
-			return okListResp([]*larkeventv1.SubscriptionDetail{
-				activeDetail("sub_other", false, "app"), // "app" authority never matches AsUser
-			}, true, fmt.Sprintf("token-%d", call)), nil
-		},
-		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) {
-			return okCreateResp(activeDetail("sub_new", false, "user")), nil
-		},
-	}
+	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{activeRemote("sub_existing", false, "user")}}
+	var buf bytes.Buffer
 
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{asJSON: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if outcome.Action != "created" {
-		t.Errorf("Action = %q, want created (a capped scan still defaults to create)", outcome.Action)
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (idempotent reuse must never call Create)", gw.createCalls)
 	}
-	if !outcome.PaginationCapped {
-		t.Error("PaginationCapped = false, want true")
+	var result createResult
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
 	}
-	if len(fake.listCalls) != eventlib.MaxSubscriptionListPages {
-		t.Errorf("List called %d times, want exactly %d (bounded by the page cap)", len(fake.listCalls), eventlib.MaxSubscriptionListPages)
-	}
-}
-
-func TestCreateOrReuseSubscription_ActiveCompatible_ReusesWithoutCallingCreate(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-			activeDetail("sub_existing", false, "user"),
-		}, false, ""), nil),
-	}
-
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if outcome.Action != "reused" {
-		t.Errorf("Action = %q, want reused", outcome.Action)
-	}
-	if strVal(outcome.Detail.SubscriptionId) != "sub_existing" {
-		t.Errorf("Detail.SubscriptionId = %q, want sub_existing", strVal(outcome.Detail.SubscriptionId))
-	}
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0 (idempotent reuse must never call Create)", fake.createCalls)
+	if result.Action != "reused" || result.RemoteSubscriptionID != "sub_existing" {
+		t.Errorf("result = %+v, want reused sub_existing", result)
 	}
 }
 
-func TestCreateOrReuseSubscription_ActiveConflict_ReturnsTypedFailedPrecondition(t *testing.T) {
+func TestApplyCreate_ActiveConflict_ReturnsTypedFailedPrecondition(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-			activeDetail("sub_conflict", true, "user"),
-		}, false, ""), nil),
-	}
+	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{activeRemote("sub_conflict", true, "user")}}
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
-	if err == nil {
-		t.Fatal("expected a conflict error, got nil")
-	}
+	// requested include_resource_data=false mismatches the existing true.
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -444,34 +295,20 @@ func TestCreateOrReuseSubscription_ActiveConflict_ReturnsTypedFailedPrecondition
 	if len(ve.Params) != 1 || ve.Params[0].Name != "include_resource_data" {
 		t.Errorf("Params = %+v, want one entry naming include_resource_data", ve.Params)
 	}
-	if !strings.Contains(ve.Hint, "sub_conflict") {
-		t.Errorf("Hint = %q, want it to mention remote_subscription_id sub_conflict", ve.Hint)
+	if !strings.Contains(ve.Hint, "sub_conflict") || !strings.Contains(ve.Hint, "get") {
+		t.Errorf("Hint = %q, want it to mention sub_conflict and guide to `get`", ve.Hint)
 	}
-	if !strings.Contains(ve.Hint, "get") {
-		t.Errorf("Hint = %q, want it to guide the caller to `get`", ve.Hint)
-	}
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0 (a conflict must never call Create)", fake.createCalls)
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (a conflict must never call Create)", gw.createCalls)
 	}
 }
 
-func TestCreateOrReuseSubscription_Suspended_ReturnsTypedFailedPrecondition_GuidesReactivate(t *testing.T) {
+func TestApplyCreate_Suspended_ReturnsTypedFailedPrecondition_GuidesReactivate(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-			// Deliberately a different reason than the "authority_revoked"
-			// used elsewhere in this file, so the assertion below on
-			// ve.Error() proves suspendedError's `reason :=
-			// strVal(...Suspension.Code)` extraction actually reads this
-			// fixture's value rather than happening to match a hardcoded one.
-			suspendedDetail("sub_susp", "identity_revoked"),
-		}, false, ""), nil),
-	}
+	// A distinct reason so the assertion proves suspendedError read this fixture.
+	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{suspendedRemote("sub_susp", "identity_revoked")}}
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
-	if err == nil {
-		t.Fatal("expected a suspended error, got nil")
-	}
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -479,73 +316,82 @@ func TestCreateOrReuseSubscription_Suspended_ReturnsTypedFailedPrecondition_Guid
 	if ve.Subtype != errs.SubtypeFailedPrecondition {
 		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
 	}
-	if !strings.Contains(ve.Hint, "reactivate") {
-		t.Errorf("Hint = %q, want it to guide the caller to `reactivate`", ve.Hint)
-	}
-	if !strings.Contains(ve.Hint, "sub_susp") {
-		t.Errorf("Hint = %q, want it to mention remote_subscription_id sub_susp", ve.Hint)
+	if !strings.Contains(ve.Hint, "reactivate") || !strings.Contains(ve.Hint, "sub_susp") {
+		t.Errorf("Hint = %q, want it to guide `reactivate` and mention sub_susp", ve.Hint)
 	}
 	if !strings.Contains(ve.Error(), "identity_revoked") {
-		t.Errorf("Error() = %q, want it to surface suspension_reason=identity_revoked from the fixture", ve.Error())
+		t.Errorf("Error() = %q, want it to surface suspension_reason=identity_revoked", ve.Error())
 	}
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0", fake.createCalls)
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0", gw.createCalls)
 	}
 }
 
-func TestCreateOrReuseSubscription_CreateFails_ReconcileFindsCompatible_ReturnsReused(t *testing.T) {
+func TestApplyCreate_Indeterminate_ReturnsTypedFailedPrecondition_NoCreate(t *testing.T) {
+	// A capped scan with no authority match -> Indeterminate -> must NOT create
+	// (the #七 must-fix: an inconclusive scan no longer silently Creates).
 	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: func(call int) (*larkeventv1.ListSubscriptionResp, error) {
-			if call == 1 {
-				return okListResp(nil, false, ""), nil // first reconcile: nothing yet
-			}
-			// second reconcile (post-Create-failure): someone else's
-			// concurrent Create already landed, and it is compatible.
-			return okListResp([]*larkeventv1.SubscriptionDetail{
-				activeDetail("sub_raced", false, "user"),
-			}, false, ""), nil
-		},
-		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) {
-			return nil, errors.New("duplicate")
-		},
+	gw := &fakeCreateGateway{
+		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_other", false, "app")}, // "app" never matches AsUser
+		walkCapped: true,
 	}
 
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (an inconclusive scan must never Create)", gw.createCalls)
+	}
+}
+
+func TestApplyCreate_CreateFails_ReconcileFindsCompatible_ReturnsReused(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	gw := &fakeCreateGateway{
+		createErr: errors.New("duplicate"),
+		walkFunc: func(call int) ([]larkgw.RemoteSubscription, bool, error) {
+			if call == 0 {
+				return nil, false, nil // first Plan: nothing yet -> Create
+			}
+			// reconcile-after-failure: someone raced a compatible one in.
+			return []larkgw.RemoteSubscription{activeRemote("sub_raced", false, "user")}, false, nil
+		},
+	}
+	var buf bytes.Buffer
+
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{asJSON: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if outcome.Action != "reused" {
-		t.Errorf("Action = %q, want reused", outcome.Action)
+	var result createResult
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
 	}
-	if strVal(outcome.Detail.SubscriptionId) != "sub_raced" {
-		t.Errorf("Detail.SubscriptionId = %q, want sub_raced", strVal(outcome.Detail.SubscriptionId))
+	if result.Action != "reused" || result.RemoteSubscriptionID != "sub_raced" {
+		t.Errorf("result = %+v, want reused sub_raced", result)
 	}
-	if len(fake.listCalls) != 2 {
-		t.Errorf("List call count = %d, want 2 (initial + post-failure reconcile)", len(fake.listCalls))
-	}
-	if fake.createCalls != 1 {
-		t.Errorf("createCalls = %d, want 1 (no automatic re-Create after reconciling)", fake.createCalls)
+	if gw.createCalls != 1 {
+		t.Errorf("createCalls = %d, want 1 (never auto-retry Create)", gw.createCalls)
 	}
 }
 
-func TestCreateOrReuseSubscription_CreateFails_ReconcileFindsConflict_ReturnsTypedFail(t *testing.T) {
+func TestApplyCreate_CreateFails_ReconcileFindsConflict_ReturnsTypedFail(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: func(call int) (*larkeventv1.ListSubscriptionResp, error) {
-			if call == 1 {
-				return okListResp(nil, false, ""), nil
+	gw := &fakeCreateGateway{
+		createErr: errors.New("duplicate"),
+		walkFunc: func(call int) ([]larkgw.RemoteSubscription, bool, error) {
+			if call == 0 {
+				return nil, false, nil
 			}
-			return okListResp([]*larkeventv1.SubscriptionDetail{
-				activeDetail("sub_raced_conflict", true, "user"),
-			}, false, ""), nil
-		},
-		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) {
-			return nil, errors.New("duplicate")
+			return []larkgw.RemoteSubscription{activeRemote("sub_raced_conflict", true, "user")}, false, nil
 		},
 	}
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -558,23 +404,190 @@ func TestCreateOrReuseSubscription_CreateFails_ReconcileFindsConflict_ReturnsTyp
 	}
 }
 
-func TestCreateOrReuseSubscription_CreateFails_ReconcileFindsNothing_ReturnsOriginalError(t *testing.T) {
+func TestApplyCreate_CreateFails_ReconcileFindsNothing_ReturnsOriginalError(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
 	sentinel := errors.New("boom: transport timeout")
-	fake := &fakeCreateAPI{
-		listFunc:   fixedList(okListResp(nil, false, ""), nil), // both reconciles find nothing
-		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) { return nil, sentinel },
-	}
+	gw := &fakeCreateGateway{createErr: sentinel} // both reconciles find nothing
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want the original Create error passed through unchanged (%v)", err, sentinel)
 	}
-	if len(fake.listCalls) != 2 {
-		t.Errorf("List call count = %d, want 2 (initial + one bounded reconcile-after-failure pass)", len(fake.listCalls))
+	if gw.createCalls != 1 {
+		t.Errorf("createCalls = %d, want 1 (never auto-retry Create)", gw.createCalls)
 	}
-	if fake.createCalls != 1 {
-		t.Errorf("createCalls = %d, want 1 (never auto-retry Create itself)", fake.createCalls)
+}
+
+// ---- encrypted create ----
+
+func TestApplyCreate_Encrypted_NotFound_CreatesAtomicallyWithKey(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	gw := &fakeCreateGateway{createResp: remotePtr(activeRemote("sub_encrypted_new", true, "app"))}
+	keyGen := 0
+	ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(countingKeyGen(&keyGen, "THE-GENERATED-KEY")))
+
+	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gw.createCalls != 1 {
+		t.Errorf("createCalls = %d, want exactly 1 (one atomic Create)", gw.createCalls)
+	}
+	if keyGen != 1 {
+		t.Errorf("key generator called %d times, want exactly 1", keyGen)
+	}
+	if gw.createSpec == nil || !gw.createSpec.IncludeResourceData || gw.createSpec.EncryptKey != "THE-GENERATED-KEY" {
+		t.Errorf("createSpec = %+v, want include_resource_data=true with the generated key injected atomically", gw.createSpec)
+	}
+}
+
+func TestApplyCreate_Encrypted_RemoteFalse_ReturnsConflict_NeverProbes(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	gw := &fakeCreateGateway{
+		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_plain", false, "app")}, // "app" matches AsBot
+		encryptKey: "usable-key",
+	}
+
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true}, nil)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0", gw.createCalls)
+	}
+	if gw.getEncryptKeyCalls != 0 {
+		t.Errorf("getEncryptKeyCalls = %d, want 0: the probe must never run when the state mismatch is already decisive", gw.getEncryptKeyCalls)
+	}
+}
+
+func TestApplyCreate_Encrypted_RemoteTrueUsableKey_ReusesNoNewCreateNoNewKey(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	gw := &fakeCreateGateway{
+		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_already_encrypted", true, "app")},
+		encryptKey: "usable-remote-key",
+	}
+	keyGen := 0
+	ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(countingKeyGen(&keyGen, "unused")))
+	var buf bytes.Buffer
+
+	err := applyCreate(context.Background(), ctrl, &buf, resolved, core.AsBot, createOpts{includeResourceData: true, asJSON: true}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var result createResult
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if result.Action != "reused" || result.RemoteSubscriptionID != "sub_already_encrypted" {
+		t.Errorf("result = %+v, want reused sub_already_encrypted", result)
+	}
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (reuse must never call Create)", gw.createCalls)
+	}
+	if keyGen != 0 {
+		t.Errorf("key generator called %d times, want 0: reusing an existing encrypted match must never generate a new key", keyGen)
+	}
+	if gw.getEncryptKeyCalls != 1 {
+		t.Errorf("getEncryptKeyCalls = %d, want 1 (the probe confirms the usable key)", gw.getEncryptKeyCalls)
+	}
+}
+
+func TestApplyCreate_Encrypted_RemoteTrueKeyUnavailable_ReturnsConflictHumanHint(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	gw := &fakeCreateGateway{
+		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_key_unavailable", true, "app")},
+		encryptErr: errors.New("boom: synthetic permission failure"),
+	}
+
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true}, nil)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	for _, want := range []string{"sub_key_unavailable", "event:encrypt_key:read", "delete"} {
+		if !strings.Contains(ve.Hint, want) {
+			t.Errorf("Hint = %q, want it to mention %q", ve.Hint, want)
+		}
+	}
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (a conflict must never call Create)", gw.createCalls)
+	}
+}
+
+func TestApplyCreate_Encrypted_CreateFails_SecondReconcileStillRequiresEncryption(t *testing.T) {
+	// The post-failure reconcile must keep requesting include_resource_data=true:
+	// a raced PLAINTEXT match must look like a conflict, never a compatible reuse.
+	resolved := resolveCreatedChatID(t)
+	gw := &fakeCreateGateway{
+		createErr: errors.New("boom: synthetic create failure"),
+		walkFunc: func(call int) ([]larkgw.RemoteSubscription, bool, error) {
+			if call == 0 {
+				return nil, false, nil
+			}
+			return []larkgw.RemoteSubscription{activeRemote("sub_raced_plaintext", false, "user")}, false, nil
+		},
+	}
+
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{includeResourceData: true}, nil)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError (conflict, not a silent plaintext fallback), got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if gw.createCalls != 1 {
+		t.Errorf("createCalls = %d, want 1 (never retry Create, encrypted or otherwise)", gw.createCalls)
+	}
+}
+
+// ---- key redaction ----
+
+func TestEncryptedCreate_Redaction_KeyNeverAppearsInAnyOutput(t *testing.T) {
+	const secret = "SPY-ENCRYPT-KEY-REDACT-ME"
+	resolved := resolveCreatedChatID(t)
+
+	for _, asJSON := range []bool{true, false} {
+		gw := &fakeCreateGateway{createResp: remotePtr(activeRemote("sub_enc", true, "app"))}
+		ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(func() (string, error) { return secret, nil }))
+		var buf bytes.Buffer
+
+		err := applyCreate(context.Background(), ctrl, &buf, resolved, core.AsBot, createOpts{includeResourceData: true, asJSON: asJSON}, nil)
+		if err != nil {
+			t.Fatalf("asJSON=%v: unexpected error: %v", asJSON, err)
+		}
+		// Control: the key really was generated and threaded into the Create.
+		if gw.createCalls != 1 || gw.createSpec == nil || gw.createSpec.EncryptKey != secret {
+			t.Fatalf("asJSON=%v: control failed — createCalls=%d createSpec=%+v (the key must actually have been used)", asJSON, gw.createCalls, gw.createSpec)
+		}
+		if strings.Contains(buf.String(), secret) {
+			t.Errorf("REDACTION VIOLATION (asJSON=%v): encrypt_key found in output: %s", asJSON, buf.String())
+		}
+	}
+}
+
+func TestEncryptedCreate_Redaction_KeyNeverAppearsInErrorOnCreateFailure(t *testing.T) {
+	const secret = "SPY-ENCRYPT-KEY-REDACT-ME"
+	resolved := resolveCreatedChatID(t)
+	gw := &fakeCreateGateway{createErr: errors.New("boom: synthetic create failure")} // both reconciles find nothing
+	ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(func() (string, error) { return secret, nil }))
+
+	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true}, nil)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if gw.createSpec == nil || gw.createSpec.EncryptKey != secret {
+		t.Fatal("control failed: the key must actually have been generated and used")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("REDACTION VIOLATION: encrypt_key found in error message: %v", err)
 	}
 }
 
@@ -605,8 +618,7 @@ func TestCreateRequiredScopes_True_AlsoIncludesEncryptKeyReadScope(t *testing.T)
 // classic Go append-aliasing bug: createRequiredScopes(true) must build a
 // fresh slice rather than appending onto (and potentially reallocating
 // into, or worse, overwriting) subscriptionMutationScopes's own backing
-// array, which every OTHER caller of subscriptionMutationScopes (dry-run's
-// own createDryRunResult default, other mutating subcommands) still relies
+// array, which every OTHER caller of subscriptionMutationScopes still relies
 // on being exactly its original 2-element literal.
 func TestCreateRequiredScopes_DoesNotMutateSharedBaseSlice(t *testing.T) {
 	before := append([]string(nil), subscriptionMutationScopes...)
@@ -616,188 +628,231 @@ func TestCreateRequiredScopes_DoesNotMutateSharedBaseSlice(t *testing.T) {
 	}
 }
 
-// ---- dry-run must never generate a key ----
+// ---- dry-run: never generate a key ----
 
 // TestDryRun_IncludeResourceDataTrue_NotFound_GeneratesNoKeyAndNoCreateCall
-// drives the exact two calls runCreate's --dry-run branch makes
-// (reconcileExisting then buildDryRunResult) with includeResourceData=true
-// and asserts, via a spy substituted for the package-level key generator,
-// that it is invoked exactly zero times — even though the plan lands on
-// planActionCreate, the one row a REAL (non-dry-run) run would generate a
-// key for.
+// locks that --dry-run's Plan step never generates a key nor writes, even when
+// the plan lands on Create (the one row a REAL run would generate a key for).
 func TestDryRun_IncludeResourceDataTrue_NotFound_GeneratesNoKeyAndNoCreateCall(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{listFunc: fixedList(okListResp(nil, false, ""), nil)}
+	gw := &fakeCreateGateway{}
+	keyGen := 0
+	ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(countingKeyGen(&keyGen, "x")))
 
-	keyGenCalls := 0
-	orig := newEncryptKeyFunc
-	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return orig() }
-	t.Cleanup(func() { newEncryptKeyFunc = orig })
-
-	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsBot, true, nil)
+	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true, dryRun: true}, nil)
 	if err != nil {
-		t.Fatalf("reconcileExisting: unexpected error: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if plan.Action != planActionCreate {
-		t.Fatalf("Action = %q, want %q", plan.Action, planActionCreate)
+	if keyGen != 0 {
+		t.Errorf("key generator invoked %d times during --dry-run, want 0", keyGen)
 	}
-	result := buildDryRunResult(resolved, core.AsBot, plan, true)
-	if result.PlannedChange.Action != planActionCreate {
-		t.Errorf("PlannedChange.Action = %q, want %q", result.PlannedChange.Action, planActionCreate)
-	}
-
-	if keyGenCalls != 0 {
-		t.Errorf("key generator invoked %d times during --dry-run, want 0", keyGenCalls)
-	}
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write", fake.createCalls)
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write", gw.createCalls)
 	}
 }
 
-// TestDryRun_IncludeResourceDataTrue_ActiveMatch_ProbesButGeneratesNoKey
-// covers the OTHER row a --dry-run preview can reach for an encrypted
-// request: an existing active, include_resource_data=true match.
-// --dry-run's plan step MAY probe remote state
-// (GetEncryptKey, to report whether the plan would be reuse or conflict)
-// but must still never generate a NEW key — this distinguishes "probing an
-// existing key" (fine, informational) from "creating a new one" (never
-// during --dry-run).
+// TestDryRun_IncludeResourceDataTrue_ActiveMatch_ProbesButGeneratesNoKey covers
+// the OTHER dry-run row: an existing active include_resource_data=true match.
+// --dry-run's plan step MAY probe remote state (GetEncryptKey, to report
+// reuse-vs-conflict) but must still never generate a NEW key or write.
 func TestDryRun_IncludeResourceDataTrue_ActiveMatch_ProbesButGeneratesNoKey(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-			activeDetail("sub_enc", true, "app"), // "app" authority matches core.AsBot identity
-		}, false, ""), nil),
-		getEncryptKeyFunc: func() (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
-			return okEncryptKeyResp("usable-key-from-remote"), nil
-		},
+	gw := &fakeCreateGateway{
+		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_enc", true, "app")},
+		encryptKey: "usable-key-from-remote",
 	}
+	keyGen := 0
+	ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(countingKeyGen(&keyGen, "x")))
 
-	keyGenCalls := 0
-	orig := newEncryptKeyFunc
-	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return orig() }
-	t.Cleanup(func() { newEncryptKeyFunc = orig })
-
-	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsBot, true, nil)
+	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true, dryRun: true}, nil)
 	if err != nil {
-		t.Fatalf("reconcileExisting: unexpected error: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if plan.Action != planActionReuse {
-		t.Fatalf("Action = %q, want %q (usable remote key -> reuse)", plan.Action, planActionReuse)
+	if gw.getEncryptKeyCalls != 1 {
+		t.Errorf("getEncryptKeyCalls = %d, want 1: dry-run's plan step may probe remote state", gw.getEncryptKeyCalls)
 	}
-	_ = buildDryRunResult(resolved, core.AsBot, plan, true)
-
-	if fake.getEncryptKeyCalls != 1 {
-		t.Errorf("getEncryptKeyCalls = %d, want 1: dry-run's plan step may probe remote state", fake.getEncryptKeyCalls)
+	if keyGen != 0 {
+		t.Errorf("key generator invoked %d times during --dry-run, want 0: probing an existing key must never generate a new one", keyGen)
 	}
-	if keyGenCalls != 0 {
-		t.Errorf("key generator invoked %d times during --dry-run, want 0: probing an existing key must never generate a new one", keyGenCalls)
-	}
-	if fake.createCalls != 0 {
+	if gw.createCalls != 0 {
 		t.Error("createCalls must be 0 for --dry-run")
 	}
 }
 
-// ---- encrypted create (--include-resource-data=true: atomic Create-time
-// key injection, the encryption conflict matrix, and key redaction) ----
+// ---- dry-run output shape ----
 
-// TestBuildCreateSubscriptionBody_IncludeResourceDataTrueWithKey_SetsBothAtomically
-// is the direct, structural proof of the atomicity requirement:
-// includeResourceData and a non-empty encryptKey are always set on the SAME
-// returned body value from ONE function call — there is no code path that
-// could build/send them as two separate requests. See
-// buildCreateSubscriptionBody's own doc comment for why this must be
-// asserted against ITS return value rather than a captured
-// *larkeventv1.CreateSubscriptionReq (the SDK request wrapper's Body field
-// is never actually populated by its own builder — verified while writing
-// this test).
-func TestBuildCreateSubscriptionBody_IncludeResourceDataTrueWithKey_SetsBothAtomically(t *testing.T) {
-	body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", true, "the-generated-key", nil)
+func TestBuildDryRunResult_NotFound_ShapeAndNoRemoteBefore(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	plan := subown.SubscriptionPlan{Action: subown.ActionCreate}
 
-	if body.EventType == nil || *body.EventType != "im.message.created_v1" {
-		t.Errorf("EventType = %v, want im.message.created_v1", body.EventType)
+	result := buildDryRunResult(resolved, core.AsUser, plan, false)
+
+	if result.Operation != "create" {
+		t.Errorf("Operation = %q, want create", result.Operation)
 	}
-	if body.TargetResource == nil || *body.TargetResource != "im.message?chat_id=oc_aaa" {
-		t.Errorf("TargetResource = %v, want im.message?chat_id=oc_aaa", body.TargetResource)
+	if !result.DryRun {
+		t.Error("DryRun = false, want true")
 	}
-	if body.PayloadOptions == nil {
-		t.Fatal("PayloadOptions = nil, want set")
+	if result.EventKey != resolved.MaterializedKey {
+		t.Errorf("EventKey = %q, want %q", result.EventKey, resolved.MaterializedKey)
 	}
-	if !boolVal(body.PayloadOptions.IncludeResourceData) {
-		t.Error("PayloadOptions.IncludeResourceData = false, want true")
+	if result.TargetResource != resolved.TargetResource {
+		t.Errorf("TargetResource = %q, want %q", result.TargetResource, resolved.TargetResource)
 	}
-	if body.PayloadOptions.Encrypt == nil || strVal(body.PayloadOptions.Encrypt.EncryptKey) != "the-generated-key" {
-		t.Fatalf("PayloadOptions.Encrypt = %+v, want EncryptKey=the-generated-key", body.PayloadOptions.Encrypt)
+	if len(result.RequiredScopes) != 2 {
+		t.Errorf("RequiredScopes = %v, want both read+write scopes", result.RequiredScopes)
+	}
+	if result.RemoteBefore != nil {
+		t.Errorf("RemoteBefore = %+v, want nil when nothing was found", result.RemoteBefore)
+	}
+	if result.PlannedChange.Action != "create" {
+		t.Errorf("PlannedChange.Action = %q, want create", result.PlannedChange.Action)
+	}
+	if result.LocalImpact.LocalConsumerAffected {
+		t.Error("LocalImpact.LocalConsumerAffected = true, want false: create never touches a local consumer")
+	}
+	if result.NextAction == "" {
+		t.Error("NextAction must not be empty")
 	}
 }
 
-// TestBuildCreateSubscriptionBody_EmptyKey_OmitsEncrypt locks the
-// includeResourceData=false path (and any defensive empty-key call): Encrypt
-// must be left nil, never an empty-but-present struct — mirroring how
-// PayloadOptionsEncrypt is Create-only and must not appear at all when there
-// is no key.
-func TestBuildCreateSubscriptionBody_EmptyKey_OmitsEncrypt(t *testing.T) {
-	body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", nil)
+func TestBuildDryRunResult_ActiveCompatible_RemoteBeforePopulated(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	plan := subown.SubscriptionPlan{Action: subown.ActionReuse, Before: remotePtr(activeRemote("sub_existing", false, "user"))}
 
-	if boolVal(body.PayloadOptions.IncludeResourceData) {
-		t.Error("PayloadOptions.IncludeResourceData = true, want false")
+	result := buildDryRunResult(resolved, core.AsUser, plan, false)
+
+	if result.PlannedChange.Action != "reuse" {
+		t.Errorf("PlannedChange.Action = %q, want reuse", result.PlannedChange.Action)
 	}
-	if body.PayloadOptions.Encrypt != nil {
-		t.Errorf("PayloadOptions.Encrypt = %+v, want nil when no key is supplied", body.PayloadOptions.Encrypt)
+	if result.RemoteBefore == nil {
+		t.Fatal("RemoteBefore = nil, want the existing subscription row")
+	}
+	if result.RemoteBefore.RemoteSubscriptionID != "sub_existing" {
+		t.Errorf("RemoteBefore.RemoteSubscriptionID = %q, want sub_existing", result.RemoteBefore.RemoteSubscriptionID)
+	}
+	if result.PlannedChange.RemoteSubscriptionID != "sub_existing" {
+		t.Errorf("PlannedChange.RemoteSubscriptionID = %q, want sub_existing", result.PlannedChange.RemoteSubscriptionID)
 	}
 }
 
-// ---- --filter (server-side event filter) ----
+// TestBuildDryRunResult_IncludeResourceDataTrue_RequiredScopesIncludesEncryptKeyRead
+// locks that dry-run's reported required_scopes reflects the conditional third
+// scope: a --dry-run preview must never claim a smaller scope requirement than
+// the real run it previews.
+func TestBuildDryRunResult_IncludeResourceDataTrue_RequiredScopesIncludesEncryptKeyRead(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	plan := subown.SubscriptionPlan{Action: subown.ActionCreate}
 
-// validCreatedFilter parses a valid filter for im.message.created_v1 through
-// the real parse/validate path so the projected body carries exactly what a
-// real --filter would.
-func validCreatedFilter(t *testing.T) *eventlib.Filter {
-	t.Helper()
-	f, err := eventlib.ParseAndValidateFilter(
-		`{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"in","list_value":["text"]}}]}}`,
-		eventlib.FilterMetaFor("im.message.created_v1"))
+	result := buildDryRunResult(resolved, core.AsUser, plan, true)
+
+	want := map[string]bool{"event:subscription:read": true, "event:subscription:write": true, "event:encrypt_key:read": true}
+	if len(result.RequiredScopes) != len(want) {
+		t.Fatalf("RequiredScopes = %v, want exactly %v", result.RequiredScopes, want)
+	}
+	for _, s := range result.RequiredScopes {
+		if !want[s] {
+			t.Errorf("unexpected required scope %q", s)
+		}
+	}
+}
+
+// TestDryRun_NotFound_EndToEnd_JSONShapeAndNoCreateCall drives applyCreate's
+// --dry-run branch over a fake gateway: it must produce the full dry-run JSON
+// shape and never call Create.
+func TestDryRun_NotFound_EndToEnd_JSONShapeAndNoCreateCall(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	gw := &fakeCreateGateway{}
+	var buf bytes.Buffer
+
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsBot, createOpts{dryRun: true, asJSON: true}, nil)
 	if err != nil {
-		t.Fatalf("build valid filter: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	return f
+
+	var generic map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &generic); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	for _, field := range []string{"operation", "dry_run", "event_key", "target_resource", "required_scopes", "preflight", "remote_before", "planned_change", "local_impact", "next_action"} {
+		if _, ok := generic[field]; !ok {
+			t.Errorf("dry-run JSON missing field %q; got: %s", field, buf.String())
+		}
+	}
+	if dryRun, _ := generic["dry_run"].(bool); !dryRun {
+		t.Errorf(`dry-run JSON "dry_run" = %v, want true`, generic["dry_run"])
+	}
+	if generic["remote_before"] != nil {
+		t.Errorf(`dry-run JSON "remote_before" = %v, want null (nothing found)`, generic["remote_before"])
+	}
+	plannedChange, ok := generic["planned_change"].(map[string]interface{})
+	if !ok || plannedChange["action"] != "create" {
+		t.Errorf(`dry-run JSON "planned_change.action" = %v, want "create"`, generic["planned_change"])
+	}
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write", gw.createCalls)
+	}
 }
 
-// TestBuildCreateSubscriptionBody_WithFilter_CarriesProjectedFilter proves a
-// requested filter is projected onto the Create body's Filter field exactly as
-// it would be sent on the wire.
-func TestBuildCreateSubscriptionBody_WithFilter_CarriesProjectedFilter(t *testing.T) {
-	f := validCreatedFilter(t)
-	body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", f)
-	if body.Filter == nil {
-		t.Fatal("body.Filter = nil, want the projected filter")
-	}
-	got, err := json.Marshal(body.Filter)
+func TestDryRun_ActiveConflicting_EndToEnd_ReportsInformationallyNoCreateCall(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{activeRemote("sub_conflict", true, "user")}}
+	var buf bytes.Buffer
+
+	// requested include_resource_data=false mismatches the existing true -> conflict.
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{dryRun: true, asJSON: true}, nil)
 	if err != nil {
-		t.Fatalf("marshal body.Filter: %v", err)
+		t.Fatalf("dry-run must report informationally, not error: %v", err)
 	}
-	want, err := f.Canonicalize()
-	if err != nil {
-		t.Fatalf("canonicalize: %v", err)
+	var result createDryRunResult
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
 	}
-	if !bytes.Equal(got, want) {
-		t.Errorf("body.Filter = %s, want %s", got, want)
+	if result.PlannedChange.Action != "conflict" {
+		t.Errorf("PlannedChange.Action = %q, want conflict", result.PlannedChange.Action)
+	}
+	if result.PlannedChange.RemoteSubscriptionID != "sub_conflict" {
+		t.Errorf("PlannedChange.RemoteSubscriptionID = %q, want sub_conflict", result.PlannedChange.RemoteSubscriptionID)
+	}
+	if len(result.PlannedChange.ConflictFields) != 1 || result.PlannedChange.ConflictFields[0].Name != "include_resource_data" {
+		t.Errorf("PlannedChange.ConflictFields = %+v, want one entry naming include_resource_data", result.PlannedChange.ConflictFields)
+	}
+	if result.RemoteBefore == nil || result.RemoteBefore.RemoteSubscriptionID != "sub_conflict" {
+		t.Errorf("RemoteBefore = %+v, want the conflicting subscription row", result.RemoteBefore)
+	}
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write", gw.createCalls)
 	}
 }
 
-// TestBuildCreateSubscriptionBody_NoFilter_OmitsFilter locks that with no
-// requested filter the field is omitted entirely — never sent as an empty
-// {"filter":{}} clear form (that is an update-only concept).
-func TestBuildCreateSubscriptionBody_NoFilter_OmitsFilter(t *testing.T) {
-	for name, f := range map[string]*eventlib.Filter{"nil": nil, "empty": {}} {
-		t.Run(name, func(t *testing.T) {
-			body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", f)
-			if body.Filter != nil {
-				t.Errorf("body.Filter = %+v, want nil (omitted) when no filter is requested", body.Filter)
-			}
-		})
+func TestDryRun_Suspended_EndToEnd_ReportsInformationallyNoCreateCall(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{suspendedRemote("sub_susp", "authority_revoked")}}
+	var buf bytes.Buffer
+
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{dryRun: true, asJSON: true}, nil)
+	if err != nil {
+		t.Fatalf("dry-run must report informationally, not error: %v", err)
+	}
+	var result createDryRunResult
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if result.PlannedChange.Action != "suspended" {
+		t.Errorf("PlannedChange.Action = %q, want suspended", result.PlannedChange.Action)
+	}
+	if result.RemoteBefore == nil || result.RemoteBefore.RemoteSubscriptionID != "sub_susp" {
+		t.Errorf("RemoteBefore = %+v, want the suspended subscription row", result.RemoteBefore)
+	}
+	if result.RemoteBefore.Remote.SuspensionReason != "authority_revoked" {
+		t.Errorf("RemoteBefore.Remote.SuspensionReason = %q, want authority_revoked", result.RemoteBefore.Remote.SuspensionReason)
+	}
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write", gw.createCalls)
 	}
 }
+
+// ---- --filter parse (command level) ----
 
 // TestRunCreate_InvalidFilter_ReturnsInvalidArgumentOnFilterParam locks that an
 // invalid --filter is rejected as a typed invalid_argument on --filter, before
@@ -824,311 +879,6 @@ func TestRunCreate_InvalidFilter_ReturnsInvalidArgumentOnFilterParam(t *testing.
 	}
 	if ve.Param != "--filter" {
 		t.Errorf("Param = %q, want --filter", ve.Param)
-	}
-}
-
-// TestCreateOrReuseSubscription_Encrypted_NotFound_CreatesAtomicallyWithKey
-// is the primary TDD case at createOrReuseSubscription's own level: no
-// existing match -> generate a key -> Create exactly once (never a separate
-// "create plain" + "add encryption" pair of calls) -> return the resulting
-// subscription_id. See TestBuildCreateSubscriptionBody_* above for the
-// direct proof of what that one call's body actually contains.
-func TestCreateOrReuseSubscription_Encrypted_NotFound_CreatesAtomicallyWithKey(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: fixedList(okListResp(nil, false, ""), nil),
-		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) {
-			return okCreateResp(activeDetail("sub_encrypted_new", true, "app")), nil
-		},
-	}
-
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if outcome.Action != "created" {
-		t.Errorf("Action = %q, want created", outcome.Action)
-	}
-	if strVal(outcome.Detail.SubscriptionId) != "sub_encrypted_new" {
-		t.Errorf("Detail.SubscriptionId = %q, want sub_encrypted_new", strVal(outcome.Detail.SubscriptionId))
-	}
-	if fake.createCalls != 1 {
-		t.Errorf("createCalls = %d, want exactly 1 (one atomic Create)", fake.createCalls)
-	}
-}
-
-// TestCreateOrReuseSubscription_Encrypted_RemoteFalse_ReturnsConflict locks
-// the conflict-matrix row "encrypted request vs existing include_resource_data=false
-// -> conflict, human decision" via createOrReuseSubscription (create.go's own typed-error layer, not
-// just the lower-level ReconcileExisting already locked in
-// internal/event/reconcile_test.go).
-func TestCreateOrReuseSubscription_Encrypted_RemoteFalse_ReturnsConflict(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-			activeDetail("sub_plain", false, "app"), // "app" authority matches core.AsBot identity
-		}, false, ""), nil),
-	}
-
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
-	var ve *errs.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
-	}
-	if ve.Subtype != errs.SubtypeFailedPrecondition {
-		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
-	}
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0 (a conflict must never call Create)", fake.createCalls)
-	}
-	if fake.getEncryptKeyCalls != 0 {
-		t.Errorf("getEncryptKeyCalls = %d, want 0: the probe must never run when the state mismatch is already decisive", fake.getEncryptKeyCalls)
-	}
-}
-
-// TestCreateOrReuseSubscription_Encrypted_RemoteTrueUsableKey_ReusesNoNewCreate
-// locks the conflict-matrix reuse row: an
-// active, include_resource_data=true match whose key GetEncryptKey confirms
-// usable is reused as-is — never a new Create, never a new key.
-func TestCreateOrReuseSubscription_Encrypted_RemoteTrueUsableKey_ReusesNoNewCreate(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-			activeDetail("sub_already_encrypted", true, "app"), // "app" authority matches core.AsBot identity
-		}, false, ""), nil),
-		getEncryptKeyFunc: func() (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
-			return okEncryptKeyResp("usable-remote-key"), nil
-		},
-	}
-
-	keyGenCalls := 0
-	orig := newEncryptKeyFunc
-	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return orig() }
-	t.Cleanup(func() { newEncryptKeyFunc = orig })
-
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if outcome.Action != "reused" {
-		t.Errorf("Action = %q, want reused", outcome.Action)
-	}
-	if strVal(outcome.Detail.SubscriptionId) != "sub_already_encrypted" {
-		t.Errorf("Detail.SubscriptionId = %q, want sub_already_encrypted", strVal(outcome.Detail.SubscriptionId))
-	}
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0 (reuse must never call Create)", fake.createCalls)
-	}
-	if keyGenCalls != 0 {
-		t.Errorf("key generator invoked %d times, want 0: reusing an existing encrypted match must never generate a new key", keyGenCalls)
-	}
-}
-
-// TestCreateOrReuseSubscription_Encrypted_RemoteTrueKeyUnavailable_ReturnsConflictHumanHint
-// locks the conflict-matrix row for an encrypted match whose key is NOT
-// retrievable: GetEncryptKey returning no usable key (here: a business
-// error, e.g. missing scope/permission at the remote side) must conflict —
-// with human-actionable guidance (delete+recreate / verify the subscription
-// / check event:encrypt_key:read), never a silent reuse.
-func TestCreateOrReuseSubscription_Encrypted_RemoteTrueKeyUnavailable_ReturnsConflictHumanHint(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-			activeDetail("sub_key_unavailable", true, "app"), // "app" authority matches core.AsBot identity
-		}, false, ""), nil),
-		getEncryptKeyFunc: func() (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
-			return nil, errors.New("boom: synthetic permission failure")
-		},
-	}
-
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
-	var ve *errs.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
-	}
-	if ve.Subtype != errs.SubtypeFailedPrecondition {
-		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
-	}
-	if !strings.Contains(ve.Hint, "sub_key_unavailable") {
-		t.Errorf("Hint = %q, want it to mention remote_subscription_id sub_key_unavailable", ve.Hint)
-	}
-	if !strings.Contains(ve.Hint, "event:encrypt_key:read") {
-		t.Errorf("Hint = %q, want it to mention scope event:encrypt_key:read", ve.Hint)
-	}
-	if !strings.Contains(ve.Hint, "delete") {
-		t.Errorf("Hint = %q, want it to guide delete+recreate", ve.Hint)
-	}
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0 (a conflict must never call Create)", fake.createCalls)
-	}
-}
-
-// TestCreateOrReuseSubscription_Encrypted_CreateFails_SecondReconcileStillRequiresEncryption
-// locks the fail-closed invariant: "if create fails, do NOT retry without
-// encryption / do NOT fall back to a plaintext sub." The post-failure
-// bounded reconcile-and-retry pass (createOrReuseSubscription's own,
-// unrelated-to-encryption "List raced us" recovery) must still request
-// includeResourceData=true on its second reconcile — proven here by racing
-// in a PLAINTEXT match on that second List: if the implementation ever
-// silently downgraded to includeResourceData=false after an encrypted
-// Create failure, this plaintext match would wrongly look like a compatible
-// reuse instead of a conflict.
-func TestCreateOrReuseSubscription_Encrypted_CreateFails_SecondReconcileStillRequiresEncryption(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{
-		listFunc: func(call int) (*larkeventv1.ListSubscriptionResp, error) {
-			if call == 1 {
-				return okListResp(nil, false, ""), nil
-			}
-			return okListResp([]*larkeventv1.SubscriptionDetail{
-				activeDetail("sub_raced_plaintext", false, "user"),
-			}, false, ""), nil
-		},
-		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) {
-			return nil, errors.New("boom: synthetic create failure")
-		},
-	}
-
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, true, nil)
-	var ve *errs.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *errs.ValidationError (conflict, not a silent plaintext fallback), got %T: %v", err, err)
-	}
-	if ve.Subtype != errs.SubtypeFailedPrecondition {
-		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
-	}
-	if fake.createCalls != 1 {
-		t.Errorf("createCalls = %d, want 1 (never retry Create, encrypted or otherwise)", fake.createCalls)
-	}
-}
-
-// ---- key redaction: the generated key must NEVER appear in stdout,
-// stderr, the --json output, the dry-run plan preview, logs, or any
-// error/Hint ----
-
-// TestEncryptedCreate_Redaction_KeyNeverAppearsInAnyOutput captures every
-// caller-visible output surface an encrypted, successful create produces —
-// the --json result (json.Marshal of buildCreateResult's return value) and
-// the human-text result (writeCreateText) — and asserts the actual
-// generated key (captured directly via a spy on the package-level
-// generator, i.e. ground truth, not a guess) is byte-for-byte absent from
-// both. The control that this key really was generated and used for this
-// exact create attempt (so the negative assertions below are not vacuous)
-// is TestBuildCreateSubscriptionBody_IncludeResourceDataTrueWithKey_SetsBothAtomically
-// plus this test's own createCalls==1 check: doCreateSubscription always
-// builds its request body via buildCreateSubscriptionBody(..., encryptKey, nil)
-// with exactly the value newEncryptKeyFunc returned (createOrReuseSubscription
-// threads it straight through with no intermediate transformation).
-func TestEncryptedCreate_Redaction_KeyNeverAppearsInAnyOutput(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-
-	var capturedKey string
-	orig := newEncryptKeyFunc
-	newEncryptKeyFunc = func() (string, error) {
-		k, err := orig()
-		capturedKey = k
-		return k, err
-	}
-	t.Cleanup(func() { newEncryptKeyFunc = orig })
-
-	fake := &fakeCreateAPI{listFunc: fixedList(okListResp(nil, false, ""), nil)}
-
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if capturedKey == "" {
-		t.Fatal("test setup issue: no key was captured, cannot verify redaction")
-	}
-	if fake.createCalls != 1 {
-		t.Fatalf("createCalls = %d, want exactly 1 (control: the generated key must have actually been used for a real create attempt)", fake.createCalls)
-	}
-
-	result := buildCreateResult(resolved, core.AsBot, outcome)
-
-	jsonBytes, err := json.Marshal(result)
-	if err != nil {
-		t.Fatalf("json.Marshal: %v", err)
-	}
-	if strings.Contains(string(jsonBytes), capturedKey) {
-		t.Errorf("REDACTION VIOLATION: encrypt_key found in --json output: %s", jsonBytes)
-	}
-
-	var textBuf bytes.Buffer
-	writeCreateText(&textBuf, result)
-	if strings.Contains(textBuf.String(), capturedKey) {
-		t.Errorf("REDACTION VIOLATION: encrypt_key found in human-text output: %s", textBuf.String())
-	}
-
-	// Also cover the dry-run preview shape (a plan built from the same
-	// createOutcome-adjacent reconcilePlan) for completeness, even though
-	// this particular call path (a completed, non-dry-run create) does not
-	// itself render one.
-	plan := &reconcilePlan{Action: planActionCreate}
-	dryRunResult := buildDryRunResult(resolved, core.AsBot, plan, true)
-	dryRunJSON, err := json.Marshal(dryRunResult)
-	if err != nil {
-		t.Fatalf("json.Marshal dry-run result: %v", err)
-	}
-	if strings.Contains(string(dryRunJSON), capturedKey) {
-		t.Errorf("REDACTION VIOLATION: encrypt_key found in dry-run plan preview: %s", dryRunJSON)
-	}
-}
-
-// TestEncryptedCreate_Redaction_KeyNeverAppearsInErrorOnCreateFailure covers
-// the error path: even when the atomic Create call itself fails, the
-// resulting typed error's Error()/Hint must never contain the key that was
-// generated and submitted for that attempt.
-func TestEncryptedCreate_Redaction_KeyNeverAppearsInErrorOnCreateFailure(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-
-	var capturedKey string
-	orig := newEncryptKeyFunc
-	newEncryptKeyFunc = func() (string, error) {
-		k, err := orig()
-		capturedKey = k
-		return k, err
-	}
-	t.Cleanup(func() { newEncryptKeyFunc = orig })
-
-	fake := &fakeCreateAPI{
-		listFunc: fixedList(okListResp(nil, false, ""), nil), // both reconciles: nothing found
-		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) {
-			return nil, errors.New("boom: synthetic create failure")
-		},
-	}
-
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	if capturedKey == "" {
-		t.Fatal("test setup issue: no key was captured, cannot verify redaction")
-	}
-	if strings.Contains(err.Error(), capturedKey) {
-		t.Errorf("REDACTION VIOLATION: encrypt_key found in error message: %v", err)
-	}
-}
-
-// TestDoCreateSubscription_IncludeResourceDataTrueWithEmptyKey_FailsClosed
-// is a defense-in-depth structural guard: doCreateSubscription itself must
-// refuse to submit include_resource_data=true with an empty encryptKey,
-// rather than ever letting an "encrypted intent, but actually unencrypted"
-// Create request reach the platform. Every real caller
-// (createOrReuseSubscription) already generates a key before reaching here
-// whenever includeResourceData is true, and returns its own error early if
-// generation fails — so this is unreachable via the production call graph
-// today, but locks the invariant against future modification (e.g. a new
-// caller that forgets to generate a key first).
-func TestDoCreateSubscription_IncludeResourceDataTrueWithEmptyKey_FailsClosed(t *testing.T) {
-	fake := &fakeCreateAPI{}
-
-	_, err := doCreateSubscription(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", true, "", nil)
-	if err == nil {
-		t.Fatal("expected an error (fail-closed, no plaintext-fallback), got nil")
-	}
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0: must refuse before ever calling Create", fake.createCalls)
 	}
 }
 
@@ -1175,7 +925,7 @@ func TestCheckTemplateAuthTypes_ChatIDTemplate_AllowsBothIdentities(t *testing.T
 }
 
 // ---- runCreate wiring (cobra-level; every case below must short-circuit
-// before any network-capable client is built) ----
+// before any network write) ----
 
 func TestRunCreate_BareRefinedBaseKey_ReturnsR1InvalidArgumentUnchanged(t *testing.T) {
 	registerCreateFixtures(t)
@@ -1261,9 +1011,8 @@ func TestRunCreate_AsBotOnOwnerMeTemplate_RejectedByTemplateAuthTypes(t *testing
 }
 
 // TestRunCreate_KeyLevelAuthTypesRejectsBeforeTemplateCheck locks tier 1:
-// a refined key whose AuthTypes as a whole excludes the
-// resolved identity must reject with invalid_argument (not
-// failed_precondition — that is tier 2's, template-specific, error).
+// a refined key whose AuthTypes as a whole excludes the resolved identity must
+// reject with invalid_argument (not failed_precondition — that is tier 2's).
 func TestRunCreate_KeyLevelAuthTypesRejectsBeforeTemplateCheck(t *testing.T) {
 	eventlib.RegisterKey(eventlib.KeyDefinition{
 		Key:                 "test.bot_only_refined_v1",
@@ -1298,24 +1047,12 @@ func TestRunCreate_KeyLevelAuthTypesRejectsBeforeTemplateCheck(t *testing.T) {
 	}
 }
 
-// An earlier test locked a deferral gate that rejected
-// --include-resource-data=true. That gate is gone — encrypted create is
-// implemented instead;
-// TestRunCreate_IncludeResourceDataTrue_MissingEncryptKeyReadScope_ReturnsPermissionError
-// and the createOrReuseSubscription-level tests below
-// (TestCreateOrReuseSubscription_Encrypted_*) are its replacement.
-
 // TestRunCreate_IncludeResourceDataFalse_DoesNotRequireEncryptKeyReadScope
 // locks that --include-resource-data=false (the default) never pulls in the
-// extra event:encrypt_key:read scope requirement added for =true:
-// with ONLY the base mutation scopes granted (deliberately omitting
-// event:encrypt_key:read), the flow must proceed past scope preflight into
-// the real reconcile List call — which then fails with an httpmock "no stub
-// registered" error (no stub is registered here on purpose, mirroring the
-// existing --include-resource-data=false convention in this file). That
-// failure is expected and irrelevant to this test: the only thing asserted
-// is that the failure is NOT a *errs.PermissionError naming
-// event:encrypt_key:read.
+// extra event:encrypt_key:read scope: with ONLY the base mutation scopes
+// granted, the flow must proceed past scope preflight into the real remote read
+// (which then fails on an unregistered stub — irrelevant here; the only thing
+// asserted is that the failure is NOT a *errs.PermissionError).
 func TestRunCreate_IncludeResourceDataFalse_DoesNotRequireEncryptKeyReadScope(t *testing.T) {
 	registerCreateFixtures(t)
 	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "cli_x"})
@@ -1336,12 +1073,9 @@ func TestRunCreate_IncludeResourceDataFalse_DoesNotRequireEncryptKeyReadScope(t 
 }
 
 // TestRunCreate_IncludeResourceDataTrue_MissingEncryptKeyReadScope_ReturnsPermissionError
-// locks the scope wiring: --include-resource-data=true additionally
-// requires event:encrypt_key:read (create's reconcile probes GetEncryptKey
-// for an active include_resource_data=true match) on top of the usual
-// event:subscription:{read,write} — missing it alone (both mutation scopes
-// otherwise granted) must fail closed with a typed permission error naming
-// it, never silently proceed without the probe capability.
+// locks the scope wiring: --include-resource-data=true additionally requires
+// event:encrypt_key:read on top of the usual event:subscription:{read,write} —
+// missing it alone must fail closed naming it.
 func TestRunCreate_IncludeResourceDataTrue_MissingEncryptKeyReadScope_ReturnsPermissionError(t *testing.T) {
 	registerCreateFixtures(t)
 	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "cli_x"})
@@ -1352,8 +1086,7 @@ func TestRunCreate_IncludeResourceDataTrue_MissingEncryptKeyReadScope_ReturnsPer
 	cmd := NewCmdCreate(f)
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
-	// --as user: resource data is user-only, so the scope preflight (not the
-	// user-only gate) is what must fire here.
+	// --as user: resource data is user-only, so the scope preflight is what fires.
 	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "user", "--include-resource-data=true"})
 
 	err := cmd.Execute()
@@ -1367,12 +1100,9 @@ func TestRunCreate_IncludeResourceDataTrue_MissingEncryptKeyReadScope_ReturnsPer
 }
 
 // TestRunCreate_IncludeResourceDataTrue_AllScopesGranted_PassesScopePreflight
-// is --include-resource-data=true's counterpart of
-// TestRunCreate_IncludeResourceDataFalse_DoesNotRequireEncryptKeyReadScope:
-// with ALL THREE scopes granted (including event:encrypt_key:read), the
-// flow must proceed past scope preflight into the real reconcile List call
-// (which then fails with an expected, unregistered httpmock stub — the only
-// thing asserted here is that it is NOT a *errs.PermissionError).
+// is the =true counterpart: with all three scopes granted the flow proceeds
+// past scope preflight into the real remote read (which then fails on an
+// unregistered stub — only asserted here is that it is NOT a PermissionError).
 func TestRunCreate_IncludeResourceDataTrue_AllScopesGranted_PassesScopePreflight(t *testing.T) {
 	registerCreateFixtures(t)
 	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "cli_x"})
@@ -1383,8 +1113,6 @@ func TestRunCreate_IncludeResourceDataTrue_AllScopesGranted_PassesScopePreflight
 	cmd := NewCmdCreate(f)
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
-	// --as user: resource data is user-only, so the encrypted create path is
-	// exercised as a user (the user-only gate passes; scope preflight passes too).
 	cmd.SetArgs([]string{"im.message.created_v1/chat-id/oc_aaa", "--as", "user", "--include-resource-data=true"})
 
 	err := cmd.Execute()
@@ -1394,11 +1122,9 @@ func TestRunCreate_IncludeResourceDataTrue_AllScopesGranted_PassesScopePreflight
 	}
 }
 
-// TestRunCreate_IncludeResourceDataTrue_AsBot_RejectedRequiresUser locks #17:
-// resource data is a user-only capability, so --include-resource-data=true with
-// --as bot is a typed invalid_argument fired BEFORE any remote call or scope
-// preflight (a bare Factory suffices — the gate runs before credentials are
-// touched, mirroring TestRunCreate_AsBotOnOwnerMeTemplate).
+// TestRunCreate_IncludeResourceDataTrue_AsBot_RejectedRequiresUser locks that
+// resource data is user-only: --include-resource-data=true with --as bot is a
+// typed invalid_argument fired BEFORE any remote call or scope preflight.
 func TestRunCreate_IncludeResourceDataTrue_AsBot_RejectedRequiresUser(t *testing.T) {
 	registerCreateFixtures(t)
 	f := &cmdutil.Factory{}
@@ -1423,11 +1149,9 @@ func TestRunCreate_IncludeResourceDataTrue_AsBot_RejectedRequiresUser(t *testing
 	}
 }
 
-// TestRunCreate_MissingReadScope_ReturnsPermissionError and
-// TestRunCreate_MissingWriteScope_ReturnsPermissionError together lock
-// create's key differentiator from list/get: create hard-requires BOTH
-// event:subscription:read AND event:subscription:write — missing EITHER one
-// alone must still fail closed (read does not imply write, or vice versa).
+// TestRunCreate_MissingReadScope / MissingWriteScope together lock create's key
+// differentiator from list/get: it hard-requires BOTH event:subscription:read
+// AND event:subscription:write — missing EITHER one alone must still fail closed.
 func TestRunCreate_MissingReadScope_ReturnsPermissionError(t *testing.T) {
 	registerCreateFixtures(t)
 	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "cli_x"})
@@ -1500,215 +1224,10 @@ func TestRunCreate_MissingBothScopes_ReturnsPermissionErrorListingBoth(t *testin
 	}
 }
 
-// ---- dry-run output shape ----
-
-func TestBuildDryRunResult_NotFound_ShapeAndNoRemoteBefore(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	plan := &reconcilePlan{Action: planActionCreate}
-
-	result := buildDryRunResult(resolved, core.AsUser, plan, false)
-
-	if result.Operation != "create" {
-		t.Errorf("Operation = %q, want create", result.Operation)
-	}
-	if !result.DryRun {
-		t.Error("DryRun = false, want true")
-	}
-	if result.EventKey != resolved.MaterializedKey {
-		t.Errorf("EventKey = %q, want %q", result.EventKey, resolved.MaterializedKey)
-	}
-	if result.TargetResource != resolved.TargetResource {
-		t.Errorf("TargetResource = %q, want %q", result.TargetResource, resolved.TargetResource)
-	}
-	if len(result.RequiredScopes) != 2 {
-		t.Errorf("RequiredScopes = %v, want both read+write scopes", result.RequiredScopes)
-	}
-	if result.RemoteBefore != nil {
-		t.Errorf("RemoteBefore = %+v, want nil when nothing was found", result.RemoteBefore)
-	}
-	if result.PlannedChange.Action != planActionCreate {
-		t.Errorf("PlannedChange.Action = %q, want %q", result.PlannedChange.Action, planActionCreate)
-	}
-	if result.LocalImpact.LocalConsumerAffected {
-		t.Error("LocalImpact.LocalConsumerAffected = true, want false: create never touches a local consumer")
-	}
-	if result.NextAction == "" {
-		t.Error("NextAction must not be empty")
-	}
-}
-
-func TestBuildDryRunResult_ActiveCompatible_RemoteBeforePopulated(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	existing := activeDetail("sub_existing", false, "user")
-	plan := &reconcilePlan{Action: planActionReuse, Existing: existing}
-
-	result := buildDryRunResult(resolved, core.AsUser, plan, false)
-
-	if result.RemoteBefore == nil {
-		t.Fatal("RemoteBefore = nil, want the existing subscription row")
-	}
-	if result.RemoteBefore.RemoteSubscriptionID != "sub_existing" {
-		t.Errorf("RemoteBefore.RemoteSubscriptionID = %q, want sub_existing", result.RemoteBefore.RemoteSubscriptionID)
-	}
-	if result.PlannedChange.RemoteSubscriptionID != "sub_existing" {
-		t.Errorf("PlannedChange.RemoteSubscriptionID = %q, want sub_existing", result.PlannedChange.RemoteSubscriptionID)
-	}
-}
-
-// TestBuildDryRunResult_IncludeResourceDataTrue_RequiredScopesIncludesEncryptKeyRead
-// locks that dry-run's own reported required_scopes accurately reflects
-// the conditional third scope: a --dry-run preview must never claim a
-// smaller scope requirement than the real run it is previewing actually
-// checked (both share the same createRequiredScopes call in runCreate).
-func TestBuildDryRunResult_IncludeResourceDataTrue_RequiredScopesIncludesEncryptKeyRead(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	plan := &reconcilePlan{Action: planActionCreate}
-
-	result := buildDryRunResult(resolved, core.AsUser, plan, true)
-
-	want := map[string]bool{"event:subscription:read": true, "event:subscription:write": true, "event:encrypt_key:read": true}
-	if len(result.RequiredScopes) != len(want) {
-		t.Fatalf("RequiredScopes = %v, want exactly %v", result.RequiredScopes, want)
-	}
-	for _, s := range result.RequiredScopes {
-		if !want[s] {
-			t.Errorf("unexpected required scope %q", s)
-		}
-	}
-}
-
-// TestDryRun_NotFound_EndToEndViaFakeService_JSONShapeAndNoCreateCall is the
-// primary TDD case from the task brief: `create <refined key> --dry-run`
-// must produce the full dry-run JSON shape and must NEVER call Create. This
-// drives the exact same two calls runCreate's --dry-run branch makes
-// (reconcileExisting then buildDryRunResult) against the fakeCreateAPI seam
-// — mirroring how list_test.go/get_test.go test listSubscriptions/
-// getSubscription directly rather than through cobra Execute + a real
-// network-capable client, per the task's "fake service, no network" mandate.
-func TestDryRun_NotFound_EndToEndViaFakeService_JSONShapeAndNoCreateCall(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{listFunc: fixedList(okListResp(nil, false, ""), nil)}
-
-	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsBot, false, nil)
-	if err != nil {
-		t.Fatalf("reconcileExisting: unexpected error: %v", err)
-	}
-	result := buildDryRunResult(resolved, core.AsBot, plan, false)
-
-	raw, err := json.Marshal(result)
-	if err != nil {
-		t.Fatalf("json.Marshal: %v", err)
-	}
-	var generic map[string]interface{}
-	if err := json.Unmarshal(raw, &generic); err != nil {
-		t.Fatalf("json.Unmarshal: %v", err)
-	}
-	for _, field := range []string{"operation", "dry_run", "event_key", "target_resource", "required_scopes", "preflight", "remote_before", "planned_change", "local_impact", "next_action"} {
-		if _, ok := generic[field]; !ok {
-			t.Errorf("dry-run JSON missing field %q; got: %s", field, raw)
-		}
-	}
-	if dryRun, _ := generic["dry_run"].(bool); !dryRun {
-		t.Errorf(`dry-run JSON "dry_run" = %v, want true`, generic["dry_run"])
-	}
-	if generic["remote_before"] != nil {
-		t.Errorf(`dry-run JSON "remote_before" = %v, want null (nothing found)`, generic["remote_before"])
-	}
-	plannedChange, ok := generic["planned_change"].(map[string]interface{})
-	if !ok || plannedChange["action"] != planActionCreate {
-		t.Errorf(`dry-run JSON "planned_change.action" = %v, want %q`, generic["planned_change"], planActionCreate)
-	}
-
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write", fake.createCalls)
-	}
-}
-
-// TestDryRun_ActiveConflicting_EndToEndViaFakeService_ReportsInformationallyNoCreateCall
-// and TestDryRun_Suspended_EndToEndViaFakeService_ReportsInformationallyNoCreateCall extend
-// TestDryRun_NotFound_EndToEndViaFakeService_JSONShapeAndNoCreateCall to the plan's other
-// two shapes; dry-run always reports the reconcile plan
-// informationally and never itself errors on conflict/suspended — only the
-// preflight steps (identity/template/scope, already passed by the time
-// runCreate reaches --dry-run) are real dry-run failures. This is the
-// counterpart of TestCreateOrReuseSubscription_ActiveConflict_
-// ReturnsTypedFailedPrecondition and TestCreateOrReuseSubscription_Suspended_
-// ReturnsTypedFailedPrecondition_GuidesReactivate, which turn the exact same
-// two plan shapes into typed errors on a REAL (non-dry-run) run.
-func TestDryRun_ActiveConflicting_EndToEndViaFakeService_ReportsInformationallyNoCreateCall(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-		activeDetail("sub_conflict", true, "user"), // existing has include_resource_data=true
-	}, false, ""), nil)}
-
-	// requested include_resource_data=false (the default) mismatches the
-	// existing true -> conflict.
-	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsUser, false, nil)
-	if err != nil {
-		t.Fatalf("reconcileExisting: unexpected error: %v", err)
-	}
-	if plan.Action != planActionConflict {
-		t.Fatalf("Action = %q, want %q", plan.Action, planActionConflict)
-	}
-	result := buildDryRunResult(resolved, core.AsUser, plan, false)
-
-	if result.PlannedChange.Action != planActionConflict {
-		t.Errorf("PlannedChange.Action = %q, want %q", result.PlannedChange.Action, planActionConflict)
-	}
-	if result.PlannedChange.RemoteSubscriptionID != "sub_conflict" {
-		t.Errorf("PlannedChange.RemoteSubscriptionID = %q, want sub_conflict", result.PlannedChange.RemoteSubscriptionID)
-	}
-	if len(result.PlannedChange.ConflictFields) != 1 || result.PlannedChange.ConflictFields[0].Name != "include_resource_data" {
-		t.Errorf("PlannedChange.ConflictFields = %+v, want one entry naming include_resource_data", result.PlannedChange.ConflictFields)
-	}
-	if result.RemoteBefore == nil || result.RemoteBefore.RemoteSubscriptionID != "sub_conflict" {
-		t.Errorf("RemoteBefore = %+v, want the conflicting subscription row", result.RemoteBefore)
-	}
-
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write, even for a plan a real run would reject", fake.createCalls)
-	}
-}
-
-func TestDryRun_Suspended_EndToEndViaFakeService_ReportsInformationallyNoCreateCall(t *testing.T) {
-	resolved := resolveCreatedChatID(t)
-	fake := &fakeCreateAPI{listFunc: fixedList(okListResp([]*larkeventv1.SubscriptionDetail{
-		suspendedDetail("sub_susp", "authority_revoked"),
-	}, false, ""), nil)}
-
-	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsUser, false, nil)
-	if err != nil {
-		t.Fatalf("reconcileExisting: unexpected error: %v", err)
-	}
-	if plan.Action != planActionSuspended {
-		t.Fatalf("Action = %q, want %q", plan.Action, planActionSuspended)
-	}
-	result := buildDryRunResult(resolved, core.AsUser, plan, false)
-
-	if result.PlannedChange.Action != planActionSuspended {
-		t.Errorf("PlannedChange.Action = %q, want %q", result.PlannedChange.Action, planActionSuspended)
-	}
-	if result.PlannedChange.RemoteSubscriptionID != "sub_susp" {
-		t.Errorf("PlannedChange.RemoteSubscriptionID = %q, want sub_susp", result.PlannedChange.RemoteSubscriptionID)
-	}
-	if result.RemoteBefore == nil || result.RemoteBefore.RemoteSubscriptionID != "sub_susp" {
-		t.Errorf("RemoteBefore = %+v, want the suspended subscription row", result.RemoteBefore)
-	}
-	if result.RemoteBefore.Remote.SuspensionReason != "authority_revoked" {
-		t.Errorf("RemoteBefore.Remote.SuspensionReason = %q, want authority_revoked", result.RemoteBefore.Remote.SuspensionReason)
-	}
-
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0: --dry-run must never issue a write, even for a plan a real run would reject", fake.createCalls)
-	}
-}
-
 // ---- command wiring ----
 
-// TestNewCmdSubscription_RegistersCreateAsWrite locks that create is
-// registered in the subscription group (without disturbing list/get — see
-// TestNewCmdSubscription_RegistersListAndGetAsRead, unmodified) and carries
-// risk=write, not read like list/get.
+// TestNewCmdSubscription_RegistersCreateAsWrite locks that create is registered
+// in the subscription group and carries risk=write.
 func TestNewCmdSubscription_RegistersCreateAsWrite(t *testing.T) {
 	f := &cmdutil.Factory{}
 	cmd := NewCmdSubscription(f)
@@ -1728,10 +1247,8 @@ func TestNewCmdSubscription_RegistersCreateAsWrite(t *testing.T) {
 	}
 }
 
-// TestNewCmdCreate_HasExpectedFlagsAndNoYes mirrors
-// TestNewCmdList_HasExpectedFlags, plus locks that create must NOT
-// expose --yes (only update/delete do — create is additive and
-// conflict-precheck'd, not a high-risk confirmation-gated action).
+// TestNewCmdCreate_HasExpectedFlagsAndNoYes locks the flag set and that create
+// does NOT expose --yes (additive, conflict-prechecked, not confirmation-gated).
 func TestNewCmdCreate_HasExpectedFlagsAndNoYes(t *testing.T) {
 	f := &cmdutil.Factory{}
 	cmd := NewCmdCreate(f)
