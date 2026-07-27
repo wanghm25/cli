@@ -57,7 +57,7 @@ var ImFeedShortcutCreate = common.Shortcut{
 		return common.NewDryRunAPI().
 			POST("/open-apis/im/v2/feed_shortcuts").
 			Body(map[string]any{
-				"shortcuts": buildShortcutItems(ids),
+				"shortcuts": shortcutItemsBody(buildShortcutItems(ids)),
 				"is_header": isHeader,
 			})
 	},
@@ -71,9 +71,9 @@ var ImFeedShortcutCreate = common.Shortcut{
 			return err
 		}
 		items := buildShortcutItems(ids)
-		data, err := runtime.DoAPIJSONTyped("POST", "/open-apis/im/v2/feed_shortcuts", nil,
+		data, err := runtime.DoWriteAPIJSONTyped("POST", "/open-apis/im/v2/feed_shortcuts", nil,
 			map[string]any{
-				"shortcuts": items,
+				"shortcuts": shortcutItemsBody(items),
 				"is_header": isHeader,
 			})
 		if err != nil {

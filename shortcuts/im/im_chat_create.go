@@ -117,7 +117,7 @@ var ImChatCreate = common.Shortcut{
 		if runtime.Bool("set-bot-manager") {
 			qp["set_bot_manager"] = []string{"true"}
 		}
-		resData, err := runtime.DoAPIJSONTyped(http.MethodPost, "/open-apis/im/v1/chats", qp, body)
+		resData, err := runtime.DoWriteAPIJSONTyped(http.MethodPost, "/open-apis/im/v1/chats", qp, body)
 		if err != nil {
 			return err
 		}

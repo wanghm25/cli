@@ -19,6 +19,7 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
 	"github.com/larksuite/cli/internal/errclass"
+	"github.com/larksuite/cli/internal/imcontract"
 	"github.com/larksuite/cli/internal/meta"
 	"github.com/larksuite/cli/internal/output"
 	"github.com/larksuite/cli/internal/registry"
@@ -130,6 +131,7 @@ type ServiceMethodOptions struct {
 	ServicePath string
 	Method      meta.Method
 	SchemaPath  string
+	ContractKey imcontract.ContractKey
 
 	// Flags
 	Params     string
@@ -203,6 +205,7 @@ type methodCommandSpec struct {
 	declaresBody bool
 	paginates    bool   // method accepts a page_token param (so --page-all is meaningful)
 	serviceName  string // owning service name (e.g. "approval"), for the lazy affordance lookup
+	contractKey  imcontract.ContractKey
 }
 
 // methodPaginates reports whether a method takes a page_token param, the signal
@@ -218,7 +221,7 @@ func methodPaginates(m meta.Method) bool {
 
 func newMethodCommandSpec(ref apicatalog.MethodRef) methodCommandSpec {
 	m := ref.Method
-	return methodCommandSpec{
+	spec := methodCommandSpec{
 		method:       m,
 		schemaPath:   ref.SchemaPath(),
 		servicePath:  ref.Service.ServicePath,
@@ -232,6 +235,19 @@ func newMethodCommandSpec(ref apicatalog.MethodRef) methodCommandSpec {
 		declaresBody: len(m.Data()) > 0 || len(m.Files()) > 0,
 		paginates:    methodPaginates(m),
 	}
+	spec.contractKey = generatedContractKey(ref.Service.Name, m.ID)
+	return spec
+}
+
+func generatedContractKey(serviceName, methodID string) imcontract.ContractKey {
+	if serviceName != "im" || methodID == "" {
+		return ""
+	}
+	i := strings.LastIndex(methodID, ".")
+	if i < 0 {
+		return ""
+	}
+	return imcontract.ContractKey(serviceName + " " + methodID[:i] + " " + methodID[i+1:])
 }
 
 // methodTakesBody reports whether the HTTP method allows a request body, i.e.
@@ -255,6 +271,7 @@ func buildMethodCommand(ctx context.Context, f *cmdutil.Factory, spec methodComm
 		ServicePath: spec.servicePath,
 		Method:      m,
 		SchemaPath:  spec.schemaPath,
+		ContractKey: spec.contractKey,
 		FileFields:  spec.fileFields,
 	}
 	var asStr string
@@ -383,6 +400,14 @@ func serviceMethodRun(opts *ServiceMethodOptions) error {
 	if err := output.ValidateJqFlags(opts.JqExpr, opts.Output, opts.Format); err != nil {
 		return err
 	}
+	contract, contractManagedWrite := imcontract.Lookup(opts.ContractKey)
+	contractManagedWrite = contractManagedWrite && contract.Strategy.Kind.IsWrite()
+	if contractManagedWrite && opts.Output != "" {
+		return errs.NewValidationError(errs.SubtypeInvalidArgument,
+			"--output is not supported for contract-managed IM write commands").
+			WithParam("--output").
+			WithHint("remove --output; read the completion result from stdout")
+	}
 
 	config, err := f.Config()
 	if err != nil {
@@ -400,7 +425,6 @@ func serviceMethodRun(opts *ServiceMethodOptions) error {
 	if err != nil {
 		return err
 	}
-
 	if opts.DryRun {
 		if fileMeta != nil {
 			return cmdutil.PrintDryRunWithFile(request, config, serviceDryRunOutputOptions(f, opts), *fileMeta)
@@ -429,15 +453,44 @@ func serviceMethodRun(opts *ServiceMethodOptions) error {
 	// errclass.BuildAPIError via ac.CheckResponse, producing *errs.PermissionError
 	// with MissingScopes / Identity / ConsoleURL populated from the response.
 	checkErr := ac.CheckResponse
+	var contractSession *imcontract.Session
+	if contractManagedWrite {
+		contractSession = imcontract.NewSession(contract)
+		requestBody, _ := request.Data.(map[string]any)
+		if uuid, ok := request.Params["uuid"].(string); ok && uuid != "" {
+			cloned := make(map[string]any, len(requestBody)+1)
+			for key, value := range requestBody {
+				cloned[key] = value
+			}
+			cloned["uuid"] = uuid
+			requestBody = cloned
+		}
+		if err := contractSession.ObserveRequest(requestBody); err != nil {
+			return err
+		}
+	}
 
 	if opts.PageAll {
+		if contractSession != nil {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument,
+				"--page-all is not valid for an IM write command").WithParam("--page-all")
+		}
 		return servicePaginate(opts.Ctx, ac, request, format, opts.JqExpr, out, f.IOStreams.ErrOut, opts.Cmd.CommandPath(),
 			client.PaginationOptions{PageLimit: opts.PageLimit, PageDelay: opts.PageDelay}, checkErr)
 	}
 
+	if contractSession != nil {
+		contractSession.RecordFact(imcontract.Fact{Kind: imcontract.FactWriteAttempted})
+	}
 	resp, err := ac.DoAPI(opts.Ctx, request)
 	if err != nil {
+		if contractSession != nil {
+			return contractSession.FinalizeError(err)
+		}
 		return err
+	}
+	if contractSession != nil {
+		return handleIMWriteContractResponse(opts, resp, format, checkErr, contractSession)
 	}
 	return client.HandleResponse(resp, client.ResponseOptions{
 		OutputPath:  opts.Output,
@@ -450,6 +503,78 @@ func serviceMethodRun(opts *ServiceMethodOptions) error {
 		Identity:    opts.As,
 		CheckError:  checkErr,
 	})
+}
+
+func handleIMWriteContractResponse(
+	opts *ServiceMethodOptions,
+	resp *larkcore.ApiResp,
+	format output.Format,
+	checkErr func(interface{}, core.Identity) error,
+	session *imcontract.Session,
+) error {
+	responseOpts := client.ResponseOptions{
+		OutputPath:  opts.Output,
+		Format:      format,
+		JqExpr:      opts.JqExpr,
+		Out:         opts.Factory.IOStreams.Out,
+		ErrOut:      opts.Factory.IOStreams.ErrOut,
+		FileIO:      opts.Factory.ResolveFileIO(opts.Ctx),
+		CommandPath: opts.Cmd.CommandPath(),
+		Identity:    opts.As,
+		CheckError:  checkErr,
+	}
+	if resp.StatusCode >= 400 {
+		return session.FinalizeError(client.HandleResponse(resp, responseOpts))
+	}
+	parsed, err := client.ParseJSONResponse(resp)
+	if err != nil {
+		return session.FinalizeError(client.HandleResponse(resp, responseOpts))
+	}
+	if apiErr := checkErr(parsed, opts.As); apiErr != nil {
+		return session.FinalizeError(apiErr)
+	}
+	data := output.SuccessEnvelopeData(parsed)
+	if m, ok := data.(map[string]any); ok {
+		session.ObserveResponse(m)
+	}
+	result, err := session.FinalizeSuccess(data)
+	if err != nil {
+		return err
+	}
+
+	out := opts.Factory.IOStreams.Out
+	errOut := opts.Factory.IOStreams.ErrOut
+	if opts.JqExpr != "" || format == output.FormatJSON {
+		if err := output.WriteEnvelope(output.Envelope{
+			OK:   result.OK,
+			Data: result.Data,
+			Hint: result.Hint,
+		}, output.SuccessEnvelopeOptions{
+			CommandPath: opts.Cmd.CommandPath(),
+			Identity:    string(opts.As),
+			JqExpr:      opts.JqExpr,
+			Out:         out,
+			ErrOut:      errOut,
+		}); err != nil {
+			return err
+		}
+	} else {
+		scanResult := output.ScanForSafety(opts.Cmd.CommandPath(), result.Data, errOut)
+		if scanResult.Blocked {
+			return scanResult.BlockErr
+		}
+		if scanResult.Alert != nil {
+			output.WriteAlertWarning(errOut, scanResult.Alert)
+		}
+		output.FormatValue(out, result.Data, format)
+		if result.Hint != "" {
+			fmt.Fprintf(errOut, "hint: %s\n", result.Hint)
+		}
+	}
+	if result.ExitCode != 0 {
+		return output.PartialFailure(result.ExitCode)
+	}
+	return nil
 }
 
 // checkServiceScopes pre-checks user scopes before making the API call.

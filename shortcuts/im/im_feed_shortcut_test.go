@@ -525,6 +525,46 @@ func TestImFeedShortcutCreateExecuteCallsAPI(t *testing.T) {
 	}
 }
 
+func TestImFeedShortcutCreateMalformedEvidenceStaysNonReplayable(t *testing.T) {
+	calls := 0
+	rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return shortcutJSONResponse(200, map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"failed_shortcuts": []any{
+					map[string]any{
+						"reason":   float64(2),
+						"shortcut": map[string]any{"type": float64(1)},
+					},
+				},
+			},
+		}), nil
+	}))
+	parent := &cobra.Command{Use: "im"}
+	ImFeedShortcutCreate.Mount(parent, rt.Factory)
+	parent.SetArgs([]string{
+		"+feed-shortcut-create",
+		"--chat-id", "oc_abc",
+		"--as", "user",
+	})
+
+	err := parent.Execute()
+	problem, ok := errs.ProblemOf(err)
+	if !ok || problem.Category != errs.CategoryInternal ||
+		problem.Subtype != errs.SubtypeInvalidResponse ||
+		problem.Retryable ||
+		problem.Hint != "The server response could not be safely mapped to the original request. Do not retry the write based on this response." {
+		t.Fatalf("error = %T %#v", err, problem)
+	}
+	if calls != 1 {
+		t.Fatalf("API calls = %d, want 1 without replay", calls)
+	}
+	if out := rt.Factory.IOStreams.Out.(*bytes.Buffer).String(); out != "" {
+		t.Fatalf("malformed completion reached stdout: %s", out)
+	}
+}
+
 func TestEmitFeedShortcutWriteResultSuccess(t *testing.T) {
 	rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		t.Fatalf("must not call API")

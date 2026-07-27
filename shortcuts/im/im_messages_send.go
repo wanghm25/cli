@@ -209,7 +209,7 @@ var ImMessagesSend = common.Shortcut{
 			data["uuid"] = idempotencyKey
 		}
 
-		resData, err := runtime.DoAPIJSONTyped(http.MethodPost, "/open-apis/im/v1/messages",
+		resData, err := runtime.DoWriteAPIJSONTyped(http.MethodPost, "/open-apis/im/v1/messages",
 			larkcore.QueryParams{"receive_id_type": []string{receiveIdType}}, data)
 		if err != nil {
 			return err

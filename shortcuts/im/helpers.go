@@ -23,6 +23,7 @@ import (
 	"github.com/larksuite/cli/extension/fileio"
 	"github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/credential"
+	"github.com/larksuite/cli/internal/imcontract"
 	"github.com/larksuite/cli/internal/validate"
 	"github.com/larksuite/cli/shortcuts/common"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
@@ -326,10 +327,19 @@ func resolveOneMedia(ctx context.Context, runtime *common.RuntimeContext, s medi
 		return s.value, nil
 	}
 
+	var (
+		key string
+		err error
+	)
 	if isURL(s.value) {
-		return resolveURLMedia(ctx, runtime, s)
+		key, err = resolveURLMedia(ctx, runtime, s)
+	} else {
+		key, err = resolveLocalMedia(ctx, runtime, s)
 	}
-	return resolveLocalMedia(ctx, runtime, s)
+	if err == nil {
+		runtime.RecordContractFact(imcontract.Fact{Kind: imcontract.FactMediaPreuploadPerformed})
+	}
+	return key, err
 }
 
 // resolveURLMedia downloads a URL and uploads it.
@@ -985,6 +995,7 @@ func resolveMarkdownImageURLs(ctx context.Context, runtime *common.RuntimeContex
 			resolveErr = markdownImageError(imgURL, "upload", err)
 			return m
 		}
+		runtime.RecordContractFact(imcontract.Fact{Kind: imcontract.FactMediaPreuploadPerformed})
 
 		// Reconstruct ![alt](img_xxx)
 		altStart := strings.Index(m, "[")
@@ -1571,6 +1582,17 @@ func buildShortcutItems(ids []string) []shortcutItem {
 		items = append(items, shortcutItem{FeedCardID: id, Type: int(ShortcutTypeChat)})
 	}
 	return items
+}
+
+func shortcutItemsBody(items []shortcutItem) []any {
+	body := make([]any, 0, len(items))
+	for _, item := range items {
+		body = append(body, map[string]any{
+			"feed_card_id": item.FeedCardID,
+			"type":         item.Type,
+		})
+	}
+	return body
 }
 
 // shortcutFailedReasonString converts the numeric failed-reason enum returned

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"mime"
 	"mime/multipart"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/httpmock"
 	"github.com/larksuite/cli/internal/meta"
+	"github.com/larksuite/cli/internal/output"
 	"github.com/spf13/cobra"
 )
 
@@ -1053,6 +1055,226 @@ func imSpec() meta.Service {
 		"name":        "im",
 		"servicePath": "/open-apis/im/v1",
 	})
+}
+
+func TestGeneratedIMRequiredResultRejectsFalseSuccess(t *testing.T) {
+	f, stdout, _, reg := cmdutil.TestFactory(t, testConfig)
+	reg.Register(&httpmock.Stub{
+		URL:  "/open-apis/im/v1/chats",
+		Body: map[string]any{"code": 0, "msg": "ok", "data": map[string]any{}},
+	})
+	method := meta.FromMap(map[string]any{
+		"id": "chats.create", "path": "chats", "httpMethod": "POST",
+		"risk": "write", "accessTokens": []any{"tenant"},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), method, "create", "chats", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--data", `{}`})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected invalid response")
+	}
+	requireProblem(t, err, errs.CategoryInternal, errs.SubtypeInvalidResponse, 0)
+	if stdout.Len() != 0 {
+		t.Fatalf("false success reached stdout: %s", stdout.String())
+	}
+}
+
+func TestGeneratedIMBatchPartialWritesCompletion(t *testing.T) {
+	f, stdout, stderr, reg := cmdutil.TestFactory(t, testConfig)
+	reg.Register(&httpmock.Stub{
+		URL: "/open-apis/im/v1/messages/om_x/urgent_app",
+		Body: map[string]any{
+			"code": 0, "msg": "ok",
+			"data": map[string]any{"invalid_user_id_list": []any{"ou_b"}},
+		},
+	})
+	method := meta.FromMap(map[string]any{
+		"id": "messages.urgent_app", "path": "messages/{message_id}/urgent_app", "httpMethod": "PATCH",
+		"risk": "write", "accessTokens": []any{"tenant"},
+		"parameters": map[string]any{
+			"message_id": map[string]any{"type": "string", "location": "path", "required": true},
+		},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), method, "urgent_app", "messages", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--params", `{"message_id":"om_x"}`, "--data", `{"user_id_list":["ou_a","ou_b"]}`})
+
+	err := cmd.Execute()
+	var partial *output.PartialFailureError
+	if !errors.As(err, &partial) {
+		t.Fatalf("error = %T %v", err, err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr must stay empty: %s", stderr.String())
+	}
+	var env map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env["ok"] != false || env["hint"] == "" {
+		t.Fatalf("unexpected envelope: %#v", env)
+	}
+}
+
+func TestGeneratedIMBatchRejectsUnsupportedRequestBeforeAPI(t *testing.T) {
+	// No HTTP stub is registered. A validation error therefore also proves the
+	// malformed request evidence was rejected before transport.
+	f, _, _, _ := cmdutil.TestFactory(t, testConfig)
+	method := meta.FromMap(map[string]any{
+		"id": "messages.urgent_app", "path": "messages/{message_id}/urgent_app", "httpMethod": "PATCH",
+		"risk": "write", "accessTokens": []any{"tenant"},
+		"parameters": map[string]any{
+			"message_id": map[string]any{"type": "string", "location": "path", "required": true},
+		},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), method, "urgent_app", "messages", nil)
+	cmd.SetArgs([]string{
+		"--as", "bot",
+		"--params", `{"message_id":"om_x"}`,
+		"--data", `{"user_id_list":{"not":"a list"}}`,
+	})
+
+	err := cmd.Execute()
+	problem, ok := errs.ProblemOf(err)
+	if !ok || problem.Category != errs.CategoryValidation ||
+		problem.Subtype != errs.SubtypeInvalidArgument {
+		t.Fatalf("error = %T %#v", err, problem)
+	}
+}
+
+func TestGeneratedIMTransientWriteRequiresSameKey(t *testing.T) {
+	f, _, _, reg := cmdutil.TestFactory(t, testConfig)
+	reg.Register(&httpmock.Stub{
+		URL:     "/open-apis/im/v1/chats",
+		Status:  503,
+		RawBody: []byte("unavailable"),
+	})
+	method := meta.FromMap(map[string]any{
+		"id": "chats.create", "path": "chats", "httpMethod": "POST",
+		"risk": "write", "accessTokens": []any{"tenant"},
+		"parameters": map[string]any{
+			"uuid": map[string]any{"type": "string", "location": "query"},
+		},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), method, "create", "chats", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--params", `{"uuid":"stable-key"}`, "--data", `{}`})
+
+	err := cmd.Execute()
+	p, ok := errs.ProblemOf(err)
+	if !ok {
+		t.Fatalf("expected typed error, got %T %v", err, err)
+	}
+	if !p.Retryable || p.Hint != "The write result is unknown. Retry only with the same idempotency key." {
+		t.Fatalf("problem = %#v", p)
+	}
+}
+
+func TestGeneratedIMModerationAlwaysReportsAcceptedUnverified(t *testing.T) {
+	f, stdout, stderr, reg := cmdutil.TestFactory(t, testConfig)
+	reg.Register(&httpmock.Stub{
+		URL:  "/open-apis/im/v1/chats/oc_x/moderation",
+		Body: map[string]any{"code": 0, "msg": "ok", "data": nil},
+	})
+	method := meta.FromMap(map[string]any{
+		"id": "chat.moderation.update", "path": "chats/{chat_id}/moderation", "httpMethod": "PUT",
+		"risk": "write", "accessTokens": []any{"tenant"},
+		"parameters": map[string]any{
+			"chat_id": map[string]any{"type": "string", "location": "path", "required": true},
+		},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), method, "update", "chat.moderation", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--params", `{"chat_id":"oc_x"}`, "--data", `{}`})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %s", stderr.String())
+	}
+	var env map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	completion := env["data"].(map[string]any)["completion"].(map[string]any)
+	if completion["status"] != "accepted_unverified" || completion["final_state_verified"] != false ||
+		env["hint"] != "The request was accepted, but the final moderator state was not verified." {
+		t.Fatalf("unexpected envelope: %#v", env)
+	}
+}
+
+func TestGeneratedIMWriteRejectsPageAll(t *testing.T) {
+	f, _, _, _ := cmdutil.TestFactory(t, testConfig)
+	method := meta.FromMap(map[string]any{
+		"id": "chats.create", "path": "chats", "httpMethod": "POST",
+		"risk": "write", "accessTokens": []any{"tenant"},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), method, "create", "chats", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--data", `{}`, "--page-all"})
+
+	err := cmd.Execute()
+	p, ok := errs.ProblemOf(err)
+	if !ok || p.Category != errs.CategoryValidation || p.Message != "--page-all is not valid for an IM write command" {
+		t.Fatalf("error = %T %#v", err, p)
+	}
+}
+
+func TestGeneratedIMWriteRejectsOutputBeforeAPI(t *testing.T) {
+	// No HTTP stub is registered. Reaching the transport would therefore
+	// produce a different error, so the typed validation result also proves
+	// the API was not called.
+	f, _, _, _ := cmdutil.TestFactory(t, testConfig)
+	method := meta.FromMap(map[string]any{
+		"id": "chats.create", "path": "chats", "httpMethod": "POST",
+		"risk": "write", "accessTokens": []any{"tenant"},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), method, "create", "chats", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--data", `{}`, "--output", "result.json"})
+
+	err := cmd.Execute()
+	p, ok := errs.ProblemOf(err)
+	var validation *errs.ValidationError
+	if !ok || p.Category != errs.CategoryValidation || !errors.As(err, &validation) || validation.Param != "--output" {
+		t.Fatalf("error = %T %#v", err, p)
+	}
+	if !strings.Contains(p.Hint, "completion result from stdout") {
+		t.Fatalf("hint = %q", p.Hint)
+	}
+}
+
+func TestNonIMWriteOutputKeepsExistingFilePath(t *testing.T) {
+	tmp := t.TempDir()
+	cmdutil.TestChdir(t, tmp)
+	f, _, _, reg := cmdutil.TestFactory(t, testConfig)
+	calls := 0
+	reg.Register(&httpmock.Stub{
+		URL: "/open-apis/svc/v1/items",
+		OnMatch: func(*http.Request) {
+			calls++
+		},
+		Body: map[string]any{"code": 0, "data": map[string]any{"id": "item_x"}},
+	})
+	spec := meta.ServiceFromMap(map[string]any{"name": "svc", "servicePath": "/open-apis/svc/v1"})
+	method := meta.FromMap(map[string]any{
+		"id": "items.create", "path": "items", "httpMethod": "POST", "risk": "write",
+		"accessTokens": []any{"tenant"},
+	})
+	outputPath := "response.json"
+	cmd := NewCmdServiceMethod(f, spec, method, "create", "items", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--data", `{}`, "--output", outputPath})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("API calls = %d, want 1", calls)
+	}
+	raw, err := os.ReadFile(filepath.Join(tmp, outputPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"item_x"`) {
+		t.Fatalf("saved response = %s", raw)
+	}
 }
 
 func TestServiceMethod_FileFlagRegistered(t *testing.T) {

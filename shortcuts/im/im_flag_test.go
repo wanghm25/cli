@@ -17,6 +17,7 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/credential"
+	"github.com/larksuite/cli/internal/imcontract"
 	"github.com/larksuite/cli/internal/output"
 	"github.com/larksuite/cli/shortcuts/common"
 	"github.com/spf13/cobra"
@@ -583,6 +584,68 @@ func TestFlagCreateAutoDetectReliesOnDeclaredLookupScopes(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("buildCreateItem() made %d lookup call(s), want 1", calls)
+	}
+}
+
+func TestFlagCreateFeedPreflightFailurePreservesRecoveryHint(t *testing.T) {
+	rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if !strings.Contains(req.URL.Path, "/open-apis/im/v1/messages/om_123") {
+			t.Fatalf("unexpected request: %s", req.URL.Path)
+		}
+		return nil, errors.New("message lookup unavailable")
+	}))
+	cmd := newFlagScopeTestCmd(t)
+	setFlag(t, cmd, "message-id", "om_123")
+	setFlag(t, cmd, "flag-type", "feed")
+	setRuntimeField(t, rt, "Cmd", cmd)
+	contract, _ := imcontract.Lookup("im +flag-create")
+	session := imcontract.NewSession(contract)
+	setRuntimeField(t, rt, "contractSession", session)
+
+	err := ImFlagCreate.Execute(context.Background(), rt)
+	if err == nil {
+		t.Fatal("preflight failure was swallowed")
+	}
+	err = session.FinalizeError(err)
+	problem, ok := errs.ProblemOf(err)
+	if !ok {
+		t.Fatalf("error = %T %v, want typed problem", err, err)
+	}
+	if !strings.Contains(problem.Hint, "specify --item-type explicitly") ||
+		strings.Contains(problem.Hint, "write result is unknown") ||
+		strings.Contains(strings.ToLower(problem.Hint), "replay") {
+		t.Fatalf("preflight hint was rewritten: %#v", problem)
+	}
+}
+
+func TestFlagCreateTargetWriteFailureUsesReplayForbidden(t *testing.T) {
+	rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost || req.URL.Path != "/open-apis/im/v1/flags" {
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+		return nil, errors.New("flag write unavailable")
+	}))
+	cmd := newFlagScopeTestCmd(t)
+	setFlag(t, cmd, "message-id", "om_123")
+	setFlag(t, cmd, "flag-type", "feed")
+	setFlag(t, cmd, "item-type", "msg_thread")
+	setRuntimeField(t, rt, "Cmd", cmd)
+	contract, _ := imcontract.Lookup("im +flag-create")
+	session := imcontract.NewSession(contract)
+	setRuntimeField(t, rt, "contractSession", session)
+
+	err := ImFlagCreate.Execute(context.Background(), rt)
+	if err == nil {
+		t.Fatal("target write failure was swallowed")
+	}
+	err = session.FinalizeError(err)
+	problem, ok := errs.ProblemOf(err)
+	if !ok {
+		t.Fatalf("error = %T %v, want typed problem", err, err)
+	}
+	if problem.Retryable ||
+		problem.Hint != "The write result is unknown. Do not replay the original request." {
+		t.Fatalf("target write problem = %#v", problem)
 	}
 }
 
@@ -1333,6 +1396,8 @@ func TestFlagCancelExecuteSummarizesPartialFailure(t *testing.T) {
 	cmd := newFlagScopeTestCmd(t)
 	setFlag(t, cmd, "message-id", "om_123")
 	setRuntimeField(t, rt, "Cmd", cmd)
+	contract, _ := imcontract.Lookup("im +flag-cancel")
+	setRuntimeField(t, rt, "contractSession", imcontract.NewSession(contract))
 
 	err := ImFlagCancel.Execute(context.Background(), rt)
 	if err == nil {
@@ -1351,7 +1416,7 @@ func TestFlagCancelExecuteSummarizesPartialFailure(t *testing.T) {
 	}
 
 	var envelope struct {
-		OK   bool `json:"ok"`
+		OK bool `json:"ok"`
 		Data struct {
 			Results []map[string]any `json:"results"`
 		} `json:"data"`
@@ -1367,6 +1432,49 @@ func TestFlagCancelExecuteSummarizesPartialFailure(t *testing.T) {
 	}
 	if errOut := rt.Factory.IOStreams.ErrOut.(*bytes.Buffer).String(); errOut != "" {
 		t.Fatalf("stderr = %q, want empty for partial failure result envelope", errOut)
+	}
+}
+
+func TestFlagCancelExecuteSkippedFeedLayerProducesPendingLedger(t *testing.T) {
+	rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(req.URL.Path, "/open-apis/im/v1/messages/om_pending"):
+			return nil, fmt.Errorf("message lookup unavailable")
+		case strings.Contains(req.URL.Path, "/open-apis/im/v1/flags/cancel"):
+			return shortcutJSONResponse(200, map[string]any{
+				"code": 0,
+				"data": map[string]any{"request_id": "message-ok"},
+			}), nil
+		default:
+			return nil, fmt.Errorf("unexpected request: %s", req.URL.Path)
+		}
+	}))
+	cmd := newFlagScopeTestCmd(t)
+	setFlag(t, cmd, "message-id", "om_pending")
+	setRuntimeField(t, rt, "Cmd", cmd)
+	contract, _ := imcontract.Lookup("im +flag-cancel")
+	setRuntimeField(t, rt, "contractSession", imcontract.NewSession(contract))
+
+	if err := ImFlagCancel.Execute(context.Background(), rt); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var envelope struct {
+		OK bool `json:"ok"`
+		Data struct {
+			Completion imcontract.Completion `json:"completion"`
+		} `json:"data"`
+	}
+	out := rt.Factory.IOStreams.Out.(*bytes.Buffer).Bytes()
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, out)
+	}
+	if envelope.OK || envelope.Data.Completion.PendingCount != 1 ||
+		len(envelope.Data.Completion.PendingItems) != 1 ||
+		envelope.Data.Completion.PendingItems[0] != "feed" {
+		t.Fatalf("pending completion = %#v", envelope.Data.Completion)
+	}
+	if errOut := rt.Factory.IOStreams.ErrOut.(*bytes.Buffer).String(); errOut != "" {
+		t.Fatalf("stderr = %q, want empty", errOut)
 	}
 }
 

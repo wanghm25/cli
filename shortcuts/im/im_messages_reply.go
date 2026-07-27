@@ -182,7 +182,7 @@ var ImMessagesReply = common.Shortcut{
 			data["uuid"] = idempotencyKey
 		}
 
-		resData, err := runtime.DoAPIJSONTyped(http.MethodPost,
+		resData, err := runtime.DoWriteAPIJSONTyped(http.MethodPost,
 			fmt.Sprintf("/open-apis/im/v1/messages/%s/reply", validate.EncodePathSegment(messageId)),
 			nil, data)
 		if err != nil {
