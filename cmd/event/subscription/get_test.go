@@ -10,43 +10,34 @@ import (
 	"io"
 	"testing"
 
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
-// fakeGetAPI is a network-free stand-in for *eventlib.SubscriptionClient's
-// Get method — the getSubscriptionAPI test seam. Note it stands in for the
-// already-classifying client (SubscriptionClient.Get), not the raw
-// SDK service: a business failure there is already surfaced as a non-nil
-// typed `err` (see internal/event/subscription_client.go's classifyFailure),
-// so fixtures simulating a failure set `err`, never a non-zero-code `resp`
-// with a nil `err`.
+// fakeGetAPI is a network-free stand-in for the platform/lark gateway's Get —
+// the getSubscriptionAPI test seam. The gateway already unwraps + validates the
+// response and classifies failures, so it hands back a domain RemoteSubscription
+// or a typed error; a fixture simulating a failure sets `err`, and success sets
+// `sub`.
 type fakeGetAPI struct {
-	resp *larkeventv1.GetSubscriptionResp
-	err  error
+	sub *larkgw.RemoteSubscription
+	err error
 }
 
-func (f *fakeGetAPI) Get(_ context.Context, _ *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error) {
-	return f.resp, f.err
-}
-
-func okGetResp(d *larkeventv1.SubscriptionDetail) *larkeventv1.GetSubscriptionResp {
-	return &larkeventv1.GetSubscriptionResp{
-		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
-		Data:    &larkeventv1.GetSubscriptionRespData{Subscription: d},
-	}
+func (f *fakeGetAPI) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+	return f.sub, f.err
 }
 
 // TestGetSubscription_SingleDetail_JSONShape is the primary TDD case from
-// the task brief: `get sub_xxx --json` maps one SubscriptionDetail into the
+// the task brief: `get sub_xxx --json` maps one RemoteSubscription into the
 // shared subscriptionRow shape.
 func TestGetSubscription_SingleDetail_JSONShape(t *testing.T) {
-	fake := &fakeGetAPI{resp: okGetResp(&larkeventv1.SubscriptionDetail{
+	fake := &fakeGetAPI{sub: subPtr(larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{
 		SubscriptionId: strPtr("sub_xxx"),
 		EventType:      strPtr("im.message.created_v1"),
 		TargetResource: strPtr("im.message?chat_id=oc_xxx"),
@@ -54,7 +45,7 @@ func TestGetSubscription_SingleDetail_JSONShape(t *testing.T) {
 		State:          strPtr("active"),
 		ExpireTime:     intPtr(1732000000),
 		PayloadOptions: &larkeventv1.PayloadOptions{IncludeResourceData: boolPtr(false)},
-	})}
+	}))}
 
 	row, err := getSubscription(context.Background(), fake, "sub_xxx")
 	if err != nil {
@@ -116,22 +107,11 @@ func TestGetSubscription_ClientError_PropagatesUnchanged(t *testing.T) {
 	}
 }
 
-// TestGetSubscription_SuccessWithNoData_ReturnsTypedInternalError is a
-// defensive edge case: a syntactically successful response (code==0) that
-// nonetheless carries no Subscription payload must not silently render as
-// an all-empty row — it is a wire anomaly, not "found an empty
-// subscription".
-func TestGetSubscription_SuccessWithNoData_ReturnsTypedInternalError(t *testing.T) {
-	fake := &fakeGetAPI{resp: okGetResp(nil)}
-
-	_, err := getSubscription(context.Background(), fake, "sub_xxx")
-	if err == nil {
-		t.Fatal("expected an error when the response carries no subscription data")
-	}
-	if _, ok := errs.ProblemOf(err); !ok {
-		t.Fatalf("expected a typed errs.* error, got %T: %v", err, err)
-	}
-}
+// The "success response carrying no subscription payload / an empty
+// remote_subscription_id -> typed InvalidResponse" edge case now lives at the
+// gateway (platform/lark's TestGateway_Get_NilData/EmptyID_ReturnsInvalidResponse),
+// since that validation moved there; getSubscription only maps the already-validated
+// RemoteSubscription the gateway guarantees.
 
 // TestRunGet_EmptyID_RejectedBeforeNetwork locks that an empty
 // remote_subscription_id (cobra.ExactArgs(1) still allows "") is rejected

@@ -20,7 +20,25 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
 	eventlib "github.com/larksuite/cli/internal/event"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
+
+// activeSub / suspendedSub are the domain (gateway-projected) counterparts of
+// activeDetail / suspendedDetail (create_test.go), for the migrated
+// read/simple-write command fakes that now speak larkgw.RemoteSubscription
+// instead of the SDK type. Projecting the SDK fixture keeps the domain fixture
+// byte-identical to what the gateway would hand a command in production.
+func activeSub(id string, includeResourceData bool, authorityType string) larkgw.RemoteSubscription {
+	return larkgw.ProjectSubscription(activeDetail(id, includeResourceData, authorityType))
+}
+
+func suspendedSub(id, reason string) larkgw.RemoteSubscription {
+	return larkgw.ProjectSubscription(suspendedDetail(id, reason))
+}
+
+// subPtr returns a pointer to s, for building the *larkgw.RemoteSubscription
+// values the domain command fakes hand back from Get/Renew/Reactivate/Patch.
+func subPtr(s larkgw.RemoteSubscription) *larkgw.RemoteSubscription { return &s }
 
 // The subscription tests build minimal catalog fixtures instead of importing the
 // full events catalog, so they seed im.message.created_v1's filter capability
@@ -269,16 +287,22 @@ func TestResolveEffectiveIdentity_StrictModeRejectsCrossIdentity(t *testing.T) {
 	}
 }
 
-// ---- mapSubscriptionDetail / formatAuthority ----
+// ---- mapRemoteSubscription (domain -> row) ----
+//
+// The SDK -> RemoteSubscription projection is covered by the gateway's
+// TestProjectSubscription_* and the authority vocabulary by model's
+// TestRemoteAuthority_String; these route an SDK fixture through
+// ProjectSubscription + mapRemoteSubscription to lock the end-to-end row shape
+// the migrated commands emit.
 
-func TestMapSubscriptionDetail_NilDetail_ReturnsZeroValue(t *testing.T) {
-	row := mapSubscriptionDetail(nil)
+func TestMapRemoteSubscription_ZeroValue_ReturnsZeroRow(t *testing.T) {
+	row := mapRemoteSubscription(larkgw.ProjectSubscription(nil))
 	if !reflect.DeepEqual(row, subscriptionRow{}) {
-		t.Errorf("mapSubscriptionDetail(nil) = %+v, want zero value", row)
+		t.Errorf("mapRemoteSubscription(zero) = %+v, want zero value", row)
 	}
 }
 
-func TestMapSubscriptionDetail_FullDetail_MapsEveryRemoteField(t *testing.T) {
+func TestMapRemoteSubscription_FullDetail_MapsEveryRemoteField(t *testing.T) {
 	d := &larkeventv1.SubscriptionDetail{
 		SubscriptionId: strPtr("sub_abc"),
 		Authority: &larkeventv1.Authority{
@@ -295,7 +319,7 @@ func TestMapSubscriptionDetail_FullDetail_MapsEveryRemoteField(t *testing.T) {
 		UpdateTime:     intPtr(1731000000),
 	}
 
-	row := mapSubscriptionDetail(d)
+	row := mapRemoteSubscription(larkgw.ProjectSubscription(d))
 
 	if row.RemoteSubscriptionID != "sub_abc" {
 		t.Errorf("RemoteSubscriptionID = %q, want sub_abc", row.RemoteSubscriptionID)
@@ -335,12 +359,12 @@ func TestMapSubscriptionDetail_FullDetail_MapsEveryRemoteField(t *testing.T) {
 	}
 }
 
-func TestMapSubscriptionDetail_MinimalDetail_OmitsOptionalFields(t *testing.T) {
+func TestMapRemoteSubscription_MinimalDetail_OmitsOptionalFields(t *testing.T) {
 	d := &larkeventv1.SubscriptionDetail{
 		SubscriptionId: strPtr("sub_min"),
 		EventType:      strPtr("im.message.receive_v1"),
 	}
-	row := mapSubscriptionDetail(d)
+	row := mapRemoteSubscription(larkgw.ProjectSubscription(d))
 	if row.PayloadOptions != nil {
 		t.Errorf("PayloadOptions = %+v, want nil when the SDK omitted it", row.PayloadOptions)
 	}
@@ -355,10 +379,10 @@ func TestMapSubscriptionDetail_MinimalDetail_OmitsOptionalFields(t *testing.T) {
 	}
 }
 
-// TestMapSubscriptionDetail_WithRemoteFilter_SurfacesCanonicalJSON proves a
+// TestMapRemoteSubscription_WithRemoteFilter_SurfacesCanonicalJSON proves a
 // remote filter is surfaced as canonical JSON (the exact wire form), shared by
 // list and get.
-func TestMapSubscriptionDetail_WithRemoteFilter_SurfacesCanonicalJSON(t *testing.T) {
+func TestMapRemoteSubscription_WithRemoteFilter_SurfacesCanonicalJSON(t *testing.T) {
 	f, err := eventlib.ParseAndValidateFilter(
 		`{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"in","list_value":["text"]}}]}}`,
 		eventlib.FilterMetaFor("im.message.created_v1"))
@@ -370,7 +394,7 @@ func TestMapSubscriptionDetail_WithRemoteFilter_SurfacesCanonicalJSON(t *testing
 		EventType:      strPtr("im.message.created_v1"),
 		Filter:         eventlib.FilterToSDK(f),
 	}
-	row := mapSubscriptionDetail(d)
+	row := mapRemoteSubscription(larkgw.ProjectSubscription(d))
 	if len(row.Filter) == 0 {
 		t.Fatal("row.Filter is empty, want the remote filter as canonical JSON")
 	}
@@ -380,28 +404,6 @@ func TestMapSubscriptionDetail_WithRemoteFilter_SurfacesCanonicalJSON(t *testing
 	}
 	if !bytes.Equal(row.Filter, want) {
 		t.Errorf("row.Filter = %s, want %s", row.Filter, want)
-	}
-}
-
-func TestFormatAuthority(t *testing.T) {
-	tests := []struct {
-		name string
-		a    *larkeventv1.Authority
-		want string
-	}{
-		{"nil", nil, ""},
-		{"nil type", &larkeventv1.Authority{}, ""},
-		{"user with open_id", &larkeventv1.Authority{Type: strPtr("user"), OpenId: strPtr("ou_xxx")}, "user:ou_xxx"},
-		{"user without open_id", &larkeventv1.Authority{Type: strPtr("user")}, "user"},
-		{"app", &larkeventv1.Authority{Type: strPtr("app"), AppId: strPtr("cli_xxx")}, "app"},
-		{"unrecognized type passes through", &larkeventv1.Authority{Type: strPtr("service")}, "service"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := formatAuthority(tc.a); got != tc.want {
-				t.Errorf("formatAuthority(%+v) = %q, want %q", tc.a, got, tc.want)
-			}
-		})
 	}
 }
 

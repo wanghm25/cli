@@ -12,67 +12,57 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
-// fakeReactivateAPI is a network-free stand-in for
-// *eventlib.SubscriptionClient's Get+Reactivate — the
-// reactivateSubscriptionAPI test seam.
+// fakeReactivateAPI is a network-free stand-in for the platform/lark gateway's
+// Get+Reactivate — the reactivateSubscriptionAPI test seam.
 type fakeReactivateAPI struct {
-	getResp *larkeventv1.GetSubscriptionResp
-	getErr  error
+	getSub *larkgw.RemoteSubscription
+	getErr error
 
-	reactivateFunc  func() (*larkeventv1.ReactivateSubscriptionResp, error)
+	reactivateFunc  func() (*larkgw.RemoteSubscription, error)
 	reactivateCalls int
 }
 
-func (f *fakeReactivateAPI) Get(_ context.Context, _ *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error) {
-	return f.getResp, f.getErr
+func (f *fakeReactivateAPI) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+	return f.getSub, f.getErr
 }
 
-func (f *fakeReactivateAPI) Reactivate(_ context.Context, _ *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error) {
+func (f *fakeReactivateAPI) Reactivate(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
 	f.reactivateCalls++
 	if f.reactivateFunc == nil {
-		return okReactivateResp(activeDetail("sub_1", false, "user")), nil
+		return subPtr(activeSub("sub_1", false, "user")), nil
 	}
 	return f.reactivateFunc()
-}
-
-func okReactivateResp(d *larkeventv1.SubscriptionDetail) *larkeventv1.ReactivateSubscriptionResp {
-	return &larkeventv1.ReactivateSubscriptionResp{
-		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
-		Data:    &larkeventv1.ReactivateSubscriptionRespData{Subscription: d},
-	}
 }
 
 // ---- doReactivateSubscription ----
 
 func TestDoReactivateSubscription_CallsReactivateAndReturnsDetail(t *testing.T) {
-	fake := &fakeReactivateAPI{reactivateFunc: func() (*larkeventv1.ReactivateSubscriptionResp, error) {
-		return okReactivateResp(activeDetail("sub_1", false, "user")), nil
+	fake := &fakeReactivateAPI{reactivateFunc: func() (*larkgw.RemoteSubscription, error) {
+		return subPtr(activeSub("sub_1", false, "user")), nil
 	}}
 
-	detail, err := doReactivateSubscription(context.Background(), fake, "sub_1")
+	sub, err := doReactivateSubscription(context.Background(), fake, "sub_1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if fake.reactivateCalls != 1 {
 		t.Errorf("reactivateCalls = %d, want 1", fake.reactivateCalls)
 	}
-	if strVal(detail.State) != "active" {
-		t.Errorf("detail.State = %q, want active", strVal(detail.State))
+	if sub.State != "active" {
+		t.Errorf("sub.State = %q, want active", sub.State)
 	}
 }
 
 func TestDoReactivateSubscription_TransportError_PropagatesUnchanged(t *testing.T) {
 	sentinel := errors.New("boom: connection reset")
-	fake := &fakeReactivateAPI{reactivateFunc: func() (*larkeventv1.ReactivateSubscriptionResp, error) { return nil, sentinel }}
+	fake := &fakeReactivateAPI{reactivateFunc: func() (*larkgw.RemoteSubscription, error) { return nil, sentinel }}
 
 	_, err := doReactivateSubscription(context.Background(), fake, "sub_1")
 	if !errors.Is(err, sentinel) {
@@ -80,14 +70,9 @@ func TestDoReactivateSubscription_TransportError_PropagatesUnchanged(t *testing.
 	}
 }
 
-func TestDoReactivateSubscription_SuccessWithNoData_ReturnsTypedInternalError(t *testing.T) {
-	fake := &fakeReactivateAPI{reactivateFunc: func() (*larkeventv1.ReactivateSubscriptionResp, error) { return okReactivateResp(nil), nil }}
-
-	_, err := doReactivateSubscription(context.Background(), fake, "sub_1")
-	if _, ok := errs.ProblemOf(err); !ok {
-		t.Fatalf("expected a typed errs.* error, got %T: %v", err, err)
-	}
-}
+// The "success response with no subscription data -> typed InvalidResponse" edge
+// case now lives at the gateway (platform/lark's
+// TestGateway_Reactivate_NilData_ReturnsInvalidResponse).
 
 // ---- --dry-run output shape, direct-call end-to-end via the
 // fake service — mirrors update_test.go's own dry-run test. Uses a
@@ -95,7 +80,7 @@ func TestDoReactivateSubscription_SuccessWithNoData_ReturnsTypedInternalError(t 
 // dry-run reports it informationally and never calls Reactivate.
 
 func TestReactivateDryRun_EndToEndViaFakeService_JSONShapeAndNoReactivateCall(t *testing.T) {
-	fake := &fakeReactivateAPI{getResp: okGetResp(suspendedDetail("sub_1", "authority_revoked"))}
+	fake := &fakeReactivateAPI{getSub: subPtr(suspendedSub("sub_1", "authority_revoked"))}
 
 	before, err := getSubscription(context.Background(), fake, "sub_1")
 	if err != nil {

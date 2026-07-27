@@ -20,14 +20,12 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
-	eventlib "github.com/larksuite/cli/internal/event"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
 // NewCmdSubscription builds the `event subscription` command group: the
@@ -259,72 +257,44 @@ type subscriptionRow struct {
 	Local  json.RawMessage `json:"local,omitempty"` // placeholder; see doc comment above.
 }
 
-// mapSubscriptionDetail converts one SDK SubscriptionDetail into the CLI's
-// stable JSON row shape.
+// mapRemoteSubscription converts one domain RemoteSubscription (projected from
+// the SDK by the platform/lark gateway) into the CLI's stable JSON row shape.
 //
-// EventKey: SubscriptionDetail has no field named event_key — the SDK only
-// carries EventType + TargetResource. This maps
-// EventKey to EventType verbatim (a legacy/plain EventKey IS its OAPI
-// event_type) and additionally surfaces
+// EventKey: a RemoteSubscription has no event_key — the platform only carries
+// EventType + TargetResource. This maps EventKey to EventType verbatim (a
+// legacy/plain EventKey IS its OAPI event_type) and additionally surfaces
 // TargetResource as its own field, rather than fabricating a materialized
-// refined-key string (e.g. "im.message.example_v1/chat-id/oc_xxx"): doing
-// that faithfully requires a reverse KeyTemplate lookup (registry base +
-// PathSegment reconstruction from the resource query string) that does not
-// exist yet, and a wrong guess would emit a key-shaped string that `event
-// schema`/`event consume` would not actually recognize.
-func mapSubscriptionDetail(d *larkeventv1.SubscriptionDetail) subscriptionRow {
-	if d == nil {
-		return subscriptionRow{}
-	}
+// refined-key string (e.g. "im.message.example_v1/chat-id/oc_xxx"): doing that
+// faithfully requires a reverse KeyTemplate lookup (registry base + PathSegment
+// reconstruction from the resource query string) that does not exist yet, and a
+// wrong guess would emit a key-shaped string that `event schema`/`event consume`
+// would not actually recognize.
+func mapRemoteSubscription(sub larkgw.RemoteSubscription) subscriptionRow {
 	row := subscriptionRow{
-		RemoteSubscriptionID: strVal(d.SubscriptionId),
-		EventType:            strVal(d.EventType),
-		TargetResource:       strVal(d.TargetResource),
-		Identity:             formatAuthority(d.Authority),
+		RemoteSubscriptionID: sub.ID.String(),
+		EventType:            sub.EventType,
+		TargetResource:       sub.TargetResource,
+		Identity:             sub.Authority.String(),
 	}
 	row.EventKey = row.EventType
-	if d.PayloadOptions != nil {
-		row.PayloadOptions = &payloadOptionsView{IncludeResourceData: boolVal(d.PayloadOptions.IncludeResourceData)}
+	if sub.PayloadOptionsPresent {
+		row.PayloadOptions = &payloadOptionsView{IncludeResourceData: boolVal(sub.IncludeResourceData)}
 	}
 	// Surface the remote filter as canonical JSON only when the subscription
 	// actually carries one; an unfiltered subscription leaves this omitted.
-	if remoteFilter := eventlib.FilterFromSDK(d.Filter); !remoteFilter.IsEmpty() {
-		if canonical, err := remoteFilter.Canonicalize(); err == nil {
+	if !sub.Filter.IsEmpty() {
+		if canonical, err := sub.Filter.Canonicalize(); err == nil {
 			row.Filter = canonical
 		}
 	}
 	row.Remote = remoteState{
-		State:      strVal(d.State),
-		ExpireTime: d.ExpireTime,
-		CreateTime: d.CreateTime,
-		UpdateTime: d.UpdateTime,
-	}
-	if d.Suspension != nil {
-		row.Remote.SuspensionReason = strVal(d.Suspension.Code)
+		State:            sub.State,
+		ExpireTime:       sub.ExpireTime,
+		CreateTime:       sub.CreateTime,
+		UpdateTime:       sub.UpdateTime,
+		SuspensionReason: sub.SuspensionReason,
 	}
 	return row
-}
-
-// formatAuthority renders a SubscriptionDetail's Authority using a
-// compact identity vocabulary ("user:ou_xxx"
-// / "app"). Authority.Type is an open string, not a closed enum,
-// so an unrecognized
-// value is passed through verbatim rather than dropped.
-func formatAuthority(a *larkeventv1.Authority) string {
-	if a == nil || a.Type == nil || *a.Type == "" {
-		return ""
-	}
-	switch *a.Type {
-	case "user":
-		if id := strVal(a.OpenId); id != "" {
-			return "user:" + id
-		}
-		return "user"
-	case "app":
-		return "app"
-	default:
-		return *a.Type
-	}
 }
 
 func strVal(s *string) string {
@@ -456,8 +426,8 @@ type mutationResult struct {
 	NextAction           string          `json:"next_action"`
 }
 
-func buildMutationResult(operation string, detail *larkeventv1.SubscriptionDetail, nextAction string) *mutationResult {
-	row := mapSubscriptionDetail(detail)
+func buildMutationResult(operation string, sub larkgw.RemoteSubscription, nextAction string) *mutationResult {
+	row := mapRemoteSubscription(sub)
 	return &mutationResult{
 		Operation:            operation,
 		RemoteSubscriptionID: row.RemoteSubscriptionID,

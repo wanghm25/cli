@@ -10,23 +10,20 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
-	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
-	eventlib "github.com/larksuite/cli/internal/event"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
 
-// reactivateSubscriptionAPI is the subset of *eventlib.SubscriptionClient
-// this command calls: Get (the remote read this command always performs
-// first, per the CLI-side read+write invariant, to report
+// reactivateSubscriptionAPI is the subset of the platform/lark
+// SubscriptionGateway this command calls: Get (the remote read this command
+// always performs first, per the CLI-side read+write invariant, to report
 // remote_before/impact for --dry-run) and Reactivate (the actual write,
 // which resumes delivery on a suspended subscription). See
 // listSubscriptionsAPI (list.go) for the test-seam rationale.
 type reactivateSubscriptionAPI interface {
-	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
-	Reactivate(ctx context.Context, req *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
+	Reactivate(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
 }
 
 // reactivateOpts holds `event subscription reactivate`'s flag values.
@@ -114,7 +111,7 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 	if err != nil {
 		return err
 	}
-	client, err := eventlib.NewSubscriptionClient(sdk, identity, uat)
+	client, err := larkgw.NewSubscriptionGateway(sdk, identity, uat)
 	if err != nil {
 		return err
 	}
@@ -136,11 +133,11 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 		return nil
 	}
 
-	detail, err := doReactivateSubscription(ctx, client, remoteSubscriptionID)
+	sub, err := doReactivateSubscription(ctx, client, remoteSubscriptionID)
 	if err != nil {
 		return err
 	}
-	result := buildMutationResult("reactivate", detail,
+	result := buildMutationResult("reactivate", *sub,
 		fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to confirm it is active again; start a local consumer with `lark-cli event consume <refined EventKey> --as %s` if none is running", remoteSubscriptionID, identity, identity))
 	if o.asJSON {
 		output.PrintJson(f.IOStreams.Out, result)
@@ -150,25 +147,14 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 	return nil
 }
 
-// doReactivateSubscription issues the actual Reactivate call and unwraps
-// its response. Any error svc.Reactivate returns (transport, or an
-// already-classified typed business failure from
-// SubscriptionClient.Reactivate) is passed through unchanged.
-func doReactivateSubscription(ctx context.Context, svc reactivateSubscriptionAPI, remoteSubscriptionID string) (*larkeventv1.SubscriptionDetail, error) {
-	req := larkeventv1.NewReactivateSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()
-	resp, err := svc.Reactivate(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	var detail *larkeventv1.SubscriptionDetail
-	if resp != nil && resp.Data != nil {
-		detail = resp.Data.Subscription
-	}
-	if detail == nil {
-		return nil, errs.NewInternalError(errs.SubtypeInvalidResponse,
-			"subscription reactivate reported success but returned no subscription data")
-	}
-	return detail, nil
+// doReactivateSubscription issues the actual Reactivate call via the gateway,
+// which builds the request, unwraps the response, and validates its required
+// fields (a success response with no subscription / an empty
+// remote_subscription_id -> a typed InvalidResponse). Any error it returns
+// (transport, an already-classified business failure, or that validation) is
+// passed through unchanged.
+func doReactivateSubscription(ctx context.Context, svc reactivateSubscriptionAPI, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error) {
+	return svc.Reactivate(ctx, remoteSubscriptionID)
 }
 
 const reactivateLocalImpactNote = "`event subscription reactivate` only resumes remote delivery; it never starts, stops, or changes a local `event consume` process — a local consumer may still need to be (re)started separately."

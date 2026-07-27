@@ -12,22 +12,19 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/internal/cmdutil"
-	eventlib "github.com/larksuite/cli/internal/event"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
 
-// listSubscriptionsAPI is the subset of *eventlib.SubscriptionClient this
-// command calls. It exists purely as a test seam: tests substitute a fake
+// listSubscriptionsAPI is the subset of the platform/lark SubscriptionGateway
+// this command calls. It exists purely as a test seam: tests substitute a fake
 // implementing just this method, so the request-building/response-mapping
 // logic (listSubscriptions) is exercised without a real *lark.Client or
-// network call (the whole management plane must be
-// testable via a fake client). eventlib.NewSubscriptionClient's return
-// value satisfies this interface structurally.
+// network call (the whole management plane must be testable via a fake
+// gateway). *larkgw.Gateway satisfies this interface structurally.
 type listSubscriptionsAPI interface {
-	List(ctx context.Context, req *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error)
+	List(ctx context.Context, params larkgw.ListParams) (*larkgw.SubscriptionPage, error)
 }
 
 // listOpts holds `event subscription list`'s flag values.
@@ -112,7 +109,7 @@ func runList(cmd *cobra.Command, f *cmdutil.Factory, o listOpts) error {
 	if err != nil {
 		return err
 	}
-	client, err := eventlib.NewSubscriptionClient(sdk, identity, uat)
+	client, err := larkgw.NewSubscriptionGateway(sdk, identity, uat)
 	if err != nil {
 		return err
 	}
@@ -139,43 +136,31 @@ type listResult struct {
 	NextAction    string            `json:"next_action,omitempty"`
 }
 
-// listSubscriptions builds the SDK ListSubscriptionReq from o, calls
-// svc.List, and maps the response into this package's stable JSON shape.
-// svc is the listSubscriptionsAPI test seam so this mapping is unit-tested
-// against a fake, without a real *lark.Client.
+// listSubscriptions builds the gateway ListParams from o, calls svc.List, and
+// maps the page into this package's stable JSON shape. svc is the
+// listSubscriptionsAPI test seam so this mapping is unit-tested against a fake,
+// without a real *lark.Client. --event-key filters on the OAPI event_type
+// server-side.
 func listSubscriptions(ctx context.Context, svc listSubscriptionsAPI, o listOpts) (*listResult, error) {
-	builder := larkeventv1.NewListSubscriptionReqBuilder()
-	if o.state != "" {
-		builder = builder.State(o.state)
-	}
-	if o.eventKey != "" {
-		builder = builder.EventType(o.eventKey)
-	}
-	if o.pageToken != "" {
-		builder = builder.PageToken(o.pageToken)
-	}
-	if o.pageSize > 0 {
-		builder = builder.PageSize(o.pageSize)
-	}
-
-	resp, err := svc.List(ctx, builder.Build())
+	page, err := svc.List(ctx, larkgw.ListParams{
+		State:     o.state,
+		EventType: o.eventKey,
+		PageToken: o.pageToken,
+		PageSize:  o.pageSize,
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	result := &listResult{Subscriptions: []subscriptionRow{}}
-	if resp == nil || resp.Data == nil {
+	if page == nil {
 		return result, nil
 	}
-	for _, item := range resp.Data.Items {
-		result.Subscriptions = append(result.Subscriptions, mapSubscriptionDetail(item))
+	for _, item := range page.Items {
+		result.Subscriptions = append(result.Subscriptions, mapRemoteSubscription(item))
 	}
-	if resp.Data.HasMore != nil {
-		result.HasMore = *resp.Data.HasMore
-	}
-	if resp.Data.PageToken != nil {
-		result.NextPageToken = *resp.Data.PageToken
-	}
+	result.HasMore = page.HasMore
+	result.NextPageToken = page.NextPageToken
 	if result.HasMore && result.NextPageToken != "" {
 		result.NextAction = fmt.Sprintf("run `lark-cli event subscription list --page-token %s --json` for the next page", result.NextPageToken)
 	}

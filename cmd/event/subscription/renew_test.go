@@ -12,66 +12,58 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
-// fakeRenewAPI is a network-free stand-in for *eventlib.SubscriptionClient's
-// Get+Renew — the renewSubscriptionAPI test seam.
+// fakeRenewAPI is a network-free stand-in for the platform/lark gateway's
+// Get+Renew — the renewSubscriptionAPI test seam. The gateway hands back a
+// domain RemoteSubscription (already unwrapped, validated, classified).
 type fakeRenewAPI struct {
-	getResp *larkeventv1.GetSubscriptionResp
-	getErr  error
+	getSub *larkgw.RemoteSubscription
+	getErr error
 
-	renewFunc  func() (*larkeventv1.RenewSubscriptionResp, error)
+	renewFunc  func() (*larkgw.RemoteSubscription, error)
 	renewCalls int
 }
 
-func (f *fakeRenewAPI) Get(_ context.Context, _ *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error) {
-	return f.getResp, f.getErr
+func (f *fakeRenewAPI) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+	return f.getSub, f.getErr
 }
 
-func (f *fakeRenewAPI) Renew(_ context.Context, _ *larkeventv1.RenewSubscriptionReq) (*larkeventv1.RenewSubscriptionResp, error) {
+func (f *fakeRenewAPI) Renew(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
 	f.renewCalls++
 	if f.renewFunc == nil {
-		return okRenewResp(activeDetail("sub_1", false, "user")), nil
+		return subPtr(activeSub("sub_1", false, "user")), nil
 	}
 	return f.renewFunc()
-}
-
-func okRenewResp(d *larkeventv1.SubscriptionDetail) *larkeventv1.RenewSubscriptionResp {
-	return &larkeventv1.RenewSubscriptionResp{
-		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
-		Data:    &larkeventv1.RenewSubscriptionRespData{Subscription: d},
-	}
 }
 
 // ---- doRenewSubscription ----
 
 func TestDoRenewSubscription_CallsRenewAndReturnsDetail(t *testing.T) {
-	fake := &fakeRenewAPI{renewFunc: func() (*larkeventv1.RenewSubscriptionResp, error) {
-		return okRenewResp(activeDetail("sub_1", false, "user")), nil
+	fake := &fakeRenewAPI{renewFunc: func() (*larkgw.RemoteSubscription, error) {
+		return subPtr(activeSub("sub_1", false, "user")), nil
 	}}
 
-	detail, err := doRenewSubscription(context.Background(), fake, "sub_1")
+	sub, err := doRenewSubscription(context.Background(), fake, "sub_1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if fake.renewCalls != 1 {
 		t.Errorf("renewCalls = %d, want 1", fake.renewCalls)
 	}
-	if strVal(detail.SubscriptionId) != "sub_1" {
-		t.Errorf("detail.SubscriptionId = %q, want sub_1", strVal(detail.SubscriptionId))
+	if sub.ID.String() != "sub_1" {
+		t.Errorf("sub.ID = %q, want sub_1", sub.ID)
 	}
 }
 
 func TestDoRenewSubscription_TransportError_PropagatesUnchanged(t *testing.T) {
 	sentinel := errors.New("boom: connection reset")
-	fake := &fakeRenewAPI{renewFunc: func() (*larkeventv1.RenewSubscriptionResp, error) { return nil, sentinel }}
+	fake := &fakeRenewAPI{renewFunc: func() (*larkgw.RemoteSubscription, error) { return nil, sentinel }}
 
 	_, err := doRenewSubscription(context.Background(), fake, "sub_1")
 	if !errors.Is(err, sentinel) {
@@ -79,20 +71,16 @@ func TestDoRenewSubscription_TransportError_PropagatesUnchanged(t *testing.T) {
 	}
 }
 
-func TestDoRenewSubscription_SuccessWithNoData_ReturnsTypedInternalError(t *testing.T) {
-	fake := &fakeRenewAPI{renewFunc: func() (*larkeventv1.RenewSubscriptionResp, error) { return okRenewResp(nil), nil }}
-
-	_, err := doRenewSubscription(context.Background(), fake, "sub_1")
-	if _, ok := errs.ProblemOf(err); !ok {
-		t.Fatalf("expected a typed errs.* error, got %T: %v", err, err)
-	}
-}
+// The "success response with no subscription data -> typed InvalidResponse" edge
+// case now lives at the gateway (platform/lark's
+// TestGateway_Renew_NilData_ReturnsInvalidResponse); doRenewSubscription only
+// forwards the RemoteSubscription the gateway already validated.
 
 // ---- --dry-run output shape, direct-call end-to-end via the
 // fake service — mirrors update_test.go's own dry-run test.
 
 func TestRenewDryRun_EndToEndViaFakeService_JSONShapeAndNoRenewCall(t *testing.T) {
-	fake := &fakeRenewAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))}
+	fake := &fakeRenewAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
 	before, err := getSubscription(context.Background(), fake, "sub_1")
 	if err != nil {

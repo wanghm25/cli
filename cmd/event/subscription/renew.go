@@ -10,23 +10,20 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
-	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
-	eventlib "github.com/larksuite/cli/internal/event"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
 
-// renewSubscriptionAPI is the subset of *eventlib.SubscriptionClient this
-// command calls: Get (the remote read this command always performs first,
+// renewSubscriptionAPI is the subset of the platform/lark SubscriptionGateway
+// this command calls: Get (the remote read this command always performs first,
 // per the CLI-side read+write invariant, to report remote_before/
 // impact for --dry-run) and Renew (the actual write, which only extends the
 // subscription's TTL). See listSubscriptionsAPI (list.go) for the test-seam
 // rationale.
 type renewSubscriptionAPI interface {
-	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
-	Renew(ctx context.Context, req *larkeventv1.RenewSubscriptionReq) (*larkeventv1.RenewSubscriptionResp, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
+	Renew(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
 }
 
 // renewOpts holds `event subscription renew`'s flag values.
@@ -114,7 +111,7 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 	if err != nil {
 		return err
 	}
-	client, err := eventlib.NewSubscriptionClient(sdk, identity, uat)
+	client, err := larkgw.NewSubscriptionGateway(sdk, identity, uat)
 	if err != nil {
 		return err
 	}
@@ -136,11 +133,11 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 		return nil
 	}
 
-	detail, err := doRenewSubscription(ctx, client, remoteSubscriptionID)
+	sub, err := doRenewSubscription(ctx, client, remoteSubscriptionID)
 	if err != nil {
 		return err
 	}
-	result := buildMutationResult("renew", detail,
+	result := buildMutationResult("renew", *sub,
 		fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to confirm the new expire_time", remoteSubscriptionID, identity))
 	if o.asJSON {
 		output.PrintJson(f.IOStreams.Out, result)
@@ -150,25 +147,13 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 	return nil
 }
 
-// doRenewSubscription issues the actual Renew call and unwraps its
-// response. Any error svc.Renew returns (transport, or an already-classified
-// typed business failure from SubscriptionClient.Renew) is passed
-// through unchanged.
-func doRenewSubscription(ctx context.Context, svc renewSubscriptionAPI, remoteSubscriptionID string) (*larkeventv1.SubscriptionDetail, error) {
-	req := larkeventv1.NewRenewSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()
-	resp, err := svc.Renew(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	var detail *larkeventv1.SubscriptionDetail
-	if resp != nil && resp.Data != nil {
-		detail = resp.Data.Subscription
-	}
-	if detail == nil {
-		return nil, errs.NewInternalError(errs.SubtypeInvalidResponse,
-			"subscription renew reported success but returned no subscription data")
-	}
-	return detail, nil
+// doRenewSubscription issues the actual Renew call via the gateway, which
+// builds the request, unwraps the response, and validates its required fields (a
+// success response with no subscription / an empty remote_subscription_id -> a
+// typed InvalidResponse). Any error it returns (transport, an already-classified
+// business failure, or that validation) is passed through unchanged.
+func doRenewSubscription(ctx context.Context, svc renewSubscriptionAPI, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error) {
+	return svc.Renew(ctx, remoteSubscriptionID)
 }
 
 const renewLocalImpactNote = "`event subscription renew` only extends the remote Subscription's TTL; it never starts, stops, or changes a local `event consume` process."

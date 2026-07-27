@@ -11,25 +11,24 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	eventlib "github.com/larksuite/cli/internal/event"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
 
-// updateSubscriptionAPI is the subset of *eventlib.SubscriptionClient this
-// command calls: Get (the remote read this command always performs first, per
-// the CLI-side read+write invariant, both to report remote_before/impact for
-// --dry-run and — since update carries no EventKey — to learn the event type
-// and current filter the new one is validated and compared against) and Patch
-// (the actual write, which only changes the subscription's server-side
+// updateSubscriptionAPI is the subset of the platform/lark SubscriptionGateway
+// this command calls: Get (the remote read this command always performs first,
+// per the CLI-side read+write invariant, both to report remote_before/impact
+// for --dry-run and — since update carries no EventKey — to learn the event
+// type and current filter the new one is validated and compared against) and
+// Patch (the actual write, which only changes the subscription's server-side
 // filter). See listSubscriptionsAPI (list.go) for the test-seam rationale.
 type updateSubscriptionAPI interface {
-	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
-	Patch(ctx context.Context, req *larkeventv1.PatchSubscriptionReq) (*larkeventv1.PatchSubscriptionResp, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
+	Patch(ctx context.Context, remoteSubscriptionID string, spec larkgw.PatchSpec) (*larkgw.RemoteSubscription, error)
 }
 
 // updateOpts holds `event subscription update`'s flag values.
@@ -177,7 +176,7 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 	if err != nil {
 		return err
 	}
-	client, err := eventlib.NewSubscriptionClient(sdk, identity, uat)
+	client, err := larkgw.NewSubscriptionGateway(sdk, identity, uat)
 	if err != nil {
 		return err
 	}
@@ -202,7 +201,7 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		return err
 	}
 
-	eventType := strVal(before.EventType)
+	eventType := before.EventType
 	if eventType == "" {
 		// A subscription with no event_type can't be mapped to a filter
 		// capability, so --filter cannot be validated against it. Treat a
@@ -226,11 +225,11 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		}
 	}
 
-	current := eventlib.FilterFromSDK(before.Filter)
+	current := before.Filter
 	noChange := eventlib.Equal(desired, current)
 
 	if o.dryRun {
-		beforeRow := mapSubscriptionDetail(before)
+		beforeRow := mapRemoteSubscription(*before)
 		localAffected, impactNote := updateLocalImpact(noChange)
 		result := buildMutationDryRunResult("update", remoteSubscriptionID, identity, &beforeRow,
 			updatePlannedAction(noChange), localAffected, impactNote,
@@ -253,7 +252,7 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		if o.clearFilter {
 			already = "already has no filter"
 		}
-		result := buildMutationResult("update", before,
+		result := buildMutationResult("update", *before,
 			fmt.Sprintf("no change: remote_subscription_id=%s %s; run `lark-cli event subscription get %s --as %s --json` to confirm", remoteSubscriptionID, already, remoteSubscriptionID, identity))
 		if o.asJSON {
 			output.PrintJson(out, result)
@@ -263,11 +262,11 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		return nil
 	}
 
-	detail, err := doUpdateSubscription(ctx, svc, remoteSubscriptionID, desired)
+	sub, err := doUpdateSubscription(ctx, svc, remoteSubscriptionID, desired)
 	if err != nil {
 		return err
 	}
-	result := buildMutationResult("update", detail,
+	result := buildMutationResult("update", *sub,
 		updateSuccessNextAction(remoteSubscriptionID, identity, o.clearFilter))
 	if o.asJSON {
 		output.PrintJson(out, result)
@@ -277,74 +276,25 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 	return nil
 }
 
-// readSubscriptionForUpdate fetches the current remote subscription and
-// unwraps its detail. Unlike the shared, row-returning getSubscription
-// (get.go), update needs the raw *larkeventv1.SubscriptionDetail: its
-// event_type selects the filter capability --filter is validated against, and
-// its current filter is what the no-op guard compares the requested one
-// against via eventlib.Equal. Any error svc.Get returns (transport, or an
-// already-classified typed business failure such as an unknown
-// remote_subscription_id) is passed through unchanged.
-func readSubscriptionForUpdate(ctx context.Context, svc updateSubscriptionAPI, remoteSubscriptionID string) (*larkeventv1.SubscriptionDetail, error) {
-	req := larkeventv1.NewGetSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()
-	resp, err := svc.Get(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	var detail *larkeventv1.SubscriptionDetail
-	if resp != nil && resp.Data != nil {
-		detail = resp.Data.Subscription
-	}
-	if detail == nil {
-		// Defensive: a syntactically successful response with no Subscription
-		// payload is a wire anomaly, not "found an empty subscription".
-		return nil, errs.NewInternalError(errs.SubtypeInvalidResponse,
-			"subscription API reported success for %s but returned no subscription data", remoteSubscriptionID)
-	}
-	return detail, nil
+// readSubscriptionForUpdate fetches the current remote subscription. Unlike the
+// shared, row-returning getSubscription (get.go), update needs the whole
+// RemoteSubscription: its EventType selects the filter capability --filter is
+// validated against, and its Filter is what the no-op guard compares the
+// requested one against via eventlib.Equal. Any error svc.Get returns
+// (transport, an already-classified business failure such as an unknown
+// remote_subscription_id, or the gateway's own required-field validation) is
+// passed through unchanged.
+func readSubscriptionForUpdate(ctx context.Context, svc updateSubscriptionAPI, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error) {
+	return svc.Get(ctx, remoteSubscriptionID)
 }
 
-// doUpdateSubscription issues the actual Patch and unwraps its response. Any
-// error svc.Patch returns (transport, or an already-classified typed business
-// failure from SubscriptionClient.Patch) is passed through unchanged.
-func doUpdateSubscription(ctx context.Context, svc updateSubscriptionAPI, remoteSubscriptionID string, desired *eventlib.Filter) (*larkeventv1.SubscriptionDetail, error) {
-	req := larkeventv1.NewPatchSubscriptionReqBuilder().
-		SubscriptionId(remoteSubscriptionID).
-		Body(buildPatchSubscriptionBody(desired)).
-		Build()
-	resp, err := svc.Patch(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	var detail *larkeventv1.SubscriptionDetail
-	if resp != nil && resp.Data != nil {
-		detail = resp.Data.Subscription
-	}
-	if detail == nil {
-		return nil, errs.NewInternalError(errs.SubtypeInvalidResponse,
-			"subscription update reported success but returned no subscription data")
-	}
-	return detail, nil
-}
-
-// buildPatchSubscriptionBody constructs the Patch request body, which carries
-// only the filter (the sole field update changes). eventlib.FilterToSDK
-// projects the desired filter to the SDK type; an empty/cleared filter becomes
-// the {"filter":{}} clear form (a non-nil empty *Filter) rather than an
-// omitted field, so a clear is distinguishable on the wire from "leave the
-// filter unchanged".
-//
-// This is split out of doUpdateSubscription (rather than inlined) so this
-// package's own tests can assert the projected filter directly against a
-// plain, fully-inspectable *larkeventv1.PatchSubscriptionReqBody value — the
-// built *PatchSubscriptionReq itself stores the body in an internal,
-// unexported field the SDK transport reads, so a test capturing the request
-// cannot read back what it carried (mirrors create.go's
-// buildCreateSubscriptionBody, same rationale).
-func buildPatchSubscriptionBody(desired *eventlib.Filter) *larkeventv1.PatchSubscriptionReqBody {
-	return larkeventv1.NewPatchSubscriptionReqBodyBuilder().
-		Filter(eventlib.FilterToSDK(desired)).
-		Build()
+// doUpdateSubscription issues the actual Patch via the gateway, passing the
+// desired filter as a PatchSpec (the gateway projects it onto the request body —
+// an empty/cleared filter becomes the {"filter":{}} clear form, distinct on the
+// wire from "leave the filter unchanged" — and validates the response's required
+// fields). Any error it returns is passed through unchanged.
+func doUpdateSubscription(ctx context.Context, svc updateSubscriptionAPI, remoteSubscriptionID string, desired *eventlib.Filter) (*larkgw.RemoteSubscription, error) {
+	return svc.Patch(ctx, remoteSubscriptionID, larkgw.PatchSpec{Filter: desired})
 }
 
 // updatePlannedAction is the --dry-run planned_change.action: "noop" when the

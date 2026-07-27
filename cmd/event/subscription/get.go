@@ -12,19 +12,17 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
-	eventlib "github.com/larksuite/cli/internal/event"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
 
-// getSubscriptionAPI is the subset of *eventlib.SubscriptionClient this
-// command calls. See listSubscriptionsAPI (list.go) for the rationale — same
-// test-seam pattern, one method.
+// getSubscriptionAPI is the subset of the platform/lark SubscriptionGateway
+// this command calls. See listSubscriptionsAPI (list.go) for the rationale —
+// same test-seam pattern, one method.
 type getSubscriptionAPI interface {
-	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
 }
 
 // NewCmdGet builds `event subscription get <remote_subscription_id>`:
@@ -93,7 +91,7 @@ func runGet(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID string,
 	if err != nil {
 		return err
 	}
-	client, err := eventlib.NewSubscriptionClient(sdk, identity, uat)
+	client, err := larkgw.NewSubscriptionGateway(sdk, identity, uat)
 	if err != nil {
 		return err
 	}
@@ -111,37 +109,23 @@ func runGet(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID string,
 	return nil
 }
 
-// getSubscription calls svc.Get and maps the response into this package's
-// stable JSON row shape. svc is the getSubscriptionAPI test seam so this is
-// unit-tested against a fake, without a real *lark.Client.
+// getSubscription calls svc.Get and maps the domain RemoteSubscription into
+// this package's stable JSON row shape. svc is the getSubscriptionAPI test seam
+// so this is unit-tested against a fake, without a real *lark.Client.
 //
 // Any error svc.Get returns is passed through unchanged: by the time this
-// function is reached, *eventlib.SubscriptionClient.Get has already turned
-// a transport failure or an OAPI business failure (e.g. an unknown/
-// nonexistent remote_subscription_id) into a typed errs.* error
-// (see internal/event/subscription_client.go's classifyFailure) — this
-// command layer must not swallow, downgrade, or re-wrap it.
+// function is reached, the platform/lark gateway has already turned a transport
+// failure, an OAPI business failure (e.g. an unknown/nonexistent
+// remote_subscription_id), or a wire anomaly (a success response carrying no
+// subscription / an empty remote_subscription_id -> typed InvalidResponse) into
+// a typed errs.* error — this command layer must not swallow, downgrade, or
+// re-wrap it, so it never renders an all-empty row as if it were real data.
 func getSubscription(ctx context.Context, svc getSubscriptionAPI, remoteSubscriptionID string) (*subscriptionRow, error) {
-	req := larkeventv1.NewGetSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()
-	resp, err := svc.Get(ctx, req)
+	sub, err := svc.Get(ctx, remoteSubscriptionID)
 	if err != nil {
 		return nil, err
 	}
-
-	var detail *larkeventv1.SubscriptionDetail
-	if resp != nil && resp.Data != nil {
-		detail = resp.Data.Subscription
-	}
-	if detail == nil {
-		// Defensive: a syntactically successful response with no
-		// Subscription payload is a wire anomaly, not "found an empty
-		// subscription" — never silently render an all-empty row as if it
-		// were real data.
-		return nil, errs.NewInternalError(errs.SubtypeInvalidResponse,
-			"subscription API reported success for %s but returned no subscription data", remoteSubscriptionID)
-	}
-
-	row := mapSubscriptionDetail(detail)
+	row := mapRemoteSubscription(*sub)
 	return &row, nil
 }
 

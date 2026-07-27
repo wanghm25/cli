@@ -16,6 +16,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	eventlib "github.com/larksuite/cli/internal/event"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
 
@@ -644,10 +645,19 @@ type localImpact struct {
 	Note                  string `json:"note"`
 }
 
+// rowFromSDKDetail renders one SDK SubscriptionDetail (create still holds these
+// from the reconcile/create path on the legacy subscription_client, which PR2b
+// retires into the gateway) as the shared subscriptionRow, routing it through
+// the gateway's SDK->domain projection so there is exactly one row source fed by
+// the domain RemoteSubscription — no second SDK-typed row mapper in this package.
+func rowFromSDKDetail(d *larkeventv1.SubscriptionDetail) subscriptionRow {
+	return mapRemoteSubscription(larkgw.ProjectSubscription(d))
+}
+
 func buildDryRunResult(resolved eventlib.ResolvedEventKey, identity core.Identity, plan *reconcilePlan, includeResourceData bool) *createDryRunResult {
 	var remoteBefore *subscriptionRow
 	if plan.Existing != nil {
-		row := mapSubscriptionDetail(plan.Existing)
+		row := rowFromSDKDetail(plan.Existing)
 		remoteBefore = &row
 	}
 	pc := plannedChange{Action: plan.Action, ConflictFields: plan.ConflictFields}
@@ -704,7 +714,7 @@ type createResult struct {
 }
 
 func buildCreateResult(resolved eventlib.ResolvedEventKey, identity core.Identity, outcome *createOutcome) *createResult {
-	row := mapSubscriptionDetail(outcome.Detail)
+	row := rowFromSDKDetail(outcome.Detail)
 	return &createResult{
 		Operation:            "create",
 		Action:               outcome.Action,

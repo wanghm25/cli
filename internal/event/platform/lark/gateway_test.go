@@ -4,7 +4,9 @@
 package lark
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -288,6 +290,87 @@ func TestGateway_WalkSubscriptions_StopsEarlyWhenVisitReturnsFalse(t *testing.T)
 	}
 	if len(seen) != 1 {
 		t.Errorf("visited %v, want exactly one before stopping", seen)
+	}
+}
+
+// --- buildPatchBody: filter projection onto the Patch request body ---
+
+func TestBuildPatchBody_SetFilter_ProjectsFilter(t *testing.T) {
+	f, err := event.ParseAndValidateFilter(
+		`{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"eq","value":"text"}}]}}`,
+		event.FilterMetaFor("im.message.created_v1"))
+	if err != nil {
+		t.Fatalf("build filter: %v", err)
+	}
+	body := buildPatchBody(PatchSpec{Filter: f})
+	if body.Filter == nil {
+		t.Fatal("body.Filter is nil, want the projected filter")
+	}
+	got, err := json.Marshal(body.Filter)
+	if err != nil {
+		t.Fatalf("marshal body.Filter: %v", err)
+	}
+	want, err := f.Canonicalize()
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("body.Filter JSON = %s, want %s", got, want)
+	}
+}
+
+// TestBuildPatchBody_ClearFilter_IsClearForm locks that clearing sends the
+// documented {"filter":{}} clear form (a non-nil empty filter), distinct from
+// omitting the field (which the server reads as "leave the filter unchanged").
+func TestBuildPatchBody_ClearFilter_IsClearForm(t *testing.T) {
+	for name, f := range map[string]*event.Filter{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			body := buildPatchBody(PatchSpec{Filter: f})
+			if body.Filter == nil {
+				t.Fatal(`clear form must send a non-nil empty filter ({"filter":{}}), not omit the field`)
+			}
+			if body.Filter.CompositeCondition != nil {
+				t.Errorf("clear form must have a nil CompositeCondition, got %+v", body.Filter.CompositeCondition)
+			}
+			got, err := json.Marshal(body.Filter)
+			if err != nil {
+				t.Fatalf("marshal body.Filter: %v", err)
+			}
+			if string(got) != "{}" {
+				t.Errorf("clear-form filter JSON = %s, want {}", got)
+			}
+		})
+	}
+}
+
+// TestBuildCreateBody_WithKeyAndFilter_SetsAtomically locks that an encrypted
+// create sets include_resource_data and the encrypt_key on the SAME
+// payload_options, and projects a requested filter; and that no filter/key
+// omits those fields entirely.
+func TestBuildCreateBody_Projection(t *testing.T) {
+	f, err := event.ParseAndValidateFilter(
+		`{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"eq","value":"text"}}]}}`,
+		event.FilterMetaFor("im.message.created_v1"))
+	if err != nil {
+		t.Fatalf("build filter: %v", err)
+	}
+	body := buildCreateBody(CreateSpec{EventType: "im.message.created_v1", TargetResource: "im.message?chat_id=oc_aaa", IncludeResourceData: true, EncryptKey: "the-key", Filter: f})
+	if body.PayloadOptions == nil || body.PayloadOptions.IncludeResourceData == nil || !*body.PayloadOptions.IncludeResourceData {
+		t.Fatalf("include_resource_data not set: %+v", body.PayloadOptions)
+	}
+	if body.PayloadOptions.Encrypt == nil || body.PayloadOptions.Encrypt.EncryptKey == nil || *body.PayloadOptions.Encrypt.EncryptKey != "the-key" {
+		t.Fatalf("encrypt_key not set atomically: %+v", body.PayloadOptions.Encrypt)
+	}
+	if body.Filter == nil {
+		t.Error("body.Filter is nil, want the projected filter")
+	}
+
+	plain := buildCreateBody(CreateSpec{EventType: "im.message.created_v1", TargetResource: "im.message?chat_id=oc_aaa"})
+	if plain.PayloadOptions.Encrypt != nil {
+		t.Errorf("Encrypt = %+v, want nil when no key supplied", plain.PayloadOptions.Encrypt)
+	}
+	if plain.Filter != nil {
+		t.Errorf("body.Filter = %+v, want nil (omitted) when no filter requested", plain.Filter)
 	}
 }
 

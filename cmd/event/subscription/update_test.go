@@ -9,13 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
 	"github.com/larksuite/cli/errs"
@@ -23,23 +21,18 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
 	eventlib "github.com/larksuite/cli/internal/event"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
-// rowFromDetail maps d through the exact same getSubscription seam runDelete
-// uses, so tests build a *subscriptionRow fixture identically to how
-// production code obtains "before" rather than hand-constructing one that
-// could drift from the real mapping. update itself no longer needs it (it
-// reads the raw *larkeventv1.SubscriptionDetail via readSubscriptionForUpdate,
-// since its no-op guard compares SDK filters), but delete_test.go still does,
-// and this file is its one definition site — kept here for that.
+// rowFromDetail maps an SDK SubscriptionDetail through the same
+// gateway-projection + row-mapper the migrated commands use, so tests build a
+// *subscriptionRow fixture identically to how production code obtains "before"
+// rather than hand-constructing one that could drift from the real mapping.
+// delete_test.go uses it; this file is its one definition site.
 func rowFromDetail(t *testing.T, d *larkeventv1.SubscriptionDetail) *subscriptionRow {
 	t.Helper()
-	fake := &fakeGetAPI{resp: okGetResp(d)}
-	row, err := getSubscription(context.Background(), fake, strVal(d.SubscriptionId))
-	if err != nil {
-		t.Fatalf("rowFromDetail: unexpected error: %v", err)
-	}
-	return row
+	row := mapRemoteSubscription(larkgw.ProjectSubscription(d))
+	return &row
 }
 
 // ---- fixtures ----
@@ -50,7 +43,7 @@ const sampleUpdateFilterJSON = `{"composite_condition":{"logic_op":"and","compos
 
 // mustParseCreatedFilter parses raw against im.message.created_v1's filter
 // capability, failing the test on any error — for fixtures that need a valid
-// *eventlib.Filter to seed a remote detail or compare against.
+// *eventlib.Filter to seed a remote subscription or compare against.
 func mustParseCreatedFilter(t *testing.T, raw string) *eventlib.Filter {
 	t.Helper()
 	f, err := eventlib.ParseAndValidateFilter(raw, eventlib.FilterMetaFor("im.message.created_v1"))
@@ -60,113 +53,69 @@ func mustParseCreatedFilter(t *testing.T, raw string) *eventlib.Filter {
 	return f
 }
 
-// activeDetailWithFilter is activeDetail carrying an existing server-side
-// filter (projected to the SDK type exactly as a remote read would surface
-// it), for the no-op / clear-a-present-filter cases.
-func activeDetailWithFilter(id string, f *eventlib.Filter) *larkeventv1.SubscriptionDetail {
+// activeSubWithFilter is activeSub carrying an existing server-side filter
+// (projected exactly as a gateway read would surface it), for the no-op /
+// clear-a-present-filter cases.
+func activeSubWithFilter(id string, f *eventlib.Filter) larkgw.RemoteSubscription {
 	d := activeDetail(id, false, "user")
 	d.Filter = eventlib.FilterToSDK(f)
-	return d
+	return larkgw.ProjectSubscription(d)
 }
 
 // ---- fake updateSubscriptionAPI ----
 
-// fakeUpdateAPI is a network-free stand-in for *eventlib.SubscriptionClient's
-// Get+Patch — the updateSubscriptionAPI test seam.
+// fakeUpdateAPI is a network-free stand-in for the platform/lark gateway's
+// Get+Patch — the updateSubscriptionAPI test seam. Get hands back a domain
+// RemoteSubscription; Patch captures the PatchSpec and returns one.
 type fakeUpdateAPI struct {
-	getResp *larkeventv1.GetSubscriptionResp
-	getErr  error
+	getSub *larkgw.RemoteSubscription
+	getErr error
 
-	patchFunc  func() (*larkeventv1.PatchSubscriptionResp, error)
+	patchFunc  func(larkgw.PatchSpec) (*larkgw.RemoteSubscription, error)
 	patchCalls int
+	patchSpec  larkgw.PatchSpec
 }
 
-func (f *fakeUpdateAPI) Get(_ context.Context, _ *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error) {
-	return f.getResp, f.getErr
+func (f *fakeUpdateAPI) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+	return f.getSub, f.getErr
 }
 
-func (f *fakeUpdateAPI) Patch(_ context.Context, _ *larkeventv1.PatchSubscriptionReq) (*larkeventv1.PatchSubscriptionResp, error) {
+func (f *fakeUpdateAPI) Patch(_ context.Context, _ string, spec larkgw.PatchSpec) (*larkgw.RemoteSubscription, error) {
 	f.patchCalls++
+	f.patchSpec = spec
 	if f.patchFunc == nil {
-		return okPatchResp(activeDetail("sub_1", false, "user")), nil
+		return subPtr(activeSub("sub_1", false, "user")), nil
 	}
-	return f.patchFunc()
+	return f.patchFunc(spec)
 }
 
-func okPatchResp(d *larkeventv1.SubscriptionDetail) *larkeventv1.PatchSubscriptionResp {
-	return &larkeventv1.PatchSubscriptionResp{
-		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
-		Data:    &larkeventv1.PatchSubscriptionRespData{Subscription: d},
-	}
-}
-
-// ---- buildPatchSubscriptionBody (the Patch body's filter projection) ----
-
-func TestBuildPatchSubscriptionBody_SetFilter_ProjectsParsedFilter(t *testing.T) {
-	desired := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
-	body := buildPatchSubscriptionBody(desired)
-	if body.Filter == nil {
-		t.Fatal("body.Filter is nil, want the projected filter")
-	}
-	if !reflect.DeepEqual(body.Filter, eventlib.FilterToSDK(desired)) {
-		t.Errorf("body.Filter = %+v, want the FilterToSDK projection of the parsed filter", body.Filter)
-	}
-	gotJSON, err := json.Marshal(body.Filter)
-	if err != nil {
-		t.Fatalf("marshal body.Filter: %v", err)
-	}
-	wantJSON, err := desired.Canonicalize()
-	if err != nil {
-		t.Fatalf("canonicalize desired: %v", err)
-	}
-	if !bytes.Equal(gotJSON, wantJSON) {
-		t.Errorf("body.Filter JSON = %s, want %s", gotJSON, wantJSON)
-	}
-}
-
-// TestBuildPatchSubscriptionBody_ClearFilter_IsClearForm locks that clearing
-// sends the documented {"filter":{}} clear form (a non-nil empty filter) —
-// distinct from omitting the field, which the server reads as "leave the
-// filter unchanged".
-func TestBuildPatchSubscriptionBody_ClearFilter_IsClearForm(t *testing.T) {
-	body := buildPatchSubscriptionBody(&eventlib.Filter{})
-	if body.Filter == nil {
-		t.Fatal(`clear form must send a non-nil empty filter ({"filter":{}}), not omit the field`)
-	}
-	if body.Filter.CompositeCondition != nil {
-		t.Errorf("clear form must have a nil CompositeCondition, got %+v", body.Filter.CompositeCondition)
-	}
-	gotJSON, err := json.Marshal(body.Filter)
-	if err != nil {
-		t.Fatalf("marshal body.Filter: %v", err)
-	}
-	if string(gotJSON) != "{}" {
-		t.Errorf("clear-form filter JSON = %s, want {}", gotJSON)
-	}
-}
+// The Patch request body's filter projection (set filter / {"filter":{}} clear
+// form) now lives at the gateway — see platform/lark's
+// TestBuildPatchBody_SetFilter/ClearFilter; the gateway also validates a Patch
+// response's required fields (TestGateway_Patch_NilData_ReturnsInvalidResponse).
 
 // ---- doUpdateSubscription ----
 
-func TestDoUpdateSubscription_CallsPatchAndReturnsDetail(t *testing.T) {
-	fake := &fakeUpdateAPI{patchFunc: func() (*larkeventv1.PatchSubscriptionResp, error) {
-		return okPatchResp(activeDetail("sub_1", false, "user")), nil
+func TestDoUpdateSubscription_CallsPatchAndReturnsSubscription(t *testing.T) {
+	fake := &fakeUpdateAPI{patchFunc: func(larkgw.PatchSpec) (*larkgw.RemoteSubscription, error) {
+		return subPtr(activeSub("sub_1", false, "user")), nil
 	}}
 
-	detail, err := doUpdateSubscription(context.Background(), fake, "sub_1", &eventlib.Filter{})
+	sub, err := doUpdateSubscription(context.Background(), fake, "sub_1", &eventlib.Filter{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if fake.patchCalls != 1 {
 		t.Errorf("patchCalls = %d, want 1", fake.patchCalls)
 	}
-	if strVal(detail.SubscriptionId) != "sub_1" {
-		t.Errorf("detail.SubscriptionId = %q, want sub_1", strVal(detail.SubscriptionId))
+	if sub.ID.String() != "sub_1" {
+		t.Errorf("sub.ID = %q, want sub_1", sub.ID)
 	}
 }
 
 func TestDoUpdateSubscription_TransportError_PropagatesUnchanged(t *testing.T) {
 	sentinel := errors.New("boom: connection reset")
-	fake := &fakeUpdateAPI{patchFunc: func() (*larkeventv1.PatchSubscriptionResp, error) { return nil, sentinel }}
+	fake := &fakeUpdateAPI{patchFunc: func(larkgw.PatchSpec) (*larkgw.RemoteSubscription, error) { return nil, sentinel }}
 
 	_, err := doUpdateSubscription(context.Background(), fake, "sub_1", &eventlib.Filter{})
 	if !errors.Is(err, sentinel) {
@@ -174,19 +123,10 @@ func TestDoUpdateSubscription_TransportError_PropagatesUnchanged(t *testing.T) {
 	}
 }
 
-func TestDoUpdateSubscription_SuccessWithNoData_ReturnsTypedInternalError(t *testing.T) {
-	fake := &fakeUpdateAPI{patchFunc: func() (*larkeventv1.PatchSubscriptionResp, error) { return okPatchResp(nil), nil }}
-
-	_, err := doUpdateSubscription(context.Background(), fake, "sub_1", &eventlib.Filter{})
-	if _, ok := errs.ProblemOf(err); !ok {
-		t.Fatalf("expected a typed errs.* error, got %T: %v", err, err)
-	}
-}
-
 // ---- applyUpdate (read + decide + write core, against the fake) ----
 
 func TestApplyUpdate_SetFilter_PatchesWhenChanged(t *testing.T) {
-	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))}
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
 		updateOpts{filter: sampleUpdateFilterJSON})
@@ -199,7 +139,7 @@ func TestApplyUpdate_SetFilter_PatchesWhenChanged(t *testing.T) {
 }
 
 func TestApplyUpdate_MalformedFilterJSON_RejectedNoPatch(t *testing.T) {
-	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))}
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
 		updateOpts{filter: `{"composite_condition":`})
@@ -227,7 +167,7 @@ func TestApplyUpdate_InvalidFilterRule_RejectedNoPatch_NeverLeaksValue(t *testin
 	// sender requires an open_id value; this one is not, so it is rejected by
 	// rule (not by JSON parsing).
 	raw := `{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"sender","op":"eq","value":"` + secret + `"}}]}}`
-	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))}
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
 		updateOpts{filter: raw})
@@ -248,7 +188,7 @@ func TestApplyUpdate_InvalidFilterRule_RejectedNoPatch_NeverLeaksValue(t *testin
 
 func TestApplyUpdate_ClearFilter_PatchesWhenFilterPresent(t *testing.T) {
 	present := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
-	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetailWithFilter("sub_1", present))}
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", present))}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
 		updateOpts{clearFilter: true})
@@ -267,7 +207,7 @@ func TestApplyUpdate_ClearFilter_PatchesWhenFilterPresent(t *testing.T) {
 // --clear-filter/--filter distinction updateDryRunNextAction already makes
 // for the --dry-run no-op case.
 func TestApplyUpdate_ClearFilter_NoOpWhenAlreadyEmpty(t *testing.T) {
-	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))} // no filter
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))} // no filter
 	var buf bytes.Buffer
 
 	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
@@ -294,7 +234,7 @@ func TestApplyUpdate_ClearFilter_NoOpWhenAlreadyEmpty(t *testing.T) {
 
 func TestApplyUpdate_SetFilter_NoOpWhenEqualsCurrent(t *testing.T) {
 	current := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
-	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetailWithFilter("sub_1", current))}
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", current))}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
 		updateOpts{filter: sampleUpdateFilterJSON})
@@ -307,7 +247,7 @@ func TestApplyUpdate_SetFilter_NoOpWhenEqualsCurrent(t *testing.T) {
 }
 
 func TestApplyUpdate_DryRun_ReadsButDoesNotPatch(t *testing.T) {
-	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))}
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 	var buf bytes.Buffer
 
 	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
@@ -351,7 +291,7 @@ func TestApplyUpdate_DryRun_ReadsButDoesNotPatch(t *testing.T) {
 // patches).
 func TestApplyUpdate_DryRun_NoOp_ReportsNoopAction(t *testing.T) {
 	current := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
-	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetailWithFilter("sub_1", current))}
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", current))}
 	var buf bytes.Buffer
 
 	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
@@ -383,9 +323,9 @@ func TestApplyUpdate_DryRun_NoOp_ReportsNoopAction(t *testing.T) {
 // detail reports an event_type with no filter capability — and nothing is
 // patched.
 func TestApplyUpdate_EventTypeComesFromGet(t *testing.T) {
-	detail := activeDetail("sub_1", false, "user")
-	detail.EventType = strPtr("im.message.receive_v1") // no filter capability
-	fake := &fakeUpdateAPI{getResp: okGetResp(detail)}
+	sub := activeSub("sub_1", false, "user")
+	sub.EventType = "im.message.receive_v1" // no filter capability
+	fake := &fakeUpdateAPI{getSub: &sub}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
 		updateOpts{filter: sampleUpdateFilterJSON})
@@ -405,9 +345,9 @@ func TestApplyUpdate_EventTypeComesFromGet(t *testing.T) {
 }
 
 func TestApplyUpdate_MissingEventType_TypedError(t *testing.T) {
-	detail := activeDetail("sub_1", false, "user")
-	detail.EventType = nil
-	fake := &fakeUpdateAPI{getResp: okGetResp(detail)}
+	sub := activeSub("sub_1", false, "user")
+	sub.EventType = ""
+	fake := &fakeUpdateAPI{getSub: &sub}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
 		updateOpts{clearFilter: true})

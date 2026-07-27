@@ -17,21 +17,27 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
-// fakeListAPI is a network-free stand-in for *eventlib.SubscriptionClient's
-// List method — the listSubscriptionsAPI test seam — so listSubscriptions'
-// request-building/response-mapping logic is exercised without a real
-// *lark.Client or network call.
+// fakeListAPI is a network-free stand-in for the platform/lark gateway's List —
+// the listSubscriptionsAPI test seam — so listSubscriptions' param-building and
+// page-mapping logic is exercised without a real *lark.Client or network call.
+// The gateway already pages/projects, so the fake hands back a domain
+// SubscriptionPage.
 type fakeListAPI struct {
-	resp *larkeventv1.ListSubscriptionResp
+	page *larkgw.SubscriptionPage
 	err  error
 }
 
-func (f *fakeListAPI) List(_ context.Context, _ *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
-	return f.resp, f.err
+func (f *fakeListAPI) List(_ context.Context, _ larkgw.ListParams) (*larkgw.SubscriptionPage, error) {
+	return f.page, f.err
 }
 
+// okListResp builds an SDK List response — kept for create_test.go's fakes,
+// which still speak the SDK (create stays on the legacy subscription_client
+// until PR2b). The migrated list command's own fake hands back a domain
+// SubscriptionPage instead.
 func okListResp(items []*larkeventv1.SubscriptionDetail, hasMore bool, pageToken string) *larkeventv1.ListSubscriptionResp {
 	return &larkeventv1.ListSubscriptionResp{
 		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
@@ -43,12 +49,22 @@ func okListResp(items []*larkeventv1.SubscriptionDetail, hasMore bool, pageToken
 	}
 }
 
+// listPage builds a domain SubscriptionPage from SDK details (projected exactly
+// as the gateway would), for the migrated list command's fake.
+func listPage(items []*larkeventv1.SubscriptionDetail, hasMore bool, pageToken string) *larkgw.SubscriptionPage {
+	page := &larkgw.SubscriptionPage{HasMore: hasMore, NextPageToken: pageToken}
+	for _, d := range items {
+		page.Items = append(page.Items, larkgw.ProjectSubscription(d))
+	}
+	return page
+}
+
 // TestListSubscriptions_TwoItems_JSONShape is the primary TDD case from the
 // task brief: a fake List returning 2 subscriptions must map into
 // subscriptions[] (remote_subscription_id/event_key/event_type/...) plus
 // has_more/next_page_token.
 func TestListSubscriptions_TwoItems_JSONShape(t *testing.T) {
-	fake := &fakeListAPI{resp: okListResp([]*larkeventv1.SubscriptionDetail{
+	fake := &fakeListAPI{page: listPage([]*larkeventv1.SubscriptionDetail{
 		{
 			SubscriptionId: strPtr("sub_1"),
 			EventType:      strPtr("im.message.created_v1"),
@@ -143,7 +159,7 @@ func TestListSubscriptions_TwoItems_JSONShape(t *testing.T) {
 }
 
 func TestListSubscriptions_EmptyResult_NoNextAction(t *testing.T) {
-	fake := &fakeListAPI{resp: okListResp(nil, false, "")}
+	fake := &fakeListAPI{page: listPage(nil, false, "")}
 
 	result, err := listSubscriptions(context.Background(), fake, listOpts{})
 	if err != nil {

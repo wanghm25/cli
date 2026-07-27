@@ -11,24 +11,22 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
-	eventlib "github.com/larksuite/cli/internal/event"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
 
-// deleteSubscriptionAPI is the subset of *eventlib.SubscriptionClient this
-// command calls: Get (the remote read this command always performs first,
+// deleteSubscriptionAPI is the subset of the platform/lark SubscriptionGateway
+// this command calls: Get (the remote read this command always performs first,
 // per the CLI-side read+write invariant, both to report
 // remote_before/impact for --dry-run and to describe the affected
 // subscription in the confirmation-required Hint) and Delete (the actual
 // write). See listSubscriptionsAPI (list.go) for the test-seam rationale.
 type deleteSubscriptionAPI interface {
-	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
-	Delete(ctx context.Context, req *larkeventv1.DeleteSubscriptionReq) (*larkeventv1.DeleteSubscriptionResp, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
+	Delete(ctx context.Context, remoteSubscriptionID string) error
 }
 
 // deleteOpts holds `event subscription delete`'s flag values.
@@ -119,7 +117,7 @@ func runDelete(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 	if err != nil {
 		return err
 	}
-	client, err := eventlib.NewSubscriptionClient(sdk, identity, uat)
+	client, err := larkgw.NewSubscriptionGateway(sdk, identity, uat)
 	if err != nil {
 		return err
 	}
@@ -167,16 +165,13 @@ func applyDelete(ctx context.Context, svc deleteSubscriptionAPI, remoteSubscript
 	return doDeleteSubscription(ctx, svc, remoteSubscriptionID)
 }
 
-// doDeleteSubscription issues the actual Delete call. Unlike Patch/Renew/
-// Reactivate, DeleteSubscriptionResp carries no Data/SubscriptionDetail at
-// all — there is nothing to unwrap on success, so this returns
-// only an error. Any error svc.Delete returns (transport, or an
-// already-classified typed business failure from
-// SubscriptionClient.Delete) is passed through unchanged.
+// doDeleteSubscription issues the actual Delete call via the gateway. Unlike
+// Patch/Renew/Reactivate, a Delete carries no subscription payload — there is
+// nothing to unwrap on success, so the gateway's Delete (and this) returns only
+// an error. Any error it returns (transport, or an already-classified business
+// failure) is passed through unchanged.
 func doDeleteSubscription(ctx context.Context, svc deleteSubscriptionAPI, remoteSubscriptionID string) error {
-	req := larkeventv1.NewDeleteSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build()
-	_, err := svc.Delete(ctx, req)
-	return err
+	return svc.Delete(ctx, remoteSubscriptionID)
 }
 
 // errDeleteConfirmationRequired implements the high-risk-write

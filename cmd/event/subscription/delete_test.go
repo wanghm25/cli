@@ -13,40 +13,35 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
 
-// fakeDeleteAPI is a network-free stand-in for *eventlib.SubscriptionClient's
-// Get+Delete — the deleteSubscriptionAPI test seam.
+// fakeDeleteAPI is a network-free stand-in for the platform/lark gateway's
+// Get+Delete — the deleteSubscriptionAPI test seam. Delete carries no payload,
+// so the gateway (and this fake) returns only an error.
 type fakeDeleteAPI struct {
-	getResp *larkeventv1.GetSubscriptionResp
-	getErr  error
+	getSub *larkgw.RemoteSubscription
+	getErr error
 
-	deleteFunc  func() (*larkeventv1.DeleteSubscriptionResp, error)
+	deleteFunc  func() error
 	deleteCalls int
 }
 
-func (f *fakeDeleteAPI) Get(_ context.Context, _ *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error) {
-	return f.getResp, f.getErr
+func (f *fakeDeleteAPI) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+	return f.getSub, f.getErr
 }
 
-func (f *fakeDeleteAPI) Delete(_ context.Context, _ *larkeventv1.DeleteSubscriptionReq) (*larkeventv1.DeleteSubscriptionResp, error) {
+func (f *fakeDeleteAPI) Delete(_ context.Context, _ string) error {
 	f.deleteCalls++
 	if f.deleteFunc == nil {
-		return okDeleteResp(), nil
+		return nil
 	}
 	return f.deleteFunc()
-}
-
-func okDeleteResp() *larkeventv1.DeleteSubscriptionResp {
-	return &larkeventv1.DeleteSubscriptionResp{ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)}}
 }
 
 // ---- applyDelete (confirmation gate) ----
@@ -106,7 +101,7 @@ func TestApplyDelete_Yes_CallsDelete(t *testing.T) {
 
 func TestDoDeleteSubscription_TransportError_PropagatesUnchanged(t *testing.T) {
 	sentinel := errors.New("boom: connection reset")
-	fake := &fakeDeleteAPI{deleteFunc: func() (*larkeventv1.DeleteSubscriptionResp, error) { return nil, sentinel }}
+	fake := &fakeDeleteAPI{deleteFunc: func() error { return sentinel }}
 
 	err := doDeleteSubscription(context.Background(), fake, "sub_1")
 	if !errors.Is(err, sentinel) {
@@ -151,7 +146,7 @@ func TestBuildDeleteResult_Shape(t *testing.T) {
 // fake service — mirrors update_test.go's own dry-run test.
 
 func TestDeleteDryRun_EndToEndViaFakeService_JSONShapeAndNoDeleteCall(t *testing.T) {
-	fake := &fakeDeleteAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))}
+	fake := &fakeDeleteAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
 	before, err := getSubscription(context.Background(), fake, "sub_1")
 	if err != nil {
