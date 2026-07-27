@@ -5,7 +5,6 @@ package subscription
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 
@@ -15,6 +14,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	eventlib "github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/app"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/output"
@@ -206,21 +206,22 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 	return applyCreate(ctx, subown.NewController(gateway), f.IOStreams.Out, resolved, identity, o, reqFilter)
 }
 
-// createController is the subset of *subown.Controller create's flow drives:
-// Plan (the read-only Observe+classify a --dry-run renders and a real run acts
-// on) and Apply (the single remote write). Declared as an interface so tests
-// substitute a fake Controller (or a real one over a fake gateway) with no
-// *lark.Client or network call.
-type createController interface {
-	Plan(ctx context.Context, policy subown.Policy, req subown.Request) (subown.SubscriptionPlan, error)
-	Apply(ctx context.Context, plan subown.SubscriptionPlan, policy subown.Policy, req subown.Request) (subown.ApplyReceipt, error)
-}
+// createController is the subset of the subscription Controller create's flow
+// drives: Plan (the read-only Observe+classify a --dry-run renders and a real
+// run acts on) and Apply (the single remote write). It is
+// app.SubscriptionController — the shared provisioning seam the use case owns —
+// aliased here so create_test.go keeps substituting a fake Controller (or a real
+// one over a fake gateway) with no *lark.Client or network call.
+type createController = app.SubscriptionController
 
-// applyCreate is create's testable core: Observe+Plan against remote state, then
-// either render the --dry-run preview, act on a writable plan (create/reuse), or
-// map a non-writable plan (conflict/suspended/indeterminate) to a typed error.
-// It never itself builds a request body or calls the SDK — the Controller and
-// the platform/lark gateway own all of that.
+// applyCreate is create's testable core: it builds the subscription Request and
+// hands it to the SubscriptionUseCase's Observe→Plan→Apply provisioning flow,
+// then renders the domain outcome — the --dry-run preview, the created/reused
+// result, or the typed conflict/suspended/indeterminate error a non-writable
+// plan maps to. It never itself calls controller.Plan/Apply, handles the
+// reconcile-after-failure matrix, builds a request body, or calls the SDK — the
+// use case, the Controller, and the platform/lark gateway own all of that; this
+// function only builds the request and renders.
 func applyCreate(ctx context.Context, controller createController, out io.Writer, resolved eventlib.ResolvedEventKey, identity core.Identity, o createOpts, reqFilter *eventlib.Filter) error {
 	req := subown.Request{
 		EventType:           resolved.Definition.EventType,
@@ -230,39 +231,29 @@ func applyCreate(ctx context.Context, controller createController, out io.Writer
 		Filter:              reqFilter,
 	}
 
-	plan, err := controller.Plan(ctx, subown.ManagementCreate, req)
+	outcome, err := app.NewSubscriptionUseCase().Provision(ctx, controller, subown.ManagementCreate, req, o.dryRun)
 	if err != nil {
 		return err
 	}
 
-	if o.dryRun {
-		result := buildDryRunResult(resolved, identity, plan, o.includeResourceData)
+	switch outcome.Kind {
+	case app.ProvisionPreview:
+		result := buildDryRunResult(resolved, identity, outcome.Plan, o.includeResourceData)
 		if o.asJSON {
 			output.PrintJson(out, result)
 			return nil
 		}
 		writeCreateDryRunText(out, result)
 		return nil
-	}
-
-	switch plan.Action {
-	case subown.ActionBlock:
-		return blockError(resolved, identity, plan, o.includeResourceData)
-	case subown.ActionIndeterminate:
+	case app.ProvisionBlocked:
+		// A block carrying conflict fields is a configuration conflict; a block
+		// with none is a suspended match create refuses to overwrite. blockError
+		// renders the right typed failed_precondition from the plan.
+		return blockError(resolved, identity, outcome.Plan, o.includeResourceData)
+	case app.ProvisionIndeterminate:
 		return indeterminateError(resolved, identity)
-	case subown.ActionCreate, subown.ActionReuse:
-		receipt, err := controller.Apply(ctx, plan, subown.ManagementCreate, req)
-		if err != nil {
-			// The Controller's bounded reconcile-after-a-failed-create pass may
-			// have found a raced remote state that now blocks — surface it as the
-			// same typed conflict/suspended error a first-pass block would.
-			var blocked *subown.PlanBlockedError
-			if errors.As(err, &blocked) {
-				return blockError(resolved, identity, blocked.Plan, o.includeResourceData)
-			}
-			return err
-		}
-		result := buildCreateResult(resolved, identity, receipt)
+	case app.ProvisionApplied:
+		result := buildCreateResult(resolved, identity, outcome.Receipt)
 		if o.asJSON {
 			output.PrintJson(out, result)
 			return nil
@@ -270,7 +261,7 @@ func applyCreate(ctx context.Context, controller createController, out io.Writer
 		writeCreateText(out, result)
 		return nil
 	default:
-		return errs.NewInternalError(errs.SubtypeUnknown, "unexpected subscription plan action %q", plan.Action)
+		return errs.NewInternalError(errs.SubtypeUnknown, "unexpected subscription provision outcome %d", outcome.Kind)
 	}
 }
 
