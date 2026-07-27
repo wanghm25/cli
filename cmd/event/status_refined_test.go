@@ -489,13 +489,20 @@ func TestWriteStatusJSON_RefinedConsumer_MismatchIncludesNextAction(t *testing.T
 	if c["current_profile_match"] != false {
 		t.Errorf("current_profile_match = %v, want false", c["current_profile_match"])
 	}
-	action, _ := c["next_action"].(string)
-	if action == "" {
-		t.Error("next_action missing/empty for a real owner/current mismatch")
+	// next_action is now the structured {command,args,reason} object; a real
+	// owner/current mismatch surfaces a reason-only recommendation (no single
+	// safe command switches the active profile).
+	na, ok := c["next_action"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("next_action = %v (%T), want a structured {command,args,reason} object", c["next_action"], c["next_action"])
 	}
-	lower := strings.ToLower(action)
+	reason, _ := na["reason"].(string)
+	if reason == "" {
+		t.Error("next_action.reason missing/empty for a real owner/current mismatch")
+	}
+	lower := strings.ToLower(reason)
 	if strings.Contains(lower, "dead") || strings.Contains(lower, "inactive") {
-		t.Errorf("next_action must not describe the consumer as dead/inactive: %q", action)
+		t.Errorf("next_action.reason must not describe the consumer as dead/inactive: %q", reason)
 	}
 }
 
@@ -709,10 +716,13 @@ func TestSupplementRefinedConsumers_ScanYieldsAllWantedIDs_Supplemented(t *testi
 	}
 	getter := &fakeRefinedGetter{walkItems: items}
 
-	capped := supplementRefinedConsumers(context.Background(), getter, consumers)
+	capped, missing := supplementRefinedConsumers(context.Background(), getter, consumers)
 
 	if capped {
 		t.Error("capped = true, want false (every wanted id was found)")
+	}
+	if len(missing) != 0 {
+		t.Errorf("missing = %v, want empty (every wanted id was found -> all verified, none missing)", missing)
 	}
 	for i, c := range consumers {
 		if c.RemoteState != "active" {
@@ -746,10 +756,16 @@ func TestSupplementRefinedConsumers_CappedScan_DegradesGracefully_NotFalseNotExi
 		walkCapped: true,
 	}
 
-	capped := supplementRefinedConsumers(context.Background(), getter, consumers)
+	capped, missing := supplementRefinedConsumers(context.Background(), getter, consumers)
 
 	if !capped {
 		t.Error("capped = false, want true (the bounded scan reported capped with none of the wanted ids found)")
+	}
+	// A CAPPED scan is not a complete enumeration, so an unfound id must NOT be
+	// reported as authoritatively missing — it degrades to scope=unknown, never
+	// a false scope=missing.
+	if len(missing) != 0 {
+		t.Errorf("missing = %v, want empty (a capped scan is not authoritative absence -> unknown, not missing)", missing)
 	}
 	for i, c := range consumers {
 		if c.RemoteSubscription != nil || c.RemoteState != "" {

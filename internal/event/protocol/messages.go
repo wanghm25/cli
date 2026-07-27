@@ -425,6 +425,16 @@ type RemoteSubscriptionInfo struct {
 	ExpireTime          int64  `json:"expire_time,omitempty"` // unix seconds; 0 = unknown
 	IncludeResourceData bool   `json:"include_resource_data,omitempty"`
 
+	// EventKey is the canonical, EXECUTABLE EventKey this remote Subscription
+	// reverses to (catalog.ReverseResolve of its event_type + target_resource),
+	// so status's remote_subscription is directly AI-composable rather than
+	// exposing a raw event_type. status.go's remote supplement is the sole
+	// producer; it sets the explicit "unavailable" marker when the pair cannot
+	// be reversed to a registered key, never a raw event_type. Omitted when the
+	// supplement did not run. This package carries the already-resolved string;
+	// it neither imports the catalog nor performs the reversal itself.
+	EventKey string `json:"event_key,omitempty"`
+
 	// SuspensionCode is the remote Subscription's suspension code (SDK
 	// service/event/v1/model.go's Suspension.Code), carried verbatim from
 	// status.go's remote supplement. Meaningful ONLY when State=="suspended"

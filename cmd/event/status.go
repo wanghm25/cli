@@ -17,6 +17,7 @@ import (
 	"github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
+	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/app"
 	"github.com/larksuite/cli/internal/event/busctl"
 	"github.com/larksuite/cli/internal/event/busdiscover"
@@ -111,6 +112,18 @@ type appStatus struct {
 	CurrentIdentityKnown bool
 	CurrentAppID         string
 	CurrentUserOpenID    string
+
+	// RemoteMissing is the set of remote_subscription_ids that the bounded
+	// remote supplement AUTHORITATIVELY found absent for this app — i.e. a
+	// reachable, COMPLETE (non-capped, error-free) List scan enumerated every
+	// page and never yielded them. It is the projector's sole basis for
+	// scope=missing: a refined consumer whose id is here reverses to a definitive
+	// "the remote subscription is gone". A consumer that is simply not verified
+	// (supplement not attempted / timed out / capped / a Get that failed —
+	// which is NOT authoritative absence) is deliberately absent from this set so
+	// the projector renders it scope=unknown rather than falsely missing. nil
+	// when the supplement did not run or ran only via per-id Get.
+	RemoteMissing map[string]bool
 }
 
 type busQuerier interface {
@@ -246,11 +259,38 @@ func (p *statusPlane) AnnotateCurrentIdentity() {
 
 func (p *statusPlane) Supplement() bool {
 	// Remote supplement: WEAK, optional, current-app-only (see
-	// resolveRemoteSupplementGetter's doc for the full precondition chain). Any
-	// failed precondition silently keeps every consumer local-only — this must
-	// never turn a plain `event status` into a hard failure.
-	return applyRefinedSupplement(p.ctx, p.statuses, p.appID, func() refinedSubscriptionGetter {
-		return resolveRemoteSupplementGetter(p.ctx, p.cmd, p.f, p.appID, p.cur.UserOpenID, time.Now())
+	// resolveRemoteSupplementGetter's doc for the full precondition chain), and
+	// BOUNDED by a single total time budget (runBoundedSupplement). Any failed
+	// precondition — or the whole supplement exceeding its budget — silently
+	// keeps every not-yet-verified consumer local-only (projected scope=unknown):
+	// this must never turn a plain `event status` into a hang or a hard failure.
+	return runBoundedSupplement(p.ctx, remoteSupplementBudget, p.statuses, p.appID, func(ctx context.Context) refinedSubscriptionGetter {
+		return resolveRemoteSupplementGetter(ctx, p.cmd, p.f, p.appID, p.cur.UserOpenID, time.Now())
+	})
+}
+
+// remoteSupplementBudget is the TOTAL wall-clock budget for the entire remote
+// supplement (getter resolution + every Get/scan for the one current app),
+// applied once as a context.WithTimeout around the whole supplement — NOT a
+// per-call deadline. A slow or unreachable remote therefore costs `event status`
+// at most this long before it degrades to local-only, rather than blocking on
+// the transport's own (much longer) timeouts one call at a time.
+const remoteSupplementBudget = 3 * time.Second
+
+// runBoundedSupplement wraps the ENTIRE remote supplement in one total time
+// budget so a slow/unreachable remote degrades to local-only instead of hanging.
+// It derives a single child context with the budget, resolves the getter under
+// it, and runs applyRefinedSupplement under it: if the budget elapses, the
+// getter's in-flight Get/scan observe the cancelled context and return promptly,
+// leaving every not-yet-verified refined consumer local-only (scope=unknown) —
+// the same graceful degrade an unreachable remote already produces. Splitting
+// this out keeps the budget mechanism unit-testable with a blocking getter and
+// no Factory/network involved.
+func runBoundedSupplement(parent context.Context, budget time.Duration, statuses []appStatus, curAppID string, resolve func(ctx context.Context) refinedSubscriptionGetter) (capped bool) {
+	ctx, cancel := context.WithTimeout(parent, budget)
+	defer cancel()
+	return applyRefinedSupplement(ctx, statuses, curAppID, func() refinedSubscriptionGetter {
+		return resolve(ctx)
 	})
 }
 
@@ -546,7 +586,13 @@ func applyRefinedSupplement(ctx context.Context, statuses []appStatus, curAppID 
 			continue
 		}
 		if getter := resolveGetter(); getter != nil {
-			capped = supplementRefinedConsumers(ctx, getter, s.Consumers)
+			// supplementRefinedConsumers fills each verified consumer's
+			// RemoteSubscription/RemoteState in place and returns the ids it
+			// AUTHORITATIVELY found absent; the projector reads both to render
+			// scope verified|missing|unknown. A nil getter (failed precondition /
+			// bounded-refresh not reachable) leaves RemoteMissing nil, so every
+			// refined consumer projects scope=unknown — never a false "missing".
+			capped, s.RemoteMissing = supplementRefinedConsumers(ctx, getter, s.Consumers)
 		}
 		return // only one appStatus can ever match curAppID
 	}
@@ -570,9 +616,18 @@ func applyRefinedSupplement(ctx context.Context, statuses []appStatus, curAppID 
 // a paginated List scan instead of that many individual Gets. capped is true
 // only when that List scan hit the page cap before every wanted id was found
 // — never set on the Get path, which has no pagination concept at all.
-func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionGetter, consumers []protocol.ConsumerInfo) (capped bool) {
+//
+// missing is the set of remote_subscription_ids a reachable, COMPLETE List scan
+// (no cap, no error) authoritatively found absent — the projector's sole basis
+// for scope=missing. It is deliberately populated ONLY on that complete-scan
+// path: a per-id Get that fails is not authoritative absence (it may be
+// transient / a permission error) and a capped scan is not a complete
+// enumeration, so both leave those ids out of missing (they project as
+// scope=unknown, never a false scope=missing). nil when nothing is
+// authoritatively absent.
+func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionGetter, consumers []protocol.ConsumerInfo) (capped bool, missing map[string]bool) {
 	if getter == nil {
-		return false
+		return false, nil
 	}
 
 	// Group consumer INDICES by remote_subscription_id: the dedup key.
@@ -585,12 +640,18 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 		byID[id] = append(byID[id], i)
 	}
 	if len(byID) == 0 {
-		return false
+		return false, nil
 	}
 
 	var details map[string]larkgw.RemoteSubscription
+	// complete reports whether the read authoritatively enumerated the account's
+	// subscriptions: only a COMPLETE List scan (no page cap, no error) lets an
+	// unfound id be reported as scope=missing. A per-id Get that fails is NOT
+	// authoritative absence (it may be transient / a permission error), so the
+	// Get path never contributes to missing — those ids stay scope=unknown.
+	complete := false
 	if len(byID) > remoteSupplementListThreshold {
-		details, capped = listRemoteSupplementDetails(ctx, getter, byID)
+		details, capped, complete = listRemoteSupplementDetails(ctx, getter, byID)
 	} else {
 		details = getRemoteSupplementDetails(ctx, getter, byID)
 	}
@@ -598,7 +659,16 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 	for id, idxs := range byID {
 		d, ok := details[id]
 		if !ok {
-			continue // unreachable/error/not-returned -> local-only for every consumer sharing this id
+			// unreachable/error/not-returned -> local-only for every consumer
+			// sharing this id. Only a COMPLETE enumeration turns "not returned"
+			// into an authoritative scope=missing.
+			if complete {
+				if missing == nil {
+					missing = map[string]bool{}
+				}
+				missing[id] = true
+			}
+			continue
 		}
 		info := mapRemoteSubscriptionInfo(d)
 		for _, i := range idxs {
@@ -606,7 +676,7 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 			consumers[i].RemoteState = info.State
 		}
 	}
-	return capped
+	return capped, missing
 }
 
 // getRemoteSupplementDetails fetches each of wantIDs' remote Subscription
@@ -640,7 +710,7 @@ func getRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionG
 // proof the missing ids don't exist, only that they weren't found within the
 // pages read, and the caller must log it rather than silently degrade as if it
 // were a confirmed negative.
-func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) (out map[string]larkgw.RemoteSubscription, capped bool) {
+func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) (out map[string]larkgw.RemoteSubscription, capped, complete bool) {
 	out = make(map[string]larkgw.RemoteSubscription, len(wantIDs))
 	remaining := len(wantIDs)
 
@@ -654,9 +724,16 @@ func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscription
 		return remaining > 0 // stop early once every wanted id has been found
 	})
 	if err != nil {
-		return out, false // unreachable/error -> whatever was found so far stands, rest stay local-only, same degrade as today
+		// unreachable/error -> whatever was found so far stands, rest stay
+		// local-only. NOT a complete enumeration, so an unfound id must NOT be
+		// reported as authoritatively missing (complete=false).
+		return out, false, false
 	}
-	return out, capped
+	// complete only when the scan ran to the end without hitting the page cap:
+	// then an id we never saw is genuinely absent from the account, not merely
+	// beyond the pages we read. An early stop (remaining==0, every wanted id
+	// found) also returns capped=false and is trivially complete.
+	return out, capped, !capped
 }
 
 // mapRemoteSubscriptionInfo maps one domain RemoteSubscription into the
@@ -664,6 +741,18 @@ func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscription
 // build this identically.
 func mapRemoteSubscriptionInfo(sub larkgw.RemoteSubscription) *protocol.RemoteSubscriptionInfo {
 	info := &protocol.RemoteSubscriptionInfo{State: sub.State}
+	// Reverse-resolve the executable event_key from the already-fetched
+	// event_type + target_resource (no new remote call) so status's
+	// remote_subscription is AI-composable; an unreversible pair gets the
+	// explicit unavailable marker, never a raw event_type. Only when the remote
+	// actually carried an event_type at all.
+	if sub.EventType != "" {
+		if key, ok := eventlib.ReverseResolve(sub.EventType, sub.TargetResource); ok {
+			info.EventKey = key
+		} else {
+			info.EventKey = statusEventKeyUnavailable
+		}
+	}
 	if sub.ExpireTime != nil {
 		info.ExpireTime = int64(*sub.ExpireTime)
 	}
@@ -761,6 +850,12 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 	if applicable {
 		parts = append(parts, fmt.Sprintf("current_profile_match=%t", match))
 	}
+	// Tri-state remote verification scope (verified|missing|unknown) — the same
+	// value the JSON `scope` field carries, so text and JSON agree. Omitted for a
+	// consumer with no remote subscription to verify.
+	if scope := (StatusProjector{}).consumerScope(s, c); scope != "" {
+		parts = append(parts, fmt.Sprintf("scope=%s", scope))
+	}
 	if c.RemoteState != "" {
 		parts = append(parts, fmt.Sprintf("remote_state=%s", c.RemoteState))
 	}
@@ -782,9 +877,6 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 
 	if c.StaleIdentity {
 		fmt.Fprintf(out, "      advisory: %s\n", staleIdentityAdvisory(match, applicable))
-		if action := refinedNextAction(match, applicable); action != "" {
-			fmt.Fprintf(out, "      next_action: %s\n", action)
-		}
 	}
 	// Per-dimension health: surface EVERY unhealthy dimension (a subscription
 	// suspended AND an identity stale can both show now), not a single slot.
@@ -793,18 +885,42 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 	}
 	// APPEND (never clobber) a degraded advisory
 	// derived from the remote-supplement result, alongside whichever of the
-	// two advisories above may already be printed.
+	// advisories above may already be printed.
 	if advisory := remoteDegradedAdvisory(c); advisory != "" {
 		fmt.Fprintf(out, "      advisory: %s — informational only (remote-supplement, read-only)\n", advisory)
 	}
-	// decryption advisory + read-only next_action for an
-	// encrypted consumer whose resource data cannot currently be decrypted.
+	// The single structured recovery next_action (bus lifecycle token / scope /
+	// identity), rendered as human text here — the SAME projection the JSON
+	// `next_action` object carries, so text and JSON stay consistent.
+	writeNextActionLine(out, StatusProjector{}.nextAction(s, c, StatusProjector{}.consumerScope(s, c)))
+	// decryption advisory + its own read-only next_action for an
+	// encrypted consumer whose resource data cannot currently be decrypted
+	// (kept separate from the structured next_action above).
 	if advisory, action := decryptAdvisory(c); advisory != "" {
 		fmt.Fprintf(out, "      advisory: %s — informational only\n", advisory)
 		if action != "" {
 			fmt.Fprintf(out, "      next_action: %s\n", action)
 		}
 	}
+}
+
+// writeNextActionLine renders the structured next_action as the human-readable
+// `next_action:` text line, appending the runnable command when one is present
+// so the text a human reads names the same command the JSON hands an AI. nil
+// (nothing recommended) prints nothing.
+func writeNextActionLine(out io.Writer, na *nextActionCommand) {
+	if na == nil {
+		return
+	}
+	if na.Command != "" {
+		cmd := na.Command
+		for _, a := range na.Args {
+			cmd += " " + a
+		}
+		fmt.Fprintf(out, "      next_action: %s (run: %s)\n", na.Reason, cmd)
+		return
+	}
+	fmt.Fprintf(out, "      next_action: %s\n", na.Reason)
 }
 
 // decryptAdvisory derives a read-only decryption advisory (+ next_action) from
@@ -896,30 +1012,37 @@ func writeStatusText(out io.Writer, statuses []appStatus) {
 // consumerView is writeStatusJSON's per-consumer wire shape: it embeds
 // protocol.ConsumerInfo directly (Go struct embedding flattens its JSON keys
 // to the top level, so every current and future ConsumerInfo field flows
-// through with ZERO per-field mapping code here) and adds three values that
-// are DERIVED/computed rather than raw bus data, so they don't belong on
-// ConsumerInfo itself: current_profile_match/next_action —
-// computed locally by consumerProfileMatch/refinedNextAction because the bus
-// does not know the querying profile — and remote_degraded_advisory,
-// computed locally by remoteDegradedAdvisory from the
-// consumer's own already-fetched remote_state/remote_subscription
-// (refreshing local degraded/error state, scoped to the two known
-// remote states this SDK documents outside an open vocabulary). Pointer
-// CurrentProfileMatch (not bool) so "not applicable" (nil -> omitted) is
-// distinguishable from a real "false" mismatch. remote_degraded_advisory is
-// deliberately a SEPARATE key from the bus-side degraded_reason (embedded
-// verbatim from ConsumerInfo) — additive/appended, never a replacement or a
-// clobber of that pre-existing advisory.
+// through with ZERO per-field mapping code here) and adds the status-DERIVED,
+// AI-composable fields the StatusProjector computes from the collected facts:
+//
+//   - current_profile_match: a *bool (not bool) so "not applicable" (nil ->
+//     omitted, e.g. a bot/legacy consumer) is distinguishable from a real
+//     "false" mismatch. Computed locally because the bus does not know the
+//     querying profile.
+//   - scope: the tri-state remote verification scope (verified|missing|unknown);
+//     omitted for a legacy consumer. An AI reads this instead of inferring
+//     verification from the absence of a remote snapshot.
+//   - next_action: the STRUCTURED {command,args,reason} recommended recovery
+//     command (nil -> omitted). It shadows the embedded ConsumerInfo.NextAction
+//     string (same JSON key, shallower field wins) — the projector maps that
+//     raw bus token into this executable form, so the field an AI reads is a
+//     runnable command, not an opaque token.
+//   - remote_degraded_advisory: a SEPARATE key from the bus-side per-dimension
+//     health (embedded verbatim) — additive display, never a replacement.
+//
+// All are computed by reading the collected facts only (no bus/remote/config
+// write).
 type consumerView struct {
 	protocol.ConsumerInfo
-	CurrentProfileMatch    *bool  `json:"current_profile_match,omitempty"`
-	NextAction             string `json:"next_action,omitempty"`
-	RemoteDegradedAdvisory string `json:"remote_degraded_advisory,omitempty"`
+	CurrentProfileMatch    *bool              `json:"current_profile_match,omitempty"`
+	Scope                  remoteScope        `json:"scope,omitempty"`
+	NextAction             *nextActionCommand `json:"next_action,omitempty"`
+	RemoteDegradedAdvisory string             `json:"remote_degraded_advisory,omitempty"`
 	// decrypt_state/last_decrypt_error/resource_data flow
 	// through automatically from the embedded ConsumerInfo; these two are the
 	// locally-computed advisory + read-only next_action for a decrypt issue,
 	// kept as separate keys (mirroring remote_degraded_advisory) so they never
-	// clobber the identity-mismatch next_action above.
+	// clobber the structured next_action above.
 	DecryptAdvisory   string `json:"decrypt_advisory,omitempty"`
 	DecryptNextAction string `json:"decrypt_next_action,omitempty"`
 }
@@ -942,15 +1065,7 @@ func writeStatusJSON(w io.Writer, statuses []appStatus) error {
 		if len(s.Consumers) > 0 {
 			consumers = make([]consumerView, 0, len(s.Consumers))
 			for _, c := range s.Consumers {
-				cv := consumerView{ConsumerInfo: c}
-				if match, applicable := consumerProfileMatch(s, c); applicable {
-					m := match
-					cv.CurrentProfileMatch = &m
-					cv.NextAction = refinedNextAction(match, applicable)
-				}
-				cv.RemoteDegradedAdvisory = remoteDegradedAdvisory(c)
-				cv.DecryptAdvisory, cv.DecryptNextAction = decryptAdvisory(c)
-				consumers = append(consumers, cv)
+				consumers = append(consumers, StatusProjector{}.projectConsumerView(s, c))
 			}
 		}
 		js := jsonStatus{
