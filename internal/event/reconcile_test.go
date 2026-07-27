@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
@@ -584,5 +585,163 @@ func TestReconcileExisting_EncryptedBothTrue_DeferredConfirmation_ReusesWithoutP
 	}
 	if plan.Existing == nil || strVal(plan.Existing.SubscriptionId) != "sub_enc" {
 		t.Errorf("Existing = %+v, want sub_enc", plan.Existing)
+	}
+}
+
+// ---- ReconcileExisting: filter reuse dimension ----
+//
+// Reuse of an active match requires the requested filter to Equal the remote
+// one; any difference (including empty-vs-filtered either way) is a conflict —
+// the fail-closed rule mirroring include_resource_data. WithRequestedFilter is
+// the option carrying the requested filter; omitting it means "no filter".
+
+// filterAlt is a second valid filter, distinct from sampleFilter()
+// (filter_sdk_test.go), used to force a filter mismatch.
+func filterAlt() *Filter {
+	return &Filter{Root: &FilterNode{
+		LogicOp:  logicAnd,
+		Children: []*FilterNode{{Condition: &FilterCond{Operand: "message_type", Op: opEq, Value: "text"}}},
+	}}
+}
+
+// filteredSub is an active authority match carrying remote filter f.
+func filteredSub(id, authorityType string, f *Filter) *larkeventv1.SubscriptionDetail {
+	sub := activeSub(id, false, authorityType)
+	sub.Filter = FilterToSDK(f)
+	return sub
+}
+
+func TestReconcileExisting_FilterMismatch_ReturnsConflictWithFilterField(t *testing.T) {
+	fake := &fakeLister{resp: listResp([]*larkeventv1.SubscriptionDetail{
+		filteredSub("sub_1", "user", sampleFilter()),
+	})}
+
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, WithRequestedFilter(filterAlt()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionConflict {
+		t.Fatalf("Action = %q, want %q", plan.Action, PlanActionConflict)
+	}
+	if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Name != "filter" {
+		t.Fatalf("ConflictFields = %+v, want one entry naming filter", plan.ConflictFields)
+	}
+	if plan.ConflictFields[0].Reason == "" {
+		t.Error("ConflictFields[0].Reason must not be empty")
+	}
+	// Never-leak: the reason must not echo any filter contents.
+	if strings.Contains(plan.ConflictFields[0].Reason, "message_type") ||
+		strings.Contains(plan.ConflictFields[0].Reason, "ou_abc") ||
+		strings.Contains(plan.ConflictFields[0].Reason, "text") {
+		t.Errorf("Reason must not leak filter contents: %q", plan.ConflictFields[0].Reason)
+	}
+}
+
+func TestReconcileExisting_FilterEqual_ReturnsReuse(t *testing.T) {
+	fake := &fakeLister{resp: listResp([]*larkeventv1.SubscriptionDetail{
+		filteredSub("sub_1", "user", sampleFilter()),
+	})}
+
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, WithRequestedFilter(sampleFilter()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionReuse {
+		t.Errorf("Action = %q, want %q (identical filter is compatible)", plan.Action, PlanActionReuse)
+	}
+}
+
+func TestReconcileExisting_EmptyRequestedVsFilteredRemote_ReturnsConflict(t *testing.T) {
+	fake := &fakeLister{resp: listResp([]*larkeventv1.SubscriptionDetail{
+		filteredSub("sub_1", "user", sampleFilter()),
+	})}
+
+	// No WithRequestedFilter option -> requested is treated as empty.
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionConflict {
+		t.Fatalf("Action = %q, want %q (empty request under-delivers vs a filtered remote)", plan.Action, PlanActionConflict)
+	}
+	if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Name != "filter" {
+		t.Errorf("ConflictFields = %+v, want one entry naming filter", plan.ConflictFields)
+	}
+}
+
+func TestReconcileExisting_FilteredRequestedVsEmptyRemote_ReturnsConflict(t *testing.T) {
+	// activeSub carries no filter -> remote is unfiltered.
+	fake := &fakeLister{resp: listResp([]*larkeventv1.SubscriptionDetail{
+		activeSub("sub_1", false, "user"),
+	})}
+
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, WithRequestedFilter(sampleFilter()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionConflict {
+		t.Fatalf("Action = %q, want %q (a filtered request against an unfiltered remote conflicts)", plan.Action, PlanActionConflict)
+	}
+	if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Name != "filter" {
+		t.Errorf("ConflictFields = %+v, want one entry naming filter", plan.ConflictFields)
+	}
+}
+
+func TestReconcileExisting_BothEmptyFilter_ReturnsReuse(t *testing.T) {
+	fake := &fakeLister{resp: listResp([]*larkeventv1.SubscriptionDetail{
+		activeSub("sub_1", false, "user"),
+	})}
+
+	// Explicit empty requested filter against an unfiltered remote -> reuse.
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, WithRequestedFilter(&Filter{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionReuse {
+		t.Errorf("Action = %q, want %q (both empty is compatible)", plan.Action, PlanActionReuse)
+	}
+}
+
+// TestReconcileExisting_EncryptedFilterMismatch_ReturnsConflict_NeverProbes
+// locks that the filter dimension blocks reuse on the encrypted (management)
+// path too, and does so BEFORE the encrypt-key probe runs — a filter mismatch
+// is decisive on its own.
+func TestReconcileExisting_EncryptedFilterMismatch_ReturnsConflict_NeverProbes(t *testing.T) {
+	match := activeSub("sub_enc", true, "user")
+	match.Filter = FilterToSDK(sampleFilter())
+	fake := &fakeLister{resp: listResp([]*larkeventv1.SubscriptionDetail{match})}
+	prober := &fakeEncryptKeyProber{resp: encryptKeyResp("usable-key-value")}
+
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, true, WithEncryptKeyProber(prober), WithRequestedFilter(filterAlt()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionConflict {
+		t.Fatalf("Action = %q, want %q", plan.Action, PlanActionConflict)
+	}
+	if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Name != "filter" {
+		t.Errorf("ConflictFields = %+v, want one entry naming filter", plan.ConflictFields)
+	}
+	if prober.calls != 0 {
+		t.Errorf("prober.calls = %d, want 0: a filter mismatch is decisive before the encrypt-key probe", prober.calls)
+	}
+}
+
+// TestReconcileExisting_EncryptedDeferred_FilterMismatch_ReturnsConflict locks
+// the same for the consume (deferred key confirmation) encrypted path.
+func TestReconcileExisting_EncryptedDeferred_FilterMismatch_ReturnsConflict(t *testing.T) {
+	match := activeSub("sub_enc", true, "user")
+	match.Filter = FilterToSDK(sampleFilter())
+	fake := &fakeLister{resp: listResp([]*larkeventv1.SubscriptionDetail{match})}
+
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, true, WithDeferredEncryptKeyConfirmation(), WithRequestedFilter(filterAlt()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionConflict {
+		t.Fatalf("Action = %q, want %q", plan.Action, PlanActionConflict)
+	}
+	if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Name != "filter" {
+		t.Errorf("ConflictFields = %+v, want one entry naming filter", plan.ConflictFields)
 	}
 }

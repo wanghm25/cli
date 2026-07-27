@@ -65,23 +65,27 @@ type EncryptKeyProber interface {
 	GetEncryptKey(ctx context.Context, req *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error)
 }
 
-// ReconcileOption customizes ReconcileExisting without changing its
-// signature for existing callers: internal/event/consume/refined.go's
-// PlanRemoteSubscription stage keeps
-// calling ReconcileExisting exactly as it does today, passing zero options,
-// and remains byte-for-byte unaffected — every option this type carries only
-// changes behavior on the requestedIncludeResourceData=true path, which that
-// call site never reaches (it always passes false).
+// ReconcileOption customizes ReconcileExisting without changing its positional
+// signature. WithEncryptKeyProber and WithDeferredEncryptKeyConfirmation only
+// affect the requestedIncludeResourceData=true path (an active,
+// include_resource_data=true match). WithRequestedFilter adds the filter reuse
+// dimension and applies on every path; an unset requested filter is compared as
+// empty, so a caller that supplies no filter option keeps the unchanged
+// both-empty reuse behavior.
 type ReconcileOption func(*reconcileConfig)
 
 // reconcileConfig carries the optional dependencies ReconcileOption values can
-// set for the encryption conflict matrix. Exactly one of these applies to an
-// active, include_resource_data=true match; which one is chosen by the caller's
-// nature (a management action that must classify now, vs a consumer that has an
-// authoritative bus-side key gate to fall back on).
+// set. encryptProber/deferEncryptKeyConfirmation drive the encryption conflict
+// matrix (exactly one applies to an active, include_resource_data=true match;
+// which one is chosen by the caller's nature — a management action that must
+// classify now, vs a consumer that has an authoritative bus-side key gate to
+// fall back on). requestedFilter is the caller's requested server-side filter,
+// compared against an active match's filter as an additional reuse dimension;
+// unset means "no filter requested" (compared as an empty filter).
 type reconcileConfig struct {
 	encryptProber               EncryptKeyProber
 	deferEncryptKeyConfirmation bool
+	requestedFilter             *Filter
 }
 
 // WithEncryptKeyProber supplies the EncryptKeyProber ReconcileExisting uses
@@ -93,6 +97,20 @@ type reconcileConfig struct {
 // the branch it configures is unreachable for them.
 func WithEncryptKeyProber(prober EncryptKeyProber) ReconcileOption {
 	return func(c *reconcileConfig) { c.encryptProber = prober }
+}
+
+// WithRequestedFilter supplies the server-side event filter the caller is
+// requesting, so ReconcileExisting can compare it against an active match's
+// remote filter as an additional reuse dimension. Reuse of an active match
+// requires the requested filter to Equal the remote one; any difference —
+// including empty-requested against a filtered remote, or vice versa — is a
+// conflict, mirroring the fail-closed include_resource_data reuse rule (a human
+// resolves it via update or a new subscription, never a silent wrong reuse).
+// Callers that request no filter may omit this option: an unset requested
+// filter is compared as an empty filter, so both-empty stays a compatible
+// reuse.
+func WithRequestedFilter(f *Filter) ReconcileOption {
+	return func(c *reconcileConfig) { c.requestedFilter = f }
 }
 
 // WithDeferredEncryptKeyConfirmation tells ReconcileExisting to treat an
@@ -161,16 +179,21 @@ type ReconcilePlan struct {
 // redundant open_id comparison would need an extra call (e.g. resolving "my
 // own open_id") this does not otherwise need.
 //
-// opts is the encryption-conflict-matrix extension point: a caller whose
-// requestedIncludeResourceData is true — meaning it
+// opts carries the extension points. It is the encryption-conflict-matrix
+// entry: a caller whose requestedIncludeResourceData is true — meaning it
 // wants an ENCRYPTED subscription, since this CLI's own fail-closed policy
 // never offers a "plaintext resource_data" request — must pass exactly one of
 // WithEncryptKeyProber (classify an active include_resource_data=true match
 // now, for a management action like create) or
 // WithDeferredEncryptKeyConfirmation (reuse without probing and let the bus
 // Hello confirm the key, for consume). A caller with
-// requestedIncludeResourceData == false needs no option at all: the plaintext
-// call site passes none and is completely unaffected by this extension.
+// requestedIncludeResourceData == false needs neither: the plaintext call site
+// passes them and is completely unaffected by that extension.
+//
+// opts also carries WithRequestedFilter (the requested server-side filter). It
+// applies on every path — an active match is only reused when the requested
+// filter equals the remote one — and defaults, when omitted, to an empty
+// filter that keeps the both-empty reuse behavior unchanged.
 func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, targetResource string, identity core.Identity, requestedIncludeResourceData bool, opts ...ReconcileOption) (*ReconcilePlan, error) {
 	cfg := reconcileConfig{}
 	for _, opt := range opts {
@@ -224,6 +247,14 @@ func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, t
 				}},
 			}, nil
 		}
+		// Filter is a second reuse dimension. An active match may only be reused
+		// when the requested filter equals the remote one; any difference
+		// (including empty-vs-filtered either way) is a conflict a human
+		// resolves. Checked here, ahead of the plaintext and encrypted reuse
+		// paths below, so a filter mismatch blocks reuse regardless of encryption.
+		if !Equal(cfg.requestedFilter, FilterFromSDK(match.Filter)) {
+			return filterConflictPlan(match), nil
+		}
 		if !requestedIncludeResourceData {
 			// Both sides agree on plain "no resource data" -- the
 			// unencrypted reuse row; no encryption dimension applies.
@@ -239,7 +270,7 @@ func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, t
 			// Management action (create): classify reuse-vs-conflict NOW by
 			// probing the key; it has no later key gate to defer to. See
 			// probeEncryptedActiveMatch.
-			return probeEncryptedActiveMatch(ctx, cfg.encryptProber, match)
+			return probeEncryptedActiveMatch(ctx, cfg.encryptProber, cfg.requestedFilter, match)
 		case cfg.deferEncryptKeyConfirmation:
 			// Consumer (consume): reuse WITHOUT probing. The bus fetches and
 			// confirms the key once at Hello time — the authoritative,
@@ -282,7 +313,14 @@ func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, t
 //     from scratch, and a human resolving a genuine conflict needs the same
 //     guidance (verify the subscription, check `event:encrypt_key:read`, or
 //     delete+recreate) regardless of which case it was.
-func probeEncryptedActiveMatch(ctx context.Context, prober EncryptKeyProber, match *larkeventv1.SubscriptionDetail) (*ReconcilePlan, error) {
+func probeEncryptedActiveMatch(ctx context.Context, prober EncryptKeyProber, requestedFilter *Filter, match *larkeventv1.SubscriptionDetail) (*ReconcilePlan, error) {
+	// The filter reuse dimension applies to an encrypted match too: a filter
+	// mismatch blocks reuse before the key is even relevant. ReconcileExisting's
+	// active-match path already enforces this before calling here; repeating it
+	// keeps this encrypted-reuse decision correct on its own terms.
+	if !Equal(requestedFilter, FilterFromSDK(match.Filter)) {
+		return filterConflictPlan(match), nil
+	}
 	id := strVal(match.SubscriptionId)
 	req := larkeventv1.NewGetEncryptKeySubscriptionReqBuilder().SubscriptionId(id).Build()
 	resp, err := prober.GetEncryptKey(ctx, req)
@@ -297,6 +335,21 @@ func probeEncryptedActiveMatch(ctx context.Context, prober EncryptKeyProber, mat
 			Reason: "existing subscription has include_resource_data=true but its encrypt_key could not be confirmed retrievable with this identity (remote may be plaintext resource_data, or the key is unavailable — indistinguishable from here, and both unsafe to auto-reuse); delete and recreate after human confirmation, or verify the subscription and the `event:encrypt_key:read` scope",
 		}},
 	}, nil
+}
+
+// filterConflictPlan builds the PlanActionConflict returned when an active
+// match's remote filter differs from the requested filter. The reason names
+// only the dimension, never the filter contents or values on either side, so
+// no filter payload can leak into an error string.
+func filterConflictPlan(match *larkeventv1.SubscriptionDetail) *ReconcilePlan {
+	return &ReconcilePlan{
+		Action:   PlanActionConflict,
+		Existing: match,
+		ConflictFields: []errs.InvalidParam{{
+			Name:   "filter",
+			Reason: "the requested event filter does not match the existing subscription's filter",
+		}},
+	}
 }
 
 // AuthorityMatchesIdentity reports whether a, an already-observed remote
