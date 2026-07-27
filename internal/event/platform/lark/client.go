@@ -1,17 +1,13 @@
 // Copyright (c) 2026 Lark Technologies Pte. Ltd.
 // SPDX-License-Identifier: MIT
 
-package event
+package lark
 
 import (
 	"context"
 
-	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larksdk "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
-
-	// larkeventv1 alias is REQUIRED: this package's declared name is
-	// larkevent, which collides with the core oapi-sdk-go/v3/event package
-	// (also larkevent).
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
 	"github.com/larksuite/cli/errs"
@@ -21,11 +17,11 @@ import (
 )
 
 // subscriptionService is the subset of the SDK's typed
-// client.Event.V1.Subscription surface this CLI needs: Create/Get/List/
+// client.Event.V1.Subscription surface this gateway needs: Create/Get/List/
 // Patch/Renew/Reactivate/Delete for the `event subscription` commands, plus
 // GetEncryptKey for the bus-side encrypted-event decrypt provider.
 //
-// It exists purely as a test seam: the concrete *lark.Client's
+// It exists purely as a test seam: the concrete *larksdk.Client's
 // Event.V1.Subscription value satisfies this interface structurally (Go
 // interfaces are duck-typed), so production code passes it straight through,
 // while tests substitute a fake and capture exactly which
@@ -42,17 +38,19 @@ type subscriptionService interface {
 	Delete(ctx context.Context, req *larkeventv1.DeleteSubscriptionReq, options ...larkcore.RequestOptionFunc) (*larkeventv1.DeleteSubscriptionResp, error)
 }
 
-// SubscriptionClient is a thin CLI <-> lark.Client adapter over the SDK's typed
+// SubscriptionClient is the identity-bound, error-classifying SDK adapter the
+// Gateway wraps: a thin gateway <-> larksdk.Client adapter over the SDK's typed
 // Subscription service (client.Event.V1.Subscription). It binds one
-// already-resolved CLI identity to the correct per-call access-token option
-// for its whole lifetime, so the `event subscription` command code calls
-// Create/Get/List/Patch/Renew/Reactivate/Delete without ever handling
-// larkcore.RequestOptionFunc or identity branching itself.
+// already-resolved CLI identity to the correct per-call access-token option for
+// its whole lifetime, so the Gateway builds domain requests and unwraps
+// responses without ever handling larkcore.RequestOptionFunc or identity
+// branching itself. It lives here, in the platform/lark gateway package, because
+// it is pure SDK-gateway plumbing (it owns no reconcile/plan decisions).
 //
 // A user identity carries a larkcore.WithUserAccessToken
 // option on every call; an app/bot identity carries none at all — the SDK
 // mints and caches its own tenant access token from the appID/secret already
-// configured on the *lark.Client.
+// configured on the *larksdk.Client.
 //
 // This client never falls back from one identity to the other: construction
 // fails closed (typed error) instead of guessing, matching the "no silent
@@ -78,7 +76,7 @@ type SubscriptionClient struct {
 // that case. It is ignored for core.AsBot: the SDK mints its own tenant
 // access token, so no per-call token option is added. Callers must not log
 // uat.
-func NewSubscriptionClient(sdk *lark.Client, as core.Identity, uat string) (*SubscriptionClient, error) {
+func NewSubscriptionClient(sdk *larksdk.Client, as core.Identity, uat string) (*SubscriptionClient, error) {
 	if sdk == nil {
 		return nil, errs.NewInternalError(errs.SubtypeSDKError, "subscription client: sdk is nil")
 	}
@@ -114,7 +112,7 @@ func identityOptions(as core.Identity, uat string) ([]larkcore.RequestOptionFunc
 	case core.AsBot:
 		// No per-call token option: the SDK mints/caches its own tenant
 		// access token from the appID/secret already configured on the
-		// *lark.Client. uat is intentionally ignored here so a
+		// *larksdk.Client. uat is intentionally ignored here so a
 		// stray/leftover value never leaks onto a bot-identity call.
 		return nil, nil
 	default:

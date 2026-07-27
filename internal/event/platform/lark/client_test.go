@@ -1,14 +1,14 @@
 // Copyright (c) 2026 Lark Technologies Pte. Ltd.
 // SPDX-License-Identifier: MIT
 
-package event
+package lark
 
 import (
 	"context"
 	"errors"
 	"testing"
 
-	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larksdk "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
@@ -324,9 +324,9 @@ func TestSubscriptionClient_GetEncryptKey_SuccessReturnsEncryptKey(t *testing.T)
 
 func TestNewSubscriptionClient_WiresRealLarkClient(t *testing.T) {
 	// Smoke test: NewSubscriptionClient must correctly navigate
-	// sdk.Event.V1.Subscription on a real *lark.Client without making any
+	// sdk.Event.V1.Subscription on a real *larksdk.Client without making any
 	// network call (construction alone never dials out).
-	sdk := lark.NewClient("cli_fake_app_id", "fake_app_secret")
+	sdk := larksdk.NewClient("cli_fake_app_id", "fake_app_secret")
 	sc, err := NewSubscriptionClient(sdk, core.AsBot, "")
 	if err != nil {
 		t.Fatalf("NewSubscriptionClient: unexpected error: %v", err)
@@ -339,7 +339,7 @@ func TestNewSubscriptionClient_WiresRealLarkClient(t *testing.T) {
 func TestNewSubscriptionClient_NilSDKFailsClosed(t *testing.T) {
 	_, err := NewSubscriptionClient(nil, core.AsBot, "")
 	if err == nil {
-		t.Fatal("expected an error for a nil *lark.Client, got nil")
+		t.Fatal("expected an error for a nil *larksdk.Client, got nil")
 	}
 	if _, ok := errs.ProblemOf(err); !ok {
 		t.Fatalf("expected a typed errs.* error, got %T: %v", err, err)

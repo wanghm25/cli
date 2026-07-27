@@ -48,12 +48,12 @@ type SubscriptionGateway interface {
 }
 
 // subscriptionClient is the identity-bound, already-classifying SDK client the
-// gateway calls. *event.SubscriptionClient satisfies it structurally: it binds
-// one resolved identity's access-token option for its whole lifetime and turns
-// transport/business failures into typed errs.* errors, so the gateway itself
-// only builds requests, unwraps + validates responses, and projects to domain
-// types. Declared as an interface purely as the gateway's test seam — a fake
-// substitutes for it with no *lark.Client or network call.
+// gateway calls. *SubscriptionClient (client.go, this package) satisfies it
+// structurally: it binds one resolved identity's access-token option for its
+// whole lifetime and turns transport/business failures into typed errs.* errors,
+// so the gateway itself only builds requests, unwraps + validates responses, and
+// projects to domain types. Declared as an interface purely as the gateway's
+// test seam — a fake substitutes for it with no *larksdk.Client or network call.
 type subscriptionClient interface {
 	Create(ctx context.Context, req *larkeventv1.CreateSubscriptionReq) (*larkeventv1.CreateSubscriptionResp, error)
 	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
@@ -75,17 +75,17 @@ type Gateway struct {
 // the identity-bound client satisfies the wrapped seam.
 var (
 	_ SubscriptionGateway = (*Gateway)(nil)
-	_ subscriptionClient  = (*event.SubscriptionClient)(nil)
+	_ subscriptionClient  = (*SubscriptionClient)(nil)
 )
 
 // NewSubscriptionGateway builds a Gateway bound to sdk (already configured with
 // the resolved account's appID/secret) and to the given already-resolved
 // identity. as must be core.AsUser or core.AsBot; uat is the user access token
-// sent on every call for core.AsUser (ignored for core.AsBot). It mirrors
-// event.NewSubscriptionClient's identity contract exactly, delegating the
-// identity binding + fail-closed construction to it.
+// sent on every call for core.AsUser (ignored for core.AsBot). It delegates the
+// identity binding + fail-closed construction to NewSubscriptionClient
+// (client.go, this package).
 func NewSubscriptionGateway(sdk *larksdk.Client, as core.Identity, uat string) (*Gateway, error) {
-	client, err := event.NewSubscriptionClient(sdk, as, uat)
+	client, err := NewSubscriptionClient(sdk, as, uat)
 	if err != nil {
 		return nil, err
 	}

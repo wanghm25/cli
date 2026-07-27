@@ -149,9 +149,8 @@ func resolveEffectiveIdentity(cmd *cobra.Command, f *cmdutil.Factory) (core.Iden
 
 // resolveUATAndCheckScopes resolves the effective identity's access token
 // and performs a local, best-effort scope pre-check against required.
-// It returns the user access token to bind into
-// eventlib.NewSubscriptionClient — empty for bot identity, which the client
-// ignores.
+// It returns the user access token to bind into the platform/lark subscription
+// gateway — empty for bot identity, which the gateway ignores.
 //
 // Scope data being unavailable is not treated as "missing": the check is
 // skipped and the real OAPI call is left to surface the authoritative
@@ -170,7 +169,7 @@ func resolveUATAndCheckScopes(ctx context.Context, f *cmdutil.Factory, appID str
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return "", err
 		}
-		// Best-effort: eventlib.NewSubscriptionClient itself fails closed
+		// Best-effort: the gateway's identity binding itself fails closed
 		// (typed AuthenticationError) for user identity when no token is
 		// available; for bot identity the real API call surfaces any real
 		// auth problem instead.

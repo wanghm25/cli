@@ -613,8 +613,8 @@ func computeConsumerScopeID(baseKey, materializedKey, authorityType, appID, user
 }
 
 // authorityTypeFor maps a resolved CLI identity to the remote Subscription's
-// own Authority.Type vocabulary ("app" for bot, "user" for user — see
-// event.AuthorityMatchesIdentity) — a DIFFERENT vocabulary from
+// own Authority.Type vocabulary ("app" for bot, "user" for user — the same
+// type-based match the subscription Observer uses) — a DIFFERENT vocabulary from
 // Hello.Identity's "bot"/"user" strings, matching the remote OAPI's own
 // terminology since ConsumerScopeID is meant to line up with it.
 func authorityTypeFor(identity core.Identity) string {

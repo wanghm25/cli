@@ -171,7 +171,7 @@ func (b *Bus) SetSubscriptionClient(sdk *lark.Client) {
 	// specific user's FRESH uat — never a historical one) fresh for
 	// every fetch, exactly like the lifecycle action above.
 	b.encryptKeyProvider.setNewClient(func(as core.Identity, uat string) (encryptKeyClient, error) {
-		return event.NewSubscriptionClient(sdk, as, uat)
+		return larkgw.NewSubscriptionClient(sdk, as, uat)
 	})
 }
 

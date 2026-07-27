@@ -32,12 +32,12 @@ const (
 // encrypted consumer registration, never a hot path.
 const defaultEncryptKeyFetchTimeout = 5 * time.Second
 
-// encryptKeyClient is the narrow seam the provider needs from
-// *event.SubscriptionClient: GetEncryptKey ONLY (the provider never
-// lists/creates/patches). *event.SubscriptionClient satisfies it structurally,
-// so bus.go's SetSubscriptionClient passes one straight through; tests
-// substitute a fake with no *lark.Client or network call — the same test-seam
-// idiom as lifecycle.SubscriptionClient.
+// encryptKeyClient is the narrow seam the provider needs from the platform/lark
+// gateway's *SubscriptionClient: GetEncryptKey ONLY (the provider never
+// lists/creates/patches). That client satisfies it structurally, so bus.go's
+// SetSubscriptionClient passes one straight through; tests substitute a fake
+// with no *lark.Client or network call — the same test-seam idiom as
+// lifecycle.SubscriptionClient.
 type encryptKeyClient interface {
 	GetEncryptKey(ctx context.Context, req *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error)
 }
