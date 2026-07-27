@@ -61,8 +61,21 @@ func classifyTATResponseCode(code int, oauthErr, errDesc, brand, appID string) e
 
 // DefaultAccountProvider resolves account from config.json via keychain.
 type DefaultAccountProvider struct {
-	keychain func() keychain.KeychainAccess
-	profile  string
+	keychain    func() keychain.KeychainAccess
+	profile     string
+	snapshot    *core.MultiAppConfig
+	useSnapshot bool
+}
+
+// NewDefaultAccountProviderFromSnapshot creates the production provider for a
+// Factory. A nil snapshot means no usable config existed when the Factory was
+// created; the provider does not re-read a file that may have changed since
+// transport wiring was selected.
+func NewDefaultAccountProviderFromSnapshot(kc func() keychain.KeychainAccess, profile string, snapshot *core.MultiAppConfig) *DefaultAccountProvider {
+	provider := NewDefaultAccountProvider(kc, profile)
+	provider.snapshot = snapshot
+	provider.useSnapshot = true
+	return provider
 }
 
 func NewDefaultAccountProvider(kc func() keychain.KeychainAccess, profile string) *DefaultAccountProvider {
@@ -73,9 +86,16 @@ func NewDefaultAccountProvider(kc func() keychain.KeychainAccess, profile string
 }
 
 func (p *DefaultAccountProvider) ResolveAccount(ctx context.Context) (*Account, error) {
-	// Load config once — used for both credentials and strict mode.
-	multi, err := core.LoadMultiAppConfig()
-	if err != nil {
+	// Use one config for both credentials and strict mode.
+	multi := p.snapshot
+	if !p.useSnapshot {
+		var err error
+		multi, err = core.LoadMultiAppConfig()
+		if err != nil {
+			return nil, core.NotConfiguredError()
+		}
+	}
+	if multi == nil {
 		return nil, core.NotConfiguredError()
 	}
 

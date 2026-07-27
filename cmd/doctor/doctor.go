@@ -84,6 +84,10 @@ func doctorRun(opts *DoctorOptions) error {
 		checks = append(checks, checkCLIUpdate()...)
 	}
 
+	if handled, editionErr := runEditionDoctor(opts, checks); handled {
+		return editionErr
+	}
+
 	// ── 1. Config file ──
 	_, err := core.LoadMultiAppConfig()
 	if err != nil {
@@ -130,8 +134,7 @@ func doctorRun(opts *DoctorOptions) error {
 		checks = append(checks, pass("identity_ready", "at least one identity is available"))
 	} else {
 		// No hint: this only summarizes the two checks above, which already carry
-		// the source-appropriate remediation. A command here would be redundant,
-		// or wrong (`auth status` is blocked under an external provider).
+		// the source-appropriate remediation. A command here would be redundant.
 		checks = append(checks, fail("identity_ready", "no usable bot or user identity is available", ""))
 	}
 
@@ -215,7 +218,7 @@ func probeEndpoint(ctx context.Context, client *http.Client, url string) error {
 // Unlike the root-level async check, this does a synchronous fetch with timeout
 // and works regardless of build version (dev builds included).
 func checkCLIUpdate() []checkResult {
-	latest, err := update.FetchLatest()
+	latest, err := fetchLatestForEdition()
 	if err != nil {
 		return []checkResult{warn("cli_update", "check failed: "+err.Error(), "")}
 	}

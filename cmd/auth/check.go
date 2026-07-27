@@ -4,6 +4,7 @@
 package auth
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/larksuite/cli/errs"
 	larkauth "github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/credential"
 	"github.com/larksuite/cli/internal/output"
 )
 
@@ -33,7 +35,7 @@ func NewCmdAuthCheck(f *cmdutil.Factory, runF func(*CheckOptions) error) *cobra.
 			if runF != nil {
 				return runF(opts)
 			}
-			return authCheckRun(opts)
+			return authCheckRunContext(cmd.Context(), opts)
 		},
 	}
 
@@ -46,6 +48,10 @@ func NewCmdAuthCheck(f *cmdutil.Factory, runF func(*CheckOptions) error) *cobra.
 }
 
 func authCheckRun(opts *CheckOptions) error {
+	return authCheckRunContext(context.Background(), opts)
+}
+
+func authCheckRunContext(ctx context.Context, opts *CheckOptions) error {
 	f := opts.Factory
 
 	required := strings.Fields(opts.Scope)
@@ -57,18 +63,74 @@ func authCheckRun(opts *CheckOptions) error {
 	if err != nil {
 		return err
 	}
-	if config.UserOpenId == "" {
+	if f.Credential == nil {
+		return errs.NewInternalError(errs.SubtypeUnknown, "credential inspection is unavailable")
+	}
+
+	inspection, err := f.Credential.InspectToken(ctx, credential.TokenInspectionRequest{
+		TokenSpec: credential.TokenSpec{
+			Type:  credential.TokenTypeUAT,
+			AppID: config.AppID,
+		},
+		IncludeScopes: true,
+	})
+	if err != nil {
+		if _, ok := errs.ProblemOf(err); ok {
+			return err
+		}
+		return errs.NewInternalError(errs.SubtypeUnknown,
+			"failed to inspect user authorization: %v", err).
+			WithCause(err)
+	}
+	if inspection == nil {
+		return errs.NewInternalError(errs.SubtypeInvalidResponse,
+			"credential source returned no authorization inspection")
+	}
+
+	if inspection.Status == credential.TokenInspectionNotLoggedIn && !inspection.Source.Managed {
 		output.PrintJson(f.IOStreams.Out, map[string]interface{}{"ok": false, "error": "not_logged_in", "missing": required})
 		return output.ErrBare(1)
 	}
-
-	stored := larkauth.GetStoredToken(config.AppID, config.UserOpenId)
-	if stored == nil {
+	if !inspection.Present {
+		if inspection.Source.Managed {
+			return errs.NewAuthenticationError(errs.SubtypeTokenMissing,
+				"credential source %q did not provide a user access token", inspection.Source.Name).
+				WithHint("authorize the user through the selected credential source")
+		}
 		output.PrintJson(f.IOStreams.Out, map[string]interface{}{"ok": false, "error": "no_token", "missing": required})
 		return output.ErrBare(1)
 	}
 
-	missing := larkauth.MissingScopes(stored.Scope, required)
+	switch inspection.ScopeState {
+	case credential.ScopeUnsupported:
+		return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+			"auth check is unsupported by credential source %q because granted scopes are unavailable", inspection.Source.Name).
+			WithHint("the credential source must expose trusted scope metadata before `auth check` can evaluate --scope")
+	case credential.ScopeUnknown:
+		return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+			"auth check result is unknown because credential source %q returned no scope metadata", inspection.Source.Name).
+			WithHint("configure the credential source to return trusted scopes for user access tokens")
+	case credential.ScopeKnown:
+		// Continue below.
+	default:
+		return errs.NewInternalError(errs.SubtypeInvalidResponse,
+			"credential source %q returned invalid scope inspection state %q", inspection.Source.Name, inspection.ScopeState)
+	}
+
+	suggestion := ""
+	missing := larkauth.MissingScopes(inspection.Scopes, required)
+	if inspection.Source.Managed {
+		if len(missing) > 0 {
+			suggestion = fmt.Sprintf("grant these scopes through credential source %s: %s", inspection.Source.Name, strings.Join(missing, " "))
+		}
+	} else {
+		suggestion = fmt.Sprintf(`lark-cli auth login --scope "%s"`, strings.Join(missing, " "))
+	}
+	return writeAuthCheckResult(f, required, inspection.Scopes, suggestion)
+}
+
+func writeAuthCheckResult(f *cmdutil.Factory, required []string, availableScopes, suggestion string) error {
+	missing := larkauth.MissingScopes(availableScopes, required)
 	missingSet := make(map[string]bool, len(missing))
 	for _, s := range missing {
 		missingSet[s] = true
@@ -82,8 +144,8 @@ func authCheckRun(opts *CheckOptions) error {
 
 	ok := len(missing) == 0
 	result := map[string]interface{}{"ok": ok, "granted": granted, "missing": missing}
-	if len(missing) > 0 {
-		result["suggestion"] = fmt.Sprintf(`lark-cli auth login --scope "%s"`, strings.Join(missing, " "))
+	if len(missing) > 0 && suggestion != "" {
+		result["suggestion"] = suggestion
 	}
 	output.PrintJson(f.IOStreams.Out, result)
 	if !ok {

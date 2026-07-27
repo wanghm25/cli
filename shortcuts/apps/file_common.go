@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -72,13 +71,6 @@ func normalizeTimestamp(raw string) (string, error) {
 		return t.UTC().Format(time.RFC3339), nil
 	}
 	return "", errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid timestamp %q (want relative 7d/2h/30s, date 2026-04-15, datetime 2026-04-15T10:00:00, or ISO 8601 with TZ)", s)
-}
-
-// newFileTransferClient 直传 / 直下对象存储 presigned URL 用（绕开 Lark 网关，无需 auth、无超时以容纳大文件）。
-//
-//nolint:forbidigo // presigned object-storage transfer bypasses the Lark gateway — raw http.Client is required (no Lark auth, no gateway routing); not a Lark API call, so RuntimeContext.DoAPI does not apply.
-func newFileTransferClient() *http.Client {
-	return &http.Client{Transport: http.DefaultTransport}
 }
 
 // URL helpers for the file (storage) CLI commands.

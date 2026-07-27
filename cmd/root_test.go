@@ -18,6 +18,7 @@ import (
 	cmdconfig "github.com/larksuite/cli/cmd/config"
 	"github.com/larksuite/cli/cmd/schema"
 	"github.com/larksuite/cli/errs"
+	extcred "github.com/larksuite/cli/extension/credential"
 	internalauth "github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
@@ -432,6 +433,25 @@ func TestHandleRootError_LeakedUntypedErrorBecomesInternal(t *testing.T) {
 	}
 	if exit != int(output.ExitInternal) {
 		t.Errorf("exit = %d, want %d (internal envelope → category-derived exit)", exit, int(output.ExitInternal))
+	}
+}
+
+func TestHandleRootError_BlockErrorPreservesUntypedFallback(t *testing.T) {
+	f, _, _, _ := cmdutil.TestFactory(t, nil)
+	errOut := &bytes.Buffer{}
+	f.IOStreams.ErrOut = errOut
+	blockErr := &extcred.BlockError{Provider: "env", Reason: "LARKSUITE_CLI_APP_ID is missing"}
+
+	exit := handleRootError(f, blockErr)
+	errObj := decodeErrorEnvelope(t, errOut.Bytes())
+	if errObj["type"] != "internal" || errObj["subtype"] != "unknown" {
+		t.Fatalf("error = %#v", errObj)
+	}
+	if errObj["message"] != "blocked by env: LARKSUITE_CLI_APP_ID is missing" {
+		t.Fatalf("error.message = %v", errObj["message"])
+	}
+	if exit != int(output.ExitInternal) {
+		t.Fatalf("exit = %d, want %d", exit, output.ExitInternal)
 	}
 }
 

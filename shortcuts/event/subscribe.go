@@ -87,6 +87,9 @@ var EventSubscribe = common.Shortcut{
 	Risk:        "read",
 	Scopes:      []string{}, // no direct OAPI; scopes depend on subscribed event types
 	AuthTypes:   []string{"bot"},
+	PostMount: common.RuntimePostMount(
+		common.RequireRuntimeCapabilities(common.RuntimeCapabilityRealtimeEvents),
+	),
 	// Hidden: superseded by `event consume`. Kept executable so existing
 	// scripts keep working, but removed from --help/tab-completion so new
 	// users land on the replacement. Delete once downstream callers have

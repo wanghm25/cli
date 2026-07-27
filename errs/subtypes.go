@@ -48,11 +48,13 @@ const (
 
 // CategoryNetwork subtypes
 const (
-	SubtypeNetworkTransport Subtype = "transport"    // fallback when no more-specific network subtype matches
-	SubtypeNetworkTimeout   Subtype = "timeout"      // dial / read timeout
-	SubtypeNetworkTLS       Subtype = "tls"          // TLS handshake / cert failure
-	SubtypeNetworkDNS       Subtype = "dns"          // DNS resolution failure
-	SubtypeNetworkServer    Subtype = "server_error" // upstream HTTP 5xx
+	SubtypeNetworkTransport            Subtype = "transport"                     // fallback when no more-specific network subtype matches
+	SubtypeNetworkTimeout              Subtype = "timeout"                       // dial / read timeout
+	SubtypeNetworkTLS                  Subtype = "tls"                           // TLS handshake / cert failure
+	SubtypeNetworkDNS                  Subtype = "dns"                           // DNS resolution failure
+	SubtypeNetworkServer               Subtype = "server_error"                  // upstream HTTP 5xx
+	SubtypeCredentialSourceUnavailable Subtype = "credential_source_unavailable" // external credential program or identity service is temporarily unavailable
+	SubtypeUpstreamUnavailable         Subtype = "upstream_unavailable"          // external proxy cannot reach the requested upstream service
 )
 
 // CategoryAPI subtypes

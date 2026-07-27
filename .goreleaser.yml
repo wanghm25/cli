@@ -5,7 +5,8 @@ before:
     - python3 scripts/fetch_meta.py
 
 builds:
-  - binary: lark-cli
+  - id: standard
+    binary: lark-cli
     env:
       - CGO_ENABLED=0
     ldflags:
@@ -18,12 +19,54 @@ builds:
       - amd64
       - arm64
       - riscv64
+    ignore:
+      - goos: darwin
+        goarch: riscv64
+      - goos: windows
+        goarch: riscv64
+  - id: extended
+    binary: lark-cli
+    tags:
+      - extended
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/larksuite/cli/internal/build.Version={{ .Version }} -X github.com/larksuite/cli/internal/build.Date={{ .Date }}
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+      - riscv64
+    ignore:
+      - goos: darwin
+        goarch: riscv64
+      - goos: windows
+        goarch: riscv64
 
 archives:
-  - name_template: "lark-cli-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+  - id: standard
+    ids:
+      - standard
+    name_template: "lark-cli-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
     format_overrides:
       - goos: windows
-        format: zip
+        formats:
+          - zip
+    files:
+      - README.md
+      - LICENSE
+      - CHANGELOG.md
+  - id: extended
+    ids:
+      - extended
+    name_template: "lark-cli-extended-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
     files:
       - README.md
       - LICENSE
@@ -31,6 +74,18 @@ archives:
 
 checksum:
   name_template: checksums.txt
+  extra_files:
+    - glob: ./scripts/install-extended.sh
+    - glob: ./scripts/install-extended.ps1
+
+release:
+  # Keep assets undiscoverable by releases/latest until the workflow has
+  # independently verified checksums, edition identity, and platform coverage.
+  draft: true
+  replace_existing_draft: true
+  extra_files:
+    - glob: ./scripts/install-extended.sh
+    - glob: ./scripts/install-extended.ps1
 
 changelog:
   sort: asc

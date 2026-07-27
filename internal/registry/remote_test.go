@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,6 +57,32 @@ func TestResetInitClearsEmbeddedVersion(t *testing.T) {
 
 	if embeddedVersion != "" {
 		t.Fatalf("embeddedVersion = %q, want empty", embeddedVersion)
+	}
+}
+
+func TestInitEmbeddedWithBrandSkipsRemoteOverlay(t *testing.T) {
+	resetInit()
+	t.Cleanup(resetInit)
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+	t.Setenv("LARKSUITE_CLI_REMOTE_META", "on")
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(testEnvelopeJSON("unexpected_remote_service"))
+	}))
+	defer server.Close()
+	testMetaURL = server.URL
+
+	InitEmbeddedWithBrand(core.BrandFeishu)
+	waitBackgroundRefresh()
+
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("remote metadata requests = %d, want 0", got)
+	}
+	if _, ok := ServiceTyped("unexpected_remote_service"); ok {
+		t.Fatal("embedded-only registry loaded a remote service")
 	}
 }
 

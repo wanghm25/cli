@@ -21,6 +21,7 @@ import (
 	"github.com/larksuite/cli/internal/deprecation"
 	"github.com/larksuite/cli/internal/hook"
 	"github.com/larksuite/cli/internal/output"
+	"github.com/larksuite/cli/internal/runtimebootstrap"
 	"github.com/larksuite/cli/internal/skillscheck"
 	"github.com/larksuite/cli/internal/suggest"
 	"github.com/larksuite/cli/internal/update"
@@ -100,6 +101,12 @@ func Execute() int {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
+	// Resolve all startup state from the detected workspace. This must happen
+	// before ResolveStartupBrand, isSingleAppMode, or buildInternal reads
+	// workspace-scoped configuration.
+	selectInvocationWorkspace()
+	startup := runtimebootstrap.Resolve(inv.Profile)
+	startupBrand := resolveStartupBrandFromConfig(inv.Profile, startup.ProfileConfig)
 	configureFlagCompletions(os.Args)
 
 	ctx := context.Background()
@@ -107,7 +114,8 @@ func Execute() int {
 		ctx, inv,
 		WithIO(os.Stdin, os.Stdout, os.Stderr),
 		HideProfile(isSingleAppMode()),
-		WithStartupBrand(ResolveStartupBrand(inv.Profile)),
+		WithStartupBrand(startupBrand),
+		withRuntimeBootstrap(startup),
 	)
 
 	// --- Notices (non-blocking) ---
@@ -137,7 +145,7 @@ func Execute() int {
 // or both may be present in any given envelope.
 func setupNotices() {
 	// Binary update — synchronous cache check + async refresh
-	if info := update.CheckCached(build.Version); info != nil {
+	if info := checkCachedEditionUpdate(build.Version); info != nil {
 		update.SetPending(info)
 	}
 	ver := build.Version
@@ -147,9 +155,9 @@ func setupNotices() {
 				fmt.Fprintf(os.Stderr, "update check panic: %v\n", r)
 			}
 		}()
-		update.RefreshCache(ver)
+		refreshEditionUpdateCache(ver)
 		if update.GetPending() == nil {
-			if info := update.CheckCached(ver); info != nil {
+			if info := checkCachedEditionUpdate(ver); info != nil {
 				update.SetPending(info)
 			}
 		}

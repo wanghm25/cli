@@ -81,12 +81,23 @@ func ConfiguredBrand() core.LarkBrand {
 // Remote fetch errors are silently ignored when embedded data is available.
 // If no embedded data exists and no cache is found, a synchronous fetch is attempted.
 func InitWithBrand(brand core.LarkBrand) {
+	initWithBrand(brand, true)
+}
+
+// InitEmbeddedWithBrand initializes the registry without reading or refreshing
+// the remote metadata overlay. Managed runtimes use this path when their startup
+// policy requires all remote access to remain inside the selected data plane.
+func InitEmbeddedWithBrand(brand core.LarkBrand) {
+	initWithBrand(brand, false)
+}
+
+func initWithBrand(brand core.LarkBrand, allowRemote bool) {
 	initOnce.Do(func() {
 		configuredBrand = brand
 		// 1. Load embedded meta_data.json as baseline (no-op if not compiled in)
 		loadEmbeddedIntoMerged()
 		// 2. Remote overlay
-		if remoteEnabled() && cacheWritable() {
+		if allowRemote && remoteEnabled() && cacheWritable() {
 			// Check if brand changed since last cache
 			cm, metaErr := loadCacheMeta()
 			brandChanged := metaErr == nil && cm.Brand != "" && cm.Brand != string(brand)

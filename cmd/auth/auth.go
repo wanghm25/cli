@@ -18,6 +18,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/errclass"
+	"github.com/larksuite/cli/internal/runtimeplan"
 )
 
 // NewCmdAuth creates the auth command with subcommands.
@@ -30,21 +31,23 @@ func NewCmdAuth(f *cmdutil.Factory) *cobra.Command {
 			// PersistentPreRun[E] found walking up the chain, so the root-level
 			// SilenceUsage=true would be skipped without this line.
 			cmd.SilenceUsage = true
-			// cmd.Name() returns the subcommand name (e.g. "login"), not "auth".
-			// Pass "auth" as a literal so the error message reads
-			// `"auth" is not supported: ...`
-			return f.RequireBuiltinCredentialProvider(cmd.Context(), "auth")
+			return f.RequireCommandRuntimeCapabilities(cmd.Context(), cmd)
 		},
 	}
 	cmdutil.DisableAuthCheck(cmd)
+	cmdutil.SetRuntimeCapabilities(cmd, runtimeplan.CapabilityLocalCredentialManagement)
 
-	cmd.AddCommand(NewCmdAuthLogin(f, nil))
-	cmd.AddCommand(NewCmdAuthLogout(f, nil))
-	cmd.AddCommand(NewCmdAuthStatus(f, nil))
-	cmd.AddCommand(NewCmdAuthScopes(f, nil))
-	cmd.AddCommand(NewCmdAuthList(f, nil))
-	cmd.AddCommand(NewCmdAuthCheck(f, nil))
-	cmd.AddCommand(NewCmdAuthQRCode(f, nil))
+	login := NewCmdAuthLogin(f, nil)
+	logout := NewCmdAuthLogout(f, nil)
+	status := NewCmdAuthStatus(f, nil)
+	scopes := NewCmdAuthScopes(f, nil)
+	list := NewCmdAuthList(f, nil)
+	check := NewCmdAuthCheck(f, nil)
+	qrcode := NewCmdAuthQRCode(f, nil)
+	for _, diagnostic := range []*cobra.Command{status, scopes, check, qrcode} {
+		cmdutil.SetRuntimeCapabilities(diagnostic)
+	}
+	cmd.AddCommand(login, logout, status, scopes, list, check, qrcode)
 	return cmd
 }
 

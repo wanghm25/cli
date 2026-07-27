@@ -3,7 +3,12 @@
 
 package apps
 
-import "testing"
+import (
+	"errors"
+	"testing"
+
+	"github.com/larksuite/cli/errs"
+)
 
 func TestAppTablesPath_ReusesExistingURL(t *testing.T) {
 	if got := appTablesPath("app_x"); got != "/open-apis/spark/v1/apps/app_x/tables" {
@@ -37,5 +42,23 @@ func TestRequireAppID_BlankRejected(t *testing.T) {
 	got, err := requireAppID("  app_x  ")
 	if err != nil || got != "app_x" {
 		t.Fatalf("requireAppID trimmed = %q err=%v", got, err)
+	}
+}
+
+func TestDBDataRequestErrorClassifiesUntypedFailure(t *testing.T) {
+	cause := errors.New("dial failed")
+	got := dbDataRequestError(cause, "export request failed", "repair export input")
+
+	problem, ok := errs.ProblemOf(got)
+	if !ok ||
+		problem.Category != errs.CategoryNetwork ||
+		problem.Subtype != errs.SubtypeNetworkTransport ||
+		problem.Message != "export request failed" ||
+		problem.Hint != "repair export input" ||
+		!problem.Retryable {
+		t.Fatalf("fallback problem = %#v", problem)
+	}
+	if !errors.Is(got, cause) {
+		t.Fatal("fallback lost the original transport cause")
 	}
 }

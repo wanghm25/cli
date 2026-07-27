@@ -46,6 +46,8 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -68,7 +70,7 @@ jobs:
       - name: Install pinned npm
         run: npm install --global npm@11.16.0
 
-      - name: Run GoReleaser
+      - name: Build and upload draft release with GoReleaser
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
           version: '~> v2'
@@ -80,14 +82,41 @@ jobs:
         run: |
           set -euo pipefail
           test -s dist/checksums.txt
+          cp scripts/install-extended.sh scripts/install-extended.ps1 dist/
           (cd dist && sha256sum --check checksums.txt)
           cp dist/checksums.txt checksums.txt
+
+      - name: Verify release edition identities
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/lark-cli-standard /tmp/lark-cli-extended
+          tar -xzf "dist/lark-cli-${GITHUB_REF_NAME#v}-linux-amd64.tar.gz" -C /tmp/lark-cli-standard lark-cli
+          tar -xzf "dist/lark-cli-extended-${GITHUB_REF_NAME#v}-linux-amd64.tar.gz" -C /tmp/lark-cli-extended lark-cli
+          test "$(/tmp/lark-cli-standard/lark-cli version --json | jq -r .edition)" = "standard"
+          test "$(/tmp/lark-cli-extended/lark-cli version --json | jq -r .edition)" = "extended"
+          test "$(/tmp/lark-cli-standard/lark-cli version --json | jq -r .version)" = "${GITHUB_REF_NAME#v}"
+          test "$(/tmp/lark-cli-extended/lark-cli version --json | jq -r .version)" = "${GITHUB_REF_NAME#v}"
+
+      - name: Verify release platform asset matrix
+        run: bash scripts/verify-release-assets.sh dist "${GITHUB_REF_NAME#v}"
+
+      - name: Attest release archives
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+            dist/install-extended.sh
+            dist/install-extended.ps1
 
       - name: Collect release asset
         run: |
           set -euo pipefail
           mkdir npm-publish-asset
-          cp dist/*.tar.gz dist/*.zip dist/checksums.txt npm-publish-asset/
+          cp dist/*.tar.gz dist/*.zip dist/checksums.txt \
+            dist/install-extended.sh dist/install-extended.ps1 \
+            npm-publish-asset/
 
       - name: Upload release asset
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -96,6 +125,76 @@ jobs:
           path: npm-publish-asset/
           if-no-files-found: error
           overwrite: true
+
+      - name: Publish verified GitHub release
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const crypto = require("node:crypto");
+            const fs = require("node:fs");
+            const tag = process.env.RELEASE_TAG;
+            const { owner, repo } = context.repo;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+            const matches = releases.filter((release) => release.tag_name === tag);
+            if (matches.length !== 1) {
+              throw new Error(`expected exactly one draft release for ${tag}, found ${matches.length}`);
+            }
+            const release = matches[0];
+            if (!release.draft) {
+              throw new Error(`release ${tag} became public before verification completed`);
+            }
+
+            const checksumPath = "dist/checksums.txt";
+            const checksumBody = fs.readFileSync(checksumPath, "utf8");
+            const expectedDigests = new Map();
+            for (const line of checksumBody.split(/\r?\n/)) {
+              if (!line.trim()) continue;
+              const match = line.match(/^([0-9a-fA-F]{64})\s+\*?(.+)$/);
+              if (!match) throw new Error(`invalid checksums.txt line: ${line}`);
+              const name = match[2];
+              if (expectedDigests.has(name)) {
+                throw new Error(`duplicate checksums.txt entry: ${name}`);
+              }
+              expectedDigests.set(name, `sha256:${match[1].toLowerCase()}`);
+            }
+            expectedDigests.set(
+              "checksums.txt",
+              `sha256:${crypto.createHash("sha256").update(checksumBody).digest("hex")}`,
+            );
+
+            const actualNames = release.assets.map((asset) => asset.name).sort();
+            const expectedNames = [...expectedDigests.keys()].sort();
+            if (JSON.stringify(actualNames) !== JSON.stringify(expectedNames)) {
+              throw new Error(
+                `draft release asset set mismatch: expected ${expectedNames.join(", ")}, got ${actualNames.join(", ")}`,
+              );
+            }
+            for (const asset of release.assets) {
+              const expected = expectedDigests.get(asset.name);
+              if (!asset.digest) {
+                throw new Error(`GitHub did not report a digest for draft asset ${asset.name}`);
+              }
+              if (asset.digest.toLowerCase() !== expected) {
+                throw new Error(
+                  `draft asset digest mismatch for ${asset.name}: expected ${expected}, got ${asset.digest}`,
+                );
+              }
+            }
+
+            await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: release.id,
+              draft: false,
+              make_latest: "true",
+            });
 
   publish-npm:
     needs: build-release

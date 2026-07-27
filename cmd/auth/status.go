@@ -44,6 +44,10 @@ func NewCmdAuthStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobr
 
 func authStatusRun(opts *StatusOptions) error {
 	f := opts.Factory
+	editionStatus, err := inspectEditionStatus(f)
+	if err != nil {
+		return err
+	}
 
 	config, err := f.Config()
 	if err != nil {
@@ -64,7 +68,9 @@ func authStatusRun(opts *StatusOptions) error {
 	result["identities"] = diagnostics
 	result["identity"] = effectiveIdentity(diagnostics)
 	addEffectiveVerification(result, diagnostics)
-	addStatusNote(result, diagnostics)
+	if !applyEditionStatus(result, diagnostics, editionStatus) {
+		addStatusNote(result, diagnostics)
+	}
 
 	output.PrintJson(f.IOStreams.Out, result)
 	return nil

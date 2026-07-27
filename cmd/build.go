@@ -29,6 +29,7 @@ import (
 	"github.com/larksuite/cli/internal/hook"
 	"github.com/larksuite/cli/internal/keychain"
 	"github.com/larksuite/cli/internal/registry"
+	"github.com/larksuite/cli/internal/runtimebootstrap"
 	"github.com/larksuite/cli/shortcuts"
 	"github.com/spf13/cobra"
 )
@@ -45,6 +46,7 @@ type buildConfig struct {
 	skipService    bool
 	serviceCatalog *apicatalog.Catalog
 	startupBrand   core.LarkBrand
+	runtime        *runtimebootstrap.Result
 }
 
 // WithStartupBrand initializes the API registry with the given brand before
@@ -55,6 +57,14 @@ type buildConfig struct {
 func WithStartupBrand(brand core.LarkBrand) BuildOption {
 	return func(c *buildConfig) {
 		c.startupBrand = brand
+	}
+}
+
+// withRuntimeBootstrap shares one invocation snapshot across registry,
+// credentials, transports, and command capabilities.
+func withRuntimeBootstrap(runtime *runtimebootstrap.Result) BuildOption {
+	return func(c *buildConfig) {
+		c.runtime = runtime
 	}
 }
 
@@ -143,9 +153,9 @@ func Build(ctx context.Context, inv cmdutil.InvocationContext, opts ...BuildOpti
 	return rootCmd
 }
 
-// buildInternal is a pure assembly function: it wires the command tree from
-// inv and BuildOptions alone. Any state-dependent decision (disk, network,
-// env) belongs in the caller and must be threaded in via BuildOption.
+// buildInternal assembles the command tree from one immutable startup
+// configuration snapshot. Profile selection happens before any registry
+// network decision and the same result is passed to the Factory.
 //
 // Returns (factory, rootCmd, registry). The registry is nil when plugin
 // install failed (FailClosed guard installed) or when no plugin produced
@@ -168,13 +178,29 @@ func buildInternal(ctx context.Context, inv cmdutil.InvocationContext, opts ...B
 		cfg.streams = cmdutil.SystemIO()
 	}
 
-	// Initialize the registry brand before anything touches the runtime
-	// catalog (its sync.Once would otherwise lock onto the Feishu default).
-	if cfg.startupBrand != "" {
-		registry.InitWithBrand(cfg.startupBrand)
+	startup := cfg.runtime
+	if startup == nil {
+		startup = runtimebootstrap.Resolve(inv.Profile)
 	}
 
-	f := cmdutil.NewDefault(cfg.streams, inv)
+	// Initialize the registry brand before anything touches the runtime
+	// catalog (its sync.Once would otherwise lock onto the Feishu default).
+	// Runtime policy can close direct metadata egress before any command is
+	// registered, without exposing a concrete credential mode here.
+	registryBrand := cfg.startupBrand
+	if registryBrand == "" {
+		registryBrand = resolveStartupBrandFromConfig(inv.Profile, startup.ProfileConfig)
+	}
+	if !startup.Plan.AllowsRemoteMetadata() {
+		if registryBrand == "" {
+			registryBrand = core.BrandFeishu
+		}
+		registry.InitEmbeddedWithBrand(registryBrand)
+	} else if registryBrand != "" {
+		registry.InitWithBrand(registryBrand)
+	}
+
+	f := cmdutil.NewDefaultWithRuntimePlan(cfg.streams, inv, startup.ProfileConfig, startup.Plan)
 	if cfg.keychain != nil {
 		f.Keychain = cfg.keychain
 	}
@@ -220,6 +246,7 @@ func buildInternal(ctx context.Context, inv cmdutil.InvocationContext, opts ...B
 	rootCmd.AddCommand(schema.NewCmdSchema(f, nil))
 	rootCmd.AddCommand(completion.NewCmdCompletion(f))
 	rootCmd.AddCommand(cmdupdate.NewCmdUpdate(f))
+	registerEditionCommands(rootCmd, f)
 	rootCmd.AddCommand(cmdevent.NewCmdEvents(f))
 	rootCmd.AddCommand(skill.NewCmdSkill(f))
 	if !cfg.skipService {

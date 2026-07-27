@@ -23,6 +23,7 @@ import (
 	"github.com/larksuite/cli/internal/credential"
 	"github.com/larksuite/cli/internal/errclass"
 	"github.com/larksuite/cli/internal/output"
+	"github.com/larksuite/cli/internal/requestcontext"
 	"github.com/larksuite/cli/internal/util"
 )
 
@@ -119,6 +120,7 @@ func (c *APIClient) buildApiReq(request RawApiRequest) (*larkcore.ApiReq, []lark
 // (a typed *errs.* from resolveAccessToken's missing-credential paths or
 // elsewhere) flow through unchanged.
 func (c *APIClient) DoSDKRequest(ctx context.Context, req *larkcore.ApiReq, as core.Identity, extraOpts ...larkcore.RequestOptionFunc) (*larkcore.ApiResp, error) {
+	ctx = requestcontext.WithIdentity(ctx, as)
 	var opts []larkcore.RequestOptionFunc
 
 	token, err := c.resolveAccessToken(ctx, as)
@@ -155,6 +157,7 @@ func (c *APIClient) DoSDKRequest(ctx context.Context, req *larkcore.ApiReq, as c
 // HTTP errors (status >= 400) are handled internally: the body is read (up to 4 KB),
 // closed, and returned as a typed *errs.NetworkError — callers only receive successful responses.
 func (c *APIClient) DoStream(ctx context.Context, req *larkcore.ApiReq, as core.Identity, opts ...Option) (*http.Response, error) {
+	ctx = requestcontext.WithIdentity(ctx, as)
 	cfg := buildConfig(opts)
 
 	// Resolve auth
@@ -212,6 +215,9 @@ func (c *APIClient) DoStream(ctx context.Context, req *larkcore.ApiReq, as core.
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		cancel()
+		if _, ok := errs.ProblemOf(err); ok {
+			return nil, err
+		}
 		return nil, errs.NewNetworkError(classifyNetworkSubtype(err), "stream request failed: %s", err).WithCause(err)
 	}
 	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}

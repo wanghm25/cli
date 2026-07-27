@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/larksuite/cli/errs"
+	"github.com/larksuite/cli/internal/build"
 	"github.com/larksuite/cli/internal/errclass"
 	"github.com/larksuite/cli/internal/output"
 )
@@ -59,6 +60,22 @@ func TestBuildAPIError_NilAndZeroCode(t *testing.T) {
 	}
 }
 
+func TestBuildAPIErrorMarksLarkOrigin(t *testing.T) {
+	err := errclass.BuildAPIError(map[string]any{
+		"code": 99991663,
+		"msg":  "token invalid",
+	}, errclass.ClassifyContext{})
+	problem, ok := errs.ProblemOf(err)
+	wantOrigin := ""
+	if build.Edition == "extended" {
+		wantOrigin = "lark"
+	}
+	metadata, _ := errs.DiagnosticMetadataOf(err)
+	if !ok || metadata.Origin != wantOrigin {
+		t.Fatalf("problem = %#v, metadata = %#v, ok = %v, want origin %q", problem, metadata, ok, wantOrigin)
+	}
+}
+
 // matchesTypedError reports whether err is the typed-error variant identified by
 // wantTyped (e.g. "ValidationError" → *errs.ValidationError). Used by the
 // ExitCode matrix so a wrong-Category routing (e.g. CategoryValidation falling
@@ -90,12 +107,28 @@ func matchesTypedError(err error, wantTyped string) bool {
 		var x *errs.SecurityPolicyError
 		return errors.As(err, &x)
 	case "APIError":
-		// APIError is the default fallback; use a direct type assertion to avoid
-		// matching against typed subclasses that also satisfy IsAPI.
-		_, ok := err.(*errs.APIError)
-		return ok
+		var x *errs.APIError
+		return errors.As(err, &x)
 	}
 	return false
+}
+
+func requirePermissionError(t *testing.T, err error) *errs.PermissionError {
+	t.Helper()
+	var permission *errs.PermissionError
+	if !errors.As(err, &permission) {
+		t.Fatalf("expected *errs.PermissionError, got %T", err)
+	}
+	return permission
+}
+
+func requireSecurityPolicyError(t *testing.T, err error) *errs.SecurityPolicyError {
+	t.Helper()
+	var policy *errs.SecurityPolicyError
+	if !errors.As(err, &policy) {
+		t.Fatalf("expected *errs.SecurityPolicyError, got %T", err)
+	}
+	return policy
 }
 
 func TestBuildAPIError_ExitCodeMatrix(t *testing.T) {
@@ -419,10 +452,7 @@ func TestRetryableEnvelope_TrueOnly(t *testing.T) {
 func TestConsoleURL_FeishuBrand(t *testing.T) {
 	resp := appScopeNotAppliedResp("docx:document")
 	err := errclass.BuildAPIError(resp, errclass.ClassifyContext{Brand: "feishu", AppID: "cli_a123", Identity: "bot"})
-	pe, ok := err.(*errs.PermissionError)
-	if !ok {
-		t.Fatalf("expected *errs.PermissionError, got %T", err)
-	}
+	pe := requirePermissionError(t, err)
 	if !strings.Contains(pe.ConsoleURL, "open.feishu.cn/page/scope-apply?clientID=cli_a123") {
 		t.Fatalf("ConsoleURL = %q, want open.feishu.cn scope-apply page", pe.ConsoleURL)
 	}
@@ -431,10 +461,7 @@ func TestConsoleURL_FeishuBrand(t *testing.T) {
 func TestConsoleURL_LarkBrand(t *testing.T) {
 	resp := appScopeNotAppliedResp("docx:document")
 	err := errclass.BuildAPIError(resp, errclass.ClassifyContext{Brand: "lark", AppID: "cli_a123", Identity: "bot"})
-	pe, ok := err.(*errs.PermissionError)
-	if !ok {
-		t.Fatalf("expected *errs.PermissionError, got %T", err)
-	}
+	pe := requirePermissionError(t, err)
 	if !strings.Contains(pe.ConsoleURL, "open.larksuite.com/page/scope-apply?clientID=cli_a123") {
 		t.Fatalf("ConsoleURL = %q, want open.larksuite.com scope-apply page", pe.ConsoleURL)
 	}
@@ -443,7 +470,7 @@ func TestConsoleURL_LarkBrand(t *testing.T) {
 func TestConsoleURL_EmptyAppID(t *testing.T) {
 	resp := appScopeNotAppliedResp("docx:document")
 	err := errclass.BuildAPIError(resp, errclass.ClassifyContext{Brand: "feishu", AppID: "", Identity: "bot"})
-	pe := err.(*errs.PermissionError)
+	pe := requirePermissionError(t, err)
 	if pe.ConsoleURL != "" {
 		t.Errorf("ConsoleURL with empty AppID should be empty; got %q", pe.ConsoleURL)
 	}
@@ -459,13 +486,13 @@ func TestConsoleURL_EmptyAppID(t *testing.T) {
 func TestConsoleURL_AttachedOnlyForAppScopeNotApplied(t *testing.T) {
 	cc := errclass.ClassifyContext{Brand: "feishu", AppID: "cli_a123", Identity: "bot"}
 
-	bot := errclass.BuildAPIError(appScopeNotAppliedResp("docx:document"), cc).(*errs.PermissionError)
+	bot := requirePermissionError(t, errclass.BuildAPIError(appScopeNotAppliedResp("docx:document"), cc))
 	if bot.ConsoleURL == "" {
 		t.Errorf("SubtypeAppScopeNotApplied envelope must carry ConsoleURL; got empty")
 	}
 
-	user := errclass.BuildAPIError(missingScopeResp("docx:document"),
-		errclass.ClassifyContext{Brand: "feishu", AppID: "cli_a123", Identity: "user"}).(*errs.PermissionError)
+	user := requirePermissionError(t, errclass.BuildAPIError(missingScopeResp("docx:document"),
+		errclass.ClassifyContext{Brand: "feishu", AppID: "cli_a123", Identity: "user"}))
 	if user.ConsoleURL != "" {
 		t.Errorf("SubtypeMissingScope envelope must NOT carry ConsoleURL; got %q", user.ConsoleURL)
 	}
@@ -538,7 +565,7 @@ func TestConsoleURL_EscapesDangerousChars(t *testing.T) {
 func TestPermissionError_DefaultIdentity(t *testing.T) {
 	resp := missingScopeResp("docx:document")
 	err := errclass.BuildAPIError(resp, errclass.ClassifyContext{Brand: "feishu", AppID: "cli_a123" /* no Identity */})
-	pe := err.(*errs.PermissionError)
+	pe := requirePermissionError(t, err)
 	if pe.Identity != "user" {
 		t.Errorf("default Identity should be \"user\"; got %q", pe.Identity)
 	}
@@ -550,7 +577,7 @@ func TestPermissionError_NoViolations(t *testing.T) {
 	// SubtypeAppScopeNotApplied envelope since that is where ConsoleURL rides.
 	resp := map[string]any{"code": 99991672, "msg": "x"}
 	err := errclass.BuildAPIError(resp, errclass.ClassifyContext{Brand: "feishu", AppID: "cli_a123", Identity: "bot"})
-	pe := err.(*errs.PermissionError)
+	pe := requirePermissionError(t, err)
 	if pe.MissingScopes != nil {
 		t.Errorf("MissingScopes should be nil; got %v", pe.MissingScopes)
 	}
@@ -573,7 +600,7 @@ func TestExtractMissingScopes_Dedup(t *testing.T) {
 		},
 	}
 	err := errclass.BuildAPIError(resp, errclass.ClassifyContext{Brand: "feishu", AppID: "cli_a123", Identity: "user"})
-	pe := err.(*errs.PermissionError)
+	pe := requirePermissionError(t, err)
 	if got, want := len(pe.MissingScopes), 2; got != want {
 		t.Fatalf("MissingScopes len = %d, want %d (raw: %v)", got, want, pe.MissingScopes)
 	}
@@ -608,9 +635,7 @@ func TestServiceShortcutEnvelopeConverge(t *testing.T) {
 	// Path A: dispatcher — BuildAPIError parsing a Lark API response.
 	resp := missingScopeResp(missing[0])
 	dispatcherErr := errclass.BuildAPIError(resp, errclass.ClassifyContext{Brand: brand, AppID: appID, Identity: identity})
-	if _, ok := dispatcherErr.(*errs.PermissionError); !ok {
-		t.Fatalf("BuildAPIError did not return *PermissionError, got %T", dispatcherErr)
-	}
+	requirePermissionError(t, dispatcherErr)
 
 	// Path B: direct construction — exercises the same helpers that
 	// cmd/service/service.go's newPreflightMissingScopeError uses. Keep this
@@ -632,7 +657,9 @@ func TestServiceShortcutEnvelopeConverge(t *testing.T) {
 		t.Fatal("direct path failed to emit typed envelope")
 	}
 
-	// Strip `code` from both envelopes — see test doc above.
+	// Strip fields that only exist when the error came from an upstream Lark
+	// response. The remaining fields must converge with the local preflight
+	// error.
 	stripA := stripUpstreamFields(t, bufA.Bytes())
 	stripB := stripUpstreamFields(t, bufB.Bytes())
 	if stripA != stripB {
@@ -640,9 +667,9 @@ func TestServiceShortcutEnvelopeConverge(t *testing.T) {
 	}
 }
 
-// stripUpstreamFields parses an envelope JSON and re-marshals it with the
-// upstream-derived "code" key removed from the inner "error" block. Used by
-// the convergence test to isolate contract fields shared between the
+// stripUpstreamFields parses an envelope JSON and re-marshals it with fields
+// that identify an upstream Lark response removed from the inner "error"
+// block. Used by the convergence test to isolate fields shared between the
 // dispatcher and pre-flight paths.
 func stripUpstreamFields(t *testing.T, raw []byte) string {
 	t.Helper()
@@ -652,6 +679,7 @@ func stripUpstreamFields(t *testing.T, raw []byte) string {
 	}
 	if errBlock, ok := obj["error"].(map[string]any); ok {
 		delete(errBlock, "code")
+		delete(errBlock, "origin")
 	}
 	out, err := json.Marshal(obj)
 	if err != nil {
@@ -838,10 +866,7 @@ func TestBuildPermissionError_CanonicalMessage(t *testing.T) {
 				"error": map[string]any{"permission_violations": []any{map[string]any{"subject": "contact:contact"}}},
 			}
 			err := errclass.BuildAPIError(resp, errclass.ClassifyContext{Brand: "feishu", AppID: appID, Identity: "user"})
-			pe, ok := err.(*errs.PermissionError)
-			if !ok {
-				t.Fatalf("expected *PermissionError, got %T", err)
-			}
+			pe := requirePermissionError(t, err)
 			if pe.Subtype != tc.wantSubtype {
 				t.Errorf("Subtype = %q, want %q", pe.Subtype, tc.wantSubtype)
 			}
@@ -938,9 +963,7 @@ func TestBuildAPIError_JSONNumberCode(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for json.Number-encoded code")
 	}
-	if _, ok := err.(*errs.PermissionError); !ok {
-		t.Errorf("expected *errs.PermissionError, got %T", err)
-	}
+	requirePermissionError(t, err)
 }
 
 // TestBuildAPIError_SecurityPolicyExtractsChallenge pins that policy responses
@@ -958,10 +981,7 @@ func TestBuildAPIError_SecurityPolicyExtractsChallenge(t *testing.T) {
 		},
 	}
 	err := errclass.BuildAPIError(resp, errclass.ClassifyContext{Brand: "feishu", AppID: "cli_test", Identity: "user"})
-	spe, ok := err.(*errs.SecurityPolicyError)
-	if !ok {
-		t.Fatalf("expected *SecurityPolicyError, got %T", err)
-	}
+	spe := requireSecurityPolicyError(t, err)
 	if spe.ChallengeURL != "https://passport.feishu.cn/challenge/xyz" {
 		t.Errorf("ChallengeURL = %q, want https://passport.feishu.cn/challenge/xyz", spe.ChallengeURL)
 	}
@@ -981,10 +1001,7 @@ func TestBuildAPIError_SecurityPolicyHintFallsBackToCliHint(t *testing.T) {
 		},
 	}
 	err := errclass.BuildAPIError(resp, errclass.ClassifyContext{Brand: "feishu", AppID: "cli_test", Identity: "user"})
-	spe, ok := err.(*errs.SecurityPolicyError)
-	if !ok {
-		t.Fatalf("expected *SecurityPolicyError, got %T", err)
-	}
+	spe := requireSecurityPolicyError(t, err)
 	if spe.Hint != "ask your admin for elevated approval" {
 		t.Errorf("Hint = %q, want cli_hint fallback", spe.Hint)
 	}
@@ -1008,10 +1025,7 @@ func TestBuildAPIError_SecurityPolicyDropsNonHTTPSChallenge(t *testing.T) {
 				"data": map[string]any{"challenge_url": bad, "hint": "h"},
 			}
 			err := errclass.BuildAPIError(resp, errclass.ClassifyContext{})
-			spe, ok := err.(*errs.SecurityPolicyError)
-			if !ok {
-				t.Fatalf("expected *SecurityPolicyError, got %T", err)
-			}
+			spe := requireSecurityPolicyError(t, err)
 			if spe.ChallengeURL != "" {
 				t.Errorf("ChallengeURL should be dropped for %q, got %q", bad, spe.ChallengeURL)
 			}
@@ -1025,10 +1039,7 @@ func TestBuildAPIError_SecurityPolicyDropsNonHTTPSChallenge(t *testing.T) {
 func TestBuildAPIError_SecurityPolicyNoData(t *testing.T) {
 	resp := map[string]any{"code": 21000, "msg": "challenge required"}
 	err := errclass.BuildAPIError(resp, errclass.ClassifyContext{})
-	spe, ok := err.(*errs.SecurityPolicyError)
-	if !ok {
-		t.Fatalf("expected *SecurityPolicyError, got %T", err)
-	}
+	spe := requireSecurityPolicyError(t, err)
 	if spe.ChallengeURL != "" {
 		t.Errorf("ChallengeURL should be empty without data; got %q", spe.ChallengeURL)
 	}
@@ -1062,10 +1073,7 @@ func TestBuildAPIError_SecurityPolicyMalformedData(t *testing.T) {
 				}
 			}()
 			err := errclass.BuildAPIError(tc.resp, errclass.ClassifyContext{})
-			spe, ok := err.(*errs.SecurityPolicyError)
-			if !ok {
-				t.Fatalf("expected *SecurityPolicyError even with malformed data, got %T", err)
-			}
+			spe := requireSecurityPolicyError(t, err)
 			if spe.ChallengeURL != "" {
 				t.Errorf("ChallengeURL should be empty for malformed data, got %q", spe.ChallengeURL)
 			}
@@ -1088,10 +1096,7 @@ func TestBuildAPIError_SecurityPolicyErrorDataShape(t *testing.T) {
 		},
 	}
 	err := errclass.BuildAPIError(resp, errclass.ClassifyContext{})
-	spe, ok := err.(*errs.SecurityPolicyError)
-	if !ok {
-		t.Fatalf("expected *SecurityPolicyError, got %T", err)
-	}
+	spe := requireSecurityPolicyError(t, err)
 	if spe.ChallengeURL != "https://passport.feishu.cn/c/abc" {
 		t.Errorf("ChallengeURL = %q, want https://passport.feishu.cn/c/abc", spe.ChallengeURL)
 	}
