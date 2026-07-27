@@ -21,13 +21,9 @@ import "github.com/larksuite/cli/internal/event/model"
 //
 // If EITHER side's selector query cannot be parsed, it falls back to an exact
 // string comparison, so the result is never more lenient than a plain == on an
-// input it cannot normalize. The normalization itself is owned by
-// internal/event/model.CanonicalTarget.
+// input it cannot normalize. The comparison itself is owned by
+// internal/event/model.TargetResourceEqual; this is a thin facade so existing
+// event.* callers keep the unchanged spelling.
 func TargetResourceEqual(a, b string) bool {
-	ca, aOK := model.ParseCanonicalTarget(a)
-	cb, bOK := model.ParseCanonicalTarget(b)
-	if !aOK || !bOK {
-		return a == b
-	}
-	return ca.Equal(cb)
+	return model.TargetResourceEqual(a, b)
 }

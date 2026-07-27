@@ -56,3 +56,23 @@ func (t CanonicalTarget) Equal(other CanonicalTarget) bool {
 	}
 	return reflect.DeepEqual(t.Selectors, other.Selectors)
 }
+
+// TargetResourceEqual reports whether two target_resource strings denote the
+// same resource + selector, tolerating URL-escaping and selector-ordering
+// differences between the platform's echoed target_resource and a
+// locally-built one (assembled as resource_type+"?"+key+"="+url.QueryEscape(value)).
+//
+// Each side is parsed via ParseCanonicalTarget and compared with Equal. If
+// EITHER side cannot be parsed, it falls back to an exact string comparison, so
+// the result is never more lenient than a plain == on an input it cannot
+// normalize. This is the single canonical target_resource comparison, shared by
+// the routing cross-check and any other host that must match a consumer's
+// listening intent against an event's echoed resource.
+func TargetResourceEqual(a, b string) bool {
+	ca, aOK := ParseCanonicalTarget(a)
+	cb, bOK := ParseCanonicalTarget(b)
+	if !aOK || !bOK {
+		return a == b
+	}
+	return ca.Equal(cb)
+}

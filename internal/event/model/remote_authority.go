@@ -43,3 +43,19 @@ func (a RemoteAuthority) String() string {
 func (a RemoteAuthority) IsZero() bool {
 	return a == RemoteAuthority{}
 }
+
+// AuthorityMatchesOwner reports whether authority (an already-normalized
+// "user:<open_id>" / "app" string — the exact vocabulary RemoteAuthority.String
+// produces) matches an owner's own fixed identity, expressed as ownerUserOpenID
+// ("" for a bot or legacy owner — the same discriminator OwnerRef.UserOpenID
+// uses everywhere else). This is the single canonical authority-vs-owner
+// comparison, so the routing cross-check and the lifecycle update-compatibility
+// check can share one spelling of "user:"+id / "app" and never drift apart.
+// authority=="" is unclear and must never reach here; callers gate on that
+// themselves.
+func AuthorityMatchesOwner(authority, ownerUserOpenID string) bool {
+	if ownerUserOpenID == "" {
+		return authority == "app"
+	}
+	return authority == "user:"+ownerUserOpenID
+}

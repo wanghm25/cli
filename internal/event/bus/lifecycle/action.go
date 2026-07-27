@@ -125,16 +125,14 @@ func classifyUpdateCompatibility(le LifecycleEvent, intent Intent) string {
 // source.FormatLifecycleAuthority / RawEvent.Authority) matches an owner's
 // own fixed identity, expressed as ownerUserOpenID ("" for a bot or legacy
 // owner — the same discriminator OwnerUserOpenID() uses everywhere else in
-// this codebase). Exported so a host package (e.g. the hub's own
-// delivery-time cross-check) can reuse this exact comparison — the one
-// place either "user:"+id or "app" is spelled out — rather than
-// re-deriving it and risking the two copies drifting apart. authority=="" is
-// unclear and must never reach here; callers gate on that themselves.
+// this codebase). The comparison itself now lives in
+// internal/event/model.AuthorityMatchesOwner — the one place either "user:"+id
+// or "app" is spelled out — so the lifecycle update-compatibility check and the
+// routing cross-check share it and can never drift apart. This is kept as a
+// thin facade for the existing lifecycle call sites. authority=="" is unclear
+// and must never reach here; callers gate on that themselves.
 func AuthorityMatchesOwner(authority, ownerUserOpenID string) bool {
-	if ownerUserOpenID == "" {
-		return authority == "app"
-	}
-	return authority == "user:"+ownerUserOpenID
+	return model.AuthorityMatchesOwner(authority, ownerUserOpenID)
 }
 
 // errIdentityGateUnconfigured/errSubscriptionClientUnconfigured are returned
