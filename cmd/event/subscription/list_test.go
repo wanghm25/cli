@@ -64,6 +64,7 @@ func listPage(items []*larkeventv1.SubscriptionDetail, hasMore bool, pageToken s
 // subscriptions[] (remote_subscription_id/event_key/event_type/...) plus
 // has_more/next_page_token.
 func TestListSubscriptions_TwoItems_JSONShape(t *testing.T) {
+	registerCreateFixtures(t) // so ReverseResolve reconstructs each row's executable event_key
 	fake := &fakeListAPI{page: listPage([]*larkeventv1.SubscriptionDetail{
 		{
 			SubscriptionId: strPtr("sub_1"),
@@ -95,8 +96,10 @@ func TestListSubscriptions_TwoItems_JSONShape(t *testing.T) {
 	if first.RemoteSubscriptionID != "sub_1" {
 		t.Errorf("Subscriptions[0].RemoteSubscriptionID = %q, want sub_1", first.RemoteSubscriptionID)
 	}
-	if first.EventKey != "im.message.created_v1" {
-		t.Errorf("Subscriptions[0].EventKey = %q, want im.message.created_v1", first.EventKey)
+	// event_key is the reversed, executable materialized key (base + chat-id +
+	// value), not the raw event_type.
+	if first.EventKey != "im.message.created_v1/chat-id/oc_aaa" {
+		t.Errorf("Subscriptions[0].EventKey = %q, want im.message.created_v1/chat-id/oc_aaa", first.EventKey)
 	}
 	if first.EventType != "im.message.created_v1" {
 		t.Errorf("Subscriptions[0].EventType = %q, want im.message.created_v1", first.EventType)

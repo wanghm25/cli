@@ -25,8 +25,20 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	eventlib "github.com/larksuite/cli/internal/event"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
+
+// EventKeyUnavailable is the explicit marker emitted in the event_key field of
+// a subscription row (and status's remote_subscription) when a remote
+// subscription's event_type + target_resource cannot be reversed to exactly one
+// registered, executable EventKey (catalog.ReverseResolve reported ok=false).
+// It is deliberately a fixed, non-key-shaped token so an AI consumer can tell an
+// executable EventKey apart from "no canonical key is available" without having
+// to infer it from an empty string — and so a raw event_type is never presented
+// where an executable event_key is expected. A real EventKey is a dotted
+// identifier and can never collide with this literal.
+const EventKeyUnavailable = "unavailable"
 
 // NewCmdSubscription builds the `event subscription` command group: the
 // read-only list/get pair plus the mutating create/update/renew/
@@ -257,15 +269,17 @@ type subscriptionRow struct {
 // mapRemoteSubscription converts one domain RemoteSubscription (projected from
 // the SDK by the platform/lark gateway) into the CLI's stable JSON row shape.
 //
-// EventKey: a RemoteSubscription has no event_key — the platform only carries
-// EventType + TargetResource. This maps EventKey to EventType verbatim (a
-// legacy/plain EventKey IS its OAPI event_type) and additionally surfaces
-// TargetResource as its own field, rather than fabricating a materialized
-// refined-key string (e.g. "im.message.example_v1/chat-id/oc_xxx"): doing that
-// faithfully requires a reverse KeyTemplate lookup (registry base + PathSegment
-// reconstruction from the resource query string) that does not exist yet, and a
-// wrong guess would emit a key-shaped string that `event schema`/`event consume`
-// would not actually recognize.
+// EventKey: a RemoteSubscription carries only event_type + target_resource, not
+// an EventKey. This reconstructs the canonical, EXECUTABLE EventKey via
+// catalog.ReverseResolve (the inverse of the forward key resolution `event
+// consume`/`create` perform) so the event_key field is directly runnable by an
+// AI/script — a legacy subscription reverses to its plain key, a refined one to
+// its materialized "<base>/<segment>/<value>" key. When the pair cannot be
+// reversed to exactly one registered key (ReverseResolve reports ok=false),
+// event_key is the explicit EventKeyUnavailable marker rather than the raw
+// event_type: presenting event_type where an executable event_key is expected
+// would hand an AI a string `event schema`/`event consume` cannot accept. The
+// raw event_type stays available in its own event_type field either way.
 func mapRemoteSubscription(sub larkgw.RemoteSubscription) subscriptionRow {
 	row := subscriptionRow{
 		RemoteSubscriptionID: sub.ID.String(),
@@ -273,7 +287,17 @@ func mapRemoteSubscription(sub larkgw.RemoteSubscription) subscriptionRow {
 		TargetResource:       sub.TargetResource,
 		Identity:             sub.Authority.String(),
 	}
-	row.EventKey = row.EventType
+	// Only a real subscription (one carrying an event_type) gets an event_key: a
+	// zero/absent record has no key at all and stays "" rather than being
+	// labelled unavailable. A present-but-unreversible event_type yields the
+	// explicit marker.
+	if sub.EventType != "" {
+		if key, ok := eventlib.ReverseResolve(sub.EventType, sub.TargetResource); ok {
+			row.EventKey = key
+		} else {
+			row.EventKey = EventKeyUnavailable
+		}
+	}
 	if sub.PayloadOptionsPresent {
 		row.PayloadOptions = &payloadOptionsView{IncludeResourceData: boolVal(sub.IncludeResourceData)}
 	}

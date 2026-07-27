@@ -303,6 +303,8 @@ func TestMapRemoteSubscription_ZeroValue_ReturnsZeroRow(t *testing.T) {
 }
 
 func TestMapRemoteSubscription_FullDetail_MapsEveryRemoteField(t *testing.T) {
+	registerCreateFixtures(t) // so ReverseResolve can reconstruct the executable event_key
+
 	d := &larkeventv1.SubscriptionDetail{
 		SubscriptionId: strPtr("sub_abc"),
 		Authority: &larkeventv1.Authority{
@@ -327,8 +329,10 @@ func TestMapRemoteSubscription_FullDetail_MapsEveryRemoteField(t *testing.T) {
 	if row.EventType != "im.message.created_v1" {
 		t.Errorf("EventType = %q, want im.message.created_v1", row.EventType)
 	}
-	if row.EventKey != row.EventType {
-		t.Errorf("EventKey = %q, want it to equal EventType (%q) per the documented best-effort mapping", row.EventKey, row.EventType)
+	// event_key is the reversed, EXECUTABLE materialized key — not the raw
+	// event_type — so an AI can run it directly against consume/schema.
+	if row.EventKey != "im.message.created_v1/chat-id/oc_xxx" {
+		t.Errorf("EventKey = %q, want the reversed materialized key im.message.created_v1/chat-id/oc_xxx", row.EventKey)
 	}
 	if row.TargetResource != "im.message?chat_id=oc_xxx" {
 		t.Errorf("TargetResource = %q, want im.message?chat_id=oc_xxx", row.TargetResource)
@@ -356,6 +360,42 @@ func TestMapRemoteSubscription_FullDetail_MapsEveryRemoteField(t *testing.T) {
 	}
 	if row.Local != nil {
 		t.Errorf("Local = %v, want nil/omitted — local-consumer association is a future concern", row.Local)
+	}
+}
+
+// TestMapRemoteSubscription_LegacyEventKey_ReversesToPlainKey locks that a
+// legacy (empty target_resource) subscription reverses to its plain, executable
+// EventKey rather than being reported unavailable.
+func TestMapRemoteSubscription_LegacyEventKey_ReversesToPlainKey(t *testing.T) {
+	registerCreateFixtures(t)
+	row := mapRemoteSubscription(larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{
+		SubscriptionId: strPtr("sub_legacy"),
+		EventType:      strPtr("im.message.receive_v1"),
+	}))
+	if row.EventKey != "im.message.receive_v1" {
+		t.Errorf("EventKey = %q, want the reversed legacy key im.message.receive_v1", row.EventKey)
+	}
+}
+
+// TestMapRemoteSubscription_Unreversible_EmitsUnavailableMarker locks the
+// explicit-unavailable contract: when event_type + target_resource cannot be
+// reversed to a registered EventKey, event_key is the EventKeyUnavailable marker
+// (never the raw event_type), while event_type itself stays available.
+func TestMapRemoteSubscription_Unreversible_EmitsUnavailableMarker(t *testing.T) {
+	registerCreateFixtures(t)
+	row := mapRemoteSubscription(larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{
+		SubscriptionId: strPtr("sub_unknown"),
+		EventType:      strPtr("does.not.exist_v1"),
+		TargetResource: strPtr("im.message?chat_id=oc_zzz"),
+	}))
+	if row.EventKey != EventKeyUnavailable {
+		t.Errorf("EventKey = %q, want the explicit %q marker for an unreversible pair", row.EventKey, EventKeyUnavailable)
+	}
+	if row.EventKey == row.EventType {
+		t.Errorf("event_key must never be the raw event_type (%q) when unreversible", row.EventType)
+	}
+	if row.EventType != "does.not.exist_v1" {
+		t.Errorf("EventType = %q, want it preserved verbatim alongside the unavailable event_key", row.EventType)
 	}
 }
 

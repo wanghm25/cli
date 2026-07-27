@@ -37,6 +37,7 @@ func (f *fakeGetAPI) Get(_ context.Context, _ string) (*larkgw.RemoteSubscriptio
 // the task brief: `get sub_xxx --json` maps one RemoteSubscription into the
 // shared subscriptionRow shape.
 func TestGetSubscription_SingleDetail_JSONShape(t *testing.T) {
+	registerCreateFixtures(t) // so ReverseResolve reconstructs the executable event_key
 	fake := &fakeGetAPI{sub: subPtr(larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{
 		SubscriptionId: strPtr("sub_xxx"),
 		EventType:      strPtr("im.message.created_v1"),
@@ -54,8 +55,9 @@ func TestGetSubscription_SingleDetail_JSONShape(t *testing.T) {
 	if row.RemoteSubscriptionID != "sub_xxx" {
 		t.Errorf("RemoteSubscriptionID = %q, want sub_xxx", row.RemoteSubscriptionID)
 	}
-	if row.EventKey != "im.message.created_v1" {
-		t.Errorf("EventKey = %q, want im.message.created_v1", row.EventKey)
+	// event_key is the reversed, executable materialized key, not the raw event_type.
+	if row.EventKey != "im.message.created_v1/chat-id/oc_xxx" {
+		t.Errorf("EventKey = %q, want im.message.created_v1/chat-id/oc_xxx", row.EventKey)
 	}
 	if row.Identity != "user:ou_xxx" {
 		t.Errorf("Identity = %q, want user:ou_xxx", row.Identity)
