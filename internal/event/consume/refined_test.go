@@ -19,12 +19,13 @@ import (
 	"testing"
 	"time"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/model"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/testutil"
 )
 
@@ -74,25 +75,96 @@ func refinedFixture() event.ResolvedEventKey {
 	}
 }
 
-func strPtr(s string) *string { return &s }
-func boolPtr(b bool) *bool     { return &b }
+// ---- domain fixtures + fake subscription.Gateway (network-free) ----
 
-// activeEncryptedListResp is a List response with a single active,
-// include_resource_data=true match under the given authority type — the remote
-// shape a consume reconcile classifies as an encrypted reuse.
-func activeEncryptedListResp(id, authorityType string) *larkeventv1.ListSubscriptionResp {
-	return &larkeventv1.ListSubscriptionResp{
-		Data: &larkeventv1.ListSubscriptionRespData{
-			Items: []*larkeventv1.SubscriptionDetail{{
-				SubscriptionId: strPtr(id),
-				EventType:      strPtr("im.message.created_v1"),
-				TargetResource: strPtr("im.message?chat_id=oc_aaa"),
-				Authority:      &larkeventv1.Authority{Type: strPtr(authorityType), OpenId: strPtr("ou_aaa")},
-				State:          strPtr("active"),
-				PayloadOptions: &larkeventv1.PayloadOptions{IncludeResourceData: boolPtr(true)},
-			}},
-		},
+// fakeGateway is a network-free stand-in for the subscription.Gateway surface
+// the refined Controller drives (mirrors the fakeGateway in
+// internal/event/subscription/controller_test.go). walkFunc lets a test vary the
+// List result by call; createSpec captures the spec Create built.
+type fakeGateway struct {
+	walkItems  []larkgw.RemoteSubscription
+	walkCapped bool
+	walkErr    error
+	walkFunc   func(call int) ([]larkgw.RemoteSubscription, bool, error)
+	walkCalls  int
+
+	createResp  *larkgw.RemoteSubscription
+	createErr   error
+	createSpec  *larkgw.CreateSpec
+	createCalls int
+
+	reactivateResp  *larkgw.RemoteSubscription
+	reactivateErr   error
+	reactivateID    string
+	reactivateCalls int
+
+	encryptKey   string
+	encryptErr   error
+	encryptCalls int
+}
+
+func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, visit func(larkgw.RemoteSubscription) bool) (bool, error) {
+	call := g.walkCalls
+	g.walkCalls++
+	items, capped, err := g.walkItems, g.walkCapped, g.walkErr
+	if g.walkFunc != nil {
+		items, capped, err = g.walkFunc(call)
 	}
+	if err != nil {
+		return false, err
+	}
+	for _, it := range items {
+		if !visit(it) {
+			return false, nil
+		}
+	}
+	return capped, nil
+}
+
+func (g *fakeGateway) Create(_ context.Context, spec larkgw.CreateSpec) (*larkgw.RemoteSubscription, error) {
+	g.createCalls++
+	s := spec
+	g.createSpec = &s
+	if g.createErr != nil {
+		return nil, g.createErr
+	}
+	return g.createResp, nil
+}
+
+func (g *fakeGateway) Reactivate(_ context.Context, id string) (*larkgw.RemoteSubscription, error) {
+	g.reactivateCalls++
+	g.reactivateID = id
+	if g.reactivateErr != nil {
+		return nil, g.reactivateErr
+	}
+	return g.reactivateResp, nil
+}
+
+func (g *fakeGateway) GetEncryptKey(_ context.Context, _ string) (string, error) {
+	g.encryptCalls++
+	return g.encryptKey, g.encryptErr
+}
+
+// activeRemote is an active authority match as the domain projection.
+func activeRemote(id, authorityType string, includeResourceData bool) larkgw.RemoteSubscription {
+	ird := includeResourceData
+	return larkgw.RemoteSubscription{
+		ID:                    model.RemoteSubscriptionID(id),
+		EventType:             "im.message.created_v1",
+		TargetResource:        "im.message?chat_id=oc_aaa",
+		Authority:             model.RemoteAuthority{Type: authorityType, OpenID: "ou_aaa"},
+		State:                 "active",
+		PayloadOptionsPresent: true,
+		IncludeResourceData:   &ird,
+		Filter:                &event.Filter{},
+	}
+}
+
+// activeFilteredRemote is a plaintext active authority match carrying filter f.
+func activeFilteredRemote(id, authorityType string, f *event.Filter) larkgw.RemoteSubscription {
+	sub := activeRemote(id, authorityType, false)
+	sub.Filter = f
+	return sub
 }
 
 // ---- fakeStatusBusTransport: a minimal local "bus" that only answers status_query ----
@@ -498,195 +570,6 @@ func TestDoHelloV2_SendsPopulatedHelloAndReadsAck(t *testing.T) {
 	}
 }
 
-// ---- applyRemoteSubscriptionPlan: the ONLY remote write ----
-
-type fakeApplyAPI struct {
-	listResp *larkeventv1.ListSubscriptionResp
-	listErr  error
-
-	// listPageAt, when non-nil, overrides listResp/listErr and returns the
-	// page for the given 0-indexed call number — used to test the plan
-	// stage's pagination (a fixed listResp can only ever serve one page).
-	listPageAt func(call int) *larkeventv1.ListSubscriptionResp
-
-	createResp *larkeventv1.CreateSubscriptionResp
-	createErr  error
-
-	reactivateResp *larkeventv1.ReactivateSubscriptionResp
-	reactivateErr  error
-
-	getEncryptKeyResp *larkeventv1.GetEncryptKeySubscriptionResp
-	getEncryptKeyErr  error
-
-	listCalls          int
-	createCalls        int
-	reactivateCalls    int
-	getEncryptKeyCalls int
-}
-
-func (f *fakeApplyAPI) List(context.Context, *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
-	call := f.listCalls
-	f.listCalls++
-	if f.listPageAt != nil {
-		return f.listPageAt(call), f.listErr
-	}
-	return f.listResp, f.listErr
-}
-
-func (f *fakeApplyAPI) Create(context.Context, *larkeventv1.CreateSubscriptionReq) (*larkeventv1.CreateSubscriptionResp, error) {
-	f.createCalls++
-	return f.createResp, f.createErr
-}
-
-func (f *fakeApplyAPI) Reactivate(context.Context, *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error) {
-	f.reactivateCalls++
-	return f.reactivateResp, f.reactivateErr
-}
-
-func (f *fakeApplyAPI) GetEncryptKey(_ context.Context, _ *larkeventv1.GetEncryptKeySubscriptionReq) (*larkeventv1.GetEncryptKeySubscriptionResp, error) {
-	f.getEncryptKeyCalls++
-	return f.getEncryptKeyResp, f.getEncryptKeyErr
-}
-
-func TestApplyRemoteSubscriptionPlan_Create_CallsCreateExactlyOnce(t *testing.T) {
-	fake := &fakeApplyAPI{createResp: &larkeventv1.CreateSubscriptionResp{
-		Data: &larkeventv1.CreateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_new")}},
-	}}
-	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, false, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if id != "sub_new" || !created {
-		t.Errorf("got id=%q created=%v, want sub_new/true", id, created)
-	}
-	if fake.createCalls != 1 || fake.reactivateCalls != 0 {
-		t.Errorf("createCalls=%d reactivateCalls=%d, want 1/0", fake.createCalls, fake.reactivateCalls)
-	}
-}
-
-func TestApplyRemoteSubscriptionPlan_Reuse_NeverWrites(t *testing.T) {
-	fake := &fakeApplyAPI{}
-	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_existing")}
-	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionReuse, Existing: existing}, false, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if id != "sub_existing" || created {
-		t.Errorf("got id=%q created=%v, want sub_existing/false", id, created)
-	}
-	if fake.createCalls != 0 || fake.reactivateCalls != 0 {
-		t.Errorf("reuse must never call Create/Reactivate; got create=%d reactivate=%d", fake.createCalls, fake.reactivateCalls)
-	}
-}
-
-func TestApplyRemoteSubscriptionPlan_Suspended_CallsReactivateNotCreate(t *testing.T) {
-	fake := &fakeApplyAPI{reactivateResp: &larkeventv1.ReactivateSubscriptionResp{
-		Data: &larkeventv1.ReactivateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_susp")}},
-	}}
-	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_susp")}
-	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionSuspended, Existing: existing}, false, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if id != "sub_susp" || created {
-		t.Errorf("got id=%q created=%v, want sub_susp/false (reactivation is not \"created by this attempt\")", id, created)
-	}
-	if fake.reactivateCalls != 1 || fake.createCalls != 0 {
-		t.Errorf("suspended must call Reactivate exactly once, never Create; got create=%d reactivate=%d", fake.createCalls, fake.reactivateCalls)
-	}
-}
-
-// ---- encrypted create (key-gen atomicity + no-key-on-non-create) ----
-
-// TestApplyRemoteSubscriptionPlan_EncryptedCreate_GeneratesKeyExactlyOnce locks
-// that an encrypted create (includeResourceData=true) generates a fresh key via
-// newEncryptKeyFunc EXACTLY once and still creates the subscription. The key is
-// never returned by applyRemoteSubscriptionPlan (only the remote id is).
-func TestApplyRemoteSubscriptionPlan_EncryptedCreate_GeneratesKeyExactlyOnce(t *testing.T) {
-	var keyGenCalls int
-	restore := newEncryptKeyFunc
-	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return "GENERATED_KEY", nil }
-	defer func() { newEncryptKeyFunc = restore }()
-
-	fake := &fakeApplyAPI{createResp: &larkeventv1.CreateSubscriptionResp{
-		Data: &larkeventv1.CreateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_enc")}},
-	}}
-	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, true, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if id != "sub_enc" || !created {
-		t.Errorf("got id=%q created=%v, want sub_enc/true", id, created)
-	}
-	if keyGenCalls != 1 {
-		t.Errorf("newEncryptKeyFunc called %d times, want exactly 1 for an encrypted create", keyGenCalls)
-	}
-	if fake.createCalls != 1 {
-		t.Errorf("createCalls=%d, want 1", fake.createCalls)
-	}
-}
-
-// TestApplyRemoteSubscriptionPlan_PlaintextAndReuse_NeverGenerateKey proves the
-// key is generated ONLY on an encrypted create — never for a plaintext create,
-// a reuse, or a suspended reactivate.
-func TestApplyRemoteSubscriptionPlan_PlaintextAndReuse_NeverGenerateKey(t *testing.T) {
-	var keyGenCalls int
-	restore := newEncryptKeyFunc
-	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return "SHOULD_NOT_HAPPEN", nil }
-	defer func() { newEncryptKeyFunc = restore }()
-
-	// plaintext create
-	fake := &fakeApplyAPI{createResp: &larkeventv1.CreateSubscriptionResp{
-		Data: &larkeventv1.CreateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_plain")}},
-	}}
-	if _, _, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, false, nil); err != nil {
-		t.Fatalf("plaintext create: unexpected error: %v", err)
-	}
-	// reuse (even with includeResourceData=true: no create happens, no key)
-	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_reuse")}
-	if _, _, err := applyRemoteSubscriptionPlan(context.Background(), &fakeApplyAPI{}, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionReuse, Existing: existing}, true, nil); err != nil {
-		t.Fatalf("reuse: unexpected error: %v", err)
-	}
-	if keyGenCalls != 0 {
-		t.Errorf("newEncryptKeyFunc called %d times, want 0 (no key for plaintext create or reuse)", keyGenCalls)
-	}
-}
-
-// TestApplyRemoteSubscriptionPlan_EncryptedCreate_KeyGenFailure_FailClosed:
-// a key-gen failure aborts the create — never a plaintext fallback.
-func TestApplyRemoteSubscriptionPlan_EncryptedCreate_KeyGenFailure_FailClosed(t *testing.T) {
-	restore := newEncryptKeyFunc
-	newEncryptKeyFunc = func() (string, error) { return "", errors.New("csprng unavailable") }
-	defer func() { newEncryptKeyFunc = restore }()
-
-	fake := &fakeApplyAPI{}
-	_, _, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, true, nil)
-	if err == nil {
-		t.Fatal("expected key-gen failure to abort the create, got nil")
-	}
-	if fake.createCalls != 0 {
-		t.Errorf("createCalls=%d, want 0: a key-gen failure must never fall back to a plaintext Create", fake.createCalls)
-	}
-}
-
-// TestBuildRefinedCreateBody_AtomicEncrypt proves the encrypt_key is set on the
-// SAME body as include_resource_data (atomicity), and that a
-// plaintext body carries no encrypt block.
-func TestBuildRefinedCreateBody_AtomicEncrypt(t *testing.T) {
-	enc := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", true, "THE_KEY", nil)
-	if enc.PayloadOptions == nil || enc.PayloadOptions.IncludeResourceData == nil || !*enc.PayloadOptions.IncludeResourceData {
-		t.Fatalf("encrypted body must set include_resource_data=true, got %+v", enc.PayloadOptions)
-	}
-	if enc.PayloadOptions.Encrypt == nil || enc.PayloadOptions.Encrypt.EncryptKey == nil || *enc.PayloadOptions.Encrypt.EncryptKey != "THE_KEY" {
-		t.Fatalf("encrypted body must carry the encrypt_key atomically, got %+v", enc.PayloadOptions.Encrypt)
-	}
-
-	plain := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", nil)
-	if plain.PayloadOptions == nil || plain.PayloadOptions.Encrypt != nil {
-		t.Fatalf("plaintext body must carry no encrypt block, got %+v", plain.PayloadOptions)
-	}
-}
-
 // ---- --filter (server-side event filter) ----
 
 // refinedFilterWith parses a valid single-condition filter for
@@ -703,150 +586,81 @@ func refinedFilterWith(t *testing.T, messageType string) *event.Filter {
 	return f
 }
 
-// activeFilteredListResp is a plaintext active authority match carrying remote
-// filter f.
-func activeFilteredListResp(id, authorityType string, f *event.Filter) *larkeventv1.ListSubscriptionResp {
-	return &larkeventv1.ListSubscriptionResp{
-		Data: &larkeventv1.ListSubscriptionRespData{
-			Items: []*larkeventv1.SubscriptionDetail{{
-				SubscriptionId: strPtr(id),
-				EventType:      strPtr("im.message.created_v1"),
-				TargetResource: strPtr("im.message?chat_id=oc_aaa"),
-				Authority:      &larkeventv1.Authority{Type: strPtr(authorityType), OpenId: strPtr("ou_aaa")},
-				State:          strPtr("active"),
-				PayloadOptions: &larkeventv1.PayloadOptions{IncludeResourceData: boolPtr(false)},
-				Filter:         event.FilterToSDK(f),
-			}},
-		},
-	}
-}
-
-// TestBuildRefinedCreateBody_WithFilter_CarriesFilter proves a requested filter
-// is projected onto the Create body exactly as it would be sent on the wire.
-func TestBuildRefinedCreateBody_WithFilter_CarriesFilter(t *testing.T) {
-	f := refinedFilterWith(t, "text")
-	body := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", f)
-	if body.Filter == nil {
-		t.Fatal("body.Filter = nil, want the projected filter")
-	}
-	got, err := json.Marshal(body.Filter)
-	if err != nil {
-		t.Fatalf("marshal body.Filter: %v", err)
-	}
-	want, err := f.Canonicalize()
-	if err != nil {
-		t.Fatalf("canonicalize: %v", err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Errorf("body.Filter = %s, want %s", got, want)
-	}
-}
-
-// TestBuildRefinedCreateBody_NoFilter_OmitsFilter locks that with no requested
-// filter the field is omitted entirely (never an empty {"filter":{}}).
-func TestBuildRefinedCreateBody_NoFilter_OmitsFilter(t *testing.T) {
-	for name, f := range map[string]*event.Filter{"nil": nil, "empty": {}} {
-		t.Run(name, func(t *testing.T) {
-			body := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", f)
-			if body.Filter != nil {
-				t.Errorf("body.Filter = %+v, want nil (omitted) when no filter is requested", body.Filter)
-			}
-		})
-	}
-}
-
 // TestProdRefinedDeps_Plan_FilterMismatch_ReturnsConflictWithFilterField proves
-// RefinedOptions.Filter reaches the reconcile plan stage: a requested filter
-// that differs from an active match's plans a conflict carrying a filter field.
+// RefinedOptions.Filter reaches the Controller plan stage: a requested filter
+// that differs from an active match's plans a Block carrying a filter field.
 func TestProdRefinedDeps_Plan_FilterMismatch_ReturnsConflictWithFilterField(t *testing.T) {
 	resolved := refinedFixture()
-	fake := &fakeApplyAPI{listResp: activeFilteredListResp("sub_1", "user", refinedFilterWith(t, "text"))}
-	opts := RefinedOptions{Identity: core.AsUser, SubClient: fake, Filter: refinedFilterWith(t, "image")}
+	gw := &fakeGateway{walkItems: []larkgw.RemoteSubscription{activeFilteredRemote("sub_1", "user", refinedFilterWith(t, "text"))}}
+	opts := RefinedOptions{Identity: core.AsUser, Controller: subown.NewController(gw), Filter: refinedFilterWith(t, "image")}
 	deps := prodRefinedDeps(failDialTransport{}, "cli_x", "test-profile", "", resolved, opts)
 
 	plan, err := deps.plan(context.Background())
 	if err != nil {
 		t.Fatalf("plan err = %v, want nil", err)
 	}
-	if plan.Action != event.PlanActionConflict {
-		t.Fatalf("plan.Action = %q, want %q", plan.Action, event.PlanActionConflict)
+	if plan.Action != subown.ActionBlock {
+		t.Fatalf("plan.Action = %q, want %q", plan.Action, subown.ActionBlock)
 	}
 	if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Name != "filter" {
 		t.Errorf("ConflictFields = %+v, want one entry naming filter", plan.ConflictFields)
 	}
+	if !subown.ConflictOnFilter(plan.ConflictFields) {
+		t.Error("ConflictOnFilter = false, want true")
+	}
 }
 
 // TestProdRefinedDeps_Plan_EncryptedActiveMatch_ReusesWithZeroGetEncryptKeyCalls
-// locks #25a: for an encrypted (IncludeResourceData=true) consume, the plan
-// stage reuses an active include_resource_data=true match WITHOUT the front-end
-// ever calling GetEncryptKey — key confirmation is deferred to the bus Hello.
+// locks that for an encrypted (IncludeResourceData=true) consume, the plan stage
+// reuses an active include_resource_data=true match WITHOUT the front-end ever
+// calling GetEncryptKey — the ConsumeBootstrap policy defers key confirmation to
+// the bus Hello.
 func TestProdRefinedDeps_Plan_EncryptedActiveMatch_ReusesWithZeroGetEncryptKeyCalls(t *testing.T) {
 	resolved := refinedFixture()
-	fake := &fakeApplyAPI{
-		listResp: activeEncryptedListResp("sub_enc", "user"),
+	gw := &fakeGateway{
+		walkItems: []larkgw.RemoteSubscription{activeRemote("sub_enc", "user", true)},
 		// If the front-end ever probed, this would be its response — it must
 		// stay untouched.
-		getEncryptKeyResp: &larkeventv1.GetEncryptKeySubscriptionResp{
-			Data: &larkeventv1.GetEncryptKeySubscriptionRespData{EncryptKey: strPtr("SHOULD_NOT_BE_FETCHED")},
-		},
+		encryptKey: "SHOULD_NOT_BE_FETCHED",
 	}
-	opts := RefinedOptions{Identity: core.AsUser, IncludeResourceData: true, SubClient: fake}
+	opts := RefinedOptions{Identity: core.AsUser, IncludeResourceData: true, Controller: subown.NewController(gw)}
 	deps := prodRefinedDeps(failDialTransport{}, "cli_x", "test-profile", "", resolved, opts)
 
 	plan, err := deps.plan(context.Background())
 	if err != nil {
 		t.Fatalf("plan err = %v, want nil", err)
 	}
-	if plan.Action != event.PlanActionReuse {
-		t.Errorf("plan.Action = %q, want %q", plan.Action, event.PlanActionReuse)
+	if plan.Action != subown.ActionReuse {
+		t.Errorf("plan.Action = %q, want %q", plan.Action, subown.ActionReuse)
 	}
-	if fake.getEncryptKeyCalls != 0 {
-		t.Errorf("front-end GetEncryptKey calls = %d, want 0 (key confirmation is deferred to the bus Hello)", fake.getEncryptKeyCalls)
+	if gw.encryptCalls != 0 {
+		t.Errorf("front-end GetEncryptKey calls = %d, want 0 (key confirmation is deferred to the bus Hello)", gw.encryptCalls)
 	}
-	if fake.listCalls != 1 {
-		t.Errorf("List calls = %d, want 1 (plan reconciles remote state once)", fake.listCalls)
+	if gw.walkCalls != 1 {
+		t.Errorf("List scan calls = %d, want 1 (plan reconciles remote state once)", gw.walkCalls)
 	}
 }
 
-// TestProdRefinedDeps_Plan_PaginationCapped_WarnsOnErrOut locks the
-// production wiring for the refined consume startup chain's plan stage: when
-// the List scan hits the page cap without finding a match, it must warn on
-// ErrOut rather than silently proceeding as if that were a confirmed
-// not-exist, while still returning the same PlanActionCreate a genuine
-// not-found would.
-func TestProdRefinedDeps_Plan_PaginationCapped_WarnsOnErrOut(t *testing.T) {
+// TestProdRefinedDeps_Plan_PaginationCapped_ReturnsIndeterminate locks the
+// must-fix: when the List scan hits the page cap without finding a match, the
+// plan is Indeterminate (never the old PlanActionCreate) so a real run fails
+// closed rather than silently creating a possible duplicate.
+func TestProdRefinedDeps_Plan_PaginationCapped_ReturnsIndeterminate(t *testing.T) {
 	resolved := refinedFixture()
-	fake := &fakeApplyAPI{
-		listPageAt: func(call int) *larkeventv1.ListSubscriptionResp {
-			// Every page: has_more=true, no matching authority item — an
-			// unbounded scan would run forever.
-			return &larkeventv1.ListSubscriptionResp{Data: &larkeventv1.ListSubscriptionRespData{
-				Items: []*larkeventv1.SubscriptionDetail{{
-					SubscriptionId: strPtr("sub_other"),
-					Authority:      &larkeventv1.Authority{Type: strPtr("app")},
-					State:          strPtr("active"),
-				}},
-				HasMore:   boolPtr(true),
-				PageToken: strPtr(fmt.Sprintf("token-%d", call+1)),
-			}}
-		},
+	gw := &fakeGateway{
+		// A non-matching (app-authority) item, and the scan reports capped.
+		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_other", "app", false)},
+		walkCapped: true,
 	}
-	var stderr bytes.Buffer
-	opts := RefinedOptions{ErrOut: &stderr, Identity: core.AsUser, SubClient: fake}
+	opts := RefinedOptions{Identity: core.AsUser, Controller: subown.NewController(gw)}
 	deps := prodRefinedDeps(failDialTransport{}, "cli_x", "test-profile", "", resolved, opts)
 
 	plan, err := deps.plan(context.Background())
 	if err != nil {
 		t.Fatalf("plan err = %v, want nil", err)
 	}
-	if plan.Action != event.PlanActionCreate {
-		t.Errorf("plan.Action = %q, want %q", plan.Action, event.PlanActionCreate)
-	}
-	if !plan.PaginationCapped {
-		t.Fatal("plan.PaginationCapped = false, want true")
-	}
-	if !strings.Contains(stderr.String(), "warning") {
-		t.Errorf("ErrOut = %q, want a warning about the capped pagination scan", stderr.String())
+	if plan.Action != subown.ActionIndeterminate {
+		t.Errorf("plan.Action = %q, want %q (a capped scan is inconclusive, never Create)", plan.Action, subown.ActionIndeterminate)
 	}
 }
 
@@ -889,11 +703,11 @@ func TestRunRefinedChain_StrictOrder_ProbePlanApplyStartBusHello(t *testing.T) {
 			rec.record("probe")
 			return nil
 		},
-		plan: func(context.Context) (event.ReconcilePlan, error) {
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
 			rec.record("plan")
-			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
 		},
-		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+		apply: func(context.Context, subown.SubscriptionPlan) (string, bool, error) {
 			rec.record("apply")
 			return "sub_new", true, nil
 		},
@@ -940,11 +754,11 @@ func TestRunRefinedChain_DryRun_OnlyProbeAndPlanRun_NoApplyNoBusNoWrite(t *testi
 			rec.record("probe")
 			return nil
 		},
-		plan: func(context.Context) (event.ReconcilePlan, error) {
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
 			rec.record("plan")
-			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
 		},
-		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+		apply: func(context.Context, subown.SubscriptionPlan) (string, bool, error) {
 			rec.record("apply")
 			t.Error("apply must never run under --dry-run")
 			return "should-not-happen", true, nil
@@ -987,13 +801,13 @@ func TestRunRefinedChain_DryRun_EvenOnConflictingPlan_ReportsInformationallyNoEr
 	// dry-run ALWAYS reports the plan informationally, even
 	// conflict/suspended -- only preflight itself can fail a dry-run. Only a
 	// REAL (non-dry-run) run turns a conflict into a typed error.
-	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_conflict")}
+	existing := &larkgw.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_conflict")}
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
-		plan: func(context.Context) (event.ReconcilePlan, error) {
-			return event.ReconcilePlan{Action: event.PlanActionConflict, Existing: existing}, nil
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionBlock, Before: existing}, nil
 		},
-		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+		apply: func(context.Context, subown.SubscriptionPlan) (string, bool, error) {
 			t.Fatal("apply must not run under dry-run")
 			return "", false, nil
 		},
@@ -1016,17 +830,17 @@ func TestRunRefinedChain_DryRun_EvenOnConflictingPlan_ReportsInformationallyNoEr
 
 func TestRunRefinedChain_PlanConflict_NonDryRun_ReturnsTypedErrorBeforeApply(t *testing.T) {
 	var applyCalled, startBusCalled, helloCalled bool
-	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_conflict")}
+	existing := &larkgw.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_conflict")}
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
-		plan: func(context.Context) (event.ReconcilePlan, error) {
-			return event.ReconcilePlan{
-				Action:         event.PlanActionConflict,
-				Existing:       existing,
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{
+				Action:         subown.ActionBlock,
+				Before:         existing,
 				ConflictFields: []errs.InvalidParam{{Name: "include_resource_data", Reason: "mismatch"}},
 			}, nil
 		},
-		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+		apply: func(context.Context, subown.SubscriptionPlan) (string, bool, error) {
 			applyCalled = true
 			return "", false, nil
 		},
@@ -1057,14 +871,53 @@ func TestRunRefinedChain_PlanConflict_NonDryRun_ReturnsTypedErrorBeforeApply(t *
 	}
 }
 
+// TestRunRefinedChain_RealRun_Indeterminate_FailsClosedNoApply locks the
+// must-fix: an inconclusive remote scan (Indeterminate) on a real run fails
+// closed with a typed error and never reaches apply/startBus/hello — it must
+// never silently create a possible duplicate.
+func TestRunRefinedChain_RealRun_Indeterminate_FailsClosedNoApply(t *testing.T) {
+	var applyCalled, startBusCalled, helloCalled bool
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionIndeterminate}, nil
+		},
+		apply: func(context.Context, subown.SubscriptionPlan) (string, bool, error) {
+			applyCalled = true
+			return "", false, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) { startBusCalled = true; return nil, nil },
+		hello: func(context.Context, net.Conn, string) (*protocol.HelloAck, *bufio.Reader, error) {
+			helloCalled = true
+			return nil, nil, nil
+		},
+	}
+	opts := RefinedOptions{ErrOut: io.Discard, Out: io.Discard, Identity: core.AsUser}
+
+	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
+	if err == nil {
+		t.Fatal("expected a typed error on an inconclusive (Indeterminate) real run")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if applyCalled || startBusCalled || helloCalled {
+		t.Error("an Indeterminate plan must short-circuit before apply/startBus/hello")
+	}
+}
+
 func TestRunRefinedChain_ApplyOkStartBusFails_InternalErrorWithHint_NoDelete(t *testing.T) {
 	var helloCalled bool
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
-		plan: func(context.Context) (event.ReconcilePlan, error) {
-			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
 		},
-		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+		apply: func(context.Context, subown.SubscriptionPlan) (string, bool, error) {
 			return "sub_new_123", true, nil
 		},
 		startBus: func(context.Context) (net.Conn, error) {
@@ -1119,10 +972,10 @@ func TestRunRefinedChain_ApplyOkHelloFails_InternalErrorWithHint_NoDelete(t *tes
 
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
-		plan: func(context.Context) (event.ReconcilePlan, error) {
-			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
 		},
-		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+		apply: func(context.Context, subown.SubscriptionPlan) (string, bool, error) {
 			return "sub_new_456", true, nil
 		},
 		startBus: func(context.Context) (net.Conn, error) {
@@ -1167,10 +1020,10 @@ func TestRunRefinedChain_ApplyOkHelloRejected_HintCarriesRecoveryInfo(t *testing
 
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
-		plan: func(context.Context) (event.ReconcilePlan, error) {
-			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
 		},
-		apply: func(context.Context, event.ReconcilePlan) (string, bool, error) {
+		apply: func(context.Context, subown.SubscriptionPlan) (string, bool, error) {
 			return "sub_new_789", true, nil
 		},
 		startBus: func(context.Context) (net.Conn, error) {
@@ -1217,7 +1070,7 @@ func TestRunRefinedChain_ApplyOkHelloRejected_HintCarriesRecoveryInfo(t *testing
 func TestRunRefinedChain_Suspended_NonDryRun_AppliesReactivateNotError(t *testing.T) {
 	// Suspended proceeds to Apply (which Reactivates) instead of failing --
 	// distinct from Conflict, which always fails before Apply.
-	var appliedAction string
+	var appliedAction subown.Action
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -1225,10 +1078,10 @@ func TestRunRefinedChain_Suspended_NonDryRun_AppliesReactivateNotError(t *testin
 
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
-		plan: func(context.Context) (event.ReconcilePlan, error) {
-			return event.ReconcilePlan{Action: event.PlanActionSuspended, Existing: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_susp")}}, nil
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionReactivate, Before: &larkgw.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_susp")}}, nil
 		},
-		apply: func(_ context.Context, plan event.ReconcilePlan) (string, bool, error) {
+		apply: func(_ context.Context, plan subown.SubscriptionPlan) (string, bool, error) {
 			appliedAction = plan.Action
 			return "sub_susp", false, nil
 		},
@@ -1244,8 +1097,8 @@ func TestRunRefinedChain_Suspended_NonDryRun_AppliesReactivateNotError(t *testin
 	if err := runRefinedChain(ctx, refinedFixture(), opts, deps); err != nil {
 		t.Fatalf("suspended plan should reach Apply/consume, not error: %v", err)
 	}
-	if appliedAction != event.PlanActionSuspended {
-		t.Errorf("apply saw action %q, want %q", appliedAction, event.PlanActionSuspended)
+	if appliedAction != subown.ActionReactivate {
+		t.Errorf("apply saw action %q, want %q", appliedAction, subown.ActionReactivate)
 	}
 }
 
@@ -1269,10 +1122,10 @@ func TestRunRefinedChain_HelloRejectedDecryptKeyUnavailable_TypedError_NotReady(
 	var stderr bytes.Buffer
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
-		plan: func(context.Context) (event.ReconcilePlan, error) {
-			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
 		},
-		apply:    func(context.Context, event.ReconcilePlan) (string, bool, error) { return "sub_enc", true, nil },
+		apply:    func(context.Context, subown.SubscriptionPlan) (string, bool, error) { return "sub_enc", true, nil },
 		startBus: func(context.Context) (net.Conn, error) { return client, nil },
 		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
 			// The bus rejects an encrypted consumer whose key fetch failed.
@@ -1322,10 +1175,10 @@ func TestRunRefinedChain_HelloRejectedBindFailed_TypedError_NotReady(t *testing.
 	var stderr bytes.Buffer
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
-		plan: func(context.Context) (event.ReconcilePlan, error) {
-			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
 		},
-		apply:    func(context.Context, event.ReconcilePlan) (string, bool, error) { return "sub_bind", true, nil },
+		apply:    func(context.Context, subown.SubscriptionPlan) (string, bool, error) { return "sub_bind", true, nil },
 		startBus: func(context.Context) (net.Conn, error) { return client, nil },
 		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
 			return &protocol.HelloAck{
@@ -1373,10 +1226,10 @@ func TestRunRefinedChain_HelloRejectedIncompleteRefinedHello_TypedError_NotReady
 	var stderr bytes.Buffer
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
-		plan: func(context.Context) (event.ReconcilePlan, error) {
-			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
 		},
-		apply:    func(context.Context, event.ReconcilePlan) (string, bool, error) { return "sub_inc", true, nil },
+		apply:    func(context.Context, subown.SubscriptionPlan) (string, bool, error) { return "sub_inc", true, nil },
 		startBus: func(context.Context) (net.Conn, error) { return client, nil },
 		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
 			return &protocol.HelloAck{
@@ -1420,10 +1273,10 @@ func TestRunRefinedChain_HelloRejectedOther_UsesGenericRejectionPath(t *testing.
 
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
-		plan: func(context.Context) (event.ReconcilePlan, error) {
-			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
 		},
-		apply:    func(context.Context, event.ReconcilePlan) (string, bool, error) { return "sub_enc", true, nil },
+		apply:    func(context.Context, subown.SubscriptionPlan) (string, bool, error) { return "sub_enc", true, nil },
 		startBus: func(context.Context) (net.Conn, error) { return client, nil },
 		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
 			return &protocol.HelloAck{

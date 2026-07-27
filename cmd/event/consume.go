@@ -24,6 +24,8 @@ import (
 	"github.com/larksuite/cli/internal/credential"
 	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/consume"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/transport"
 	"github.com/larksuite/cli/internal/output"
 	"github.com/larksuite/cli/internal/validate"
@@ -435,8 +437,8 @@ func eventKeyBaseRegistered(eventKey string) bool {
 // none of the preflight below has run yet at this point in runConsume (the
 // IsRefined check happens before keyDef/identity resolution) — so this
 // resolves the minimal additional values consume.RunRefined needs (identity,
-// an identity-bound SubscriptionClient, the local API client, domain, signal
-// handling) and drives the refined startup chain: ProbeBusEligibility ->
+// an identity-bound subscription Controller, the local API client, domain,
+// signal handling) and drives the refined startup chain: ProbeBusEligibility ->
 // PlanRemoteSubscription -> [--dry-run exit] -> ApplyRemoteSubscriptionPlan
 // (the ONLY remote write) -> StartOrConnectBus -> HelloV2.
 // It deliberately mirrors, rather than shares code with, the legacy
@@ -544,10 +546,11 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 	if err != nil {
 		return err
 	}
-	subClient, err := eventlib.NewSubscriptionClient(sdk, identity, uat)
+	gateway, err := larkgw.NewSubscriptionGateway(sdk, identity, uat)
 	if err != nil {
 		return err
 	}
+	controller := subown.NewController(gateway)
 
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
@@ -589,14 +592,14 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 		IsTTY:               f.IOStreams.IsTerminal,
 		DryRun:              o.dryRun,
 		Identity:            identity,
-		SubClient:           subClient,
+		Controller:          controller,
 		IncludeResourceData: o.includeResourceData,
 		Filter:              reqFilter,
 	})
 }
 
 // refinedEncryptKeyReadScopes is the scope required to fetch a
-// subscription's encrypt_key (eventlib.SubscriptionClient.GetEncryptKey) —
+// subscription's encrypt_key (the bus's Hello-time GetEncryptKey) —
 // mirrors cmd/event/subscription/subscription.go's own (unexported, and in
 // a different package) subscriptionEncryptKeyReadScopes; this package keeps
 // its own copy rather than reaching across a package boundary for one scope
@@ -647,9 +650,9 @@ func preflightEncryptKeyScope(ctx context.Context, f *cmdutil.Factory, appID str
 		WithHint("grant/re-authorize scope `event:encrypt_key:read` for identity %s, then retry `lark-cli event consume %s --include-resource-data=true --as %s`; this scope is required for resource data delivery", identity, materializedKey, identity)
 }
 
-// resolveIdentityUAT resolves the user access token SubscriptionClient needs
-// when identity is core.AsUser; for core.AsBot it returns "" without any
-// call at all — eventlib.NewSubscriptionClient ignores uat for a bot
+// resolveIdentityUAT resolves the user access token the subscription gateway
+// needs when identity is core.AsUser; for core.AsBot it returns "" without any
+// call at all — the gateway's identity binding ignores uat for a bot
 // identity (the SDK mints/caches its own tenant access token), mirroring
 // resolveTenantToken's error handling for the equivalent bot-token lookup.
 func resolveIdentityUAT(ctx context.Context, f *cmdutil.Factory, appID string, identity core.Identity) (string, error) {

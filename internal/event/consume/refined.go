@@ -17,35 +17,29 @@ import (
 	"sync/atomic"
 	"time"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/protocol"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/transport"
 )
 
-// subscriptionApplyAPI is ApplyRemoteSubscriptionPlan's seam: List (reused by
-// PlanRemoteSubscription via event.ReconcileExisting; SubscriptionLister),
-// Create (event.SubscriptionCreateAPI's write half), and Reactivate (the
-// suspended-plan write path). It embeds event.SubscriptionCreateAPI — the
-// ready-made seam exported for exactly this purpose (see
-// internal/event/reconcile.go's own doc comment) — rather than redeclaring
-// List+Create here. *event.SubscriptionClient satisfies this structurally
-// (Create/Get/List/Patch/Renew/Reactivate/Delete); no explicit "implements"
-// needed. Deliberately does NOT expose Delete: refined cleanup is nil
-// (a failure after Apply never auto-deletes the remote subscription),
-// so the type this whole chain is built against cannot even call Delete.
+// refinedSubscriptionController is the subset of *subown.Controller the refined
+// startup chain drives: Plan (the read-only Observe+classify PlanRemoteSubscription
+// runs, safe under --dry-run) and Apply (the single remote write —
+// Create/Reactivate/reuse). Declared as an interface so refined_test.go can drive
+// the chain with a fake (or a real Controller over a fake platform/lark gateway)
+// and no network.
 //
-// It also deliberately does NOT expose GetEncryptKey: the consume front-end
-// never fetches an encrypt_key. For an encrypted request it reconciles with
-// WithDeferredEncryptKeyConfirmation and lets the bus fetch and confirm the key
-// once at Hello time (internal/event/bus encryptKeyProvider.fetchAndSet) —
-// omitting the method here makes a front-end key fetch structurally impossible.
-type subscriptionApplyAPI interface {
-	event.SubscriptionCreateAPI
-	Reactivate(ctx context.Context, req *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error)
+// The consume front-end deliberately never fetches an encrypt_key itself: for an
+// encrypted request the ConsumeBootstrap policy reuses an active match WITHOUT a
+// front-end GetEncryptKey probe, and the bus fetches and confirms the key once at
+// Hello time (internal/event/bus encryptKeyProvider.fetchAndSet) — the
+// authoritative, fail-closed key gate.
+type refinedSubscriptionController interface {
+	Plan(ctx context.Context, policy subown.Policy, req subown.Request) (subown.SubscriptionPlan, error)
+	Apply(ctx context.Context, plan subown.SubscriptionPlan, policy subown.Policy, req subown.Request) (subown.ApplyReceipt, error)
 }
 
 // RefinedOptions holds RunRefined's own parameters — deliberately separate
@@ -98,10 +92,10 @@ type RefinedOptions struct {
 	// RunRefined never guesses or re-resolves it).
 	Identity core.Identity
 
-	// SubClient is the already-constructed, identity-bound remote
-	// subscription seam PlanRemoteSubscription/ApplyRemoteSubscriptionPlan
-	// call (List for Plan; Create/Reactivate for Apply).
-	SubClient subscriptionApplyAPI
+	// Controller is the already-constructed subscription Observe->Plan->Apply
+	// owner (built by the caller over the identity-bound platform/lark gateway).
+	// PlanRemoteSubscription calls Plan; ApplyRemoteSubscriptionPlan calls Apply.
+	Controller refinedSubscriptionController
 }
 
 // refinedDeps are RunRefined's injectable seams for the 5 ordered stages
@@ -112,8 +106,8 @@ type RefinedOptions struct {
 // closures directly.
 type refinedDeps struct {
 	probe    func(ctx context.Context) error
-	plan     func(ctx context.Context) (event.ReconcilePlan, error)
-	apply    func(ctx context.Context, plan event.ReconcilePlan) (remoteSubscriptionID string, createdByThisAttempt bool, err error)
+	plan     func(ctx context.Context) (subown.SubscriptionPlan, error)
+	apply    func(ctx context.Context, plan subown.SubscriptionPlan) (remoteSubscriptionID string, createdByThisAttempt bool, err error)
 	startBus func(ctx context.Context) (net.Conn, error)
 	hello    func(ctx context.Context, conn net.Conn, remoteSubscriptionID string) (*protocol.HelloAck, *bufio.Reader, error)
 }
@@ -143,38 +137,26 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 		probe: func(ctx context.Context) error {
 			return ProbeBusEligibility(ctx, tr, appID, opts.RemoteAPIClient, opts.ErrOut)
 		},
-		plan: func(ctx context.Context) (event.ReconcilePlan, error) {
-			// An encrypted request (IncludeResourceData=true) defers key
+		plan: func(ctx context.Context) (subown.SubscriptionPlan, error) {
+			// The ConsumeBootstrap policy encodes the consume-specific decisions:
+			// an encrypted request (IncludeResourceData=true) defers key
 			// confirmation to the bus Hello — the authoritative, fail-closed key
 			// gate — so an active include_resource_data=true match plans a reuse
-			// WITHOUT the consume front-end ever calling GetEncryptKey. (Unlike
-			// `event subscription create`, which classifies at Plan time because
-			// it has no later key gate.) The plaintext path passes no option and
-			// is byte-for-byte unchanged.
-			// The requested filter is compared against an existing active
-			// subscription's as a reuse dimension: a mismatch plans a conflict.
-			// Always supplied — an empty requested filter compares as "no
-			// filter", so an unfiltered consume against an unfiltered match
-			// still reuses.
-			reconcileOpts := []event.ReconcileOption{event.WithRequestedFilter(opts.Filter)}
-			if opts.IncludeResourceData {
-				reconcileOpts = append(reconcileOpts, event.WithDeferredEncryptKeyConfirmation())
-			}
-			plan, err := event.ReconcileExisting(ctx, opts.SubClient, eventType, targetResource, opts.Identity, opts.IncludeResourceData, reconcileOpts...)
-			if err != nil {
-				return event.ReconcilePlan{}, err
-			}
-			if plan.PaginationCapped {
-				errOut := opts.ErrOut
-				if errOut == nil {
-					errOut = os.Stderr //nolint:forbidigo // library-caller fallback, mirrors EnsureBus's own default
-				}
-				fmt.Fprintln(errOut, event.PaginationCappedWarning(eventType, targetResource))
-			}
-			return *plan, nil
+			// WITHOUT the consume front-end ever calling GetEncryptKey (unlike
+			// `event subscription create`'s ManagementCreate, which probes at Plan
+			// time because it has no later key gate); and a compatible suspended
+			// match plans a Reactivate rather than a Block. The requested filter is
+			// compared against an existing subscription's as a reuse dimension (an
+			// empty filter compares as "no filter", so an unfiltered consume against
+			// an unfiltered match still reuses).
+			return opts.Controller.Plan(ctx, subown.ConsumeBootstrap, refinedRequest(opts, eventType, targetResource))
 		},
-		apply: func(ctx context.Context, plan event.ReconcilePlan) (string, bool, error) {
-			return applyRemoteSubscriptionPlan(ctx, opts.SubClient, eventType, targetResource, plan, opts.IncludeResourceData, opts.Filter)
+		apply: func(ctx context.Context, plan subown.SubscriptionPlan) (string, bool, error) {
+			receipt, err := opts.Controller.Apply(ctx, plan, subown.ConsumeBootstrap, refinedRequest(opts, eventType, targetResource))
+			if err != nil {
+				return "", false, err
+			}
+			return receipt.RemoteID.String(), receipt.CreatedByAttempt, nil
 		},
 		startBus: func(ctx context.Context) (net.Conn, error) {
 			return EnsureBus(ctx, tr, appID, profileName, domain, opts.RemoteAPIClient, opts.ErrOut)
@@ -281,11 +263,17 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 		return nil
 	}
 
-	// A conflicting existing subscription is the one plan outcome Apply
-	// cannot safely resolve on its own (create/reuse/suspended all proceed
-	// below) — a real run fails closed instead of guessing.
-	if plan.Action == event.PlanActionConflict {
+	// Block (a configuration conflict) and Indeterminate (an inconclusive remote
+	// scan that hit the page cap) are the two plan outcomes Apply cannot safely
+	// resolve — create, reuse, and reactivate all proceed below. A real run fails
+	// closed instead of guessing. A compatible suspended match is never a Block
+	// under ConsumeBootstrap (it plans a Reactivate), so a Block here is always a
+	// configuration conflict.
+	switch plan.Action {
+	case subown.ActionBlock:
 		return refinedConflictError(resolved, opts.Identity, plan)
+	case subown.ActionIndeterminate:
+		return refinedIndeterminateError(resolved, opts.Identity)
 	}
 
 	// ---- 4. ApplyRemoteSubscriptionPlan (the ONLY remote write) ----
@@ -386,91 +374,23 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 	return consumeLoop(ctx, conn, br, resolved.Definition, consumeOpts, localSubscriptionID, &lastForKey, &emitted)
 }
 
-// applyRemoteSubscriptionPlan is the refined startup chain's ONLY remote
-// write: Create for a fresh plan, Reactivate for
-// a suspended match (auto-resumed — `event consume`'s job is to get the
-// caller listening, unlike `event subscription create`'s own stricter
-// suspended handling), a no-op reuse of the existing id for an
-// already-active compatible match. Never called for PlanActionConflict —
-// runRefinedChain returns a typed error before Apply in that case.
-func applyRemoteSubscriptionPlan(ctx context.Context, svc subscriptionApplyAPI, eventType, targetResource string, plan event.ReconcilePlan, includeResourceData bool, requestedFilter *event.Filter) (remoteSubscriptionID string, createdByThisAttempt bool, err error) {
-	switch plan.Action {
-	case event.PlanActionReuse:
-		return strVal(plan.Existing.SubscriptionId), false, nil
-
-	case event.PlanActionSuspended:
-		id := strVal(plan.Existing.SubscriptionId)
-		resp, err := svc.Reactivate(ctx, larkeventv1.NewReactivateSubscriptionReqBuilder().SubscriptionId(id).Build())
-		if err != nil {
-			return "", false, err
-		}
-		if resp != nil && resp.Data != nil && resp.Data.Subscription != nil && resp.Data.Subscription.SubscriptionId != nil {
-			return strVal(resp.Data.Subscription.SubscriptionId), false, nil
-		}
-		return id, false, nil
-
-	case event.PlanActionCreate:
-		// An encrypted request generates a fresh
-		// per-subscription encrypt_key via the OS CSPRNG and submits it
-		// ATOMICALLY in the same Create body as include_resource_data=true —
-		// fail-closed: a key-gen failure aborts the create, never falls back to
-		// a plaintext subscription. The key is used only to build this one body
-		// and is never logged, persisted, returned, or sent to the bus over IPC
-		// (the bus fetches its own copy via GetEncryptKey). The plaintext path
-		// (includeResourceData=false) generates no key — byte-for-byte the
-		// pre-existing behavior.
-		var encryptKey string
-		if includeResourceData {
-			encryptKey, err = newEncryptKeyFunc()
-			if err != nil {
-				return "", false, err
-			}
-		}
-		body := buildRefinedCreateBody(eventType, targetResource, includeResourceData, encryptKey, requestedFilter)
-		resp, err := svc.Create(ctx, larkeventv1.NewCreateSubscriptionReqBuilder().Body(body).Build())
-		if err != nil {
-			return "", false, err
-		}
-		if resp == nil || resp.Data == nil || resp.Data.Subscription == nil {
-			return "", false, errs.NewInternalError(errs.SubtypeInvalidResponse,
-				"subscription create reported success but returned no subscription data")
-		}
-		return strVal(resp.Data.Subscription.SubscriptionId), true, nil
-
-	default:
-		return "", false, errs.NewInternalError(errs.SubtypeUnknown,
-			"apply_remote_subscription_plan: unexpected reconcile plan action %q", plan.Action)
+// refinedRequest builds the subscription.Request for this refined consume from
+// its resolved coordinates and options. The Controller (ConsumeBootstrap policy)
+// turns it into the single remote write: Create for a fresh plan (generating a
+// fresh encrypt_key for an encrypted request and injecting it atomically —
+// fail-closed, never a plaintext fallback), Reactivate for a compatible suspended
+// match (auto-resumed, so `event consume` gets the caller listening), or a no-op
+// reuse of an existing compatible match. The generated key is never logged,
+// persisted, returned, or sent to the bus over IPC (the bus fetches its own copy
+// via GetEncryptKey at Hello time).
+func refinedRequest(opts RefinedOptions, eventType, targetResource string) subown.Request {
+	return subown.Request{
+		EventType:           eventType,
+		TargetResource:      targetResource,
+		Identity:            opts.Identity,
+		IncludeResourceData: opts.IncludeResourceData,
+		Filter:              opts.Filter,
 	}
-}
-
-// newEncryptKeyFunc is indirected (mirroring cmd/event/subscription/create.go's
-// own var of the same name) so a test can spy that it is called EXACTLY once
-// for an encrypted create and NEVER for a plaintext create / reuse / suspended
-// / dry-run. Production code must never reassign it outside tests.
-var newEncryptKeyFunc = event.NewEncryptKey
-
-// buildRefinedCreateBody constructs the Create body, always setting
-// include_resource_data and (when non-empty) the encrypt_key on the SAME
-// CreatePayloadOptions within the SAME body value — the atomicity is
-// structural here, exactly like cmd/event/subscription/create.go's
-// buildCreateSubscriptionBody. Split out so a test can assert the atomicity
-// directly against a plain, inspectable body value.
-func buildRefinedCreateBody(eventType, targetResource string, includeResourceData bool, encryptKey string, requestedFilter *event.Filter) *larkeventv1.CreateSubscriptionReqBody {
-	payloadOptions := larkeventv1.NewCreatePayloadOptionsBuilder().IncludeResourceData(includeResourceData)
-	if encryptKey != "" {
-		payloadOptions = payloadOptions.Encrypt(larkeventv1.NewPayloadOptionsEncryptBuilder().EncryptKey(encryptKey).Build())
-	}
-	builder := larkeventv1.NewCreateSubscriptionReqBodyBuilder().
-		EventType(eventType).
-		TargetResource(targetResource).
-		PayloadOptions(payloadOptions.Build())
-	// Send filter only when one was requested; omit the field entirely
-	// otherwise (an empty {"filter":{}} clear form is an update-only concept),
-	// mirroring cmd/event/subscription/create.go's buildCreateSubscriptionBody.
-	if !requestedFilter.IsEmpty() {
-		builder = builder.Filter(event.FilterToSDK(requestedFilter))
-	}
-	return builder.Build()
 }
 
 // refinedDecryptKeyUnavailableError turns the bus's decrypt_key_unavailable
@@ -523,13 +443,16 @@ func refinedIncompleteHelloError(resolved event.ResolvedEventKey, identity core.
 }
 
 // refinedConflictError mirrors cmd/event/subscription/create.go's own
-// conflictError for PlanActionConflict — the one ReconcilePlan outcome
+// conflictError for an ActionBlock plan — the configuration-conflict outcome
 // runRefinedChain always turns into a typed error on a real run (create,
-// reuse, and suspended all proceed to Apply instead).
-func refinedConflictError(resolved event.ResolvedEventKey, identity core.Identity, plan event.ReconcilePlan) error {
-	id := strVal(plan.Existing.SubscriptionId)
+// reuse, and reactivate all proceed to Apply instead).
+func refinedConflictError(resolved event.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) error {
+	id := ""
+	if plan.Before != nil {
+		id = plan.Before.ID.String()
+	}
 	hint := fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before consuming", id, identity, id)
-	if event.ConflictOnFilter(plan.ConflictFields) {
+	if subown.ConflictOnFilter(plan.ConflictFields) {
 		// A filter difference is resolvable in place — change it with `update`
 		// rather than deleting a possibly-shared subscription. Guide inspect ->
 		// preview -> apply -> re-run consume; the filter values are never named.
@@ -541,6 +464,18 @@ func refinedConflictError(resolved event.ResolvedEventKey, identity core.Identit
 		WithParam("event_key").
 		WithParams(plan.ConflictFields...).
 		WithHint("%s", hint)
+}
+
+// refinedIndeterminateError turns an ActionIndeterminate plan (the remote
+// subscription list scan hit its page cap without a definitive answer) into a
+// fail-closed typed error on a real run: bootstrapping a subscription now could
+// duplicate an existing one beyond the pages read, so the consumer is NOT started.
+func refinedIndeterminateError(resolved event.ResolvedEventKey, identity core.Identity) error {
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"cannot start consuming %s: could not determine whether a matching remote subscription already exists — the subscription list scan reached its %d-page cap before finding a match or exhausting all results",
+		resolved.MaterializedKey, event.MaxSubscriptionListPages).
+		WithParam("event_key").
+		WithHint("the consumer was NOT started. Run `lark-cli event subscription list --as %s --json` to inspect existing subscriptions (this is NOT confirmed absence, only \"no match within the pages read\"), then retry once you have confirmed none matches", identity)
 }
 
 // applyOkRecoveryHint builds the recovery guidance shared by EVERY
@@ -607,11 +542,11 @@ func applyOkRejectedError(resolved event.ResolvedEventKey, identity core.Identit
 // leaves stdout completely empty. Structured, no secrets: only the event
 // key/target resource/planned action/existing remote id, nothing UAT- or
 // token-shaped ever flows through this.
-func writeRefinedDryRunPreview(errOut io.Writer, resolved event.ResolvedEventKey, plan event.ReconcilePlan) {
+func writeRefinedDryRunPreview(errOut io.Writer, resolved event.ResolvedEventKey, plan subown.SubscriptionPlan) {
 	fmt.Fprintf(errOut, "[event] dry-run: event_key=%s target_resource=%s planned_action=%s",
 		resolved.MaterializedKey, resolved.TargetResource, plan.Action)
-	if plan.Existing != nil {
-		fmt.Fprintf(errOut, " remote_subscription_id=%s", strVal(plan.Existing.SubscriptionId))
+	if plan.Before != nil {
+		fmt.Fprintf(errOut, " remote_subscription_id=%s", plan.Before.ID.String())
 	}
 	fmt.Fprintln(errOut)
 	fmt.Fprintf(errOut, "[event] dry-run: next_action=run without --dry-run to apply this plan and start consuming %s\n", resolved.MaterializedKey)
@@ -687,16 +622,4 @@ func authorityTypeFor(identity core.Identity) string {
 		return "app"
 	}
 	return "user"
-}
-
-// strVal is a nil-safe *string dereference — this package's own tiny copy
-// (internal/event/reconcile.go and cmd/event/subscription/subscription.go
-// each already keep an independent one; internal/event/consume adding its
-// own follows the same established repo pattern rather than reaching across
-// a package boundary for a one-liner).
-func strVal(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }
