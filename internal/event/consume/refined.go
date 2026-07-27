@@ -298,14 +298,23 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 		// generic unactionable message.
 		return errApplyOkHelloFailed(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, err)
 	}
-	// An encrypted consumer whose Hello-time key fetch failed is rejected by
-	// the bus with a fixed decrypt_key_unavailable reason (the bus, not the
-	// consume side, owns the key fetch now). Surface it as a typed
-	// failed_precondition guiding the operator to fix scope/identity — NOT the
-	// single-consumer hint the generic rejection carries. The consumer was
-	// never registered on the bus, so there is nothing local to roll back.
-	if ack != nil && ack.Rejected && ack.RejectReason == protocol.RejectReasonDecryptKeyUnavailable {
-		return refinedDecryptKeyUnavailableError(resolved, opts.Identity, remoteSubscriptionID)
+	// The bus rejects a refined Hello with a fixed reason token for several
+	// distinct fail-closed conditions (it never reveals WHY beyond the token —
+	// no oracle). Each maps to its OWN typed error with actionable, fully-local
+	// guidance, instead of the generic rejectionError below whose hint
+	// ("EventKey allows only one consumer") would misrepresent an identity, key,
+	// or registration failure as a single-consumer conflict. The consumer never
+	// remains registered for any of these (each reject closes the connection,
+	// unwinding any registration), so there is nothing local to roll back.
+	if ack != nil && ack.Rejected {
+		switch ack.RejectReason {
+		case protocol.RejectReasonDecryptKeyUnavailable:
+			return refinedDecryptKeyUnavailableError(resolved, opts.Identity, remoteSubscriptionID)
+		case protocol.RejectReasonBindFailed:
+			return refinedBindFailedError(resolved, opts.Identity, remoteSubscriptionID)
+		case protocol.RejectReasonIncompleteRefinedHello:
+			return refinedIncompleteHelloError(resolved, opts.Identity, remoteSubscriptionID)
+		}
 	}
 	if rejErr := rejectionError(ack, resolved.MaterializedKey); rejErr != nil {
 		return applyOkRejectedError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, rejErr)
@@ -458,6 +467,37 @@ func refinedDecryptKeyUnavailableError(resolved event.ResolvedEventKey, identity
 		WithParam("--include-resource-data").
 		WithHint("the consumer was NOT started (no half-registered consumer remains). Ensure identity %s holds scope `event:encrypt_key:read` and is the owner of remote_subscription_id=%s (switch --as/--profile if this identity is not the owner), then retry `lark-cli event consume %s --as %s`; or delete and recreate the subscription after human confirmation",
 			identity, remoteSubscriptionID, resolved.MaterializedKey, identity)
+}
+
+// refinedBindFailedError turns the bus's identity_bind_failed Hello rejection
+// into a typed error. The bus binds a WS-ready user consumer to its
+// subscription at Hello time under the owner==current gate; when that bind
+// fails — the active profile/user is no longer the subscription owner, its user
+// access token could not be minted, or the BindUser call failed — the bus
+// rejects and closes the connection (unwinding any registration) so the
+// consumer never readies. The bus returns only the fixed reason token (no
+// oracle for which check failed), so this guidance is fully local.
+func refinedBindFailedError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string) error {
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"cannot start consuming %s: the event bus could not bind this subscription to identity %s (identity_bind_failed)",
+		resolved.MaterializedKey, identity).
+		WithParam("--as").
+		WithHint("the consumer was NOT started. Confirm the active profile/user is the owner of remote_subscription_id=%s (switch --as/--profile if it is not) and that its user access token is still valid (re-run `lark-cli auth login` to re-authorize if needed), then retry `lark-cli event consume %s --as %s` (the remote subscription was left as-is; retrying reconciles/reuses it)",
+			remoteSubscriptionID, resolved.MaterializedKey, identity)
+}
+
+// refinedIncompleteHelloError turns the bus's incomplete_refined_hello Hello
+// rejection into a typed error. The bus rejects — before registering the
+// consumer — a refined Hello that carries a remote_subscription_id but no
+// target_resource. A refined consumer always resolves a target_resource from
+// its key, so this signals an internal inconsistency rather than an
+// operator-fixable condition.
+func refinedIncompleteHelloError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string) error {
+	return errs.NewInternalError(errs.SubtypeUnknown,
+		"cannot start consuming %s: the event bus rejected the registration as incomplete (incomplete_refined_hello) — the refined Hello for remote_subscription_id=%s carried no target_resource",
+		resolved.MaterializedKey, remoteSubscriptionID).
+		WithHint("the consumer was NOT started. This is an internal inconsistency (a refined consumer should always resolve a target_resource); please retry `lark-cli event consume %s --as %s`, and report it if it persists",
+			resolved.MaterializedKey, identity)
 }
 
 // refinedConflictError mirrors cmd/event/subscription/create.go's own

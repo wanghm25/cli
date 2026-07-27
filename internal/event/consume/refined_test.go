@@ -1200,6 +1200,99 @@ func TestRunRefinedChain_HelloRejectedDecryptKeyUnavailable_TypedError_NotReady(
 	}
 }
 
+// An identity_bind_failed rejection becomes a failed_precondition guiding the
+// operator to check profile/user and re-authorize — never the single-consumer
+// hint — and the consumer never readies.
+func TestRunRefinedChain_HelloRejectedBindFailed_TypedError_NotReady(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	var stderr bytes.Buffer
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		},
+		apply:    func(context.Context, event.ReconcilePlan) (string, bool, error) { return "sub_bind", true, nil },
+		startBus: func(context.Context) (net.Conn, error) { return client, nil },
+		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
+			return &protocol.HelloAck{
+				Type:         protocol.MsgTypeHelloAck,
+				Rejected:     true,
+				RejectReason: protocol.RejectReasonBindFailed,
+			}, bufio.NewReader(conn), nil
+		},
+	}
+	opts := RefinedOptions{Quiet: false, ErrOut: &stderr, Out: io.Discard, Identity: core.AsUser}
+
+	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
+	if err == nil {
+		t.Fatal("expected an identity_bind_failed rejection error, got nil")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) || ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Fatalf("expected a failed_precondition, got %T: %v", err, err)
+	}
+	if !strings.Contains(ve.Error(), "identity_bind_failed") {
+		t.Errorf("error must be classified identity_bind_failed, got: %v", ve.Error())
+	}
+	if !strings.Contains(ve.Hint, "profile") || !strings.Contains(ve.Hint, "auth login") {
+		t.Errorf("hint must guide the operator to check profile/user and re-authorize, got: %v", ve.Hint)
+	}
+	if strings.Contains(ve.Hint, "only one consumer") {
+		t.Errorf("an identity_bind_failed rejection must NOT reuse the single-consumer hint, got: %v", ve.Hint)
+	}
+	if strings.Contains(stderr.String(), "ready") {
+		t.Errorf("consumer must NOT emit the ready marker on an identity_bind_failed rejection; stderr:\n%s", stderr.String())
+	}
+}
+
+// An incomplete_refined_hello rejection becomes a typed internal error (a
+// refined consumer always resolves a target_resource, so an empty one is an
+// internal inconsistency) — never the single-consumer hint — and never readies.
+func TestRunRefinedChain_HelloRejectedIncompleteRefinedHello_TypedError_NotReady(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	var stderr bytes.Buffer
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (event.ReconcilePlan, error) {
+			return event.ReconcilePlan{Action: event.PlanActionCreate}, nil
+		},
+		apply:    func(context.Context, event.ReconcilePlan) (string, bool, error) { return "sub_inc", true, nil },
+		startBus: func(context.Context) (net.Conn, error) { return client, nil },
+		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
+			return &protocol.HelloAck{
+				Type:         protocol.MsgTypeHelloAck,
+				Rejected:     true,
+				RejectReason: protocol.RejectReasonIncompleteRefinedHello,
+			}, bufio.NewReader(conn), nil
+		},
+	}
+	opts := RefinedOptions{Quiet: false, ErrOut: &stderr, Out: io.Discard, Identity: core.AsUser}
+
+	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
+	if err == nil {
+		t.Fatal("expected an incomplete_refined_hello rejection error, got nil")
+	}
+	var ie *errs.InternalError
+	if !errors.As(err, &ie) {
+		t.Fatalf("expected an internal error, got %T: %v", err, err)
+	}
+	if !strings.Contains(ie.Error(), "incomplete_refined_hello") {
+		t.Errorf("error must be classified incomplete_refined_hello, got: %v", ie.Error())
+	}
+	if strings.Contains(ie.Hint, "only one consumer") {
+		t.Errorf("an incomplete_refined_hello rejection must NOT reuse the single-consumer hint, got: %v", ie.Hint)
+	}
+	if strings.Contains(stderr.String(), "ready") {
+		t.Errorf("consumer must NOT emit the ready marker on an incomplete_refined_hello rejection; stderr:\n%s", stderr.String())
+	}
+}
+
 // A NON-decrypt rejection (e.g. a SingleConsumer conflict) still flows through
 // the generic rejection path with its own recovery hint — a regression guard
 // that the decrypt-specific branch didn't swallow every rejection.
