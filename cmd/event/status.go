@@ -14,14 +14,12 @@ import (
 
 	"github.com/spf13/cobra"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
-	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/busctl"
 	"github.com/larksuite/cli/internal/event/busdiscover"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
 	"github.com/larksuite/cli/internal/event/transport"
 	"github.com/larksuite/cli/internal/output"
@@ -380,24 +378,24 @@ func staleIdentityAdvisory(match, applicable bool) string {
 
 // --- weak remote supplement (read-only) ---
 
-// refinedSubscriptionGetter narrows *eventlib.SubscriptionClient to the two
-// calls the remote supplement needs. Tests substitute a fake with no
-// *lark.Client or network call involved. List is included so the supplement can
-// switch from one Get per id to a paginated List scan when many distinct
-// remote_subscription_ids are present.
+// refinedSubscriptionGetter narrows the platform/lark SubscriptionGateway to the
+// two calls the remote supplement needs. Tests substitute a fake with no
+// *lark.Client or network call involved. WalkSubscriptions is included so the
+// supplement can switch from one Get per id to a single bounded List scan when
+// many distinct remote_subscription_ids are present.
 type refinedSubscriptionGetter interface {
-	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
-	List(ctx context.Context, req *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
+	WalkSubscriptions(ctx context.Context, params larkgw.ListParams, visit func(larkgw.RemoteSubscription) bool) (bool, error)
 }
 
 // remoteSupplementListThreshold is supplementRefinedConsumers's dedup/List
 // switchover point: at or below this many distinct remote_subscription_ids,
 // one Get per id stays targeted; above it, a paginated List scan (see
 // listRemoteSupplementDetails) is cheaper than that many individual Gets.
-// This is still a weak, best-effort supplement — List takes no id filter, so
-// it pages (bounded by eventlib.MaxSubscriptionListPages) collecting only the
-// wanted ids it encounters; any wanted id not found within the pages actually
-// read simply stays local-only, same as an unreachable/errored Get would.
+// This is still a weak, best-effort supplement — the scan takes no id filter, so
+// the gateway pages (bounded) collecting only the wanted ids it encounters; any
+// wanted id not found within the pages actually read simply stays local-only,
+// same as an unreachable/errored Get would.
 const remoteSupplementListThreshold = 5
 
 // requiredRemoteSupplementScopes is the single scope status's weak remote
@@ -476,7 +474,7 @@ func resolveRemoteSupplementGetter(ctx context.Context, cmd *cobra.Command, f *c
 	if err != nil || sdk == nil {
 		return nil
 	}
-	client, err := eventlib.NewSubscriptionClient(sdk, as, uat)
+	client, err := larkgw.NewSubscriptionGateway(sdk, as, uat)
 	if err != nil {
 		return nil
 	}
@@ -559,7 +557,7 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 		return false
 	}
 
-	var details map[string]*larkeventv1.SubscriptionDetail
+	var details map[string]larkgw.RemoteSubscription
 	if len(byID) > remoteSupplementListThreshold {
 		details, capped = listRemoteSupplementDetails(ctx, getter, byID)
 	} else {
@@ -581,57 +579,45 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 }
 
 // getRemoteSupplementDetails fetches each of wantIDs' remote Subscription
-// snapshots via ONE Get per distinct id: at most len(wantIDs) calls, never one
-// per consumer. An error or empty/malformed response for one id simply omits it
-// from the returned map — the caller treats a missing entry as "stays
+// snapshots via ONE gateway Get per distinct id: at most len(wantIDs) calls,
+// never one per consumer. An error (transport, business, or the gateway's own
+// required-field validation of a malformed/empty response) for one id simply
+// omits it from the returned map — the caller treats a missing entry as "stays
 // local-only", never a failure.
-func getRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) map[string]*larkeventv1.SubscriptionDetail {
-	out := make(map[string]*larkeventv1.SubscriptionDetail, len(wantIDs))
+func getRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) map[string]larkgw.RemoteSubscription {
+	out := make(map[string]larkgw.RemoteSubscription, len(wantIDs))
 	for id := range wantIDs {
-		req := larkeventv1.NewGetSubscriptionReqBuilder().SubscriptionId(id).Build()
-		resp, err := getter.Get(ctx, req)
-		if err != nil || resp == nil || resp.Data == nil || resp.Data.Subscription == nil {
+		sub, err := getter.Get(ctx, id)
+		if err != nil || sub == nil {
 			continue
 		}
-		out[id] = resp.Data.Subscription
+		out[id] = *sub
 	}
 	return out
 }
 
-// listRemoteSupplementDetails fetches wantIDs' remote Subscription snapshots
-// by paginating List (via eventlib.WalkSubscriptionPages, bounded by
-// eventlib.MaxSubscriptionListPages) — cheaper than individual Gets once
-// there are more than remoteSupplementListThreshold distinct ids. List takes
-// no id filter (only state/target_resource/event_type), so this pages
-// through an unfiltered scan, stopping as soon as every wanted id has been
-// found, a page reports has_more=false, or the cap is reached.
+// listRemoteSupplementDetails fetches wantIDs' remote Subscription snapshots via
+// the gateway's bounded WalkSubscriptions (an unfiltered scan) — cheaper than
+// individual Gets once there are more than remoteSupplementListThreshold
+// distinct ids. It stops as soon as every wanted id has been found; the gateway
+// bounds the scan (page cap) and reports capped.
 //
-// This is still a weak, best-effort supplement, not a completeness
-// guarantee: any wanted id not found within the pages actually read simply
-// stays local-only in the returned map, same as an unreachable/errored Get.
-// capped=true means the cap was reached before every wanted id was
-// accounted for — that is NOT proof the missing ids don't exist, only that
-// they weren't found within the pages read, and the caller must log it
-// rather than silently degrade as if it were a confirmed negative.
-func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) (out map[string]*larkeventv1.SubscriptionDetail, capped bool) {
-	out = make(map[string]*larkeventv1.SubscriptionDetail, len(wantIDs))
+// This is still a weak, best-effort supplement, not a completeness guarantee:
+// any wanted id not found within the pages actually read simply stays local-only
+// in the returned map, same as an unreachable/errored Get. capped=true means the
+// scan cap was reached before every wanted id was accounted for — that is NOT
+// proof the missing ids don't exist, only that they weren't found within the
+// pages read, and the caller must log it rather than silently degrade as if it
+// were a confirmed negative.
+func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) (out map[string]larkgw.RemoteSubscription, capped bool) {
+	out = make(map[string]larkgw.RemoteSubscription, len(wantIDs))
 	remaining := len(wantIDs)
 
-	buildReq := func(pageToken string) *larkeventv1.ListSubscriptionReq {
-		b := larkeventv1.NewListSubscriptionReqBuilder()
-		if pageToken != "" {
-			b = b.PageToken(pageToken)
-		}
-		return b.Build()
-	}
-
-	capped, err := eventlib.WalkSubscriptionPages(ctx, getter, buildReq, func(item *larkeventv1.SubscriptionDetail) bool {
-		if item.SubscriptionId != nil {
-			if id := *item.SubscriptionId; wantIDs[id] != nil {
-				if _, already := out[id]; !already {
-					out[id] = item
-					remaining--
-				}
+	capped, err := getter.WalkSubscriptions(ctx, larkgw.ListParams{}, func(sub larkgw.RemoteSubscription) bool {
+		if id := sub.ID.String(); id != "" && wantIDs[id] != nil {
+			if _, already := out[id]; !already {
+				out[id] = sub
+				remaining--
 			}
 		}
 		return remaining > 0 // stop early once every wanted id has been found
@@ -642,32 +628,26 @@ func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscription
 	return out, capped
 }
 
-// mapRemoteSubscriptionInfo maps one SDK SubscriptionDetail into the
+// mapRemoteSubscriptionInfo maps one domain RemoteSubscription into the
 // CLI-facing wire shape — shared by both the Get and the List path so they
-// build this identically (extracted from the old inline per-consumer
-// mapping).
-func mapRemoteSubscriptionInfo(d *larkeventv1.SubscriptionDetail) *protocol.RemoteSubscriptionInfo {
-	info := &protocol.RemoteSubscriptionInfo{}
-	if d.State != nil {
-		info.State = *d.State
+// build this identically.
+func mapRemoteSubscriptionInfo(sub larkgw.RemoteSubscription) *protocol.RemoteSubscriptionInfo {
+	info := &protocol.RemoteSubscriptionInfo{State: sub.State}
+	if sub.ExpireTime != nil {
+		info.ExpireTime = int64(*sub.ExpireTime)
 	}
-	if d.ExpireTime != nil {
-		info.ExpireTime = int64(*d.ExpireTime)
+	if sub.IncludeResourceData != nil {
+		info.IncludeResourceData = *sub.IncludeResourceData
 	}
-	if d.PayloadOptions != nil && d.PayloadOptions.IncludeResourceData != nil {
-		info.IncludeResourceData = *d.PayloadOptions.IncludeResourceData
-	}
-	if d.Suspension != nil && d.Suspension.Code != nil {
-		// Captured verbatim from the response already fetched above — NOT a
-		// new remote call. Feeds the degraded advisory (remoteDegradedAdvisory
-		// below); this function itself does no interpretation, only mapping.
-		info.SuspensionCode = *d.Suspension.Code
-	}
+	// Captured verbatim from the snapshot already fetched above — NOT a new
+	// remote call. Feeds the degraded advisory (remoteDegradedAdvisory below);
+	// empty when the subscription is not suspended.
+	info.SuspensionCode = sub.SuspensionReason
 	// Surface the remote server-side filter (canonical JSON) only when present;
 	// an unfiltered subscription leaves it omitted. Same already-fetched
-	// response — no new remote call.
-	if remoteFilter := eventlib.FilterFromSDK(d.Filter); !remoteFilter.IsEmpty() {
-		if canonical, err := remoteFilter.Canonicalize(); err == nil {
+	// snapshot — no new remote call.
+	if !sub.Filter.IsEmpty() {
+		if canonical, err := sub.Filter.Canonicalize(); err == nil {
 			info.Filter = canonical
 		}
 	}

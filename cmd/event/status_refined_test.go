@@ -14,7 +14,6 @@ import (
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 	"github.com/spf13/cobra"
 
@@ -22,43 +21,47 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	eventlib "github.com/larksuite/cli/internal/event"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
-// fakeRefinedGetter is a network-free stand-in for
-// *eventlib.SubscriptionClient's Get/List methods (the refinedSubscriptionGetter
-// test seam) — mirrors cmd/event/subscription/get_test.go's fakeGetAPI.
+// fakeRefinedGetter is a network-free stand-in for the platform/lark gateway's
+// Get + WalkSubscriptions (the refinedSubscriptionGetter test seam). The gateway
+// already unwraps/validates/projects and owns the bounded pagination, so this
+// fake just hands back a domain RemoteSubscription (Get) or replays a fixed set
+// of items through visit (WalkSubscriptions). The scan's own page bound / cap /
+// early-stop mechanics are covered at the gateway (platform/lark's
+// TestGateway_WalkSubscriptions_*); here the fake reports capped directly so the
+// supplement's dedup/threshold/fan-out/degrade logic is exercised in isolation.
 type fakeRefinedGetter struct {
-	resp  *larkeventv1.GetSubscriptionResp
+	sub   *larkgw.RemoteSubscription
 	err   error
 	calls int
 
-	// List seam (issue #8): a separate resp/err/call-counter pair so a test
-	// can assert dedup/threshold behavior (Get vs List call counts)
-	// independently.
-	listResp  *larkeventv1.ListSubscriptionResp
-	listErr   error
-	listCalls int
-
-	// listPageAt, when non-nil, overrides listResp/listErr and returns the
-	// page for the given 0-indexed call number — used to test
-	// listRemoteSupplementDetails's pagination (a fixed listResp can only
-	// ever serve one page).
-	listPageAt func(call int) *larkeventv1.ListSubscriptionResp
+	// walk seam: the items the scan yields, whether it reports capped, and any
+	// error — plus a call counter so a test can assert the Get-vs-scan switch.
+	walkItems  []larkgw.RemoteSubscription
+	walkCapped bool
+	walkErr    error
+	walkCalls  int
 }
 
-func (f *fakeRefinedGetter) Get(_ context.Context, _ *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error) {
+func (f *fakeRefinedGetter) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
 	f.calls++
-	return f.resp, f.err
+	return f.sub, f.err
 }
 
-func (f *fakeRefinedGetter) List(_ context.Context, _ *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
-	call := f.listCalls
-	f.listCalls++
-	if f.listPageAt != nil {
-		return f.listPageAt(call), f.listErr
+func (f *fakeRefinedGetter) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, visit func(larkgw.RemoteSubscription) bool) (bool, error) {
+	f.walkCalls++
+	if f.walkErr != nil {
+		return false, f.walkErr
 	}
-	return f.listResp, f.listErr
+	for _, s := range f.walkItems {
+		if !visit(s) {
+			return false, nil // caller found everything it needed
+		}
+	}
+	return f.walkCapped, nil
 }
 
 func strPtr(s string) *string { return &s }
@@ -66,18 +69,21 @@ func boolPtr(b bool) *bool    { return &b }
 
 var errBoom = errors.New("boom: unreachable")
 
-func okGetSubscriptionResp(state string, expireTime int, includeResourceData bool) *larkeventv1.GetSubscriptionResp {
-	return &larkeventv1.GetSubscriptionResp{
-		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
-		Data: &larkeventv1.GetSubscriptionRespData{
-			Subscription: &larkeventv1.SubscriptionDetail{
-				State:          &state,
-				ExpireTime:     &expireTime,
-				PayloadOptions: &larkeventv1.PayloadOptions{IncludeResourceData: &includeResourceData},
-			},
-		},
-	}
+// remoteSub / subRef build the domain fixtures the migrated supplement fakes
+// hand back, projected exactly as the gateway would from an SDK detail.
+func remoteSub(state string, expireTime int, includeResourceData bool) larkgw.RemoteSubscription {
+	return larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{
+		State:          &state,
+		ExpireTime:     &expireTime,
+		PayloadOptions: &larkeventv1.PayloadOptions{IncludeResourceData: &includeResourceData},
+	})
 }
+
+func remoteSubID(id, state string) larkgw.RemoteSubscription {
+	return larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{SubscriptionId: &id, State: &state})
+}
+
+func subRef(s larkgw.RemoteSubscription) *larkgw.RemoteSubscription { return &s }
 
 // --- local current_profile_match (no scope, always available) ---
 //
@@ -272,7 +278,7 @@ func TestMapRemoteSubscriptionInfo_WithFilter_SurfacesCanonicalJSON(t *testing.T
 	if err != nil {
 		t.Fatalf("build filter: %v", err)
 	}
-	info := mapRemoteSubscriptionInfo(&larkeventv1.SubscriptionDetail{State: strPtr("enabled"), Filter: eventlib.FilterToSDK(f)})
+	info := mapRemoteSubscriptionInfo(larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{State: strPtr("enabled"), Filter: eventlib.FilterToSDK(f)}))
 	if len(info.Filter) == 0 {
 		t.Fatal("info.Filter empty, want canonical JSON")
 	}
@@ -286,7 +292,7 @@ func TestMapRemoteSubscriptionInfo_WithFilter_SurfacesCanonicalJSON(t *testing.T
 }
 
 func TestMapRemoteSubscriptionInfo_NoFilter_OmitsFilter(t *testing.T) {
-	info := mapRemoteSubscriptionInfo(&larkeventv1.SubscriptionDetail{State: strPtr("enabled")})
+	info := mapRemoteSubscriptionInfo(larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{State: strPtr("enabled")}))
 	if info.Filter != nil {
 		t.Errorf("info.Filter = %s, want nil/omitted when the SDK omitted it", info.Filter)
 	}
@@ -499,7 +505,7 @@ func TestWriteStatusJSON_LegacyConsumer_OmitsCurrentProfileMatchKey(t *testing.T
 
 func TestSupplementRefinedConsumers_FillsRemoteSubscriptionOnSuccess(t *testing.T) {
 	consumers := []protocol.ConsumerInfo{refinedConsumer()}
-	getter := &fakeRefinedGetter{resp: okGetSubscriptionResp("enabled", 1732000000, true)}
+	getter := &fakeRefinedGetter{sub: subRef(remoteSub("enabled", 1732000000, true))}
 
 	supplementRefinedConsumers(context.Background(), getter, consumers)
 
@@ -519,7 +525,7 @@ func TestSupplementRefinedConsumers_FillsRemoteSubscriptionOnSuccess(t *testing.
 
 func TestSupplementRefinedConsumers_SkipsLegacyConsumers(t *testing.T) {
 	consumers := []protocol.ConsumerInfo{{PID: 1, EventKey: "mail.x"}} // RemoteSubscriptionID == ""
-	getter := &fakeRefinedGetter{resp: okGetSubscriptionResp("enabled", 0, false)}
+	getter := &fakeRefinedGetter{sub: subRef(remoteSub("enabled", 0, false))}
 
 	supplementRefinedConsumers(context.Background(), getter, consumers)
 
@@ -565,7 +571,7 @@ func TestSupplementRefinedConsumers_DedupsSharedRemoteSubscriptionID(t *testing.
 	c2 := refinedConsumer()
 	c2.PID = 456 // a second, DIFFERENT consumer bound to the SAME remote_subscription_id
 	consumers := []protocol.ConsumerInfo{c1, c2}
-	getter := &fakeRefinedGetter{resp: okGetSubscriptionResp("active", 42, false)}
+	getter := &fakeRefinedGetter{sub: subRef(remoteSub("active", 42, false))}
 
 	supplementRefinedConsumers(context.Background(), getter, consumers)
 
@@ -579,37 +585,30 @@ func TestSupplementRefinedConsumers_DedupsSharedRemoteSubscriptionID(t *testing.
 	}
 }
 
-// TestSupplementRefinedConsumers_ManyDistinctIDs_UsesListNotManyGets locks
+// TestSupplementRefinedConsumers_ManyDistinctIDs_UsesScanNotManyGets locks
 // the threshold fix: more than remoteSupplementListThreshold DISTINCT
-// remote_subscription_ids must use ONE List call instead of one Get per id.
-func TestSupplementRefinedConsumers_ManyDistinctIDs_UsesListNotManyGets(t *testing.T) {
+// remote_subscription_ids must use ONE bounded scan (WalkSubscriptions) instead
+// of one Get per id.
+func TestSupplementRefinedConsumers_ManyDistinctIDs_UsesScanNotManyGets(t *testing.T) {
 	n := remoteSupplementListThreshold + 1
 	consumers := make([]protocol.ConsumerInfo, 0, n)
-	items := make([]*larkeventv1.SubscriptionDetail, 0, n)
+	items := make([]larkgw.RemoteSubscription, 0, n)
 	for i := 0; i < n; i++ {
 		c := refinedConsumer()
 		c.PID = 100 + i
 		c.RemoteSubscriptionID = fmt.Sprintf("sub_%d", i)
 		consumers = append(consumers, c)
-
-		state := "active"
-		id := c.RemoteSubscriptionID
-		items = append(items, &larkeventv1.SubscriptionDetail{SubscriptionId: &id, State: &state})
+		items = append(items, remoteSubID(c.RemoteSubscriptionID, "active"))
 	}
-	getter := &fakeRefinedGetter{
-		listResp: &larkeventv1.ListSubscriptionResp{
-			ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
-			Data:    &larkeventv1.ListSubscriptionRespData{Items: items},
-		},
-	}
+	getter := &fakeRefinedGetter{walkItems: items}
 
 	supplementRefinedConsumers(context.Background(), getter, consumers)
 
-	if getter.listCalls != 1 {
-		t.Errorf("List called %d times, want 1", getter.listCalls)
+	if getter.walkCalls != 1 {
+		t.Errorf("scan called %d times, want 1", getter.walkCalls)
 	}
 	if getter.calls != 0 {
-		t.Errorf("Get called %d times, want 0 (List substitutes for per-id Get above the threshold)", getter.calls)
+		t.Errorf("Get called %d times, want 0 (the scan substitutes for per-id Get above the threshold)", getter.calls)
 	}
 	for i, c := range consumers {
 		if c.RemoteState != "active" {
@@ -630,22 +629,22 @@ func TestSupplementRefinedConsumers_AtThreshold_StillUsesGet(t *testing.T) {
 		c.RemoteSubscriptionID = fmt.Sprintf("sub_%d", i)
 		consumers = append(consumers, c)
 	}
-	getter := &fakeRefinedGetter{resp: okGetSubscriptionResp("active", 0, false)}
+	getter := &fakeRefinedGetter{sub: subRef(remoteSub("active", 0, false))}
 
 	supplementRefinedConsumers(context.Background(), getter, consumers)
 
 	if getter.calls != n {
 		t.Errorf("Get called %d times, want %d (one per distinct id, at the threshold)", getter.calls, n)
 	}
-	if getter.listCalls != 0 {
-		t.Errorf("List called %d times, want 0 (threshold not yet exceeded)", getter.listCalls)
+	if getter.walkCalls != 0 {
+		t.Errorf("scan called %d times, want 0 (threshold not yet exceeded)", getter.walkCalls)
 	}
 }
 
-// TestSupplementRefinedConsumers_ListMissingID_StaysLocalOnly: an id NOT
-// present in the List response's one page stays local-only, same
-// "unreachable -> local-only, no fail" contract as an errored/empty Get.
-func TestSupplementRefinedConsumers_ListMissingID_StaysLocalOnly(t *testing.T) {
+// TestSupplementRefinedConsumers_ScanMissingID_StaysLocalOnly: an id the scan
+// never yields stays local-only, same "unreachable -> local-only, no fail"
+// contract as an errored/empty Get.
+func TestSupplementRefinedConsumers_ScanMissingID_StaysLocalOnly(t *testing.T) {
 	n := remoteSupplementListThreshold + 1
 	consumers := make([]protocol.ConsumerInfo, 0, n)
 	for i := 0; i < n; i++ {
@@ -654,81 +653,60 @@ func TestSupplementRefinedConsumers_ListMissingID_StaysLocalOnly(t *testing.T) {
 		c.RemoteSubscriptionID = fmt.Sprintf("sub_missing_%d", i)
 		consumers = append(consumers, c)
 	}
-	// List succeeds but returns no items at all -> every id is "not found".
-	getter := &fakeRefinedGetter{listResp: &larkeventv1.ListSubscriptionResp{
-		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
-		Data:    &larkeventv1.ListSubscriptionRespData{},
-	}}
+	// The scan yields no items at all -> every id is "not found".
+	getter := &fakeRefinedGetter{}
 
 	supplementRefinedConsumers(context.Background(), getter, consumers)
 
 	for i, c := range consumers {
 		if c.RemoteSubscription != nil || c.RemoteState != "" {
-			t.Errorf("consumers[%d] must stay local-only when its id isn't in the List page: %+v", i, c)
+			t.Errorf("consumers[%d] must stay local-only when its id isn't in the scan: %+v", i, c)
 		}
 	}
 }
 
-// --- issue #25b: List above the threshold now paginates (bounded), never
-// misreading a still-unread later page as "these ids don't exist" ---
-
-// TestSupplementRefinedConsumers_TargetIDOnSecondPage_Supplemented locks the
-// core fix: a wanted remote_subscription_id that only appears on page 2 must
-// still be supplemented — never left local-only just because page 1 alone
-// didn't carry it.
-func TestSupplementRefinedConsumers_TargetIDOnSecondPage_Supplemented(t *testing.T) {
+// TestSupplementRefinedConsumers_ScanYieldsAllWantedIDs_Supplemented locks that
+// every wanted remote_subscription_id the bounded scan yields is supplemented
+// via a single scan. The scan's own multi-page mechanics (a wanted id first
+// appearing on a later page, the page cap) are the gateway's concern and are
+// covered by platform/lark's TestGateway_WalkSubscriptions_*; here the seam
+// hands back the found items directly.
+func TestSupplementRefinedConsumers_ScanYieldsAllWantedIDs_Supplemented(t *testing.T) {
 	n := remoteSupplementListThreshold + 1
 	consumers := make([]protocol.ConsumerInfo, 0, n)
+	items := make([]larkgw.RemoteSubscription, 0, n)
 	for i := 0; i < n; i++ {
 		c := refinedConsumer()
 		c.PID = 100 + i
 		c.RemoteSubscriptionID = fmt.Sprintf("sub_%d", i)
 		consumers = append(consumers, c)
+		items = append(items, remoteSubID(c.RemoteSubscriptionID, "active"))
 	}
-	// Every id except the last one shows up on page 1; the last one only
-	// appears on page 2.
-	page1Items := make([]*larkeventv1.SubscriptionDetail, 0, n-1)
-	for i := 0; i < n-1; i++ {
-		id, state := fmt.Sprintf("sub_%d", i), "active"
-		page1Items = append(page1Items, &larkeventv1.SubscriptionDetail{SubscriptionId: &id, State: &state})
-	}
-	lastID, lastState := fmt.Sprintf("sub_%d", n-1), "active"
-	page2Items := []*larkeventv1.SubscriptionDetail{{SubscriptionId: &lastID, State: &lastState}}
-
-	getter := &fakeRefinedGetter{listPageAt: func(call int) *larkeventv1.ListSubscriptionResp {
-		if call == 0 {
-			return &larkeventv1.ListSubscriptionResp{Data: &larkeventv1.ListSubscriptionRespData{
-				Items: page1Items, HasMore: boolPtr(true), PageToken: strPtr("p2"),
-			}}
-		}
-		return &larkeventv1.ListSubscriptionResp{Data: &larkeventv1.ListSubscriptionRespData{
-			Items: page2Items, HasMore: boolPtr(false),
-		}}
-	}}
+	getter := &fakeRefinedGetter{walkItems: items}
 
 	capped := supplementRefinedConsumers(context.Background(), getter, consumers)
 
 	if capped {
-		t.Error("capped = true, want false (every wanted id was found before any cap)")
+		t.Error("capped = true, want false (every wanted id was found)")
 	}
 	for i, c := range consumers {
 		if c.RemoteState != "active" {
 			t.Errorf("consumers[%d].RemoteState = %q, want active (id=%s)", i, c.RemoteState, c.RemoteSubscriptionID)
 		}
 	}
-	if getter.listCalls != 2 {
-		t.Errorf("List called %d times, want exactly 2", getter.listCalls)
+	if getter.walkCalls != 1 {
+		t.Errorf("scan called %d times, want exactly 1", getter.walkCalls)
 	}
 }
 
-// TestSupplementRefinedConsumers_PageCapReached_DegradesGracefully_NotFalseNotExist
-// locks the "incomplete pagination must never be read as not-exist"
-// principle: when every page reports has_more=true and none of the wanted
-// ids ever turn up, the scan hits the page cap and every consumer stays
-// local-only (the SAME degrade an unreachable Get already produces) — capped
-// must be true so the caller logs it, rather than the supplement silently
-// asserting these subscriptions don't exist.
-func TestSupplementRefinedConsumers_PageCapReached_DegradesGracefully_NotFalseNotExist(t *testing.T) {
+// TestSupplementRefinedConsumers_CappedScan_DegradesGracefully_NotFalseNotExist
+// locks the "incomplete scan must never be read as not-exist" principle: when
+// the bounded scan reports capped and never yielded any of the wanted ids, every
+// consumer stays local-only (the SAME degrade an unreachable Get produces) —
+// capped must bubble up so the caller logs it, rather than the supplement
+// silently asserting these subscriptions don't exist. The scan's page-cap
+// bound itself is covered at the gateway (TestGateway_WalkSubscriptions_HitsCap).
+func TestSupplementRefinedConsumers_CappedScan_DegradesGracefully_NotFalseNotExist(t *testing.T) {
 	n := remoteSupplementListThreshold + 1
 	consumers := make([]protocol.ConsumerInfo, 0, n)
 	for i := 0; i < n; i++ {
@@ -737,28 +715,21 @@ func TestSupplementRefinedConsumers_PageCapReached_DegradesGracefully_NotFalseNo
 		c.RemoteSubscriptionID = fmt.Sprintf("sub_missing_%d", i)
 		consumers = append(consumers, c)
 	}
-	// Every page: has_more=true, and never contains any of the wanted ids.
-	getter := &fakeRefinedGetter{listPageAt: func(call int) *larkeventv1.ListSubscriptionResp {
-		otherID, state := fmt.Sprintf("unrelated_%d", call), "active"
-		return &larkeventv1.ListSubscriptionResp{Data: &larkeventv1.ListSubscriptionRespData{
-			Items:     []*larkeventv1.SubscriptionDetail{{SubscriptionId: &otherID, State: &state}},
-			HasMore:   boolPtr(true),
-			PageToken: strPtr(fmt.Sprintf("token-%d", call+1)),
-		}}
-	}}
+	// The scan reports capped and only ever yielded unrelated subscriptions.
+	getter := &fakeRefinedGetter{
+		walkItems:  []larkgw.RemoteSubscription{remoteSubID("unrelated_1", "active")},
+		walkCapped: true,
+	}
 
 	capped := supplementRefinedConsumers(context.Background(), getter, consumers)
 
 	if !capped {
-		t.Error("capped = false, want true (every page had has_more=true; none of the wanted ids ever appeared)")
+		t.Error("capped = false, want true (the bounded scan reported capped with none of the wanted ids found)")
 	}
 	for i, c := range consumers {
 		if c.RemoteSubscription != nil || c.RemoteState != "" {
 			t.Errorf("consumers[%d] must degrade to local-only on a capped scan, got: %+v", i, c)
 		}
-	}
-	if getter.listCalls != eventlib.MaxSubscriptionListPages {
-		t.Errorf("List called %d times, want exactly %d (bounded by the page cap)", getter.listCalls, eventlib.MaxSubscriptionListPages)
 	}
 }
 
@@ -772,7 +743,7 @@ func TestApplyRefinedSupplement_WrongApp_GetterNeverResolved(t *testing.T) {
 	calls := 0
 	applyRefinedSupplement(context.Background(), statuses, "cli_a", func() refinedSubscriptionGetter {
 		calls++
-		return &fakeRefinedGetter{resp: okGetSubscriptionResp("enabled", 0, false)}
+		return &fakeRefinedGetter{sub: subRef(remoteSub("enabled", 0, false))}
 	})
 	if calls != 0 {
 		t.Errorf("resolveGetter called %d times for a non-current app, want 0", calls)
@@ -813,7 +784,7 @@ func TestApplyRefinedSupplement_Valid_FillsCurrentAppConsumers(t *testing.T) {
 		{AppID: "cli_OTHER", State: stateRunning, Consumers: []protocol.ConsumerInfo{refinedConsumer()}},
 		{AppID: "cli_a", State: stateRunning, Consumers: []protocol.ConsumerInfo{refinedConsumer()}},
 	}
-	getter := &fakeRefinedGetter{resp: okGetSubscriptionResp("enabled", 42, true)}
+	getter := &fakeRefinedGetter{sub: subRef(remoteSub("enabled", 42, true))}
 	applyRefinedSupplement(context.Background(), statuses, "cli_a", func() refinedSubscriptionGetter { return getter })
 
 	if statuses[0].Consumers[0].RemoteSubscription != nil {
@@ -838,14 +809,10 @@ func TestApplyRefinedSupplement_PaginationCapped_BubblesUpToCaller(t *testing.T)
 		consumers = append(consumers, c)
 	}
 	statuses := []appStatus{{AppID: "cli_a", State: stateRunning, Consumers: consumers}}
-	getter := &fakeRefinedGetter{listPageAt: func(call int) *larkeventv1.ListSubscriptionResp {
-		otherID, state := fmt.Sprintf("unrelated_%d", call), "active"
-		return &larkeventv1.ListSubscriptionResp{Data: &larkeventv1.ListSubscriptionRespData{
-			Items:     []*larkeventv1.SubscriptionDetail{{SubscriptionId: &otherID, State: &state}},
-			HasMore:   boolPtr(true),
-			PageToken: strPtr(fmt.Sprintf("token-%d", call+1)),
-		}}
-	}}
+	getter := &fakeRefinedGetter{
+		walkItems:  []larkgw.RemoteSubscription{remoteSubID("unrelated_1", "active")},
+		walkCapped: true,
+	}
 
 	capped := applyRefinedSupplement(context.Background(), statuses, "cli_a", func() refinedSubscriptionGetter { return getter })
 
@@ -939,20 +906,12 @@ func TestResolveRemoteSupplementGetter_LarkClientError_ReturnsNil(t *testing.T) 
 // verbatim SuspensionCode capture. suspensionCode=="" omits
 // the Suspension object entirely (a suspended response with no suspension
 // details, which must still produce a suspended advisory with no code).
-func okGetSubscriptionRespSuspended(suspensionCode string) *larkeventv1.GetSubscriptionResp {
-	state := "suspended"
-	resp := &larkeventv1.GetSubscriptionResp{
-		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
-		Data: &larkeventv1.GetSubscriptionRespData{
-			Subscription: &larkeventv1.SubscriptionDetail{
-				State: &state,
-			},
-		},
-	}
+func suspendedRemoteSub(suspensionCode string) larkgw.RemoteSubscription {
+	d := &larkeventv1.SubscriptionDetail{State: strPtr("suspended")}
 	if suspensionCode != "" {
-		resp.Data.Subscription.Suspension = &larkeventv1.Suspension{Code: &suspensionCode}
+		d.Suspension = &larkeventv1.Suspension{Code: &suspensionCode}
 	}
-	return resp
+	return larkgw.ProjectSubscription(d)
 }
 
 // --- remoteDegradedAdvisory: pure function, no ctx/getter/bus involved at
@@ -1164,7 +1123,7 @@ func TestWriteStatusJSON_LegacyConsumer_OmitsRemoteDegradedAdvisoryKey(t *testin
 
 func TestSupplementRefinedConsumers_CapturesSuspensionCodeVerbatim(t *testing.T) {
 	consumers := []protocol.ConsumerInfo{refinedConsumer()}
-	getter := &fakeRefinedGetter{resp: okGetSubscriptionRespSuspended("app_ticket_expired")}
+	getter := &fakeRefinedGetter{sub: subRef(suspendedRemoteSub("app_ticket_expired"))}
 
 	supplementRefinedConsumers(context.Background(), getter, consumers)
 
