@@ -14,9 +14,9 @@ import (
 	"github.com/larksuite/cli/internal/event/session"
 )
 
-// reasonCurrentIdentityUnresolved is the shared SetDegraded reason used by both
-// bus-side gates (hub.go Publish's delivery gate and onConnReady's bind gate)
-// when resolveCurrent itself fails — distinct from stale_identity (which means
+// reasonCurrentIdentityUnresolved is the shared identity-dimension reason used
+// by both bus-side gates (hub.go Publish's delivery gate and onConnReady's bind
+// gate) when resolveCurrent itself fails — distinct from stale_identity (which means
 // current WAS resolved but didn't match this consumer's owner). It aliases the
 // single session-owned token so every gate records one consistent value.
 const reasonCurrentIdentityUnresolved = session.ReasonCurrentIdentityUnresolved
@@ -102,7 +102,7 @@ func (g *identityGate) logf(format string, args ...interface{}) {
 
 // errOwnerMismatch/errConnectionNotReady/errStaleEpoch are bindConsumer's own
 // sentinel errors — callers only need "did this fail" (Conn.SetStaleIdentity/
-// SetDegraded already recorded WHY), but a plain non-nil error is still
+// SetIdentityDegraded already recorded WHY), but a plain non-nil error is still
 // clearer at call sites than a bare bool. errStaleEpoch is NOT a failure of the
 // consumer — it means a newer WS generation superseded this bind mid-flight, so
 // the result was dropped; a caller that must confirm a bind (handleHello)
@@ -206,14 +206,14 @@ func (g *identityGate) awaitWSReady(ctx context.Context, timeout time.Duration) 
 // Every failure mode degrades/marks ONLY c, exactly like onConnReady's own
 // original loop did, and returns a non-nil error so a caller can tell
 // success from failure without re-deriving it from Conn state:
-//   - resolveCurrent fails -> SetDegraded(reasonCurrentIdentityUnresolved).
+//   - resolveCurrent fails -> SetIdentityDegraded(reasonCurrentIdentityUnresolved).
 //   - owner != current -> SetStaleIdentity() — NEVER loads a UAT for that
 //     (historical) owner, NEVER binds (the security red line, via session.Gate).
 //   - already bound on the memoized connID -> no-op success (no duplicate Bind).
 //   - no WS connection has ever become ready (bindUser still nil) ->
-//     SetDegraded("bind_failed: connection_not_ready") rather than panic.
-//   - resolveUAT fails -> SetDegraded("bind_failed: uat_unavailable").
-//   - bindUser fails -> SetDegraded("bind_failed: bind_api_error").
+//     SetIdentityDegraded("bind_failed: connection_not_ready") rather than panic.
+//   - resolveUAT fails -> SetIdentityDegraded("bind_failed: uat_unavailable").
+//   - bindUser fails -> SetIdentityDegraded("bind_failed: bind_api_error").
 //   - the source epoch advanced while binding (a reconnect superseded this
 //     generation) -> errStaleEpoch, result dropped, NOT written to c (the newer
 //     generation's onConnReady will bind it).
@@ -229,7 +229,7 @@ func (g *identityGate) bindConsumer(ctx context.Context, c *Conn) error {
 	switch session.Gate(owner, cur, err) {
 	case session.AdmitUnresolved:
 		g.logf("WARN: identity gate: resolveCurrent failed for pid=%d: %v", c.PID(), err)
-		c.SetDegraded(reasonCurrentIdentityUnresolved)
+		c.SetIdentityDegraded(reasonCurrentIdentityUnresolved)
 		return err
 	case session.AdmitStale:
 		c.SetStaleIdentity()
@@ -245,19 +245,19 @@ func (g *identityGate) bindConsumer(ctx context.Context, c *Conn) error {
 	}
 	if bindUser == nil {
 		g.logf("WARN: identity gate: no WS connection ready yet to bind pid=%d", c.PID())
-		c.SetDegraded("bind_failed: connection_not_ready")
+		c.SetIdentityDegraded("bind_failed: connection_not_ready")
 		return errConnectionNotReady
 	}
 
 	uat, err := g.resolveUAT(ctx, cur.AppID, cur.UserOpenID)
 	if err != nil {
 		g.logf("WARN: identity gate: UAT resolution failed for pid=%d: %v", c.PID(), err)
-		c.SetDegraded("bind_failed: uat_unavailable")
+		c.SetIdentityDegraded("bind_failed: uat_unavailable")
 		return err
 	}
 	if err := bindUser(ctx, uat); err != nil {
 		g.logf("WARN: identity gate: BindUser failed for pid=%d: %v", c.PID(), err)
-		c.SetDegraded("bind_failed: bind_api_error")
+		c.SetIdentityDegraded("bind_failed: bind_api_error")
 		return err
 	}
 	// Epoch guard: if a newer WS generation superseded this one while the

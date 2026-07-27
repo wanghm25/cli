@@ -25,8 +25,8 @@ type CurrentIdentity struct {
 	Profile string
 }
 
-// ReasonCurrentIdentityUnresolved is the shared SetDegraded reason used by
-// every gate when the current identity itself could not be resolved — distinct
+// ReasonCurrentIdentityUnresolved is the shared identity-dimension reason used
+// by every gate when the current identity itself could not be resolved — distinct
 // from stale_identity (which means current WAS resolved but did not match this
 // consumer's owner). A single stable token so a status display keys off one
 // vocabulary regardless of which gate recorded it.
@@ -89,7 +89,7 @@ const (
 // Gate is the ONE owner/current security gate the four call sites share (hub
 // Publish delivery, the bind gate, the lifecycle eligibility gate, and the
 // encrypt-key fetch). It decides the fail-closed outcome; each call site
-// applies its own side effects (SetStaleIdentity / SetDegraded / continue vs
+// applies its own side effects (SetStaleIdentity / SetIdentityDegraded / continue vs
 // return) to that decision, because those differ by site while the POLICY must
 // not.
 //

@@ -1,0 +1,19 @@
+# tests_skill_eval/setup/event_setup.yaml
+# 构造 event（精细化事件订阅）eval 依赖的测试资源。eval 前由 entrypoint 串行执行；不评分。
+# 命令来自 lark-cli lark-im skill（im +chat-create），已在现有二进制上 --dry-run 验证通过（exit 0）。
+# {{RUN_TAG}} 由 entrypoint 注入本次 run 的时间戳，与 eval query 同名占位同值 → 名字匹配 + 每次 run 唯一。
+#
+# 为什么只构造 chat、不预建 refined subscription（sub_）：
+#   - 唯一在 query 里被命名引用的实体是这个测试群；005/006/007 提到的「远端订阅」都用群名指代，
+#     query 里没有任何 sub_ 字面量（真人不知道 sub_ 开头的 id），AI 在 eval 时用 event subscription
+#     list 按该群自行发现订阅 → 无悬空命名实体，无需为 sub_ 单列 setup 条目。
+#   - 精细化 subscription 的构造命令 event subscription create 在生成时尚未实现、无法按 HARD-GATE 做
+#     --dry-run 验证；且 event/v1 订阅端点 GA 未定（spec §0.3.5），无可验证的通用 api 端点可替代 →
+#     按「不得写入未验证命令、不得 mock/假 id」不在 setup 预建 sub_。这些管理面/dry-run 决策点在
+#     endpoint 未 GA 时优雅降级为「命令与参数选择」评分（仍是核心决策点），详见 evals 文件顶部说明。
+#
+# chat 构造身份：用沙箱测试账号 --as user 建群（user 即 owner+成员，可按名搜到 → 005/006/007 的
+#   list/搜索按名定位可用；002/003 可解析出 chat_id）。owner/成员关系由沙箱自身身份自建，非人工提供。
+
+- name: "事件订阅测试群-{{RUN_TAG}}"
+  create: "im +chat-create --name '事件订阅测试群-{{RUN_TAG}}' --chat-mode group --as user"   # 可构造：dry-run ✓（POST /open-apis/im/v1/chats, exit 0）

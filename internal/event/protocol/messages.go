@@ -284,15 +284,23 @@ type ConsumerInfo struct {
 	OwnerAppID      string `json:"owner_app_id,omitempty"`
 	OwnerUserOpenID string `json:"owner_user_open_id,omitempty"`
 
-	// StaleIdentity/DegradedReason mirror Conn's identical-named accessors
-	// (internal/event/bus/conn.go) as of the last bus-side identity-gate
-	// evaluation. ADVISORY ONLY: no liveness signal exists and status is a
-	// single-shot query, so a live, actively-receiving consumer can still
-	// carry a stale flag from an earlier profile switch that was never
-	// cleared — a display MUST NOT treat these as
-	// "this consumer is dead", only as informational.
-	StaleIdentity  bool   `json:"stale_identity,omitempty"`
-	DegradedReason string `json:"degraded_reason,omitempty"`
+	// StaleIdentity mirrors Conn.StaleIdentity() as of the last bus-side
+	// identity-gate evaluation. ADVISORY ONLY: no liveness signal exists and
+	// status is a single-shot query, so a live, actively-receiving consumer can
+	// still carry a stale flag from an earlier profile switch that was never
+	// cleared — a display MUST NOT treat it as "this consumer is dead", only as
+	// informational.
+	StaleIdentity bool `json:"stale_identity,omitempty"`
+
+	// Health is this consumer's per-dimension health, projected from
+	// Conn.HealthSnapshot() (internal/event/health). It replaces the single
+	// degraded_reason slot: MULTIPLE independent dimensions can be unhealthy at
+	// once (e.g. a suspended subscription AND an unresolved identity), and each
+	// is owned/written by exactly one subsystem so none clobbers another. Each
+	// entry is a short dimension/reason/severity classification — never a key,
+	// ciphertext, or raw error. omitempty: an all-healthy consumer carries none,
+	// so an older consumer entry still marshals to the old wire shape.
+	Health []HealthFact `json:"health,omitempty"`
 
 	// RemoteState is a short summary of this consumer's remote Subscription
 	// state. Two independent producers, neither the bus's live Publish path:
@@ -389,6 +397,16 @@ type DecryptError struct {
 	Class string `json:"class,omitempty"`
 	Count int64  `json:"count,omitempty"`
 	Time  string `json:"time,omitempty"`
+}
+
+// HealthFact is one entry of ConsumerInfo.Health: a single dimension's health,
+// projected from internal/event/health. Dimension is the axis
+// ("identity"/"subscription"/"decryption"/...), Reason a short classified
+// token, Severity "advisory"/"degraded". Never a key, ciphertext, or raw error.
+type HealthFact struct {
+	Dimension string `json:"dimension"`
+	Reason    string `json:"reason"`
+	Severity  string `json:"severity,omitempty"`
 }
 
 // RemoteSubscriptionInfo is the CLI-facing snapshot of one remote

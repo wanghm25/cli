@@ -25,8 +25,8 @@ const (
 // it directly; restore the saved value when done.
 var ActionTimeout = 5 * time.Second
 
-// ReasonExecutorFull is the SetDegraded classification used when the bounded
-// queue is full (recorded as lifecycle_executor_full).
+// ReasonExecutorFull is the subscription-dimension classification used when the
+// bounded queue is full (recorded as lifecycle_executor_full).
 const ReasonExecutorFull = "lifecycle_executor_full"
 
 // Action is the pluggable per-event action seam. One implementation
@@ -259,7 +259,7 @@ func (e *Executor) markFull(le LifecycleEvent) {
 	e.logf("WARN: %s: remote_subscription_id=%s type=%s event_id=%s dropped (executor at capacity)",
 		ReasonExecutorFull, le.RemoteSubscriptionID, le.EventType, le.EventID)
 	for _, c := range e.registry.ConnsByRemoteSubscriptionID(le.RemoteSubscriptionID) {
-		c.SetDegraded(ReasonExecutorFull)
+		c.SetSubscriptionDegraded(ReasonExecutorFull)
 		c.SetNextAction(NextActionGet)
 	}
 }

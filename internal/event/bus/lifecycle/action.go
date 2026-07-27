@@ -281,8 +281,8 @@ func (a *SubscriptionAction) isTombstonedResurrection(le LifecycleEvent) bool {
 // identity (never cached, never UAT) matches its fixed owner — routed through
 // the shared session.Gate exactly like the other three gates. Every ineligible
 // USER conn is marked (SetStaleIdentity on a mismatch;
-// SetDegraded(session.ReasonCurrentIdentityUnresolved) if resolveCurrent itself
-// failed or no identity gate is configured at all) but otherwise left completely
+// SetIdentityDegraded(session.ReasonCurrentIdentityUnresolved) if resolveCurrent
+// itself failed or no identity gate is configured at all) but otherwise left completely
 // untouched: no remote call, no BindUser, no historical UAT load.
 func (a *SubscriptionAction) eligibleConns(conns []Conn) eligibilityResult {
 	var res eligibilityResult
@@ -305,7 +305,7 @@ func (a *SubscriptionAction) eligibleConns(conns []Conn) eligibilityResult {
 		owner := model.OwnerRef{AppID: c.OwnerAppID(), UserOpenID: c.OwnerUserOpenID()}
 		switch session.Gate(owner, res.cur, curErr) {
 		case session.AdmitUnresolved:
-			c.SetDegraded(session.ReasonCurrentIdentityUnresolved)
+			c.SetIdentityDegraded(session.ReasonCurrentIdentityUnresolved)
 		case session.AdmitStale:
 			c.SetStaleIdentity()
 		default: // AdmitDeliver

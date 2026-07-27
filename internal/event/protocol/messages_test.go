@@ -404,7 +404,7 @@ func TestDecode_OldStatusResponse_BackwardCompat(t *testing.T) {
 	// zero-valued, exactly like the StatusResponse-level v2 fields above.
 	c := sr.Consumers[0]
 	if c.RefinedSubscription || c.RemoteSubscriptionID != "" || c.OwnerIdentity != "" ||
-		c.OwnerAppID != "" || c.OwnerUserOpenID != "" || c.StaleIdentity || c.DegradedReason != "" ||
+		c.OwnerAppID != "" || c.OwnerUserOpenID != "" || c.StaleIdentity || len(c.Health) != 0 ||
 		c.RemoteState != "" || c.RemoteSubscription != nil || c.LastLifecycleEvent != "" {
 		t.Errorf("refined-status ConsumerInfo fields should be zero-valued decoding an old frame, got %+v", c)
 	}
@@ -472,7 +472,7 @@ func TestConsumerInfo_V2FieldsRoundTrip(t *testing.T) {
 		OwnerAppID:           "cli_app123",
 		OwnerUserOpenID:      "ou_xxx",
 		StaleIdentity:        true,
-		DegradedReason:       "bind_failed: uat_unavailable",
+		Health:               []HealthFact{{Dimension: "identity", Reason: "bind_failed: uat_unavailable", Severity: "degraded"}},
 		RemoteState:          "enabled",
 		RemoteSubscription: &RemoteSubscriptionInfo{
 			State:               "enabled",
@@ -520,7 +520,7 @@ func TestConsumerInfo_V2FieldsOmittedWhenZero(t *testing.T) {
 	for _, key := range []string{
 		`"refined_subscription"`, `"remote_subscription_id"`, `"owner_identity"`,
 		`"owner_app_id"`, `"owner_user_open_id"`, `"stale_identity"`,
-		`"degraded_reason"`, `"remote_state"`, `"remote_subscription"`,
+		`"health"`, `"remote_state"`, `"remote_subscription"`,
 		`"last_lifecycle_event"`,
 	} {
 		if bytes.Contains(data, []byte(key)) {

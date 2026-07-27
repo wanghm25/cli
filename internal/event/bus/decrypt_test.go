@@ -29,9 +29,9 @@ func TestSubscriptionLifecycleAction_Deleted_RemovesEncryptKey(t *testing.T) {
 	if len(removed) != 1 || removed[0] != "sub-del" {
 		t.Errorf("encrypt-key remover called with %v, want [sub-del]", removed)
 	}
-	// The existing deleted_v1 behavior is preserved.
-	if c.DegradedReason() != lifecycle.ReasonRemoteSubscriptionDeleted {
-		t.Errorf("DegradedReason = %q, want %q", c.DegradedReason(), lifecycle.ReasonRemoteSubscriptionDeleted)
+	// The existing deleted_v1 behavior is preserved (subscription dimension).
+	if c.SubscriptionDegradedReason() != lifecycle.ReasonRemoteSubscriptionDeleted {
+		t.Errorf("SubscriptionDegradedReason = %q, want %q", c.SubscriptionDegradedReason(), lifecycle.ReasonRemoteSubscriptionDeleted)
 	}
 }
 
@@ -77,7 +77,7 @@ func TestConn_RecordDecryptFailure_CountsThenDegrades(t *testing.T) {
 		if c.DecryptState() != decryptStateFailed {
 			t.Errorf("DecryptState = %q, want decrypt_failed", c.DecryptState())
 		}
-		if c.DegradedReason() != "" {
+		if c.DecryptionDegradedReason() != "" {
 			t.Errorf("consumer degraded too early at count=%d (single fails only count)", i)
 		}
 	}
@@ -86,8 +86,8 @@ func TestConn_RecordDecryptFailure_CountsThenDegrades(t *testing.T) {
 	if c.DecryptFailCount() != decryptFailDegradeThreshold {
 		t.Errorf("DecryptFailCount = %d, want %d", c.DecryptFailCount(), decryptFailDegradeThreshold)
 	}
-	if c.DegradedReason() != decryptStateFailed {
-		t.Errorf("DegradedReason = %q, want decrypt_failed after persistent failures", c.DegradedReason())
+	if c.DecryptionDegradedReason() != decryptStateFailed {
+		t.Errorf("DecryptionDegradedReason = %q, want decrypt_failed after persistent failures", c.DecryptionDegradedReason())
 	}
 	if c.LastDecryptErrorClass() != decryptStateFailed {
 		t.Errorf("LastDecryptErrorClass = %q, want decrypt_failed", c.LastDecryptErrorClass())

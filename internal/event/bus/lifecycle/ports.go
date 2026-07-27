@@ -36,13 +36,20 @@ type Conn interface {
 	SetLastActionError(reason string)
 	// SetNextAction records the recommended recovery step ("" = none).
 	SetNextAction(action string)
-	// SetDegraded records a per-consumer degraded classification.
-	SetDegraded(reason string)
-	// DegradedReason returns the current degraded classification ("" = healthy).
-	DegradedReason() string
-	// ClearActionDegraded clears both the degraded reason and the next action
-	// together (used when an action's outcome means "fully healthy again").
-	ClearActionDegraded()
+	// SetSubscriptionDegraded records the SUBSCRIPTION health dimension's reason
+	// (the only dimension the lifecycle control plane owns).
+	SetSubscriptionDegraded(reason string)
+	// SubscriptionDegradedReason returns the current subscription-dimension
+	// reason ("" = healthy).
+	SubscriptionDegradedReason() string
+	// ClearSubscriptionDegraded clears the subscription-dimension fact and the
+	// subscription-tied next_action together (used when an action's outcome
+	// means "the subscription is healthy again") — never touching the Identity
+	// or Decryption dimensions.
+	ClearSubscriptionDegraded()
+	// SetIdentityDegraded records the IDENTITY health dimension's reason, used by
+	// the eligibility gate when the current identity itself cannot be resolved.
+	SetIdentityDegraded(reason string)
 	// SetStaleIdentity marks owner != current.
 	SetStaleIdentity()
 	// OwnerAppID / OwnerUserOpenID are the owner identity fixed at

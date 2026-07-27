@@ -280,15 +280,15 @@ func TestConn_BoundConnID_DefaultEmpty(t *testing.T) {
 	}
 }
 
-// SetBoundConnID marks a successful BindUser; a fresh success supersedes any
-// prior stale/degraded state (both are cleared).
-func TestConn_SetBoundConnID_ClearsStaleAndDegraded(t *testing.T) {
+// SetBoundConnID marks a successful BindUser; a fresh success supersedes the
+// IDENTITY state (stale flag + identity health fact) only.
+func TestConn_SetBoundConnID_ClearsStaleAndIdentity(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
 	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
 	conn.SetStaleIdentity()
-	conn.SetDegraded("bind_failed: test")
+	conn.SetIdentityDegraded("bind_failed: test")
 
 	conn.SetBoundConnID("conn-42")
 
@@ -298,24 +298,41 @@ func TestConn_SetBoundConnID_ClearsStaleAndDegraded(t *testing.T) {
 	if conn.StaleIdentity() {
 		t.Error("SetBoundConnID must clear staleIdentity — a fresh successful bind supersedes it")
 	}
-	if got := conn.DegradedReason(); got != "" {
-		t.Errorf("DegradedReason() after SetBoundConnID = %q, want \"\" (cleared by a fresh successful bind)", got)
+	if got := conn.IdentityDegradedReason(); got != "" {
+		t.Errorf("IdentityDegradedReason() after SetBoundConnID = %q, want \"\" (cleared by a fresh successful bind)", got)
 	}
 }
 
-// Task 18: SetBoundConnID must ALSO clear nextAction — a fresh successful
-// bind supersedes all three (staleIdentity/degradedReason/nextAction).
-func TestConn_SetBoundConnID_ClearsNextAction(t *testing.T) {
+// MUST-FIX (per-dimension health): a successful BindUser (a rebind) clears ONLY
+// the identity dimension — it must NOT wipe a still-true Subscription
+// (deleted/expired/...) or Decryption (decrypt_failed) health fact, nor the
+// subscription-tied next_action. The old shared slot cleared everything on a
+// rebind; this test locks that that regression is gone.
+func TestConn_SetBoundConnID_ClearsOnlyIdentity(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
 	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
-	conn.SetNextAction(lifecycle.NextActionReactivate)
+	conn.SetIdentityDegraded("bind_failed: test")
+	conn.SetSubscriptionDegraded(lifecycle.ReasonRemoteSubscriptionDeleted)
+	conn.SetNextAction(lifecycle.NextActionRebuild)
+	conn.RecordDecryptFailure()
+	conn.RecordDecryptFailure()
+	conn.RecordDecryptFailure() // cross the degrade threshold
 
 	conn.SetBoundConnID("conn-42")
 
-	if got := conn.NextAction(); got != "" {
-		t.Errorf("NextAction() after SetBoundConnID = %q, want \"\" (cleared by a fresh successful bind)", got)
+	if got := conn.IdentityDegradedReason(); got != "" {
+		t.Errorf("IdentityDegradedReason() = %q, want \"\" (bind clears identity)", got)
+	}
+	if got := conn.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionDeleted {
+		t.Errorf("SubscriptionDegradedReason() = %q, want %q (a rebind must NOT clear the subscription fact)", got, lifecycle.ReasonRemoteSubscriptionDeleted)
+	}
+	if got := conn.DecryptionDegradedReason(); got != decryptStateFailed {
+		t.Errorf("DecryptionDegradedReason() = %q, want %q (a rebind must NOT clear the decryption fact)", got, decryptStateFailed)
+	}
+	if got := conn.NextAction(); got != lifecycle.NextActionRebuild {
+		t.Errorf("NextAction() = %q, want %q (a rebind must NOT clear a subscription-tied next_action)", got, lifecycle.NextActionRebuild)
 	}
 }
 
@@ -333,17 +350,17 @@ func TestConn_SetStaleIdentity(t *testing.T) {
 	}
 }
 
-func TestConn_SetDegraded_RoundTrips(t *testing.T) {
+func TestConn_SetIdentityDegraded_RoundTrips(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
 	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
-	if got := conn.DegradedReason(); got != "" {
-		t.Errorf("DegradedReason() on a fresh Conn = %q, want \"\"", got)
+	if got := conn.IdentityDegradedReason(); got != "" {
+		t.Errorf("IdentityDegradedReason() on a fresh Conn = %q, want \"\"", got)
 	}
-	conn.SetDegraded("bind_failed: uat_unavailable")
-	if got := conn.DegradedReason(); got != "bind_failed: uat_unavailable" {
-		t.Errorf("DegradedReason() = %q, want %q", got, "bind_failed: uat_unavailable")
+	conn.SetIdentityDegraded("bind_failed: uat_unavailable")
+	if got := conn.IdentityDegradedReason(); got != "bind_failed: uat_unavailable" {
+		t.Errorf("IdentityDegradedReason() = %q, want %q", got, "bind_failed: uat_unavailable")
 	}
 }
 
@@ -514,25 +531,26 @@ func TestConn_SetNextAction_RoundTrips(t *testing.T) {
 	}
 }
 
-// ClearActionDegraded (used internally by subscriptionLifecycleAction) must
-// clear BOTH degradedReason and nextAction together, but must NEVER touch
+// ClearSubscriptionDegraded (used internally by subscriptionLifecycleAction)
+// must clear the subscription-dimension fact AND the subscription-tied
+// nextAction together, but must NEVER touch
 // suspensionReason/lastAction/lastActionError -- those are historical
 // record-keeping, not "is this consumer currently degraded" state.
-func TestConn_ClearActionDegraded_ClearsOnlyDegradedAndNextAction(t *testing.T) {
+func TestConn_ClearSubscriptionDegraded_ClearsOnlySubscriptionAndNextAction(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
 	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
-	conn.SetDegraded("remote_subscription_suspended")
+	conn.SetSubscriptionDegraded("remote_subscription_suspended")
 	conn.SetNextAction(lifecycle.NextActionReactivate)
 	conn.SetSuspensionReason("authority_revoked")
 	conn.SetLastAction("reactivate")
 	conn.SetLastActionError("some_error")
 
-	conn.ClearActionDegraded()
+	conn.ClearSubscriptionDegraded()
 
-	if got := conn.DegradedReason(); got != "" {
-		t.Errorf("DegradedReason() = %q, want \"\"", got)
+	if got := conn.SubscriptionDegradedReason(); got != "" {
+		t.Errorf("SubscriptionDegradedReason() = %q, want \"\"", got)
 	}
 	if got := conn.NextAction(); got != "" {
 		t.Errorf("NextAction() = %q, want \"\"", got)
@@ -573,7 +591,7 @@ func TestConn_ActionState_ConcurrentAccessRace(t *testing.T) {
 				conn.SetLastAction("reactivate")
 				conn.SetLastActionError("")
 				conn.SetNextAction(lifecycle.NextActionReactivate)
-				conn.ClearActionDegraded()
+				conn.ClearSubscriptionDegraded()
 				_ = conn.SuspensionReason()
 				_ = conn.LastAction()
 				_ = conn.LastActionError()
@@ -606,10 +624,10 @@ func TestConn_IdentityGateState_ConcurrentAccessRace(t *testing.T) {
 				} else {
 					conn.SetStaleIdentity()
 				}
-				conn.SetDegraded("bind_failed: test")
+				conn.SetIdentityDegraded("bind_failed: test")
 				_ = conn.BoundConnID()
 				_ = conn.StaleIdentity()
-				_ = conn.DegradedReason()
+				_ = conn.IdentityDegradedReason()
 				_ = conn.OwnerAppID()
 				_ = conn.OwnerUserOpenID()
 				_ = conn.OwnerIdentity()

@@ -827,8 +827,8 @@ func TestHub_Publish_IdentityGate_ResolveCurrentErrorFailsClosedForUsersOnly(t *
 	h.Publish(&event.RawEvent{EventID: "evt-1", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
 
 	mustNotReceive(t, userConn.SendCh(), "user consumer must fail CLOSED when current identity cannot be resolved")
-	if got := userConn.DegradedReason(); got == "" {
-		t.Error("user consumer should be marked degraded when resolveCurrent errors")
+	if got := userConn.IdentityDegradedReason(); got == "" {
+		t.Error("user consumer should be marked degraded on the identity dimension when resolveCurrent errors")
 	}
 	mustReceiveEvent(t, botConn.SendCh(), "bot consumer must be unaffected by a resolveCurrent error")
 }

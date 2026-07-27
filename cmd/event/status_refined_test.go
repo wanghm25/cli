@@ -373,10 +373,10 @@ func TestWriteStatusText_DecryptKeyUnavailable_ShowsResourceDataAndAdvisory(t *t
 	}
 }
 
-func TestWriteStatusText_DegradedReason_ShownAsAdvisory(t *testing.T) {
+func TestWriteStatusText_Health_ShownAsAdvisory(t *testing.T) {
 	var buf bytes.Buffer
 	c := refinedConsumer()
-	c.DegradedReason = "bind_failed: uat_unavailable"
+	c.Health = []protocol.HealthFact{{Dimension: "identity", Reason: "bind_failed: uat_unavailable", Severity: "degraded"}}
 	statuses := []appStatus{{
 		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
 		Consumers: []protocol.ConsumerInfo{c},
@@ -384,7 +384,31 @@ func TestWriteStatusText_DegradedReason_ShownAsAdvisory(t *testing.T) {
 	writeStatusText(&buf, statuses)
 	out := buf.String()
 	if !strings.Contains(out, "bind_failed: uat_unavailable") || !strings.Contains(out, "advisory") {
-		t.Errorf("degraded_reason not shown as advisory; full output:\n%s", out)
+		t.Errorf("health fact not shown as advisory; full output:\n%s", out)
+	}
+}
+
+// TestWriteStatusText_MultipleHealthFacts_AllShown locks the PR5 enrichment:
+// two INDEPENDENT health dimensions (a suspended subscription AND a stale
+// identity) are both surfaced at once — the old single degraded_reason slot
+// could only ever show one.
+func TestWriteStatusText_MultipleHealthFacts_AllShown(t *testing.T) {
+	var buf bytes.Buffer
+	c := refinedConsumer()
+	c.Health = []protocol.HealthFact{
+		{Dimension: "identity", Reason: "bind_failed: uat_unavailable", Severity: "degraded"},
+		{Dimension: "subscription", Reason: "remote_subscription_suspended", Severity: "degraded"},
+	}
+	statuses := []appStatus{{
+		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
+		Consumers: []protocol.ConsumerInfo{c},
+	}}
+	writeStatusText(&buf, statuses)
+	out := buf.String()
+	for _, want := range []string{"bind_failed: uat_unavailable", "remote_subscription_suspended", "identity", "subscription"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q (both independent facts must show at once); full output:\n%s", want, out)
+		}
 	}
 }
 
@@ -1022,10 +1046,10 @@ func TestWriteStatusText_RemoteStateUnknownHealthy_NoDegradedAdvisory(t *testing
 // the "APPEND, do not clobber" guard: a pre-existing bus-side degraded_reason
 // advisory must still be shown in full alongside the new remote-derived one
 // — neither replaces the other.
-func TestWriteStatusText_RemoteDegradedAdvisory_AppendsAlongsideDegradedReason(t *testing.T) {
+func TestWriteStatusText_RemoteDegradedAdvisory_AppendsAlongsideHealth(t *testing.T) {
 	var buf bytes.Buffer
 	c := refinedConsumer()
-	c.DegradedReason = "bind_failed: uat_unavailable"
+	c.Health = []protocol.HealthFact{{Dimension: "identity", Reason: "bind_failed: uat_unavailable", Severity: "degraded"}}
 	c.RemoteState = "suspended"
 	statuses := []appStatus{{
 		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
@@ -1092,15 +1116,19 @@ func TestWriteStatusJSON_RemoteStateUnknownHealthy_OmitsDegradedAdvisoryKey(t *t
 	}
 }
 
-func TestWriteStatusJSON_RemoteDegradedAdvisory_AppendsAlongsideDegradedReason(t *testing.T) {
+func TestWriteStatusJSON_RemoteDegradedAdvisory_AppendsAlongsideHealth(t *testing.T) {
 	c := refinedConsumer()
-	c.DegradedReason = "bind_failed: uat_unavailable"
+	c.Health = []protocol.HealthFact{{Dimension: "identity", Reason: "bind_failed: uat_unavailable", Severity: "degraded"}}
 	c.RemoteState = "expired"
 	statuses := []appStatus{{AppID: "cli_a", State: stateRunning, Consumers: []protocol.ConsumerInfo{c}}}
 
 	cv := consumerJSONFromStatuses(t, statuses)
-	if cv["degraded_reason"] != "bind_failed: uat_unavailable" {
-		t.Errorf("degraded_reason = %v, want it preserved untouched", cv["degraded_reason"])
+	hf, _ := cv["health"].([]interface{})
+	if len(hf) != 1 {
+		t.Fatalf("health = %v, want one per-dimension fact preserved untouched", cv["health"])
+	}
+	if entry, _ := hf[0].(map[string]interface{}); entry["reason"] != "bind_failed: uat_unavailable" || entry["dimension"] != "identity" {
+		t.Errorf("health[0] = %v, want identity/bind_failed: uat_unavailable", hf[0])
 	}
 	advisory, _ := cv["remote_degraded_advisory"].(string)
 	if advisory == "" || !strings.Contains(advisory, "expired") {

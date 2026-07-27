@@ -786,8 +786,10 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 			fmt.Fprintf(out, "      next_action: %s\n", action)
 		}
 	}
-	if c.DegradedReason != "" {
-		fmt.Fprintf(out, "      advisory: degraded (%s) — informational only\n", c.DegradedReason)
+	// Per-dimension health: surface EVERY unhealthy dimension (a subscription
+	// suspended AND an identity stale can both show now), not a single slot.
+	for _, hf := range c.Health {
+		fmt.Fprintf(out, "      advisory: %s (%s: %s) — informational only\n", hf.Severity, hf.Dimension, hf.Reason)
 	}
 	// APPEND (never clobber) a degraded advisory
 	// derived from the remote-supplement result, alongside whichever of the

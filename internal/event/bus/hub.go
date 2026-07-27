@@ -13,6 +13,7 @@ import (
 
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
+	"github.com/larksuite/cli/internal/event/health"
 	"github.com/larksuite/cli/internal/event/model"
 	"github.com/larksuite/cli/internal/event/protocol"
 	"github.com/larksuite/cli/internal/event/session"
@@ -146,8 +147,8 @@ func (h *Hub) SetCurrentResolver(fn func() (session.CurrentIdentity, error)) {
 // == "") are excluded: they are never identity-gated or BindUser'd. Only
 // *Conn is inspected (not the bare Subscriber interface) because the
 // identity gate needs to mutate Conn-only state (BoundConnID/StaleIdentity/
-// DegradedReason) that intentionally isn't part of the Subscriber contract
-// every mock must satisfy — mirrors how findSubscriberByPID
+// the per-dimension health facts) that intentionally isn't part of the
+// Subscriber contract every mock must satisfy — mirrors how findSubscriberByPID
 // (handle_hello_test.go) whitebox-iterates h.subscribers from within this
 // same package.
 func (h *Hub) userConns() []*Conn {
@@ -450,7 +451,7 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 				// every user consumer matched in THIS Publish call; bot
 				// consumers never reach this branch at all.
 				if c, ok := s.(*Conn); ok {
-					c.SetDegraded(reasonCurrentIdentityUnresolved)
+					c.SetIdentityDegraded(reasonCurrentIdentityUnresolved)
 				}
 				continue
 			case session.AdmitStale:
@@ -646,8 +647,8 @@ func (h *Hub) BroadcastSourceStatus(source, state, detail string) {
 // they're read directly for every subscriber, refined or not — OwnerAppID in
 // particular is populated for EVERY consumer registered against a
 // bus (it is just that bus's own AppID), not only refined ones.
-// OwnerIdentity/StaleIdentity/DegradedReason are *Conn-only state (not part
-// of Subscriber — see Conn's own doc comment on identityMu), so they need
+// OwnerIdentity/StaleIdentity/per-dimension health are *Conn-only state (not
+// part of Subscriber — see Conn's own doc comment on identityMu), so they need
 // the same s.(*Conn) type-assert the Publish delivery gate already uses
 // (hub.go's Publish, "if c, ok := s.(*Conn); ok"): this keeps the Subscriber
 // interface untouched (no mock churn) while still surfacing them for every
@@ -673,7 +674,11 @@ func (h *Hub) Consumers() []protocol.ConsumerInfo {
 		if c, ok := s.(*Conn); ok {
 			info.OwnerIdentity = c.OwnerIdentity()
 			info.StaleIdentity = c.StaleIdentity()
-			info.DegradedReason = c.DegradedReason()
+			// Per-dimension health: every currently-unhealthy dimension
+			// (identity / subscription / decryption / ...) projected at once,
+			// replacing the single degraded_reason slot — so a status display
+			// can surface multiple independent facts simultaneously.
+			info.Health = healthFactsToProtocol(c.HealthSnapshot())
 			// Populate the summary fields from the Conn
 			// getters the lifecycle executor's action writes to.
 			info.LastLifecycleEvent = c.LastLifecycleEvent()
@@ -702,4 +707,23 @@ func (h *Hub) Consumers() []protocol.ConsumerInfo {
 		result = append(result, info)
 	}
 	return result
+}
+
+// healthFactsToProtocol projects a Conn's per-dimension health snapshot onto
+// the wire ConsumerInfo.Health shape — dimension/reason/severity tokens only,
+// never a key/ciphertext/raw error. nil in, nil out (an all-healthy consumer
+// carries no health entry, so omitempty keeps the old wire shape).
+func healthFactsToProtocol(snap []health.DimensionFact) []protocol.HealthFact {
+	if len(snap) == 0 {
+		return nil
+	}
+	out := make([]protocol.HealthFact, 0, len(snap))
+	for _, df := range snap {
+		out = append(out, protocol.HealthFact{
+			Dimension: df.Dimension.String(),
+			Reason:    df.Reason,
+			Severity:  df.Severity.String(),
+		})
+	}
+	return out
 }

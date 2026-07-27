@@ -23,7 +23,7 @@ func TestHub_Consumers_PopulatesRefinedFields(t *testing.T) {
 	c.SetRemoteSubscriptionID("sub_abc123")
 	c.SetOwnerIdentity("user", "cli_app1", "ou_xxx")
 	c.SetStaleIdentity()
-	c.SetDegraded("bind_failed: uat_unavailable")
+	c.SetIdentityDegraded("bind_failed: uat_unavailable")
 	h.RegisterAndIsFirst(c)
 
 	consumers := h.Consumers()
@@ -50,8 +50,8 @@ func TestHub_Consumers_PopulatesRefinedFields(t *testing.T) {
 	if !got.StaleIdentity {
 		t.Errorf("StaleIdentity = false, want true")
 	}
-	if got.DegradedReason != "bind_failed: uat_unavailable" {
-		t.Errorf("DegradedReason = %q, want %q", got.DegradedReason, "bind_failed: uat_unavailable")
+	if len(got.Health) != 1 || got.Health[0].Dimension != "identity" || got.Health[0].Reason != "bind_failed: uat_unavailable" {
+		t.Errorf("Health = %+v, want one identity fact reason=bind_failed: uat_unavailable", got.Health)
 	}
 }
 
@@ -76,7 +76,7 @@ func TestHub_Consumers_LegacyConnFieldsStayZero(t *testing.T) {
 		t.Errorf("RefinedSubscription = true, want false for a legacy conn")
 	}
 	if got.RemoteSubscriptionID != "" || got.OwnerIdentity != "" || got.OwnerAppID != "" ||
-		got.OwnerUserOpenID != "" || got.StaleIdentity || got.DegradedReason != "" {
+		got.OwnerUserOpenID != "" || got.StaleIdentity || len(got.Health) != 0 {
 		t.Errorf("Task 16 fields not all zero for a legacy conn: %+v", got)
 	}
 	// Pre-existing fields must be completely unaffected by this change.
@@ -110,7 +110,7 @@ func TestHub_Consumers_NonConnSubscriber_NewFieldsStayZero(t *testing.T) {
 		t.Errorf("interface-level fields did not flow through for a non-*Conn subscriber: %+v", got)
 	}
 	// But the *Conn-only fields must stay zero: the type-assert misses.
-	if got.OwnerIdentity != "" || got.StaleIdentity || got.DegradedReason != "" {
+	if got.OwnerIdentity != "" || got.StaleIdentity || len(got.Health) != 0 {
 		t.Errorf("*Conn-only fields leaked non-zero for a non-*Conn subscriber: %+v", got)
 	}
 }

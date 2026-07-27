@@ -290,7 +290,7 @@ func TestLifecycleExecutor_QueueFull_MarksMatchedConsumerDegraded_NoBlock(t *tes
 		t.Fatal("Submit blocked on a full executor -- spec §5.2 requires it never block")
 	}
 
-	if got := c.DegradedReason(); got != lifecycle.ReasonExecutorFull {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonExecutorFull {
 		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonExecutorFull)
 	}
 	// Task 18 review Minor 2: now that a next_action field exists, the

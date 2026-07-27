@@ -146,7 +146,7 @@ func TestIdentityGate_OnConnReady_BindsMatchingOwner(t *testing.T) {
 	if c.StaleIdentity() {
 		t.Error("matching owner must not be marked stale_identity")
 	}
-	if got := c.DegradedReason(); got != "" {
+	if got := c.IdentityDegradedReason(); got != "" {
 		t.Errorf("DegradedReason() = %q, want \"\" (bind succeeded)", got)
 	}
 	if fb.callCount() != 1 {
@@ -247,7 +247,7 @@ func TestIdentityGate_OnConnReady_BindFailureIsolatesOnlyThatConsumer(t *testing
 
 	var degraded, bound int
 	for _, c := range []*Conn{connX, connY} {
-		if c.DegradedReason() != "" {
+		if c.IdentityDegradedReason() != "" {
 			degraded++
 			if got := c.BoundConnID(); got != "" {
 				t.Errorf("degraded consumer pid=%d must not also be bound, got BoundConnID=%q", c.PID(), got)
@@ -255,7 +255,7 @@ func TestIdentityGate_OnConnReady_BindFailureIsolatesOnlyThatConsumer(t *testing
 		}
 		if c.BoundConnID() == "conn-1" {
 			bound++
-			if got := c.DegradedReason(); got != "" {
+			if got := c.IdentityDegradedReason(); got != "" {
 				t.Errorf("bound consumer pid=%d must not also be degraded, got DegradedReason=%q", c.PID(), got)
 			}
 		}
@@ -297,7 +297,7 @@ func TestIdentityGate_OnConnReady_UATResolutionFailureIsolatesOnlyThatConsumer(t
 
 	var degraded, bound int
 	for _, c := range []*Conn{connX, connY} {
-		if c.DegradedReason() != "" {
+		if c.IdentityDegradedReason() != "" {
 			degraded++
 		}
 		if c.BoundConnID() == "conn-1" {
@@ -339,7 +339,7 @@ func TestIdentityGate_OnConnReady_BotNeverGatedNeverBound(t *testing.T) {
 	if botConn.StaleIdentity() {
 		t.Error("bot consumer must never be marked stale_identity")
 	}
-	if got := botConn.DegradedReason(); got != "" {
+	if got := botConn.IdentityDegradedReason(); got != "" {
 		t.Errorf("bot consumer DegradedReason() = %q, want \"\" (bots are never touched by the gate)", got)
 	}
 }
@@ -369,10 +369,10 @@ func TestIdentityGate_OnConnReady_ResolveCurrentErrorDegradesAllUsersButNotBots(
 	if uat.callCount() != 0 {
 		t.Errorf("resolveUAT call count = %d, want 0", uat.callCount())
 	}
-	if got := userConn.DegradedReason(); got == "" {
+	if got := userConn.IdentityDegradedReason(); got == "" {
 		t.Error("user consumer should be marked degraded when resolveCurrent errors")
 	}
-	if got := botConn.BoundConnID(); got != "" || botConn.DegradedReason() != "" || botConn.StaleIdentity() {
+	if got := botConn.BoundConnID(); got != "" || botConn.IdentityDegradedReason() != "" || botConn.StaleIdentity() {
 		t.Error("bot consumer must be completely unaffected by a resolveCurrent error")
 	}
 }
@@ -444,7 +444,7 @@ func TestIdentityGate_BindConsumer_BeforeAnyOnConnReady_DegradesGracefully(t *te
 	if err := gate.bindConsumer(context.Background(), c); err == nil {
 		t.Fatal("bindConsumer before any onConnReady must return an error, got nil")
 	}
-	if got := c.DegradedReason(); got != "bind_failed: connection_not_ready" {
+	if got := c.IdentityDegradedReason(); got != "bind_failed: connection_not_ready" {
 		t.Errorf("DegradedReason() = %q, want %q", got, "bind_failed: connection_not_ready")
 	}
 	if c.BoundConnID() != "" {

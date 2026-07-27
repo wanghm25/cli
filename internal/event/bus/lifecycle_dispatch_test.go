@@ -230,7 +230,7 @@ func TestSubscriptionLifecycleAction_Suspended_HitCurrentOwnerUser_SingleReactiv
 	if got := c.BoundConnID(); got != "conn-1" {
 		t.Errorf("BoundConnID() = %q, want %q", got, "conn-1")
 	}
-	if got := c.DegradedReason(); got != "" {
+	if got := c.SubscriptionDegradedReason(); got != "" {
 		t.Errorf("DegradedReason() = %q, want \"\" (Reactivate+bind both succeeded)", got)
 	}
 	if got := c.SuspensionReason(); got != "authority_revoked" {
@@ -267,7 +267,7 @@ func TestSubscriptionLifecycleAction_Suspended_Bot_SingleReactivate_NoBindNeeded
 	if got := deps.bind.callCount(); got != 0 {
 		t.Errorf("bindUser call count = %d, want 0 (bot never needs BindUser)", got)
 	}
-	if got := c.DegradedReason(); got != "" {
+	if got := c.SubscriptionDegradedReason(); got != "" {
 		t.Errorf("DegradedReason() = %q, want \"\"", got)
 	}
 }
@@ -351,7 +351,7 @@ func TestSubscriptionLifecycleAction_Suspended_UnknownCode_DefaultBranch_GetOnce
 	if got := deps.client.getCount(); got != 1 {
 		t.Errorf("Get call count = %d, want 1 (default branch reconciles once)", got)
 	}
-	if got := c.DegradedReason(); got == "" {
+	if got := c.SubscriptionDegradedReason(); got == "" {
 		t.Error("DegradedReason() = \"\", want non-empty (still suspended per the reconcile)")
 	}
 	if got := c.SuspensionReason(); got != "some_future_unrecognized_code" {
@@ -374,7 +374,7 @@ func TestSubscriptionLifecycleAction_Suspended_ReactivateFails_Degraded_NextActi
 		t.Fatal("Handle should surface the Reactivate failure")
 	}
 
-	if got := c.DegradedReason(); got == "" {
+	if got := c.SubscriptionDegradedReason(); got == "" {
 		t.Error("DegradedReason() empty after a Reactivate failure")
 	}
 	if got := c.NextAction(); got != lifecycle.NextActionReactivate {
@@ -423,8 +423,13 @@ func TestSubscriptionLifecycleAction_Suspended_ReactivateSucceeds_BindFails_NotR
 	if got := c.BoundConnID(); got != "" {
 		t.Errorf("BoundConnID() = %q, want \"\" (bind failed -- must not be considered bound/running)", got)
 	}
-	if got := c.DegradedReason(); got == "" {
-		t.Error("DegradedReason() empty -- a failed bind after a successful Reactivate must still be degraded (spec §5.4: NOT running)")
+	if got := c.IdentityDegradedReason(); got == "" {
+		t.Error("IdentityDegradedReason() empty -- a failed bind after a successful Reactivate must still be degraded on the IDENTITY dimension (spec §5.4: NOT running)")
+	}
+	// The subscription itself was reactivated OK, so its dimension is clear —
+	// the degradation is purely the bind (identity) failure above.
+	if got := c.SubscriptionDegradedReason(); got != "" {
+		t.Errorf("SubscriptionDegradedReason() = %q, want \"\" (Reactivate succeeded; only the bind failed)", got)
 	}
 	if got := c.NextAction(); got != lifecycle.NextActionRebind {
 		t.Errorf("NextAction() = %q, want %q", got, lifecycle.NextActionRebind)
@@ -440,7 +445,7 @@ func TestSubscriptionLifecycleAction_ExpirationReminder_Hit_SingleRenew_Success(
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
-	c.SetDegraded("stale_marker_from_before")
+	c.SetSubscriptionDegraded("stale_marker_from_before")
 
 	le := lifecycle.LifecycleEvent{EventType: "event.subscription.expiration_reminder_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", ExpireTime: 123}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
@@ -453,7 +458,7 @@ func TestSubscriptionLifecycleAction_ExpirationReminder_Hit_SingleRenew_Success(
 	if got := c.LastAction(); got != "renew" {
 		t.Errorf("LastAction() = %q, want %q", got, "renew")
 	}
-	if got := c.DegradedReason(); got != "" {
+	if got := c.SubscriptionDegradedReason(); got != "" {
 		t.Errorf("DegradedReason() = %q, want \"\" (a successful Renew clears a prior degraded state)", got)
 	}
 }
@@ -474,7 +479,7 @@ func TestSubscriptionLifecycleAction_ExpirationReminder_RenewFails_Degraded_Next
 	// reported as "remote_subscription_expired" (that reason is reserved for
 	// the actual expired_v1 event/reconcile outcome) -- a renew failure only
 	// means the subscription is at risk of expiring soon, a distinct fact.
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpiringSoon {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpiringSoon {
 		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionExpiringSoon)
 	}
 	if got := c.NextAction(); got != lifecycle.NextActionRenew {
@@ -526,7 +531,7 @@ func TestSubscriptionLifecycleAction_Expired_Hit_Degraded_NoRemoteCallAtAll(t *t
 		t.Fatalf("Handle returned err: %v", err)
 	}
 
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpired {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpired {
 		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionExpired)
 	}
 	if got := c.NextAction(); got != lifecycle.NextActionRebuild {
@@ -553,7 +558,7 @@ func TestSubscriptionLifecycleAction_Expired_OwnerMismatch_StillMarkedLocally_No
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpired {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpired {
 		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionExpired)
 	}
 	if deps.client.reactivateCount() != 0 || deps.client.renewCount() != 0 {
@@ -576,7 +581,7 @@ func TestSubscriptionLifecycleAction_Deleted_Hit_Degraded_NoRebuild(t *testing.T
 		t.Fatalf("Handle returned err: %v", err)
 	}
 
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionDeleted {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionDeleted {
 		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionDeleted)
 	}
 	if got := c.NextAction(); got != lifecycle.NextActionRebuild {
@@ -604,7 +609,7 @@ func TestSubscriptionLifecycleAction_Tombstone_BlocksLateActivatedAfterDeletedMi
 	// late/out-of-order activated_v1 for it arrives.
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
-	c.SetDegraded("pre_existing_marker") // proves the activated-success path never ran
+	c.SetSubscriptionDegraded("pre_existing_marker") // proves the activated-success path never ran
 
 	activated := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-2", RemoteSubscriptionID: "sub-1", State: "active"}
 	if err := deps.action.Handle(context.Background(), activated); err != nil {
@@ -614,7 +619,7 @@ func TestSubscriptionLifecycleAction_Tombstone_BlocksLateActivatedAfterDeletedMi
 	if got := deps.bind.callCount(); got != 0 {
 		t.Errorf("bindUser call count = %d, want 0 (tombstoned activated must never resurrect/bind)", got)
 	}
-	if got := c.DegradedReason(); got != "pre_existing_marker" {
+	if got := c.SubscriptionDegradedReason(); got != "pre_existing_marker" {
 		t.Errorf("DegradedReason() = %q, want unchanged %q (tombstoned event must not run the normal activated success path)", got, "pre_existing_marker")
 	}
 }
@@ -643,7 +648,7 @@ func TestSubscriptionLifecycleAction_Tombstone_ExpiresAfterTTL_AllowsLateResurre
 	if got := c.LastLifecycleEvent(); got != activated.EventType {
 		t.Errorf("LastLifecycleEvent() = %q, want %q (tombstone must have expired)", got, activated.EventType)
 	}
-	if got := c.DegradedReason(); got != "" {
+	if got := c.SubscriptionDegradedReason(); got != "" {
 		t.Errorf("DegradedReason() = %q, want \"\" (bot activated after tombstone expiry should resolve clean)", got)
 	}
 }
@@ -673,7 +678,7 @@ func TestSubscriptionLifecycleAction_Updated_Compatible_Continue(t *testing.T) {
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != "" {
+	if got := c.SubscriptionDegradedReason(); got != "" {
 		t.Errorf("DegradedReason() = %q, want \"\" (compatible update)", got)
 	}
 	if deps.client.getCount() != 0 {
@@ -700,7 +705,7 @@ func TestSubscriptionLifecycleAction_Updated_DifferingTargetResource_DegradedCon
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
 		t.Errorf("DegradedReason() = %q, want %q (target_resource changed remotely)", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 	if deps.client.getCount() != 0 {
@@ -726,7 +731,7 @@ func TestSubscriptionLifecycleAction_Updated_DifferingIncludeResourceData_Degrad
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
 		t.Errorf("DegradedReason() = %q, want %q (include_resource_data changed remotely)", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 	if deps.client.getCount() != 0 {
@@ -772,7 +777,7 @@ func TestSubscriptionLifecycleAction_Updated_Incompatible_DegradedConflict(t *te
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
 		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 	if deps.client.getCount() != 0 {
@@ -829,7 +834,7 @@ func TestSubscriptionLifecycleAction_Updated_MatchingFilter_Compatible(t *testin
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != "" {
+	if got := c.SubscriptionDegradedReason(); got != "" {
 		t.Errorf("DegradedReason() = %q, want \"\" (filter Equal intent -> compatible)", got)
 	}
 	if deps.client.getCount() != 0 {
@@ -856,7 +861,7 @@ func TestSubscriptionLifecycleAction_Updated_DifferingFilter_DegradedConflict(t 
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
 		t.Errorf("DegradedReason() = %q, want %q (filter changed remotely)", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 	if got := c.NextAction(); got != lifecycle.NextActionGet {
@@ -885,7 +890,7 @@ func TestSubscriptionLifecycleAction_Updated_NilIntentFilteredRemote_DegradedCon
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
 		t.Errorf("DegradedReason() = %q, want %q (nil intent vs a set remote filter)", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 }
@@ -910,7 +915,7 @@ func TestSubscriptionLifecycleAction_Updated_FilteredIntentClearedRemote_Degrade
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
 		t.Errorf("DegradedReason() = %q, want %q (a set intent vs a cleared remote filter)", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 }
@@ -959,7 +964,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveCompatible_ClearsDeg
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
-	c.SetDegraded(lifecycle.ReasonRemoteSubscriptionConflict) // simulate an earlier degraded evaluation
+	c.SetSubscriptionDegraded(lifecycle.ReasonRemoteSubscriptionConflict) // simulate an earlier degraded evaluation
 	hub.RegisterAndIsFirst(c)
 	deps.client.getSub = buildGetSubActive("im.message?chat_id=oc_1", "ou_alice", true)
 
@@ -972,7 +977,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveCompatible_ClearsDeg
 	if got := deps.client.getCount(); got != 1 {
 		t.Fatalf("Get call count = %d, want 1", got)
 	}
-	if got := c.DegradedReason(); got != "" {
+	if got := c.SubscriptionDegradedReason(); got != "" {
 		t.Errorf("DegradedReason() = %q, want \"\" (Get confirmed active AND all 3 dimensions compatible)", got)
 	}
 }
@@ -993,7 +998,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleTargetRe
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
 		t.Errorf("DegradedReason() = %q, want %q (Get's own target_resource disagrees)", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 	if got := c.NextAction(); got != lifecycle.NextActionGet {
@@ -1015,7 +1020,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleIncludeR
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
 		t.Errorf("DegradedReason() = %q, want %q (Get's own include_resource_data disagrees)", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 }
@@ -1034,7 +1039,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleAuthorit
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
 		t.Errorf("DegradedReason() = %q, want %q (Get's own authority disagrees)", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 }
@@ -1061,7 +1066,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleFilter_S
 	if got := deps.client.getCount(); got != 1 {
 		t.Fatalf("Get call count = %d, want 1", got)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
 		t.Errorf("DegradedReason() = %q, want %q (Get's own filter disagrees)", got, lifecycle.ReasonRemoteSubscriptionConflict)
 	}
 	if got := c.NextAction(); got != lifecycle.NextActionGet {
@@ -1085,7 +1090,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_Suspended_Unchanged(t *tes
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got == "" {
+	if got := c.SubscriptionDegradedReason(); got == "" {
 		t.Error("DegradedReason() = \"\", want non-empty (still suspended per the reconcile)")
 	}
 	if got := c.SuspensionReason(); got != "some_future_unrecognized_code" {
@@ -1107,7 +1112,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_Expired_Unchanged(t *testi
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpired {
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionExpired {
 		t.Errorf("DegradedReason() = %q, want %q", got, lifecycle.ReasonRemoteSubscriptionExpired)
 	}
 	if got := c.NextAction(); got != lifecycle.NextActionRebuild {
@@ -1157,7 +1162,7 @@ func TestSubscriptionLifecycleAction_Activated_User_ClearsSuspension_NeverBinds(
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
 	c.SetSuspensionReason("authority_revoked")
-	c.SetDegraded(lifecycle.ReasonRemoteSubscriptionSuspended)
+	c.SetSubscriptionDegraded(lifecycle.ReasonRemoteSubscriptionSuspended)
 	c.SetNextAction(lifecycle.NextActionReactivate)
 
 	le := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
@@ -1168,7 +1173,7 @@ func TestSubscriptionLifecycleAction_Activated_User_ClearsSuspension_NeverBinds(
 	if got := c.SuspensionReason(); got != "" {
 		t.Errorf("SuspensionReason() = %q, want \"\" (activated clears suspension)", got)
 	}
-	if got := c.DegradedReason(); got != "" {
+	if got := c.SubscriptionDegradedReason(); got != "" {
 		t.Errorf("DegradedReason() = %q, want \"\" (suspension-degraded cleared on activated)", got)
 	}
 	if got := c.NextAction(); got != "" {
@@ -1208,14 +1213,14 @@ func TestSubscriptionLifecycleAction_Activated_Bot_ClearsWithoutBind(t *testing.
 	hub := NewHub()
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "bot", "app1", "")
 	hub.RegisterAndIsFirst(c)
-	c.SetDegraded(lifecycle.ReasonRemoteSubscriptionSuspended)
+	c.SetSubscriptionDegraded(lifecycle.ReasonRemoteSubscriptionSuspended)
 
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), false) // no bindUser wired at all
 	le := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
 	}
-	if got := c.DegradedReason(); got != "" {
+	if got := c.SubscriptionDegradedReason(); got != "" {
 		t.Errorf("DegradedReason() = %q, want \"\" (bot activated needs no bind)", got)
 	}
 	if got := deps.bind.callCount(); got != 0 {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/health"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
@@ -80,10 +81,18 @@ type Conn struct {
 	// Hub.Publish's per-event delivery gate (the source's emit goroutine) —
 	// and read by the status command, so they need real
 	// synchronization rather than the zero-lock convention above.
-	identityMu     sync.Mutex
-	boundConnID    string
-	staleIdentity  bool
-	degradedReason string
+	identityMu    sync.Mutex
+	boundConnID   string
+	staleIdentity bool
+
+	// health holds this consumer's per-dimension health facts (identity /
+	// subscription / decryption / source / delivery), each written ONLY by its
+	// owning subsystem — replacing the single degraded-reason slot that hub /
+	// identity / lifecycle / decrypt used to overwrite last-writer-wins.
+	// *health.Facts is concurrency-safe on its own (its own mutex), so it is
+	// deliberately NOT guarded by identityMu; set once in NewConn, never
+	// reassigned.
+	health *health.Facts
 
 	// --- lifecycle summary state ---
 	// lastLifecycleEvent/lastLifecycleEventID/remoteState summarize the most
@@ -170,6 +179,7 @@ func NewConn(conn net.Conn, reader *bufio.Reader, eventKey string, eventTypes []
 		pid:        pid,
 		subID:      subID,
 		closed:     make(chan struct{}),
+		health:     health.New(),
 	}
 }
 
@@ -265,16 +275,18 @@ func (c *Conn) BoundConnID() string {
 	return c.boundConnID
 }
 
-// SetBoundConnID records a successful BindUser for connID and clears any
-// prior stale/degraded state — a fresh successful bind supersedes all three
-// (staleIdentity, degradedReason, and nextAction).
+// SetBoundConnID records a successful BindUser for connID and clears ONLY the
+// identity/binding state — the stale flag and the Identity health dimension. A
+// fresh successful bind supersedes the identity state, but it must NOT wipe a
+// still-true Subscription (deleted/expired/...) or Decryption (decrypt_failed)
+// health fact, nor the subscription-tied next_action: a rebind that cleared
+// everything was the bug this per-dimension model fixes.
 func (c *Conn) SetBoundConnID(connID string) {
 	c.identityMu.Lock()
-	defer c.identityMu.Unlock()
 	c.boundConnID = connID
 	c.staleIdentity = false
-	c.degradedReason = ""
-	c.nextAction = ""
+	c.identityMu.Unlock()
+	c.health.Clear(health.Identity)
 }
 
 // StaleIdentity reports whether this consumer's owner last mismatched the
@@ -295,24 +307,35 @@ func (c *Conn) SetStaleIdentity() {
 	c.staleIdentity = true
 }
 
-// DegradedReason returns why this consumer is degraded ("" = not degraded).
-// Deliberately a short classified string, never a raw error or token — this
-// may be surfaced by the status command.
-func (c *Conn) DegradedReason() string {
-	c.identityMu.Lock()
-	defer c.identityMu.Unlock()
-	return c.degradedReason
-}
+// SetIdentityDegraded records an identity-dimension failure on this consumer —
+// an unresolved current identity or a bind/UAT error. Written ONLY by the
+// identity gate (the delivery gate, the bind gate, and the lifecycle
+// eligibility gate). A single consumer's failure never affects any other. A
+// later successful bind (SetBoundConnID) clears it.
+func (c *Conn) SetIdentityDegraded(reason string) { c.health.Degrade(health.Identity, reason) }
 
-// SetDegraded records a per-consumer failure reason (e.g. a bind/UAT error,
-// or an unresolved current identity). A single consumer's failure must
-// never affect any other consumer — callers only ever set this
-// on the ONE Conn that failed.
-func (c *Conn) SetDegraded(reason string) {
-	c.identityMu.Lock()
-	defer c.identityMu.Unlock()
-	c.degradedReason = reason
-}
+// IdentityDegradedReason returns the identity-dimension reason ("" = healthy).
+func (c *Conn) IdentityDegradedReason() string { return c.health.Reason(health.Identity) }
+
+// SetSubscriptionDegraded records a subscription-dimension failure (the remote
+// Subscription is suspended / expired / deleted / conflicting / unreconciled,
+// or the lifecycle executor was at capacity). Written ONLY by the lifecycle
+// control plane.
+func (c *Conn) SetSubscriptionDegraded(reason string) { c.health.Degrade(health.Subscription, reason) }
+
+// SubscriptionDegradedReason returns the subscription-dimension reason ("" =
+// healthy).
+func (c *Conn) SubscriptionDegradedReason() string { return c.health.Reason(health.Subscription) }
+
+// DecryptionDegradedReason returns the decryption-dimension reason ("" =
+// healthy); set only by RecordDecryptFailure once failures persist.
+func (c *Conn) DecryptionDegradedReason() string { return c.health.Reason(health.Decryption) }
+
+// HealthSnapshot returns every currently-unhealthy dimension's fact, in
+// dimension order — the status projection surface (Hub.Consumers). Multiple
+// independent facts (e.g. subscription-suspended AND identity-stale) can be
+// present at once.
+func (c *Conn) HealthSnapshot() []health.DimensionFact { return c.health.Snapshot() }
 
 // LastLifecycleEvent returns the most recent subscription lifecycle event
 // type observed for this consumer's remote Subscription ("" = none yet).
@@ -421,18 +444,18 @@ func (c *Conn) SetNextAction(action string) {
 	c.nextAction = action
 }
 
-// ClearActionDegraded clears BOTH degradedReason and nextAction together —
-// used whenever a lifecycle action's outcome means "fully healthy again"
-// (a bare successful Reactivate for a bot, or a successful
-// Reactivate+bindConsumer pair for a user; likewise a successful Renew).
-// Deliberately does NOT touch suspensionReason/lastAction/lastActionError —
-// those are historical record-keeping, not "is this consumer currently
-// degraded" state.
-func (c *Conn) ClearActionDegraded() {
+// ClearSubscriptionDegraded clears the subscription-dimension health fact
+// together with the subscription-tied next_action — used whenever a lifecycle
+// action's outcome means "the subscription is healthy again" (a bare
+// successful Reactivate for a bot, or a successful Reactivate+bindConsumer pair
+// for a user; likewise a successful Renew). Deliberately does NOT touch the
+// Identity/Decryption health dimensions, nor the historical
+// suspensionReason/lastAction/lastActionError bookkeeping.
+func (c *Conn) ClearSubscriptionDegraded() {
+	c.health.Clear(health.Subscription)
 	c.identityMu.Lock()
-	defer c.identityMu.Unlock()
-	c.degradedReason = ""
 	c.nextAction = ""
+	c.identityMu.Unlock()
 }
 
 // DecryptState returns this consumer's most recent decryption status ("" =
@@ -468,13 +491,16 @@ const decryptFailDegradeThreshold = 3
 // itself is dropped by the SDK before ever reaching delivery.
 func (c *Conn) RecordDecryptFailure() {
 	c.identityMu.Lock()
-	defer c.identityMu.Unlock()
 	c.decryptFailCount++
 	c.lastDecryptErrorClass = decryptStateFailed
 	c.lastDecryptErrorTime = time.Now()
 	c.decryptState = decryptStateFailed
-	if c.decryptFailCount >= decryptFailDegradeThreshold {
-		c.degradedReason = decryptStateFailed
+	degrade := c.decryptFailCount >= decryptFailDegradeThreshold
+	c.identityMu.Unlock()
+	// Persistent failure marks the Decryption health dimension — its own slot,
+	// so it is never cleared by an unrelated Renew/BindUser success.
+	if degrade {
+		c.health.Degrade(health.Decryption, decryptStateFailed)
 	}
 }
 

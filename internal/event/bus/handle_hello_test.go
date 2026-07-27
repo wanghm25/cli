@@ -1174,8 +1174,8 @@ func TestHandleHello_BotConsumer_WSReady_NeverBound(t *testing.T) {
 	if c.StaleIdentity() {
 		t.Error("bot consumer must never be marked stale_identity")
 	}
-	if got := c.DegradedReason(); got != "" {
-		t.Errorf("bot DegradedReason() = %q, want \"\"", got)
+	if got := c.IdentityDegradedReason(); got != "" {
+		t.Errorf("bot IdentityDegradedReason() = %q, want \"\"", got)
 	}
 	if fb.callCount() != 0 {
 		t.Errorf("bindUser call count = %d, want 0 for a bot consumer", fb.callCount())

@@ -34,8 +34,8 @@ func (a *SubscriptionAction) handleActivated(conns []Conn) error {
 	}
 	res := a.eligibleConns(conns)
 	for _, c := range res.conns {
-		if c.DegradedReason() == ReasonRemoteSubscriptionSuspended {
-			c.ClearActionDegraded()
+		if c.SubscriptionDegradedReason() == ReasonRemoteSubscriptionSuspended {
+			c.ClearSubscriptionDegraded()
 		}
 	}
 	return nil
@@ -59,14 +59,14 @@ func (a *SubscriptionAction) handleUpdated(ctx context.Context, le LifecycleEven
 	switch classifyUpdateCompatibility(le, res.conns[0]) {
 	case updateCompatible:
 		for _, c := range res.conns {
-			if c.DegradedReason() == ReasonRemoteSubscriptionConflict {
-				c.ClearActionDegraded()
+			if c.SubscriptionDegradedReason() == ReasonRemoteSubscriptionConflict {
+				c.ClearSubscriptionDegraded()
 			}
 		}
 		return nil
 	case updateIncompatible:
 		for _, c := range res.conns {
-			c.SetDegraded(ReasonRemoteSubscriptionConflict)
+			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionConflict)
 			c.SetNextAction(NextActionGet)
 		}
 		return nil
@@ -114,7 +114,7 @@ func (a *SubscriptionAction) reactivateAndMaybeBind(ctx context.Context, le Life
 	if err != nil {
 		markActionResult(res.conns, "reactivate", err)
 		for _, c := range res.conns {
-			c.SetDegraded(ReasonRemoteSubscriptionSuspended)
+			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionSuspended)
 			c.SetNextAction(NextActionReactivate)
 		}
 		return err
@@ -124,7 +124,7 @@ func (a *SubscriptionAction) reactivateAndMaybeBind(ctx context.Context, le Life
 	markActionResult(res.conns, "reactivate", callErr)
 	if callErr != nil {
 		for _, c := range res.conns {
-			c.SetDegraded(ReasonRemoteSubscriptionSuspended)
+			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionSuspended)
 			c.SetNextAction(NextActionReactivate)
 		}
 		return callErr
@@ -132,14 +132,14 @@ func (a *SubscriptionAction) reactivateAndMaybeBind(ctx context.Context, le Life
 
 	for _, c := range res.conns {
 		if c.OwnerUserOpenID() == "" {
-			c.ClearActionDegraded()
+			c.ClearSubscriptionDegraded()
 			continue
 		}
 		if bindErr := a.gate.BindConsumer(ctx, c); bindErr != nil {
 			c.SetNextAction(NextActionRebind)
 			continue
 		}
-		c.ClearActionDegraded()
+		c.ClearSubscriptionDegraded()
 	}
 	return nil
 }
@@ -164,7 +164,7 @@ func (a *SubscriptionAction) handleExpirationReminder(ctx context.Context, le Li
 	if err != nil {
 		markActionResult(res.conns, "renew", err)
 		for _, c := range res.conns {
-			c.SetDegraded(ReasonRemoteSubscriptionExpiringSoon)
+			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionExpiringSoon)
 			c.SetNextAction(NextActionRenew)
 		}
 		return err
@@ -174,13 +174,13 @@ func (a *SubscriptionAction) handleExpirationReminder(ctx context.Context, le Li
 	markActionResult(res.conns, "renew", callErr)
 	if callErr != nil {
 		for _, c := range res.conns {
-			c.SetDegraded(ReasonRemoteSubscriptionExpiringSoon)
+			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionExpiringSoon)
 			c.SetNextAction(NextActionRenew)
 		}
 		return callErr
 	}
 	for _, c := range res.conns {
-		c.ClearActionDegraded()
+		c.ClearSubscriptionDegraded()
 	}
 	return nil
 }
@@ -194,7 +194,7 @@ func (a *SubscriptionAction) handleExpirationReminder(ctx context.Context, le Li
 // isn't the kind of "action" the security gate covers.
 func (a *SubscriptionAction) handleExpired(conns []Conn) error {
 	for _, c := range conns {
-		c.SetDegraded(ReasonRemoteSubscriptionExpired)
+		c.SetSubscriptionDegraded(ReasonRemoteSubscriptionExpired)
 		c.SetNextAction(NextActionRebuild)
 	}
 	return nil
@@ -215,7 +215,7 @@ func (a *SubscriptionAction) handleDeleted(le LifecycleEvent, conns []Conn) erro
 		a.encryptKeyRemover(le.RemoteSubscriptionID)
 	}
 	for _, c := range conns {
-		c.SetDegraded(ReasonRemoteSubscriptionDeleted)
+		c.SetSubscriptionDegraded(ReasonRemoteSubscriptionDeleted)
 		c.SetNextAction(NextActionRebuild)
 	}
 	return nil
@@ -262,7 +262,7 @@ func (a *SubscriptionAction) reconcileWithGet(ctx context.Context, le LifecycleE
 	markActionResult(res.conns, "get", callErr)
 	if callErr != nil {
 		for _, c := range res.conns {
-			c.SetDegraded(reasonRemoteStateUnreconciled)
+			c.SetSubscriptionDegraded(reasonRemoteStateUnreconciled)
 			c.SetNextAction(NextActionGet)
 		}
 		return callErr
@@ -285,17 +285,17 @@ func (a *SubscriptionAction) reconcileWithGet(ctx context.Context, le LifecycleE
 		case "active":
 			c.SetSuspensionReason("")
 			if compatible {
-				c.ClearActionDegraded()
+				c.ClearSubscriptionDegraded()
 			} else {
-				c.SetDegraded(ReasonRemoteSubscriptionConflict)
+				c.SetSubscriptionDegraded(ReasonRemoteSubscriptionConflict)
 				c.SetNextAction(NextActionGet)
 			}
 		case "suspended":
 			c.SetSuspensionReason(suspensionCode)
-			c.SetDegraded(ReasonRemoteSubscriptionSuspended)
+			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionSuspended)
 			c.SetNextAction(NextActionReactivate)
 		case "expired":
-			c.SetDegraded(ReasonRemoteSubscriptionExpired)
+			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionExpired)
 			c.SetNextAction(NextActionRebuild)
 		default:
 			// Open vocabulary: don't guess (mirrors status.go's
