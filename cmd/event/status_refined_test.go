@@ -23,6 +23,7 @@ import (
 	eventlib "github.com/larksuite/cli/internal/event"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
+	"github.com/larksuite/cli/internal/event/session"
 )
 
 // fakeRefinedGetter is a network-free stand-in for the platform/lark gateway's
@@ -168,7 +169,7 @@ func TestAnnotateCurrentIdentity_OnlyStampsMatchingApp(t *testing.T) {
 		{AppID: "cli_a"},
 		{AppID: "cli_b"},
 	}
-	annotateCurrentIdentity(statuses, "cli_a", currentIdentityForMatch{appID: "cli_a", userOpenID: "ou_1"}, true)
+	annotateCurrentIdentity(statuses, "cli_a", session.CurrentIdentity{AppID: "cli_a", UserOpenID: "ou_1"}, true)
 
 	if !statuses[0].CurrentIdentityKnown || statuses[0].CurrentAppID != "cli_a" || statuses[0].CurrentUserOpenID != "ou_1" {
 		t.Errorf("cli_a not annotated: %+v", statuses[0])
@@ -180,7 +181,7 @@ func TestAnnotateCurrentIdentity_OnlyStampsMatchingApp(t *testing.T) {
 
 func TestAnnotateCurrentIdentity_UnresolvableCurrentLeavesKnownFalse(t *testing.T) {
 	statuses := []appStatus{{AppID: "cli_a"}}
-	annotateCurrentIdentity(statuses, "cli_a", currentIdentityForMatch{}, false)
+	annotateCurrentIdentity(statuses, "cli_a", session.CurrentIdentity{}, false)
 	if statuses[0].CurrentIdentityKnown {
 		t.Error("CurrentIdentityKnown = true, want false when curOK is false")
 	}

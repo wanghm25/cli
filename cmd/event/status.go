@@ -20,8 +20,10 @@ import (
 	"github.com/larksuite/cli/internal/event/app"
 	"github.com/larksuite/cli/internal/event/busctl"
 	"github.com/larksuite/cli/internal/event/busdiscover"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
+	"github.com/larksuite/cli/internal/event/session"
 	"github.com/larksuite/cli/internal/event/transport"
 	"github.com/larksuite/cli/internal/output"
 )
@@ -97,10 +99,10 @@ type appStatus struct {
 	// Local current_profile_match support.
 	//
 	// CurrentIdentityKnown/CurrentAppID/CurrentUserOpenID carry the FRESHLY
-	// resolved current identity (core.LoadMultiAppConfig, never
-	// Factory.Config()'s cache — mirrors internal/event/bus/identity.go's
-	// resolveCurrentIdentity so status's notion of "current" tracks exactly
-	// what the bus-side delivery gate itself would use right now) used by
+	// resolved current identity from the shared session.ResolveCurrentIdentity
+	// (reads config.json fresh, never Factory.Config()'s cache — the SAME read
+	// the bus-side delivery gate uses, so status's notion of "current" tracks
+	// exactly what that gate would use right now) used by
 	// consumerProfileMatch below. Populated by annotateCurrentIdentity ONLY
 	// on the one appStatus row whose AppID matches the current profile's
 	// AppID (runStatus's cfg.AppID) — every other (foreign, merely scanned)
@@ -224,7 +226,7 @@ type statusPlane struct {
 	querier  busQuerier
 
 	statuses []appStatus
-	cur      currentIdentityForMatch
+	cur      session.CurrentIdentity
 }
 
 func (p *statusPlane) Derive() {
@@ -248,7 +250,7 @@ func (p *statusPlane) Supplement() bool {
 	// failed precondition silently keeps every consumer local-only — this must
 	// never turn a plain `event status` into a hard failure.
 	return applyRefinedSupplement(p.ctx, p.statuses, p.appID, func() refinedSubscriptionGetter {
-		return resolveRemoteSupplementGetter(p.ctx, p.cmd, p.f, p.appID, p.cur.userOpenID, time.Now())
+		return resolveRemoteSupplementGetter(p.ctx, p.cmd, p.f, p.appID, p.cur.UserOpenID, time.Now())
 	})
 }
 
@@ -314,36 +316,22 @@ func deriveStatuses(seedAppIDs []string, sc busdiscover.Scanner, q busQuerier, n
 
 // --- current_profile_match (local, read-only) ---
 
-// currentIdentityForMatch is the CLI-side "current" identity used to compute
-// each refined consumer's current_profile_match. Mirrors
-// internal/event/bus/identity.go's currentIdentity concept, kept as an
-// independent (unexported) type here rather than importing the bus package
-// just for two strings — cmd/event has no other reason to depend on
-// internal/event/bus.
-type currentIdentityForMatch struct {
-	appID      string
-	userOpenID string
-}
-
-// loadCurrentIdentityForMatch resolves the current identity FRESH from disk
-// (core.LoadMultiAppConfig → CurrentAppConfig("") → Users[0]) — never
-// Factory.Config()'s cache — exactly mirroring
-// internal/event/bus/identity.go's resolveCurrentIdentity, so what `event
-// status` displays as "matching" tracks exactly what the bus's own live
-// delivery gate would do right now. ok=false (unreadable
-// config, no current app, or no logged-in user under it) means "nothing
-// resolvable to compare against" — callers must treat this as
-// not-applicable, never as a synthetic mismatch.
-func loadCurrentIdentityForMatch() (currentIdentityForMatch, bool) {
-	multi, err := core.LoadMultiAppConfig()
-	if err != nil {
-		return currentIdentityForMatch{}, false
+// loadCurrentIdentityForMatch resolves the current identity for owner-match
+// display via the ONE shared reader, session.ResolveCurrentIdentity (
+// LoadMultiAppConfig → CurrentAppConfig("") → Users[0], read fresh — never
+// Factory.Config()'s cache) — the SAME read the bus's own delivery gate uses,
+// so what `event status` displays as "matching" tracks exactly what the gate
+// would do right now. status layers its own applicability policy on top of that
+// shared read: ok=false (unreadable config, no current app, or no logged-in
+// user) means "nothing resolvable to compare against" — callers treat it as
+// not-applicable, never a synthetic mismatch. (A no-user config is tolerated by
+// the shared reader but is not applicable HERE, since a match needs a user.)
+func loadCurrentIdentityForMatch() (session.CurrentIdentity, bool) {
+	cur, err := session.ResolveCurrentIdentity()
+	if err != nil || cur.UserOpenID == "" {
+		return session.CurrentIdentity{}, false
 	}
-	app := multi.CurrentAppConfig("")
-	if app == nil || len(app.Users) == 0 {
-		return currentIdentityForMatch{}, false
-	}
-	return currentIdentityForMatch{appID: app.AppId, userOpenID: app.Users[0].UserOpenId}, true
+	return cur, true
 }
 
 // annotateCurrentIdentity stamps cur/curOK onto the one appStatus row whose
@@ -351,30 +339,35 @@ func loadCurrentIdentityForMatch() (currentIdentityForMatch, bool) {
 // merely scanned) appStatus is left at its zero value, so
 // consumerProfileMatch below never attempts a match for an app that isn't
 // "current" at all.
-func annotateCurrentIdentity(statuses []appStatus, curAppID string, cur currentIdentityForMatch, curOK bool) {
+func annotateCurrentIdentity(statuses []appStatus, curAppID string, cur session.CurrentIdentity, curOK bool) {
 	for i := range statuses {
 		if statuses[i].AppID != curAppID {
 			continue
 		}
 		statuses[i].CurrentIdentityKnown = curOK
-		statuses[i].CurrentAppID = cur.appID
-		statuses[i].CurrentUserOpenID = cur.userOpenID
+		statuses[i].CurrentAppID = cur.AppID
+		statuses[i].CurrentUserOpenID = cur.UserOpenID
 	}
 }
 
 // consumerProfileMatch reports current_profile_match for one
 // consumer against s's current identity (see appStatus's Current* field doc
-// and loadCurrentIdentityForMatch). applicable=false — NEVER treated as a
-// mismatch — when either side has nothing to compare: the consumer has no
-// owner user at all (OwnerUserOpenID=="", i.e. a bot or legacy
-// registration — OwnerAppID alone is populated for every consumer and
-// is deliberately never used as a standalone comparison
-// key), or s isn't the current app / has no resolvable current identity.
+// and loadCurrentIdentityForMatch). It is the SINGLE-AUTHORITY freshness check:
+// it computes the owner==current answer through the very same
+// session.OwnerMatchesCurrent the bus's live gate uses, so status can never
+// drift from — or contradict — the gate's own comparison. applicable=false —
+// NEVER treated as a mismatch — when either side has nothing to compare: the
+// consumer has no owner user at all (OwnerUserOpenID=="", i.e. a bot or legacy
+// registration — OwnerAppID alone is populated for every consumer and is
+// deliberately never used as a standalone comparison key), or s isn't the
+// current app / has no resolvable current identity.
 func consumerProfileMatch(s appStatus, c protocol.ConsumerInfo) (match, applicable bool) {
 	if !s.CurrentIdentityKnown || c.OwnerUserOpenID == "" {
 		return false, false
 	}
-	return c.OwnerAppID == s.CurrentAppID && c.OwnerUserOpenID == s.CurrentUserOpenID, true
+	owner := model.OwnerRef{AppID: c.OwnerAppID, UserOpenID: c.OwnerUserOpenID}
+	cur := session.CurrentIdentity{AppID: s.CurrentAppID, UserOpenID: s.CurrentUserOpenID}
+	return session.OwnerMatchesCurrent(owner, cur), true
 }
 
 // refinedNextAction returns the read-only advisory action to display next to
@@ -390,20 +383,20 @@ func refinedNextAction(match, applicable bool) string {
 }
 
 // staleIdentityAdvisory renders the stale_identity flag's advisory text
-// for display. The FRESHLY-computed match/applicable (from
-// consumerProfileMatch above) is authoritative for "does it currently
-// match" — the bus-side StaleIdentity flag, by contrast, is only ever set,
-// never cleared except on rebind, so a live
-// consumer that currently matches can still carry a stale flag left over
-// from an earlier evaluation. Presenting that leftover flag next to a fresh
-// "current_profile_match=true" as if it were a CURRENT mismatch would be
-// two textually-contradictory adjacent lines. So: only a CONFIRMED fresh
-// mismatch (applicable && !match) is phrased as a current mismatch; every
-// other case — a fresh match, or no fresh comparison available at all for
-// this app/consumer — is phrased as an earlier-snapshot advisory instead,
-// never asserting a current mismatch it cannot verify. Never describes the
-// consumer as dead/inactive (advisory-only — no liveness signal
-// exists).
+// for display. The single authority for "does it currently match" is the
+// FRESHLY-computed match/applicable from consumerProfileMatch above — which
+// runs the same session.OwnerMatchesCurrent the bus gate does. The bus-side
+// StaleIdentity flag, by contrast, is only ever set, never cleared except on
+// rebind, so a live consumer that currently matches can still carry a stale
+// flag left over from an earlier evaluation. Presenting that leftover flag next
+// to a fresh "current_profile_match=true" as if it were a CURRENT mismatch
+// would be two textually-contradictory adjacent lines. So the fresh session
+// recompute wins: only a CONFIRMED fresh mismatch (applicable && !match) is
+// phrased as a current mismatch; every other case — a fresh match, or no fresh
+// comparison available at all for this app/consumer — is phrased as an
+// earlier-snapshot advisory instead, never asserting a current mismatch it
+// cannot verify. Never describes the consumer as dead/inactive (advisory-only —
+// no liveness signal exists).
 func staleIdentityAdvisory(match, applicable bool) string {
 	if applicable && !match {
 		return "stale_identity (owner identity does not match the current profile; informational only — the consumer may still be actively receiving events)"

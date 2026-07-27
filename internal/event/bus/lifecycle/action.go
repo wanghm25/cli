@@ -318,8 +318,8 @@ func (a *SubscriptionAction) eligibleConns(conns []Conn) eligibilityResult {
 // buildClientForConn resolves the ONE SubscriptionClient this event's single
 // remote action will use, bound to c's OWN identity — bot -> core.AsBot, no
 // uat; user -> core.AsUser with a FRESH uat minted for cur (never a historical
-// identity — c is only ever passed here after eligibleConns already verified
-// ownerMatchesCurrent(c, cur)).
+// identity — c is only ever passed here after eligibleConns already admitted it
+// through the shared session.Gate against cur).
 func (a *SubscriptionAction) buildClientForConn(ctx context.Context, c Conn, cur session.CurrentIdentity) (SubscriptionClient, error) {
 	if a.newSubClient == nil {
 		return nil, errSubscriptionClientUnconfigured
