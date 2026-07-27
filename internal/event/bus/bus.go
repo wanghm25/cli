@@ -414,6 +414,26 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 	bc.SetListenIntent(hello.TargetResource, hello.IncludeResourceData)
 	bc.SetLogger(b.logger)
 
+	// Reject an INCOMPLETE refined registration before acking: a refined
+	// consumer (a non-empty RemoteSubscriptionID) always builds its
+	// target_resource from the resolved selector key, so an empty one is a
+	// malformed registration — fail closed here rather than register a consumer
+	// whose delivery-time cross-check could never have a target_resource to
+	// compare against. This runs before any hub/bus registration, so the reject
+	// simply closes the conn — no half-registered consumer to unwind. Legacy
+	// Hellos (empty RemoteSubscriptionID) are untouched. The reject reason is a
+	// fixed token, never a resolved resource value.
+	if hello.RemoteSubscriptionID != "" && hello.TargetResource == "" {
+		b.logger.Printf("WARN: rejecting incomplete refined consumer pid=%d key=%q: refined Hello missing target_resource",
+			hello.PID, hello.EventKey)
+		if werr := bc.writeFrame(protocol.NewHelloAckRejected("v1", protocol.RejectReasonIncompleteRefinedHello)); werr != nil {
+			b.logger.Printf("WARN: reject hello_ack (incomplete_refined_hello) write to pid=%d key=%q failed: %v",
+				hello.PID, hello.EventKey, werr)
+		}
+		bc.Close()
+		return
+	}
+
 	// Encrypted refined consumer: fetch the subscription's encrypt_key ONCE
 	// now (under the owner==current gate) and register it with the SDK decrypt
 	// provider BEFORE acking, so the dispatcher decrypts later events with zero

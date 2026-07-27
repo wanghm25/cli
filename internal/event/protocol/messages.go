@@ -72,6 +72,17 @@ const RejectReasonDecryptKeyUnavailable = "decrypt_key_unavailable"
 // a UAT, open_id, or key.
 const RejectReasonBindFailed = "identity_bind_failed"
 
+// RejectReasonIncompleteRefinedHello is the HelloAck.RejectReason the bus sends
+// when a refined consumer's Hello (a non-empty RemoteSubscriptionID) omits its
+// target_resource. A legit refined consumer always builds target_resource from
+// the resolved selector key, so an empty one is a malformed registration: the
+// bus fails closed and refuses it before acking rather than registering a
+// consumer whose delivery-time cross-check could never have a target_resource
+// to compare against. The consumer never registers or readies. A single fixed
+// token — never any resolved resource value. Legacy (non-refined) Hellos, which
+// carry no RemoteSubscriptionID, are unaffected.
+const RejectReasonIncompleteRefinedHello = "incomplete_refined_hello"
+
 // SourceStatus is best-effort: hub drops it when consumer's send channel is full.
 type SourceStatus struct {
 	Type   string `json:"type"`

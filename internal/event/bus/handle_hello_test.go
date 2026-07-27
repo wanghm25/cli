@@ -79,6 +79,7 @@ func TestHandleHello_EncryptedConsumer_KeyFetchSuccess_RegistersAndCaches(t *tes
 		Identity:             "user",
 		UserOpenID:           "ou_me",
 		RemoteSubscriptionID: "sub_enc_ok",
+		TargetResource:       "im.message?chat_id=oc_1",
 		IncludeResourceData:  true,
 	}
 	ack := readAckFromClient(t, b, hello)
@@ -109,6 +110,7 @@ func TestHandleHello_EncryptedConsumer_KeyFetchFailure_RejectsNotRegistered(t *t
 		Identity:             "user",
 		UserOpenID:           "ou_me",
 		RemoteSubscriptionID: "sub_enc_fail",
+		TargetResource:       "im.message?chat_id=oc_2",
 		IncludeResourceData:  true,
 	}
 	ack := readAckFromClient(t, b, hello)
@@ -148,6 +150,7 @@ func TestHandleHello_EncryptedUserConsumer_OwnerMismatch_Rejected(t *testing.T) 
 		Identity:             "user",
 		UserOpenID:           "ou_owner",
 		RemoteSubscriptionID: "sub_enc_user",
+		TargetResource:       "im.message?chat_id=oc_3",
 		IncludeResourceData:  true,
 	}
 	ack := readAckFromClient(t, b, hello)
@@ -174,6 +177,7 @@ func TestHandleHello_EncryptedBotConsumer_Unsupported_Rejected(t *testing.T) {
 		EventTypes:           []string{"im.message.receive_v1"},
 		Identity:             "bot", // bot: no owner user_open_id
 		RemoteSubscriptionID: "sub_enc_bot",
+		TargetResource:       "im.message?chat_id=oc_5",
 		IncludeResourceData:  true,
 	}
 	ack := readAckFromClient(t, b, hello)
@@ -265,6 +269,66 @@ func TestHandleHello_LegacyHello_LeavesListenIntentEmpty(t *testing.T) {
 	}
 }
 
+// --- refined Hello completeness gate: a refined consumer
+// (RemoteSubscriptionID set) MUST declare its target_resource, since it always
+// builds one from the resolved selector key. An empty one is a malformed
+// registration and the bus fails closed BEFORE acking — the consumer never
+// registers or readies. Legacy Hellos are untouched. ---
+
+// A refined Hello missing target_resource is rejected with the fixed
+// incomplete_refined_hello reason and is never registered.
+func TestHandleHello_IncompleteRefinedHello_Rejected(t *testing.T) {
+	var buf bytes.Buffer
+	b := newPlainHelloBus(t, log.New(&buf, "", 0))
+	hello := &protocol.Hello{
+		PID:                  8003,
+		EventKey:             "im.message.created_v1/chat-id/oc_1",
+		EventTypes:           []string{"im.message.created_v1"},
+		Identity:             "user",
+		UserOpenID:           "ou_alice",
+		RemoteSubscriptionID: "sub_incomplete",
+		// TargetResource intentionally omitted -> malformed refined registration.
+	}
+	ack := readAckFromClient(t, b, hello)
+	if !ack.Rejected {
+		t.Fatal("a refined Hello without target_resource must be rejected")
+	}
+	if ack.RejectReason != protocol.RejectReasonIncompleteRefinedHello {
+		t.Errorf("reject reason = %q, want %q", ack.RejectReason, protocol.RejectReasonIncompleteRefinedHello)
+	}
+	if got := b.hub.ConnCount(); got != 0 {
+		t.Errorf("hub.ConnCount = %d, want 0 (a rejected refined consumer must NEVER register)", got)
+	}
+	if got := len(b.hub.connsByRemoteSubscriptionID("sub_incomplete")); got != 0 {
+		t.Errorf("connsByRemoteSubscriptionID(sub_incomplete) = %d conns, want 0", got)
+	}
+	// The reject reason is a fixed token — no resolved open_id / resource value.
+	if strings.Contains(ack.RejectReason, "ou_alice") || strings.Contains(ack.RejectReason, "oc_1") {
+		t.Errorf("reject reason leaked a resolved value: %q", ack.RejectReason)
+	}
+}
+
+// A refined Hello that DOES declare its target_resource is accepted normally:
+// the completeness gate must not over-reject a well-formed refined consumer.
+func TestHandleHello_RefinedHelloWithTargetResource_Accepted(t *testing.T) {
+	b := newPlainHelloBus(t, log.New(io.Discard, "", 0))
+	hello := &protocol.Hello{
+		PID:                  8004,
+		EventKey:             "im.message.created_v1/chat-id/oc_1",
+		EventTypes:           []string{"im.message.created_v1"},
+		Identity:             "bot",
+		RemoteSubscriptionID: "sub_complete",
+		TargetResource:       "im.message?chat_id=oc_1",
+	}
+	ack := readAckFromClient(t, b, hello)
+	if ack.Rejected {
+		t.Fatalf("a complete refined Hello must not be rejected, got: %q", ack.RejectReason)
+	}
+	if got := b.hub.ConnCount(); got != 1 {
+		t.Errorf("hub.ConnCount = %d, want 1 (a complete refined consumer registers)", got)
+	}
+}
+
 // A plaintext consumer (IncludeResourceData=false) never triggers a key fetch —
 // the fetch client would error if called, yet the consumer registers fine.
 func TestHandleHello_PlaintextConsumer_NoKeyFetch(t *testing.T) {
@@ -276,6 +340,7 @@ func TestHandleHello_PlaintextConsumer_NoKeyFetch(t *testing.T) {
 		EventTypes:           []string{"im.message.receive_v1"},
 		Identity:             "bot",
 		RemoteSubscriptionID: "sub_plain",
+		TargetResource:       "im.message?chat_id=oc_4",
 		IncludeResourceData:  false, // plaintext
 	}
 	ack := readAckFromClient(t, b, hello)
@@ -510,6 +575,7 @@ func TestHandleHello_PopulatesRemoteSubscriptionID(t *testing.T) {
 		EventKey:             "im.message.receive_v1/chat-id/oc_1",
 		EventTypes:           []string{"im.message.receive_v1"},
 		RemoteSubscriptionID: "sub_xyz789",
+		TargetResource:       "im.message?chat_id=oc_1",
 	}
 
 	br := bufio.NewReader(server)
