@@ -401,6 +401,13 @@ type RemoteSubscriptionInfo struct {
 	// package does not interpret the code, it only carries it — status.go's
 	// remoteDegradedAdvisory is the sole consumer.
 	SuspensionCode string `json:"suspension_code,omitempty"`
+
+	// Filter is the remote Subscription's server-side event filter as canonical
+	// JSON, carried verbatim from status.go's remote supplement — present only
+	// when the subscription actually carries one, omitted otherwise. Stored as
+	// raw JSON so this SDK-independent package neither imports the CLI filter
+	// model nor interprets the filter; status.go is the sole producer.
+	Filter json.RawMessage `json:"filter,omitempty"`
 }
 
 type StatusResponse struct {

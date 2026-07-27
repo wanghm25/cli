@@ -27,6 +27,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	eventlib "github.com/larksuite/cli/internal/event"
 )
 
 // NewCmdSubscription builds the `event subscription` command group: the
@@ -258,8 +259,13 @@ type subscriptionRow struct {
 	TargetResource       string              `json:"target_resource,omitempty"`
 	Identity             string              `json:"identity,omitempty"`
 	PayloadOptions       *payloadOptionsView `json:"payload_options,omitempty"`
-	Remote               remoteState         `json:"remote"`
-	Local                json.RawMessage     `json:"local,omitempty"` // placeholder; see doc comment above.
+	// Filter is the remote server-side event filter as canonical JSON, present
+	// only when the remote subscription actually carries one (omitted for an
+	// unfiltered subscription). Faithfully surfaced from the remote record; the
+	// CLI does not interpret it here.
+	Filter json.RawMessage `json:"filter,omitempty"`
+	Remote remoteState     `json:"remote"`
+	Local  json.RawMessage `json:"local,omitempty"` // placeholder; see doc comment above.
 }
 
 // mapSubscriptionDetail converts one SDK SubscriptionDetail into the CLI's
@@ -288,6 +294,13 @@ func mapSubscriptionDetail(d *larkeventv1.SubscriptionDetail) subscriptionRow {
 	row.EventKey = row.EventType
 	if d.PayloadOptions != nil {
 		row.PayloadOptions = &payloadOptionsView{IncludeResourceData: boolVal(d.PayloadOptions.IncludeResourceData)}
+	}
+	// Surface the remote filter as canonical JSON only when the subscription
+	// actually carries one; an unfiltered subscription leaves this omitted.
+	if remoteFilter := eventlib.FilterFromSDK(d.Filter); !remoteFilter.IsEmpty() {
+		if canonical, err := remoteFilter.Canonicalize(); err == nil {
+			row.Filter = canonical
+		}
 	}
 	row.Remote = remoteState{
 		State:      strVal(d.State),

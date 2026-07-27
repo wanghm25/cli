@@ -260,6 +260,58 @@ func TestWriteStatusText_RefinedConsumerSubLine_MismatchShowsAdvisoryAndNextActi
 	}
 }
 
+// --- remote filter supplement ---
+
+// TestMapRemoteSubscriptionInfo_WithFilter_SurfacesCanonicalJSON proves the
+// remote supplement surfaces a subscription's server-side filter as canonical
+// JSON on RemoteSubscriptionInfo.
+func TestMapRemoteSubscriptionInfo_WithFilter_SurfacesCanonicalJSON(t *testing.T) {
+	f, err := eventlib.ParseAndValidateFilter(
+		`{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"in","list_value":["text"]}}]}}`,
+		eventlib.FilterMetaFor("im.message.created_v1"))
+	if err != nil {
+		t.Fatalf("build filter: %v", err)
+	}
+	info := mapRemoteSubscriptionInfo(&larkeventv1.SubscriptionDetail{State: strPtr("enabled"), Filter: eventlib.FilterToSDK(f)})
+	if len(info.Filter) == 0 {
+		t.Fatal("info.Filter empty, want canonical JSON")
+	}
+	want, err := f.Canonicalize()
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	if !bytes.Equal(info.Filter, want) {
+		t.Errorf("info.Filter = %s, want %s", info.Filter, want)
+	}
+}
+
+func TestMapRemoteSubscriptionInfo_NoFilter_OmitsFilter(t *testing.T) {
+	info := mapRemoteSubscriptionInfo(&larkeventv1.SubscriptionDetail{State: strPtr("enabled")})
+	if info.Filter != nil {
+		t.Errorf("info.Filter = %s, want nil/omitted when the SDK omitted it", info.Filter)
+	}
+}
+
+// TestWriteStatusText_RefinedConsumerSubLine_ShowsRemoteFilterWhenPresent locks
+// that a supplemented remote filter is rendered on its own indented line.
+func TestWriteStatusText_RefinedConsumerSubLine_ShowsRemoteFilterWhenPresent(t *testing.T) {
+	var buf bytes.Buffer
+	c := refinedConsumer()
+	c.RemoteSubscription = &protocol.RemoteSubscriptionInfo{
+		State:  "enabled",
+		Filter: json.RawMessage(`{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"in","list_value":["text"]}}]}}`),
+	}
+	statuses := []appStatus{{
+		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
+		Consumers: []protocol.ConsumerInfo{c},
+	}}
+	writeStatusText(&buf, statuses)
+	out := buf.String()
+	if !strings.Contains(out, "filter=") || !strings.Contains(out, "message_type") {
+		t.Errorf("output missing the remote filter line; full output:\n%s", out)
+	}
+}
+
 // --- decrypt observability display ---
 
 func TestDecryptAdvisory_PerState(t *testing.T) {

@@ -663,6 +663,14 @@ func mapRemoteSubscriptionInfo(d *larkeventv1.SubscriptionDetail) *protocol.Remo
 		// below); this function itself does no interpretation, only mapping.
 		info.SuspensionCode = *d.Suspension.Code
 	}
+	// Surface the remote server-side filter (canonical JSON) only when present;
+	// an unfiltered subscription leaves it omitted. Same already-fetched
+	// response — no new remote call.
+	if remoteFilter := eventlib.FilterFromSDK(d.Filter); !remoteFilter.IsEmpty() {
+		if canonical, err := remoteFilter.Canonicalize(); err == nil {
+			info.Filter = canonical
+		}
+	}
 	return info
 }
 
@@ -754,6 +762,12 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 		parts = append(parts, fmt.Sprintf("decrypt_state=%s", c.DecryptState))
 	}
 	fmt.Fprintf(out, "      %s\n", strings.Join(parts, "  "))
+
+	// Remote server-side filter, on its own line since canonical JSON can be
+	// long; shown only when the remote supplement actually returned one.
+	if c.RemoteSubscription != nil && len(c.RemoteSubscription.Filter) > 0 {
+		fmt.Fprintf(out, "      filter=%s\n", c.RemoteSubscription.Filter)
+	}
 
 	if c.StaleIdentity {
 		fmt.Fprintf(out, "      advisory: %s\n", staleIdentityAdvisory(match, applicable))

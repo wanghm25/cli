@@ -168,4 +168,7 @@ func writeGetText(out io.Writer, row *subscriptionRow) {
 	if row.PayloadOptions != nil {
 		fmt.Fprintf(out, "Include Resource Data:   %v\n", row.PayloadOptions.IncludeResourceData)
 	}
+	if len(row.Filter) > 0 {
+		fmt.Fprintf(out, "Filter:                  %s\n", row.Filter)
+	}
 }

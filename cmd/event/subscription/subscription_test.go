@@ -4,6 +4,7 @@
 package subscription
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"reflect"
@@ -18,6 +19,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	eventlib "github.com/larksuite/cli/internal/event"
 )
 
 // fakeTokenResolver is a network-free stand-in for credential.DefaultTokenResolver,
@@ -327,6 +329,37 @@ func TestMapSubscriptionDetail_MinimalDetail_OmitsOptionalFields(t *testing.T) {
 	}
 	if row.Identity != "" {
 		t.Errorf("Identity = %q, want empty when the SDK omitted Authority", row.Identity)
+	}
+	if row.Filter != nil {
+		t.Errorf("Filter = %s, want nil/omitted when the SDK omitted it", row.Filter)
+	}
+}
+
+// TestMapSubscriptionDetail_WithRemoteFilter_SurfacesCanonicalJSON proves a
+// remote filter is surfaced as canonical JSON (the exact wire form), shared by
+// list and get.
+func TestMapSubscriptionDetail_WithRemoteFilter_SurfacesCanonicalJSON(t *testing.T) {
+	f, err := eventlib.ParseAndValidateFilter(
+		`{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"in","list_value":["text"]}}]}}`,
+		eventlib.FilterMetaFor("im.message.created_v1"))
+	if err != nil {
+		t.Fatalf("build filter: %v", err)
+	}
+	d := &larkeventv1.SubscriptionDetail{
+		SubscriptionId: strPtr("sub_f"),
+		EventType:      strPtr("im.message.created_v1"),
+		Filter:         eventlib.FilterToSDK(f),
+	}
+	row := mapSubscriptionDetail(d)
+	if len(row.Filter) == 0 {
+		t.Fatal("row.Filter is empty, want the remote filter as canonical JSON")
+	}
+	want, err := f.Canonicalize()
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	if !bytes.Equal(row.Filter, want) {
+		t.Errorf("row.Filter = %s, want %s", row.Filter, want)
 	}
 }
 
