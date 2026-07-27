@@ -86,6 +86,13 @@ type RefinedOptions struct {
 	// unchanged.
 	IncludeResourceData bool
 
+	// Filter is the already-parsed, already-validated server-side event filter
+	// the caller requested (empty/nil when no --filter was given). It is used
+	// here only to reconcile against an existing subscription's filter and to
+	// build the Create body on an apply — local delivery is not yet filtered by
+	// it.
+	Filter *event.Filter
+
 	// Identity is the already-resolved --as identity (
 	// resolved by the caller, e.g. cmd/event/consume.go's resolveIdentity;
 	// RunRefined never guesses or re-resolves it).
@@ -144,7 +151,12 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 			// `event subscription create`, which classifies at Plan time because
 			// it has no later key gate.) The plaintext path passes no option and
 			// is byte-for-byte unchanged.
-			var reconcileOpts []event.ReconcileOption
+			// The requested filter is compared against an existing active
+			// subscription's as a reuse dimension: a mismatch plans a conflict.
+			// Always supplied — an empty requested filter compares as "no
+			// filter", so an unfiltered consume against an unfiltered match
+			// still reuses.
+			reconcileOpts := []event.ReconcileOption{event.WithRequestedFilter(opts.Filter)}
 			if opts.IncludeResourceData {
 				reconcileOpts = append(reconcileOpts, event.WithDeferredEncryptKeyConfirmation())
 			}
@@ -162,7 +174,7 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 			return *plan, nil
 		},
 		apply: func(ctx context.Context, plan event.ReconcilePlan) (string, bool, error) {
-			return applyRemoteSubscriptionPlan(ctx, opts.SubClient, eventType, targetResource, plan, opts.IncludeResourceData)
+			return applyRemoteSubscriptionPlan(ctx, opts.SubClient, eventType, targetResource, plan, opts.IncludeResourceData, opts.Filter)
 		},
 		startBus: func(ctx context.Context) (net.Conn, error) {
 			return EnsureBus(ctx, tr, appID, profileName, domain, opts.RemoteAPIClient, opts.ErrOut)
@@ -377,7 +389,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 // suspended handling), a no-op reuse of the existing id for an
 // already-active compatible match. Never called for PlanActionConflict —
 // runRefinedChain returns a typed error before Apply in that case.
-func applyRemoteSubscriptionPlan(ctx context.Context, svc subscriptionApplyAPI, eventType, targetResource string, plan event.ReconcilePlan, includeResourceData bool) (remoteSubscriptionID string, createdByThisAttempt bool, err error) {
+func applyRemoteSubscriptionPlan(ctx context.Context, svc subscriptionApplyAPI, eventType, targetResource string, plan event.ReconcilePlan, includeResourceData bool, requestedFilter *event.Filter) (remoteSubscriptionID string, createdByThisAttempt bool, err error) {
 	switch plan.Action {
 	case event.PlanActionReuse:
 		return strVal(plan.Existing.SubscriptionId), false, nil
@@ -410,7 +422,7 @@ func applyRemoteSubscriptionPlan(ctx context.Context, svc subscriptionApplyAPI, 
 				return "", false, err
 			}
 		}
-		body := buildRefinedCreateBody(eventType, targetResource, includeResourceData, encryptKey)
+		body := buildRefinedCreateBody(eventType, targetResource, includeResourceData, encryptKey, requestedFilter)
 		resp, err := svc.Create(ctx, larkeventv1.NewCreateSubscriptionReqBuilder().Body(body).Build())
 		if err != nil {
 			return "", false, err
@@ -439,16 +451,22 @@ var newEncryptKeyFunc = event.NewEncryptKey
 // structural here, exactly like cmd/event/subscription/create.go's
 // buildCreateSubscriptionBody. Split out so a test can assert the atomicity
 // directly against a plain, inspectable body value.
-func buildRefinedCreateBody(eventType, targetResource string, includeResourceData bool, encryptKey string) *larkeventv1.CreateSubscriptionReqBody {
+func buildRefinedCreateBody(eventType, targetResource string, includeResourceData bool, encryptKey string, requestedFilter *event.Filter) *larkeventv1.CreateSubscriptionReqBody {
 	payloadOptions := larkeventv1.NewCreatePayloadOptionsBuilder().IncludeResourceData(includeResourceData)
 	if encryptKey != "" {
 		payloadOptions = payloadOptions.Encrypt(larkeventv1.NewPayloadOptionsEncryptBuilder().EncryptKey(encryptKey).Build())
 	}
-	return larkeventv1.NewCreateSubscriptionReqBodyBuilder().
+	builder := larkeventv1.NewCreateSubscriptionReqBodyBuilder().
 		EventType(eventType).
 		TargetResource(targetResource).
-		PayloadOptions(payloadOptions.Build()).
-		Build()
+		PayloadOptions(payloadOptions.Build())
+	// Send filter only when one was requested; omit the field entirely
+	// otherwise (an empty {"filter":{}} clear form is an update-only concept),
+	// mirroring cmd/event/subscription/create.go's buildCreateSubscriptionBody.
+	if !requestedFilter.IsEmpty() {
+		builder = builder.Filter(event.FilterToSDK(requestedFilter))
+	}
+	return builder.Build()
 }
 
 // refinedDecryptKeyUnavailableError turns the bus's decrypt_key_unavailable

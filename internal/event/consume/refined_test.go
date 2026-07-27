@@ -533,7 +533,7 @@ func TestApplyRemoteSubscriptionPlan_Create_CallsCreateExactlyOnce(t *testing.T)
 	fake := &fakeApplyAPI{createResp: &larkeventv1.CreateSubscriptionResp{
 		Data: &larkeventv1.CreateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_new")}},
 	}}
-	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, false)
+	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -548,7 +548,7 @@ func TestApplyRemoteSubscriptionPlan_Create_CallsCreateExactlyOnce(t *testing.T)
 func TestApplyRemoteSubscriptionPlan_Reuse_NeverWrites(t *testing.T) {
 	fake := &fakeApplyAPI{}
 	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_existing")}
-	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionReuse, Existing: existing}, false)
+	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionReuse, Existing: existing}, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -565,7 +565,7 @@ func TestApplyRemoteSubscriptionPlan_Suspended_CallsReactivateNotCreate(t *testi
 		Data: &larkeventv1.ReactivateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_susp")}},
 	}}
 	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_susp")}
-	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionSuspended, Existing: existing}, false)
+	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionSuspended, Existing: existing}, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -592,7 +592,7 @@ func TestApplyRemoteSubscriptionPlan_EncryptedCreate_GeneratesKeyExactlyOnce(t *
 	fake := &fakeApplyAPI{createResp: &larkeventv1.CreateSubscriptionResp{
 		Data: &larkeventv1.CreateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_enc")}},
 	}}
-	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, true)
+	id, created, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, true, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -620,12 +620,12 @@ func TestApplyRemoteSubscriptionPlan_PlaintextAndReuse_NeverGenerateKey(t *testi
 	fake := &fakeApplyAPI{createResp: &larkeventv1.CreateSubscriptionResp{
 		Data: &larkeventv1.CreateSubscriptionRespData{Subscription: &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_plain")}},
 	}}
-	if _, _, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, false); err != nil {
+	if _, _, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, false, nil); err != nil {
 		t.Fatalf("plaintext create: unexpected error: %v", err)
 	}
 	// reuse (even with includeResourceData=true: no create happens, no key)
 	existing := &larkeventv1.SubscriptionDetail{SubscriptionId: strPtr("sub_reuse")}
-	if _, _, err := applyRemoteSubscriptionPlan(context.Background(), &fakeApplyAPI{}, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionReuse, Existing: existing}, true); err != nil {
+	if _, _, err := applyRemoteSubscriptionPlan(context.Background(), &fakeApplyAPI{}, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionReuse, Existing: existing}, true, nil); err != nil {
 		t.Fatalf("reuse: unexpected error: %v", err)
 	}
 	if keyGenCalls != 0 {
@@ -641,7 +641,7 @@ func TestApplyRemoteSubscriptionPlan_EncryptedCreate_KeyGenFailure_FailClosed(t 
 	defer func() { newEncryptKeyFunc = restore }()
 
 	fake := &fakeApplyAPI{}
-	_, _, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, true)
+	_, _, err := applyRemoteSubscriptionPlan(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", event.ReconcilePlan{Action: event.PlanActionCreate}, true, nil)
 	if err == nil {
 		t.Fatal("expected key-gen failure to abort the create, got nil")
 	}
@@ -654,7 +654,7 @@ func TestApplyRemoteSubscriptionPlan_EncryptedCreate_KeyGenFailure_FailClosed(t 
 // SAME body as include_resource_data (atomicity), and that a
 // plaintext body carries no encrypt block.
 func TestBuildRefinedCreateBody_AtomicEncrypt(t *testing.T) {
-	enc := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", true, "THE_KEY")
+	enc := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", true, "THE_KEY", nil)
 	if enc.PayloadOptions == nil || enc.PayloadOptions.IncludeResourceData == nil || !*enc.PayloadOptions.IncludeResourceData {
 		t.Fatalf("encrypted body must set include_resource_data=true, got %+v", enc.PayloadOptions)
 	}
@@ -662,9 +662,98 @@ func TestBuildRefinedCreateBody_AtomicEncrypt(t *testing.T) {
 		t.Fatalf("encrypted body must carry the encrypt_key atomically, got %+v", enc.PayloadOptions.Encrypt)
 	}
 
-	plain := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "")
+	plain := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", nil)
 	if plain.PayloadOptions == nil || plain.PayloadOptions.Encrypt != nil {
 		t.Fatalf("plaintext body must carry no encrypt block, got %+v", plain.PayloadOptions)
+	}
+}
+
+// ---- --filter (server-side event filter) ----
+
+// refinedFilterWith parses a valid single-condition filter for
+// im.message.created_v1 through the real parse/validate path. Vary messageType
+// to produce two distinct filters for a mismatch.
+func refinedFilterWith(t *testing.T, messageType string) *event.Filter {
+	t.Helper()
+	f, err := event.ParseAndValidateFilter(
+		fmt.Sprintf(`{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"in","list_value":[%q]}}]}}`, messageType),
+		event.FilterMetaFor("im.message.created_v1"))
+	if err != nil {
+		t.Fatalf("build filter: %v", err)
+	}
+	return f
+}
+
+// activeFilteredListResp is a plaintext active authority match carrying remote
+// filter f.
+func activeFilteredListResp(id, authorityType string, f *event.Filter) *larkeventv1.ListSubscriptionResp {
+	return &larkeventv1.ListSubscriptionResp{
+		Data: &larkeventv1.ListSubscriptionRespData{
+			Items: []*larkeventv1.SubscriptionDetail{{
+				SubscriptionId: strPtr(id),
+				EventType:      strPtr("im.message.created_v1"),
+				TargetResource: strPtr("im.message?chat_id=oc_aaa"),
+				Authority:      &larkeventv1.Authority{Type: strPtr(authorityType), OpenId: strPtr("ou_aaa")},
+				State:          strPtr("active"),
+				PayloadOptions: &larkeventv1.PayloadOptions{IncludeResourceData: boolPtr(false)},
+				Filter:         event.FilterToSDK(f),
+			}},
+		},
+	}
+}
+
+// TestBuildRefinedCreateBody_WithFilter_CarriesFilter proves a requested filter
+// is projected onto the Create body exactly as it would be sent on the wire.
+func TestBuildRefinedCreateBody_WithFilter_CarriesFilter(t *testing.T) {
+	f := refinedFilterWith(t, "text")
+	body := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", f)
+	if body.Filter == nil {
+		t.Fatal("body.Filter = nil, want the projected filter")
+	}
+	got, err := json.Marshal(body.Filter)
+	if err != nil {
+		t.Fatalf("marshal body.Filter: %v", err)
+	}
+	want, err := f.Canonicalize()
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("body.Filter = %s, want %s", got, want)
+	}
+}
+
+// TestBuildRefinedCreateBody_NoFilter_OmitsFilter locks that with no requested
+// filter the field is omitted entirely (never an empty {"filter":{}}).
+func TestBuildRefinedCreateBody_NoFilter_OmitsFilter(t *testing.T) {
+	for name, f := range map[string]*event.Filter{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			body := buildRefinedCreateBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", f)
+			if body.Filter != nil {
+				t.Errorf("body.Filter = %+v, want nil (omitted) when no filter is requested", body.Filter)
+			}
+		})
+	}
+}
+
+// TestProdRefinedDeps_Plan_FilterMismatch_ReturnsConflictWithFilterField proves
+// RefinedOptions.Filter reaches the reconcile plan stage: a requested filter
+// that differs from an active match's plans a conflict carrying a filter field.
+func TestProdRefinedDeps_Plan_FilterMismatch_ReturnsConflictWithFilterField(t *testing.T) {
+	resolved := refinedFixture()
+	fake := &fakeApplyAPI{listResp: activeFilteredListResp("sub_1", "user", refinedFilterWith(t, "text"))}
+	opts := RefinedOptions{Identity: core.AsUser, SubClient: fake, Filter: refinedFilterWith(t, "image")}
+	deps := prodRefinedDeps(failDialTransport{}, "cli_x", "test-profile", "", resolved, opts)
+
+	plan, err := deps.plan(context.Background())
+	if err != nil {
+		t.Fatalf("plan err = %v, want nil", err)
+	}
+	if plan.Action != event.PlanActionConflict {
+		t.Fatalf("plan.Action = %q, want %q", plan.Action, event.PlanActionConflict)
+	}
+	if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Name != "filter" {
+		t.Errorf("ConflictFields = %+v, want one entry naming filter", plan.ConflictFields)
 	}
 }
 

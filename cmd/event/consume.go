@@ -48,6 +48,14 @@ type consumeCmdOpts struct {
 	// has no remote-Subscription concept to apply to there) — checked before
 	// any side effect.
 	includeResourceData bool
+
+	// filter is the inline JSON server-side event filter, mirroring
+	// `event subscription create --filter`. SUPPORTED on a refined key
+	// (validated against the event type's filter schema, then applied to the
+	// remote Subscription this run creates/reuses). On an ORDINARY (non-refined)
+	// key it is rejected as invalid_argument — there is no remote Subscription
+	// for it to control, so it must never silently no-op.
+	filter string
 }
 
 func NewCmdConsume(f *cmdutil.Factory) *cobra.Command {
@@ -123,6 +131,8 @@ no-op there.`,
 		"Preview the refined-subscription remote-write plan (probe + plan only) without applying it, starting the bus, or writing anything remote. No-op for legacy (non-refined) EventKeys, which never write remote state at all.")
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
 		"Include resource data in delivered events for a refined key. Requires --as user and scope event:encrypt_key:read; the platform delivers resource data encrypted and the CLI decrypts it before output. Always rejected as invalid_argument on an ordinary (non-refined) key.")
+	cmd.Flags().StringVar(&o.filter, "filter", "",
+		"Inline JSON event filter to apply server-side for a refined key; validated against this event type's filter schema (see `event schema <key> --json`). Omit for no filter. Rejected as invalid_argument on an ordinary (non-refined) key.")
 	// Static default: "write", not "read". A single risk_level annotation
 	// can't vary by the EventKey argument (unknown until RunE resolves it),
 	// and a refined key's consume startup chain has REAL write side effects
@@ -208,6 +218,14 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 	// branch's own before-side-effect placement above.
 	if o.includeResourceData {
 		return errIncludeResourceDataNotApplicable(eventKey)
+	}
+
+	// --filter only controls a refined key's remote Subscription; a legacy key
+	// has no remote Subscription for it to apply to, so reject it rather than
+	// silently ignore a requested filter (mirrors --include-resource-data
+	// above, same before-side-effect placement).
+	if o.filter != "" {
+		return errFilterNotApplicable(eventKey)
 	}
 
 	// --dry-run's own --help text promises it is a no-op for a legacy
@@ -368,6 +386,19 @@ func errIncludeResourceDataNotApplicable(eventKey string) error {
 		WithHint("drop --include-resource-data for this EventKey, or pass a materialized refined EventKey instead if you need resource-data control (see `lark-cli event schema %s --json` key_templates)", eventKey)
 }
 
+// errFilterNotApplicable returns the typed rejection for --filter on an
+// ordinary (legacy) EventKey: --filter only ever controls a
+// refined-subscription EventKey's remote Subscription (see `event subscription
+// create --filter`) — an ordinary key has no remote Subscription for a
+// server-side filter to apply to, so passing it is a caller mistake. Subtype is
+// invalid_argument: this is permanent by design, not a temporary gate.
+func errFilterNotApplicable(eventKey string) error {
+	return errs.NewValidationError(errs.SubtypeInvalidArgument,
+		"--filter does not apply to EventKey %q: it is not a refined-subscription key, and --filter only controls a refined key's remote Subscription", eventKey).
+		WithParam("--filter").
+		WithHint("drop --filter for this EventKey, or pass a materialized refined EventKey instead if you need server-side filtering (see `lark-cli event schema %s --json` key_templates)", eventKey)
+}
+
 // errIncludeResourceDataRequiresUser rejects --include-resource-data=true on a
 // non-user identity for a refined key: resource data is a user-only platform
 // capability, so a bot/app subscription cannot carry it. Typed invalid_argument
@@ -413,6 +444,16 @@ func eventKeyBaseRegistered(eventKey string) bool {
 // byte-identical, and refined's own console-precheck/scopes preflight is
 // intentionally not part of this seam.
 func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConfig, paramMap map[string]string, resolved eventlib.ResolvedEventKey, o consumeCmdOpts) error {
+	// Validate --filter against this event type's filter capability first (a
+	// cheap, purely local check). Empty input is "no filter". A failure is
+	// already a typed invalid_argument on --filter — returned unchanged, before
+	// identity/scope resolution or any remote write. Mirrors
+	// cmd/event/subscription/create.go's own filter validation.
+	reqFilter, err := eventlib.ParseAndValidateFilter(o.filter, eventlib.FilterMetaFor(resolved.Definition.EventType))
+	if err != nil {
+		return err
+	}
+
 	identity, err := resolveIdentity(cmd, f, resolved.Definition)
 	if err != nil {
 		return err
@@ -550,6 +591,7 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 		Identity:            identity,
 		SubClient:           subClient,
 		IncludeResourceData: o.includeResourceData,
+		Filter:              reqFilter,
 	})
 }
 
