@@ -123,17 +123,17 @@ func TestTryNotify_NilNotifySafe(t *testing.T) {
 }
 
 // TestRawHandlerSubscriptionEnvelope_UserAuthority: a refined-subscription V2
-// event carries header.subscription{subscription_id,resource,authority{type,
-// principal_id},subscription_event_id} — buildRawHandler must normalize all
-// four into RawEvent, with a "user" authority rendering as "user:<open_id>"
-// (matching cmd/event/subscription/subscription.go's formatAuthority
-// vocabulary).
+// event carries the 通用事件信封 header.subscription{subscription_id,
+// target_resource,authority{type,open_id},subscription_event_id} —
+// buildRawHandler must normalize all four into RawEvent, with a "user"
+// authority rendering as "user:<open_id>" (matching
+// cmd/event/subscription/subscription.go's formatAuthority vocabulary).
 func TestRawHandlerSubscriptionEnvelope_UserAuthority(t *testing.T) {
 	s := &FeishuSource{}
 	var captured *event.RawEvent
 	handler := s.buildRawHandler(func(e *event.RawEvent) { captured = e })
 
-	body := []byte(`{"header":{"event_id":"evt-100","event_type":"im.message.receive_v1","create_time":"1700000000000","subscription":{"subscription_id":"sub_123","resource":"im.message?chat_id=oc_xxx","authority":{"type":"user","principal_id":"ou_abc123"},"subscription_event_id":"sub_evt_456"}}}`)
+	body := []byte(`{"header":{"event_id":"evt-100","event_type":"im.message.receive_v1","create_time":"1700000000000","subscription":{"subscription_id":"sub_123","target_resource":"im.message?chat_id=oc_xxx","authority":{"type":"user","open_id":"ou_abc123"},"subscription_event_id":"sub_evt_456"}}}`)
 	if err := handler(context.Background(), &larkevent.EventReq{Body: body}); err != nil {
 		t.Fatalf("handler returned err: %v", err)
 	}
@@ -159,14 +159,15 @@ func TestRawHandlerSubscriptionEnvelope_UserAuthority(t *testing.T) {
 }
 
 // TestRawHandlerSubscriptionEnvelope_AppAuthority: same envelope shape but an
-// "app" authority, which formats as the bare string "app" (no principal_id
-// suffix) per the shared vocabulary.
+// "app" authority carrying app_id. app_id is parsed (the body parses cleanly)
+// yet is NOT part of the emitted vocabulary — the authority formats as the
+// bare string "app", with no app_id suffix.
 func TestRawHandlerSubscriptionEnvelope_AppAuthority(t *testing.T) {
 	s := &FeishuSource{}
 	var captured *event.RawEvent
 	handler := s.buildRawHandler(func(e *event.RawEvent) { captured = e })
 
-	body := []byte(`{"header":{"event_id":"evt-101","event_type":"im.message.receive_v1","create_time":"1700000000001","subscription":{"subscription_id":"sub_789","resource":"im.message?chat_id=oc_yyy","authority":{"type":"app","principal_id":"cli_xxx"},"subscription_event_id":"sub_evt_999"}}}`)
+	body := []byte(`{"header":{"event_id":"evt-101","event_type":"im.message.receive_v1","create_time":"1700000000001","subscription":{"subscription_id":"sub_789","target_resource":"im.message?chat_id=oc_yyy","authority":{"type":"app","app_id":"cli_xxx"},"subscription_event_id":"sub_evt_999"}}}`)
 	if err := handler(context.Background(), &larkevent.EventReq{Body: body}); err != nil {
 		t.Fatalf("handler returned err: %v", err)
 	}
@@ -222,29 +223,93 @@ func TestRawHandlerNoSubscription_NewFieldsEmpty(t *testing.T) {
 	}
 }
 
+// TestRawHandlerEnvelopeKeySwitch guards the 通用事件信封 key migration:
+// buildRawHandler must honor ONLY the current keys (target_resource +
+// authority{type,open_id}) and must NOT honor the superseded ones (resource +
+// authority{type,principal_id}). The two subtests carry identical values under
+// the two key sets, so the assertions prove the switch itself — not merely
+// that some value happened to parse.
+func TestRawHandlerEnvelopeKeySwitch(t *testing.T) {
+	newHandler := func(captured **event.RawEvent) func(context.Context, *larkevent.EventReq) error {
+		s := &FeishuSource{}
+		return s.buildRawHandler(func(e *event.RawEvent) { *captured = e })
+	}
+
+	t.Run("current keys are honored", func(t *testing.T) {
+		var captured *event.RawEvent
+		handler := newHandler(&captured)
+		body := []byte(`{"header":{"event_id":"evt-200","event_type":"im.message.receive_v1","create_time":"1700000000000","subscription":{"subscription_id":"sub_new","target_resource":"im.message?chat_id=oc_new","authority":{"type":"user","open_id":"ou_new"},"subscription_event_id":"sub_evt_new"}}}`)
+		if err := handler(context.Background(), &larkevent.EventReq{Body: body}); err != nil {
+			t.Fatalf("handler returned err: %v", err)
+		}
+		if captured == nil {
+			t.Fatal("expected emit to fire")
+		}
+		if captured.Resource != "im.message?chat_id=oc_new" {
+			t.Errorf("Resource from target_resource: got %q, want %q", captured.Resource, "im.message?chat_id=oc_new")
+		}
+		if captured.Authority != "user:ou_new" {
+			t.Errorf("Authority from authority.open_id: got %q, want %q", captured.Authority, "user:ou_new")
+		}
+	})
+
+	t.Run("superseded keys are no longer honored", func(t *testing.T) {
+		var captured *event.RawEvent
+		handler := newHandler(&captured)
+		// Identical values, but under the superseded keys: resource (not
+		// target_resource) and authority.principal_id (not open_id).
+		body := []byte(`{"header":{"event_id":"evt-201","event_type":"im.message.receive_v1","create_time":"1700000000000","subscription":{"subscription_id":"sub_old","resource":"im.message?chat_id=oc_old","authority":{"type":"user","principal_id":"ou_old"},"subscription_event_id":"sub_evt_old"}}}`)
+		if err := handler(context.Background(), &larkevent.EventReq{Body: body}); err != nil {
+			t.Fatalf("handler returned err: %v", err)
+		}
+		if captured == nil {
+			t.Fatal("expected emit to fire")
+		}
+		// The stale "resource" key must be ignored -> empty target resource.
+		if captured.Resource != "" {
+			t.Errorf("stale \"resource\" key must not populate Resource: got %q, want empty", captured.Resource)
+		}
+		// "type" is unchanged so it still parses, but the stale "principal_id"
+		// carries no open_id under the current tags, so the user id is absent ->
+		// bare "user", never "user:ou_old".
+		if captured.Authority != "user" {
+			t.Errorf("stale \"principal_id\" key must not supply the user id: got %q, want %q", captured.Authority, "user")
+		}
+		// subscription_id / subscription_event_id keys are unchanged across the
+		// migration, so they must still parse — proving the switch touches only
+		// the two migrated keys.
+		if captured.RemoteSubscriptionID != "sub_old" {
+			t.Errorf("RemoteSubscriptionID: got %q, want %q", captured.RemoteSubscriptionID, "sub_old")
+		}
+		if captured.SubscriptionEventID != "sub_evt_old" {
+			t.Errorf("SubscriptionEventID: got %q, want %q", captured.SubscriptionEventID, "sub_evt_old")
+		}
+	})
+}
+
 // TestFormatSubscriptionAuthority covers the full vocabulary the helper must
 // mirror from cmd/event/subscription/subscription.go's formatAuthority:
-// "user"+principal -> "user:<principal_id>"; "user" alone -> "user"; "app"
-// -> "app" (principal_id ignored); unrecognized type -> passthrough verbatim;
-// empty type -> "".
+// "user"+open_id -> "user:<open_id>"; "user" alone -> "user"; "app" -> "app"
+// (the second arg ignored); unrecognized type -> passthrough verbatim; empty
+// type -> "".
 func TestFormatSubscriptionAuthority(t *testing.T) {
 	cases := []struct {
-		name        string
-		authType    string
-		principalID string
-		want        string
+		name     string
+		authType string
+		openID   string
+		want     string
 	}{
-		{"user with principal", "user", "ou_abc123", "user:ou_abc123"},
-		{"user without principal", "user", "", "user"},
-		{"app ignores principal", "app", "cli_xxx", "app"},
+		{"user with open_id", "user", "ou_abc123", "user:ou_abc123"},
+		{"user without open_id", "user", "", "user"},
+		{"app ignores second arg", "app", "ou_ignored", "app"},
 		{"unrecognized type passthrough", "robot", "id_xxx", "robot"},
 		{"empty type", "", "ou_abc123", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := formatSubscriptionAuthority(tc.authType, tc.principalID)
+			got := formatSubscriptionAuthority(tc.authType, tc.openID)
 			if got != tc.want {
-				t.Errorf("formatSubscriptionAuthority(%q, %q) = %q, want %q", tc.authType, tc.principalID, got, tc.want)
+				t.Errorf("formatSubscriptionAuthority(%q, %q) = %q, want %q", tc.authType, tc.openID, got, tc.want)
 			}
 		})
 	}

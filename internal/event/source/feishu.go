@@ -117,7 +117,7 @@ type LifecycleEvent struct {
 	// formatSubscriptionAuthority (RawEvent.Authority) — "user:<id>" / "app" /
 	// passthrough / "" — even though the SOURCE shape differs (this is the
 	// OpenAPI management-side Authority{Type,OpenId,UnionId,AppId}, not the
-	// push-envelope's Authority{Type,PrincipalID}).
+	// push envelope's authority{type, app_id, open_id}).
 	Authority string
 
 	ExpireTime int64 // body.expire_time, unix seconds; 0 when absent
@@ -309,11 +309,11 @@ func headerEventID(base *larkevent.EventV2Base) string {
 
 // FormatLifecycleAuthority normalizes the OpenAPI management-side
 // Authority{Type,OpenId,UnionId,AppId} (all pointers) through the SAME
-// vocabulary formatSubscriptionAuthority already implements for the
-// push-envelope's Authority{Type,PrincipalID} shape — reusing it here (rather
-// than re-deriving the user/app/passthrough rules) is why that helper takes
-// an already-resolved principalID string rather than the push-envelope type
-// directly. OpenId is preferred over UnionId when a "user" authority carries
+// vocabulary formatSubscriptionAuthority already implements for the push
+// envelope's structured authority{type, app_id, open_id} shape — reusing it
+// here (rather than re-deriving the user/app/passthrough rules) is why that
+// helper takes an already-resolved user-id string rather than a whole
+// authority struct. OpenId is preferred over UnionId when a "user" authority carries
 // both (OpenId is this CLI's canonical user identifier elsewhere, e.g.
 // cmd/event/subscription's own formatAuthority).
 //
@@ -466,19 +466,21 @@ func (s *FeishuSource) buildRawHandler(emit func(*event.RawEvent)) func(context.
 				EventID    string `json:"event_id"`
 				EventType  string `json:"event_type"`
 				CreateTime string `json:"create_time"`
-				// Subscription is the refined-subscription push envelope:
-				// SDK event/model.go's EventHeader.Subscription
-				// shape (resource/authority{type,principal_id}), NOT the OpenAPI
-				// management-side Subscription (target_resource/authority{open_id,
-				// union_id,app_id}) — do not conflate the two. Absent on
-				// non-refined events, in which case every subfield below
-				// zero-values to "".
+				// Subscription follows the platform's 通用事件信封 (general
+				// event envelope) push spec: header.subscription carries
+				// target_resource plus a structured authority{type, app_id,
+				// open_id} — an "app" authority carries app_id, a "user"
+				// authority carries open_id. This is NOT the OpenAPI
+				// management-side Subscription shape (whose authority also has
+				// union_id) — do not conflate the two. Absent on non-refined
+				// events, in which case every subfield below zero-values to "".
 				Subscription struct {
 					SubscriptionID string `json:"subscription_id"`
-					Resource       string `json:"resource"`
+					TargetResource string `json:"target_resource"`
 					Authority      struct {
-						Type        string `json:"type"`
-						PrincipalID string `json:"principal_id"`
+						Type   string `json:"type"`
+						AppID  string `json:"app_id"`
+						OpenID string `json:"open_id"`
 					} `json:"authority"`
 					SubscriptionEventID string `json:"subscription_event_id"`
 				} `json:"subscription"`
@@ -509,10 +511,10 @@ func (s *FeishuSource) buildRawHandler(emit func(*event.RawEvent)) func(context.
 			Timestamp:  time.Now(),
 
 			RemoteSubscriptionID: envelope.Header.Subscription.SubscriptionID,
-			Resource:             envelope.Header.Subscription.Resource,
+			Resource:             envelope.Header.Subscription.TargetResource,
 			Authority: formatSubscriptionAuthority(
 				envelope.Header.Subscription.Authority.Type,
-				envelope.Header.Subscription.Authority.PrincipalID,
+				envelope.Header.Subscription.Authority.OpenID,
 			),
 			SubscriptionEventID: envelope.Header.Subscription.SubscriptionEventID,
 		})
@@ -520,22 +522,22 @@ func (s *FeishuSource) buildRawHandler(emit func(*event.RawEvent)) func(context.
 	}
 }
 
-// formatSubscriptionAuthority normalizes the push-envelope's
-// header.subscription.authority{type,principal_id} into this package's compact
-// identity vocabulary. Mirrors cmd/event/subscription/subscription.go's
-// formatAuthority (same "user:<id>" / "user" / "app" / passthrough rules),
-// but takes the push-envelope's {type, principal_id} shape rather than the
-// management-side larkeventv1.Authority{Type,OpenId,...} — principal_id IS
-// the open_id for a "user" authority, so no separate OpenId field is needed.
-// authType is an open string, not a closed enum, so an unrecognized value is
-// passed through verbatim rather than dropped.
-func formatSubscriptionAuthority(authType, principalID string) string {
+// formatSubscriptionAuthority normalizes a subscription authority into this
+// package's compact identity vocabulary. Mirrors
+// cmd/event/subscription/subscription.go's formatAuthority (same "user:<id>" /
+// "user" / "app" / passthrough rules). The push envelope's structured
+// authority{type, app_id, open_id} maps in as (type, open_id): a "user"
+// authority is keyed by its open_id, while an "app" authority's app_id is NOT
+// part of this vocabulary — a bus is per-app, so the bare "app" already means
+// "this app". authType is an open string, not a closed enum, so an
+// unrecognized value is passed through verbatim rather than dropped.
+func formatSubscriptionAuthority(authType, openID string) string {
 	switch authType {
 	case "":
 		return ""
 	case "user":
-		if principalID != "" {
-			return "user:" + principalID
+		if openID != "" {
+			return "user:" + openID
 		}
 		return "user"
 	case "app":
