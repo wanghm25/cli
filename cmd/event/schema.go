@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -240,8 +241,64 @@ type DryRunInfo struct {
 
 // SubscriptionInfo documents refined-key subscription-management affordances.
 type SubscriptionInfo struct {
-	PayloadOptions PayloadOptions `json:"payload_options"`
-	DryRun         DryRunInfo     `json:"dry_run"`
+	PayloadOptions PayloadOptions    `json:"payload_options"`
+	DryRun         DryRunInfo        `json:"dry_run"`
+	Filter         *FilterSchemaMeta `json:"filter,omitempty"`
+}
+
+// FilterSchemaMeta documents the server-side --filter capability of an
+// event_type: the accepted logic ops / operators, the structural limits, the
+// filterable operands, and a wire-valid example. It is emitted only when the
+// resolved event_type supports filtering, so keys without filter support are
+// unaffected.
+type FilterSchemaMeta struct {
+	Supported     bool                  `json:"supported"`
+	Optional      bool                  `json:"optional"`
+	InputFlag     string                `json:"input_flag"`
+	Format        string                `json:"format"`
+	LogicOps      []string              `json:"logic_ops"`
+	Operators     []string              `json:"operators"`
+	MaxDepth      int                   `json:"max_depth"`
+	MaxConditions int                   `json:"max_conditions"`
+	MaxBytes      int                   `json:"max_bytes"`
+	Operands      []FilterSchemaOperand `json:"operands"`
+	Example       json.RawMessage       `json:"example,omitempty"`
+}
+
+// FilterSchemaOperand documents one filterable operand.
+type FilterSchemaOperand struct {
+	Key               string   `json:"key"`
+	Operators         []string `json:"operators"`
+	InputValueType    string   `json:"input_value_type,omitempty"`
+	ListValueMaxItems int      `json:"list_value_max_items,omitempty"`
+}
+
+// buildFilterSchemaMeta projects an event filter capability onto its schema
+// disclosure. It is the single source both the JSON and text renderings read,
+// so they cannot drift.
+func buildFilterSchemaMeta(fm eventlib.FilterMeta) *FilterSchemaMeta {
+	operands := make([]FilterSchemaOperand, 0, len(fm.Operands))
+	for _, o := range fm.Operands {
+		operands = append(operands, FilterSchemaOperand{
+			Key:               o.Key,
+			Operators:         o.Operators,
+			InputValueType:    o.InputValueType,
+			ListValueMaxItems: o.ListValueMax,
+		})
+	}
+	return &FilterSchemaMeta{
+		Supported:     true,
+		Optional:      true,
+		InputFlag:     "--filter",
+		Format:        "json",
+		LogicOps:      fm.LogicOps,
+		Operators:     fm.Operators,
+		MaxDepth:      fm.MaxDepth,
+		MaxConditions: fm.MaxConditions,
+		MaxBytes:      fm.MaxBytes,
+		Operands:      operands,
+		Example:       eventlib.FilterExample(fm),
+	}
 }
 
 // refinedDryRunExample returns the copy-pasteable dry-run command for a refined
@@ -317,6 +374,30 @@ func renderRefinedSubscriptionText(out io.Writer, def *eventlib.KeyDefinition) {
 		sub.PayloadOptions.IncludeResourceDataFlag, sub.PayloadOptions.IncludeResourceDataDefault)
 	fmt.Fprintf(out, "Dry Run: supported — %s\n", sub.DryRun.Example)
 	fmt.Fprintf(out, "Next Action: run `%s` before consume\n", dryRunExample)
+
+	if fm := eventlib.FilterMetaFor(def.EventType); fm.Supported {
+		renderFilterText(out, buildFilterSchemaMeta(fm))
+	}
+}
+
+// renderFilterText surfaces the same --filter capability the --json output
+// carries, one concise line for the limits plus one per filterable operand. It
+// reads the shared FilterSchemaMeta builder so the two renderings stay in sync.
+func renderFilterText(out io.Writer, fm *FilterSchemaMeta) {
+	fmt.Fprintf(out, "Filter: supported — %s (optional, %s); logic %s; operators %s; max depth %d, max conditions %d, max bytes %d\n",
+		fm.InputFlag, fm.Format,
+		strings.Join(fm.LogicOps, "/"), strings.Join(fm.Operators, "/"),
+		fm.MaxDepth, fm.MaxConditions, fm.MaxBytes)
+	for _, o := range fm.Operands {
+		line := fmt.Sprintf("  - %s: %s", o.Key, strings.Join(o.Operators, "/"))
+		if o.InputValueType != "" {
+			line += fmt.Sprintf(" (%s)", o.InputValueType)
+		}
+		if o.ListValueMaxItems > 0 {
+			line += fmt.Sprintf(" [list<=%d]", o.ListValueMaxItems)
+		}
+		fmt.Fprintln(out, line)
+	}
 }
 
 // writeSchemaJSON emits the EventKey definition plus resolved schema; jq_root_path tells callers whether fields live at `.` or `.event`.
@@ -364,6 +445,9 @@ func writeSchemaJSON(f *cmdutil.Factory, def *eventlib.KeyDefinition) error {
 		p.ConditionalScopes = refinedConditionalScopes()
 		p.Risk = refinedRiskDisclosure()
 		p.Subscription = refinedSubscriptionInfo(dryRunExample)
+		if fm := eventlib.FilterMetaFor(def.EventType); fm.Supported {
+			p.Subscription.Filter = buildFilterSchemaMeta(fm)
+		}
 		p.NextAction = fmt.Sprintf("run `%s` before consume", dryRunExample)
 	}
 

@@ -4,6 +4,8 @@
 package event
 
 import (
+	"encoding/json"
+
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 )
 
@@ -92,4 +94,38 @@ func condFromSDK(c *larkeventv1.Contidion) *FilterCond {
 		fc.ListValue = append([]string(nil), c.ListValue...)
 	}
 	return fc
+}
+
+// FilterExample returns a representative, wire-valid filter for a capability as
+// the exact JSON the CLI would send. It is built from the first declared operand
+// through the same projection used for real filters, so a schema example can
+// never drift from the actual wire form. It returns nil when the capability
+// declares no usable operand.
+func FilterExample(meta FilterMeta) json.RawMessage {
+	if !meta.Supported || len(meta.Operands) == 0 {
+		return nil
+	}
+	operand := meta.Operands[0]
+	if len(operand.Operators) == 0 {
+		return nil
+	}
+	placeholder := "example"
+	if operand.InputValueType == inputValueTypeOpenID {
+		placeholder = "ou_xxx"
+	}
+	cond := &FilterCond{Operand: operand.Key, Op: operand.Operators[0]}
+	if cond.Op == opIn {
+		cond.ListValue = []string{placeholder}
+	} else {
+		cond.Value = placeholder
+	}
+	example := &Filter{Root: &FilterNode{
+		LogicOp:  logicAnd,
+		Children: []*FilterNode{{Condition: cond}},
+	}}
+	raw, err := example.Canonicalize()
+	if err != nil {
+		return nil
+	}
+	return raw
 }

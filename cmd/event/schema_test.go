@@ -629,3 +629,110 @@ func TestResolveSchemaJSON_InvalidBaseWithOverridesIsTypedInternalError(t *testi
 		t.Errorf("category = %s, want %s", p.Category, errs.CategoryInternal)
 	}
 }
+
+// TestSchemaJSON_FilterMetaSupported pins that a Filter-supporting event_type
+// surfaces the --filter capability under `subscription`, with the DSL limits,
+// the filterable operands, and a wire-valid example.
+func TestSchemaJSON_FilterMetaSupported(t *testing.T) {
+	f, stdout, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "test"})
+
+	if err := runSchema(f, "im.message.created_v1", true); err != nil {
+		t.Fatalf("runSchema json: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, stdout.String())
+	}
+	sub, ok := payload["subscription"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("subscription missing or wrong type: %v", payload["subscription"])
+	}
+	filter, ok := sub["filter"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("subscription.filter missing: %v", sub)
+	}
+
+	if filter["supported"] != true || filter["optional"] != true {
+		t.Errorf("supported/optional = %v/%v, want true/true", filter["supported"], filter["optional"])
+	}
+	if filter["input_flag"] != "--filter" || filter["format"] != "json" {
+		t.Errorf("input_flag/format = %v/%v, want --filter/json", filter["input_flag"], filter["format"])
+	}
+	if filter["max_depth"] != float64(2) || filter["max_conditions"] != float64(10) || filter["max_bytes"] != float64(1024) {
+		t.Errorf("limits = depth %v, conditions %v, bytes %v; want 2/10/1024",
+			filter["max_depth"], filter["max_conditions"], filter["max_bytes"])
+	}
+
+	operands := map[string]map[string]interface{}{}
+	for _, raw := range filter["operands"].([]interface{}) {
+		o := raw.(map[string]interface{})
+		operands[o["key"].(string)] = o
+	}
+	sender, ok := operands["sender"]
+	if !ok || sender["input_value_type"] != "open_id" {
+		t.Errorf("sender operand = %v, want input_value_type open_id", sender)
+	}
+	if got := sender["operators"].([]interface{}); len(got) != 1 || got[0] != "eq" {
+		t.Errorf("sender operators = %v, want [eq]", got)
+	}
+	if _, present := sender["list_value_max_items"]; present {
+		t.Errorf("sender must not carry list_value_max_items: %v", sender)
+	}
+	mt, ok := operands["message_type"]
+	if !ok || mt["list_value_max_items"] != float64(10) {
+		t.Errorf("message_type operand = %v, want list_value_max_items 10", mt)
+	}
+
+	// The advertised example must itself be a valid filter for this event_type.
+	exampleRaw, err := json.Marshal(filter["example"])
+	if err != nil {
+		t.Fatalf("marshal example: %v", err)
+	}
+	if _, err := eventlib.ParseAndValidateFilter(string(exampleRaw), eventlib.FilterMetaFor("im.message.created_v1")); err != nil {
+		t.Errorf("advertised filter example is not valid: %v\nexample: %s", err, exampleRaw)
+	}
+}
+
+// TestRunSchema_FilterMetaText pins the text parity: a Filter-supporting key
+// surfaces the same capability in the human-readable output.
+func TestRunSchema_FilterMetaText(t *testing.T) {
+	f, stdout, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "test"})
+
+	if err := runSchema(f, "im.message.created_v1", false); err != nil {
+		t.Fatalf("runSchema: %v", err)
+	}
+
+	out := stdout.String()
+	for _, want := range []string{
+		"Filter: supported — --filter (optional, json)",
+		"operators eq/in/contains",
+		"- sender: eq (open_id)",
+		"- message_type: eq/in [list<=10]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("filter schema text missing %q; full output:\n%s", want, out)
+		}
+	}
+}
+
+// TestSchemaJSON_FilterMetaUnsupported is the regression half: an event_type
+// without filter support advertises no filter capability.
+func TestSchemaJSON_FilterMetaUnsupported(t *testing.T) {
+	f, stdout, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "test"})
+
+	if err := runSchema(f, "im.message.receive_v1", true); err != nil {
+		t.Fatalf("runSchema json: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, stdout.String())
+	}
+	if _, ok := payload["subscription"]; ok {
+		t.Errorf("non-filter key must not carry a subscription block: %v", payload["subscription"])
+	}
+	if _, ok := payload["filter"]; ok {
+		t.Errorf("non-filter key must not advertise a filter capability: %v", payload["filter"])
+	}
+}
