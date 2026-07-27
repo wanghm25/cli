@@ -95,6 +95,16 @@ func RegisterFilterMeta(eventType string, meta FilterMeta) {
 	catalog.RegisterFilterMeta(eventType, meta)
 }
 
+// ReverseResolve reconstructs a canonical EventKey from a remote event_type +
+// target_resource. See catalog.ReverseResolve.
+func ReverseResolve(eventType, targetResource string) (string, bool) {
+	return catalog.ReverseResolve(eventType, targetResource)
+}
+
+// Validate checks the registered catalog for integrity problems. See
+// catalog.Validate.
+func Validate() error { return catalog.Validate() }
+
 // ResetRegistryForTest clears the registry. See catalog.ResetRegistryForTest.
 func ResetRegistryForTest() { catalog.ResetRegistryForTest() }
 
