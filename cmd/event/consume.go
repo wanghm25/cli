@@ -23,6 +23,7 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
 	eventlib "github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/app"
 	"github.com/larksuite/cli/internal/event/consume"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	subown "github.com/larksuite/cli/internal/event/subscription"
@@ -141,28 +142,13 @@ no-op there.`,
 	// (create/reuse/reactivate a remote Subscription) — so the static tag
 	// (what --help shows and what anything inspecting risk before args are
 	// resolved sees) must reflect this command's worst case, never silently
-	// under-report it as pure "read". runConsume narrows this to the precise
-	// per-invocation value ("read" for an ordinary key) once the EventKey is
-	// actually resolved — see consumeEffectiveRisk.
+	// under-report it as pure "read". The precise per-invocation value ("read"
+	// for an ordinary key) is app.InvocationDescriptor.Risk once the EventKey is
+	// resolved; RunE never mutates this annotation — a command must not rewrite
+	// its own Cobra risk mid-run.
 	cmdutil.SetRisk(cmd, "write")
 
 	return cmd
-}
-
-// consumeEffectiveRisk reports one invocation's ACTUAL risk once its
-// EventKey has been resolved: "write" for a refined key (its startup chain
-// may create, reuse, or reactivate a remote Subscription even though the
-// command otherwise reads as pure observe); "read" for an ordinary (legacy)
-// key, which never writes remote state at all. Distinct from NewCmdConsume's
-// static risk_level annotation (always "write", the safe default before any
-// argument is known) — runConsume calls cmdutil.SetRisk again with this
-// value so the annotation reflects THIS invocation precisely once that's
-// knowable.
-func consumeEffectiveRisk(isRefined bool) string {
-	if isRefined {
-		return "write"
-	}
-	return "read"
 }
 
 func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consumeCmdOpts) error {
@@ -191,57 +177,86 @@ func runConsume(cmd *cobra.Command, f *cmdutil.Factory, eventKey string, o consu
 		}
 		return err
 	}
-	// Narrow the static "write" default to this invocation's actual risk now
-	// that the EventKey is resolved (see consumeEffectiveRisk / NewCmdConsume's
-	// own comment on why the static tag can't do this by itself).
-	cmdutil.SetRisk(cmd, consumeEffectiveRisk(resolved.IsRefined))
-	if resolved.IsRefined {
-		// --include-resource-data=true is SUPPORTED on
-		// a refined key — it creates an ENCRYPTED remote Subscription. The
-		// flag flows through to
-		// RunRefined (RefinedOptions.IncludeResourceData), which reconciles
-		// against the encryption conflict matrix and generates + injects a
-		// fresh CSPRNG encrypt_key on create; the bus fetches that key when the
-		// consumer registers (rejecting the Hello if it cannot).
-		// This is a materialized refined key: drive the refined
-		// startup chain — ProbeBusEligibility
-		// (read-only) -> PlanRemoteSubscription (List/Get) -> [--dry-run
-		// exits here] -> ApplyRemoteSubscriptionPlan (the ONLY remote write)
-		// -> StartOrConnectBus -> HelloV2. The legacy branch below
-		// (keyDef/identity resolution through consume.Run) is UNTOUCHED and
-		// never reached for a refined key.
-		return runRefinedConsume(cmd, f, cfg, paramMap, resolved, o)
+	// Classify the invocation explicitly — refined (remote-subscription setup),
+	// legacy real run, or legacy dry-run (no setup) — instead of branching on
+	// isRefined/dry-run inline, and let the ConsumeUseCase dispatch it. RunE does
+	// NOT mutate the command's static risk annotation; the per-invocation risk
+	// policy is app.InvocationDescriptor.Risk.
+	descriptor := app.DescribeConsume(resolved, o.dryRun)
+	setup := consumeSetup{cmd: cmd, f: f, cfg: cfg, paramMap: paramMap, resolved: resolved, o: o}
+	return app.NewConsumeUseCase(setup).Run(cmd.Context(), descriptor)
+}
+
+// consumeSetup is cmd/event's app.ConsumeSetup implementation: it closes over
+// the resolved invocation inputs so the ConsumeUseCase can dispatch each
+// SetupKind to its Factory-bound execution without the command's RunE branching
+// on isRefined/dry-run itself.
+type consumeSetup struct {
+	cmd      *cobra.Command
+	f        *cmdutil.Factory
+	cfg      *core.CliConfig
+	paramMap map[string]string
+	resolved eventlib.ResolvedEventKey
+	o        consumeCmdOpts
+}
+
+// RunRemoteSubscription drives a materialized refined key: the refined startup
+// chain — ProbeBusEligibility (read-only) -> PlanRemoteSubscription (List/Get)
+// -> [--dry-run exits here] -> ApplyRemoteSubscriptionPlan (the ONLY remote
+// write) -> StartOrConnectBus -> HelloV2. --include-resource-data=true is
+// SUPPORTED here (it creates an ENCRYPTED remote Subscription; the flag flows
+// through to consume.RunRefined, which generates + injects a fresh CSPRNG
+// encrypt_key on create and lets the bus fetch it at Hello time). The legacy
+// path is never reached for a refined key.
+func (s consumeSetup) RunRemoteSubscription(context.Context) error {
+	return runRefinedConsume(s.cmd, s.f, s.cfg, s.paramMap, s.resolved, s.o)
+}
+
+// RunNoSetup drives a legacy key under --dry-run: a legacy key has no
+// remote-Subscription plan for a dry-run to preview, so — after the legacy-only
+// flag rejections (which apply regardless of --dry-run) — this reports that and
+// exits with ZERO side effects: no identity resolution, no bus, no consume.Run.
+func (s consumeSetup) RunNoSetup(context.Context) error {
+	if err := s.rejectLegacyOnlyFlags(); err != nil {
+		return err
 	}
+	fmt.Fprintln(s.f.IOStreams.ErrOut, "[event] dry-run: legacy EventKey has no remote subscription plan — nothing to preview")
+	return nil
+}
+
+// RunLegacy drives an ordinary key's real run: the legacy-only flag rejections,
+// then the console/scope preflight and the bus consume start (runLegacyConsume).
+func (s consumeSetup) RunLegacy(context.Context) error {
+	if err := s.rejectLegacyOnlyFlags(); err != nil {
+		return err
+	}
+	return runLegacyConsume(s.cmd, s.f, s.cfg, s.paramMap, s.resolved, s.o)
+}
+
+// rejectLegacyOnlyFlags rejects the two flags that only ever control a refined
+// key's remote Subscription — --include-resource-data and --filter — when they
+// are passed for an ordinary (legacy) key. Shared by the legacy real run and the
+// legacy dry-run, since neither has a remote Subscription for them to apply to,
+// and fired before any identity resolution or other side effect. resolved.
+// MaterializedKey is the legacy input verbatim (ResolveEventKey never rewrites a
+// legacy key), matching the raw argument this rejection previously named.
+func (s consumeSetup) rejectLegacyOnlyFlags() error {
+	if s.o.includeResourceData {
+		return errIncludeResourceDataNotApplicable(s.resolved.MaterializedKey)
+	}
+	if s.o.filter != "" {
+		return errFilterNotApplicable(s.resolved.MaterializedKey)
+	}
+	return nil
+}
+
+// runLegacyConsume is the ordinary (legacy) EventKey real-run path: identity
+// resolution + console/scope preflight + the bus consume start. Its behavior and
+// error ordering are unchanged from runConsume's old legacy branch; it is never
+// reached for a refined key or a legacy dry-run.
+func runLegacyConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConfig, paramMap map[string]string, resolved eventlib.ResolvedEventKey, o consumeCmdOpts) error {
+	eventKey := resolved.MaterializedKey
 	keyDef := resolved.Definition
-
-	// --include-resource-data has no remote-Subscription
-	// concept to apply to on an ordinary (legacy) EventKey — reject before
-	// identity resolution or any other side effect, mirroring the refined
-	// branch's own before-side-effect placement above.
-	if o.includeResourceData {
-		return errIncludeResourceDataNotApplicable(eventKey)
-	}
-
-	// --filter only controls a refined key's remote Subscription; a legacy key
-	// has no remote Subscription for it to apply to, so reject it rather than
-	// silently ignore a requested filter (mirrors --include-resource-data
-	// above, same before-side-effect placement).
-	if o.filter != "" {
-		return errFilterNotApplicable(eventKey)
-	}
-
-	// --dry-run's own --help text promises it is a no-op for a legacy
-	// (non-refined) EventKey, which never writes remote state at all — a
-	// legacy key has no remote-Subscription plan for a dry-run to preview
-	// at all, unlike the refined branch above (which still runs Probe+Plan
-	// before its own dry-run exit). Report that and exit before identity
-	// resolution, token/API-client setup, or any other preflight below, so
-	// this really is zero side effects: never starts a bus, never calls
-	// consume.Run.
-	if o.dryRun {
-		fmt.Fprintln(f.IOStreams.ErrOut, "[event] dry-run: legacy EventKey has no remote subscription plan — nothing to preview")
-		return nil
-	}
 
 	identity, err := resolveIdentity(cmd, f, keyDef)
 	if err != nil {

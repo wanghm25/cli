@@ -18,6 +18,8 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	eventlib "github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/app"
 
 	_ "github.com/larksuite/cli/events" // registers the real catalog: im.message.created_v1 (refined base) + im.message.receive_v1 (legacy)
 )
@@ -553,9 +555,10 @@ func TestNewCmdConsume_HasIncludeResourceDataFlag(t *testing.T) {
 // A single risk_level annotation can't vary by the EventKey argument (not
 // known until RunE resolves it), and a refined key's consume startup chain
 // has real write side effects — so NewCmdConsume's static default must be
-// "write" (never silently under-report the worst case), and runConsume
-// narrows it to the precise per-invocation value once the EventKey is
-// actually resolved.
+// "write" (never silently under-report the worst case). The precise
+// per-invocation value is app.InvocationDescriptor.Risk, a policy the command
+// consults once the EventKey is resolved; RunE no longer mutates the command's
+// Cobra risk annotation (a command must not rewrite its own risk mid-run).
 
 // TestNewCmdConsume_StaticRisk_IsWrite locks the static default: the safe,
 // conservative value --help (and anything inspecting risk before args are
@@ -569,36 +572,35 @@ func TestNewCmdConsume_StaticRisk_IsWrite(t *testing.T) {
 	}
 }
 
-// TestRunConsume_OrdinaryKey_EffectiveRiskNarrowsToRead locks the dynamic
-// per-invocation refinement: once an ORDINARY (legacy) EventKey is resolved,
-// this invocation's risk narrows to "read" — it never writes remote state.
-// Reuses newRefinedConsumeTestFactory's blocked bus-fork safety net (see its
-// own doc comment): the invocation still fails deep in the unrelated
-// bus-fork path, which is irrelevant here — only the risk annotation matters.
-func TestRunConsume_OrdinaryKey_EffectiveRiskNarrowsToRead(t *testing.T) {
-	f := newRefinedConsumeTestFactory(t)
-	f.IOStreams.IsTerminal = true // avoid the background stdin-EOF watcher racing with consume.Run's own errOut writes (unrelated to what this test checks)
-	cmd := newConsumeCmd(f, "im.message.receive_v1", "--as", "bot")
-	_ = cmd.Execute()
-
-	level, ok := cmdutil.GetRisk(cmd)
-	if !ok || level != "read" {
-		t.Errorf("effective risk after an ordinary-key invocation = %q (ok=%v), want %q", level, ok, "read")
+// TestConsumeInvocationRisk_OrdinaryKey_IsRead locks the per-invocation risk
+// policy for an ORDINARY (legacy) EventKey: it resolves to a read-risk
+// invocation — a legacy consume never writes remote management state. The risk
+// is now the descriptor's policy (app.InvocationDescriptor.Risk), consulted
+// instead of RunE mutating the static "write" annotation.
+func TestConsumeInvocationRisk_OrdinaryKey_IsRead(t *testing.T) {
+	resolved, err := eventlib.ResolveEventKey("im.message.receive_v1")
+	if err != nil {
+		t.Fatalf("ResolveEventKey: %v", err)
+	}
+	if got := app.DescribeConsume(resolved, false).Risk(); got != core.RiskRead {
+		t.Errorf("ordinary-key invocation risk = %q, want %q", got, core.RiskRead)
 	}
 }
 
-// TestRunConsume_RefinedMaterializedKey_EffectiveRiskStaysWrite locks the
-// OTHER side: a materialized refined EventKey's risk stays "write" — its
-// startup chain may create, reuse, or reactivate a remote Subscription.
-func TestRunConsume_RefinedMaterializedKey_EffectiveRiskStaysWrite(t *testing.T) {
-	f := newRefinedConsumeTestFactory(t)
-	f.IOStreams.IsTerminal = true // same non-interference reasoning as the ordinary-key test above
-	cmd := newConsumeCmd(f, "im.message.created_v1/chat-id/oc_9f3b1c2d8a")
-	_ = cmd.Execute() // fails deep in the real refined chain (this Factory has no HTTP stubs); only the risk annotation matters here
-
-	level, ok := cmdutil.GetRisk(cmd)
-	if !ok || level != "write" {
-		t.Errorf("effective risk after a refined-key invocation = %q (ok=%v), want %q", level, ok, "write")
+// TestConsumeInvocationRisk_RefinedKey_IsWrite locks the OTHER side: a
+// materialized refined EventKey resolves to a write-risk invocation — its
+// startup chain may create, reuse, or reactivate a remote Subscription — for
+// BOTH a real run and a --dry-run (which still runs Probe+Plan before its write
+// exit, so it stays a remote-subscription setup).
+func TestConsumeInvocationRisk_RefinedKey_IsWrite(t *testing.T) {
+	resolved, err := eventlib.ResolveEventKey("im.message.created_v1/chat-id/oc_9f3b1c2d8a")
+	if err != nil {
+		t.Fatalf("ResolveEventKey: %v", err)
+	}
+	for _, dryRun := range []bool{false, true} {
+		if got := app.DescribeConsume(resolved, dryRun).Risk(); got != core.RiskWrite {
+			t.Errorf("refined-key invocation risk (dryRun=%v) = %q, want %q", dryRun, got, core.RiskWrite)
+		}
 	}
 }
 
