@@ -56,7 +56,7 @@ Every remote Subscription carries a server TTL (`expire_time`, unix seconds — 
   - Match → delivery / BindUser / lifecycle recovery proceed normally.
   - Mismatch → the consumer is flagged `stale_identity` (informational only, surfaced by `event status`): no events are delivered to it, no historical UAT is loaded, nothing remote changes. Switch back to the owning profile to resume delivery.
   - Bot consumers are never identity-gated this way (no per-user BindUser applies to them).
-- The management plane (`subscription list/get/update/renew/reactivate/delete`) carries no owner/current concept at all — `--as` just resolves one effective identity per call; user and bot tokens are never mixed within a single call. Only `create` enforces the template-level check above (it is the one management command that takes an EventKey).
+- The management plane (`subscription list/get/renew/reactivate/delete`) carries no owner/current concept at all — `--as` just resolves one effective identity per call; user and bot tokens are never mixed within a single call. `update` is the exception: it takes no `--as` at all, since its `--include-resource-data` rejection is entirely local and never resolves an identity (see §6/§8). Only `create` enforces the template-level check above (it is the one management command that takes an EventKey).
 
 ## 5. Lifecycle control plane (automatic — nothing to call)
 
@@ -82,14 +82,14 @@ All 7 subcommands operate on the platform's persistent remote Subscription, addr
 | `list` | `event:subscription:read` | effective identity only | no |
 | `get <id>` | `event:subscription:read` | effective identity only | no |
 | `create <refined key>` | read **+** write (both, always) | base key's `auth_types` **and** the matched template's `auth_types` | no (additive + pre-checked for conflicts) |
-| `update <id>` | read **+** write | effective identity only | **yes** (exit code 10 without it) |
+| `update <id>` | none — pure local, never reads/writes remote state | none — no identity is ever resolved | no — not confirmation-gated; every call is always rejected with a typed `failed_precondition` before any identity/scope/network step |
 | `renew <id>` | read **+** write | effective identity only | no |
 | `reactivate <id>` | read **+** write | effective identity only | no |
 | `delete <id>` | read **+** write | effective identity only | **yes** (exit code 10 without it) |
 
-- Every mutating subcommand hard-requires **both** `event:subscription:read` and `event:subscription:write` even where the underlying platform call would only need `write` — the CLI always reads remote state first (idempotency / conflict / impact analysis) as a design invariant, and never offers a "skip the read" path.
-- `--dry-run` on any of the 5 mutating subcommands previews `remote_before` / `planned_change` / `next_action` with zero writes (`list`/`get` are already read-only and have no `--dry-run`).
-- `update` and `delete` are the only two gated by a confirmation-required error (category `confirmation`, **exit code 10**) — retry the identical command with `--yes` only after a human has confirmed. `create`/`renew`/`reactivate` never prompt for confirmation.
+- Every mutating subcommand other than `update` hard-requires **both** `event:subscription:read` and `event:subscription:write` even where the underlying platform call would only need `write` — the CLI always reads remote state first (idempotency / conflict / impact analysis) as a design invariant, and never offers a "skip the read" path. `update` needs **neither** scope: its rejection is decided purely from the `--include-resource-data` value it was given, before any scope check.
+- `--dry-run` on `create`/`renew`/`reactivate`/`delete` (4 of the 5 mutating subcommands) previews `remote_before` / `planned_change` / `next_action` with zero writes (`list`/`get` are already read-only and have no `--dry-run`). `update` has no `--dry-run` either — not because it's read-only, but because it never touches the network at all, so there is nothing to preview.
+- `delete` is the only subcommand gated by a confirmation-required error (category `confirmation`, **exit code 10**) — retry the identical command with `--yes` only after a human has confirmed. `create`/`renew`/`reactivate` never prompt for confirmation, and neither does `update`: it has no successful path to confirm into, so it rejects unconditionally instead of asking for `--yes` (which it does not even accept).
 - `create` reconciles against existing remote state before writing anything: no match → create; active + compatible `payload_options` → idempotent reuse (same id, no duplicate); active + conflicting → typed `failed_precondition` (guides you to `get`); suspended → guides you to `reactivate` instead of creating a duplicate; expired/deleted → treated as gone, safe to create fresh.
 - `delete` removing the remote Subscription is explicitly **not** a substitute for stopping a local `event consume` process still bound to it — see the stop chain below.
 
@@ -127,7 +127,7 @@ To fully tear down a refined subscription: stop the local consumer **and** delet
 | encrypted | encrypted + key retrievable | reuse |
 | encrypted | encrypted + key NOT retrievable | create: conflict → fix scope/identity; consume: reuse, then the bus Hello rejects (`decrypt_key_unavailable`) if the key is unretrievable |
 
-**Rotation / enable / disable = delete + recreate.** `encrypt` is Create-only: it can never be added, changed, or removed afterward. `event subscription update --include-resource-data=true` is therefore refused with a typed `failed_precondition` guiding you to delete + recreate (or create a separate new subscription) after human confirmation. There is no in-place rotate/update-key.
+**Rotation / enable / disable = delete + recreate.** `encrypt` is Create-only: it can never be added, changed, or removed afterward — and the platform's update (Patch) API is filter-only now, carrying no `payload_options` field at all, so it is structurally incapable of touching `include_resource_data` in either direction. `event subscription update --include-resource-data=true` **and** `--include-resource-data=false` are therefore both refused, identically, with a typed `failed_precondition` guiding you to delete + recreate (or create a separate new subscription) after human confirmation — purely locally, with no remote read. There is no in-place rotate/update-key.
 
 **Observability.** `event status` shows, per encrypted consumer, `resource_data` (`decrypted`/`unavailable`), `decrypt_state` (`decrypted`/`decrypt_key_unavailable`/`decrypt_failed`), and `last_decrypt_error {class,count,time}` — advisory only. A single undecryptable event is dropped fail-closed and counted (never delivered as ciphertext, never on stdout); persistent failures mark the consumer `degraded`.
 

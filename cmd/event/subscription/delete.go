@@ -39,13 +39,13 @@ type deleteOpts struct {
 }
 
 // NewCmdDelete builds `event subscription delete <remote_subscription_id>`.
-// Like create/update/renew/reactivate, delete
+// Like create/renew/reactivate, delete
 // requires BOTH event:subscription:read and event:subscription:write:
 // it always reads the current remote state first (Get), both to
 // report remote_before/impact for --dry-run and to describe what is about
 // to be deleted in the confirmation-required Hint.
 //
-// Like update, delete is a high-risk write on a shared remote resource:
+// delete is a high-risk write on a shared remote resource:
 // without --yes it returns a typed ConfirmationRequiredError
 // (category confirmation, exit code 10) instead of proceeding. Deleting the
 // remote Subscription is explicitly NOT a substitute for stopping a local
@@ -183,7 +183,7 @@ func doDeleteSubscription(ctx context.Context, svc deleteSubscriptionAPI, remote
 // confirmation gate for delete: category confirmation (exit code 10),
 // risk high-risk-write, and a Hint naming the affected
 // remote_subscription_id/event_key/identity/current state (pids omitted —
-// see update.go's errUpdateConfirmationRequired doc comment for why) plus
+// no bus/local-consumer registry exists yet to know them) plus
 // the required "not a substitute for stopping local consumers" caveat.
 func errDeleteConfirmationRequired(remoteSubscriptionID string, identity core.Identity, before *subscriptionRow) error {
 	return errs.NewConfirmationRequiredError(errs.RiskHighRiskWrite, "event subscription delete",
@@ -194,7 +194,7 @@ func errDeleteConfirmationRequired(remoteSubscriptionID string, identity core.Id
 const deleteLocalImpactNote = "`event subscription delete` only removes the remote Subscription; it never stops a local `event consume` process — it is not a substitute for stopping local consumers, which must be stopped separately."
 
 // deleteResult is delete's own non-dry-run success JSON shape — distinct
-// from the shared mutationResult (update/renew/reactivate.go) because
+// from the shared mutationResult (renew/reactivate.go) because
 // DeleteSubscriptionResp carries no fresh SubscriptionDetail to echo back;
 // Subscription here is the last known state, captured by the
 // Get this command always performs before deleting.

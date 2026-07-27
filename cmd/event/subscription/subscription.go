@@ -42,32 +42,43 @@ starts a local process that consumes already-delivered events.
 
 Use 'list' / 'get <remote_subscription_id>' to inspect what is currently
 subscribed remotely, 'create <refined EventKey>' to create (or idempotently
-reuse) one, 'update <remote_subscription_id>' to change its payload_options,
-'renew'/'reactivate' to extend its TTL or resume delivery, and
+reuse) one, 'update <remote_subscription_id>' to reject an
+--include-resource-data change (the platform's update API only accepts a
+new event filter now, and this CLI does not support filter updates yet, so
+update has no successful path today — delete + recreate, after human
+confirmation, to actually change resource-data/encryption), 'renew'/
+'reactivate' to extend its TTL or resume delivery, and
 'delete <remote_subscription_id>' to remove it.
 
-IDENTITY: --as user|bot|auto on every subcommand, resolved to one effective
-identity per call — user and bot tokens are never mixed within one call.
-Every subcommand EXCEPT 'create' (list/get/update/renew/reactivate/delete)
-carries no EventKey/template context, so there is no extra per-template
-identity check for them; only 'create' enforces one, since it is the sole
-subcommand that takes an EventKey (see 'event subscription create --help').
+IDENTITY: --as user|bot|auto on every subcommand except 'update' (which
+takes no identity at all — its rejection is entirely local, before any
+--as/scope/network step), resolved to one effective identity per call —
+user and bot tokens are never mixed within one call. Every subcommand
+EXCEPT 'create' (list/get/renew/reactivate/delete) carries no
+EventKey/template context, so there is no extra per-template identity check
+for them; only 'create' enforces one, since it is the sole subcommand that
+takes an EventKey (see 'event subscription create --help').
 
-SCOPE: list/get need event:subscription:read only. create/update/renew/
+SCOPE: list/get need event:subscription:read only. create/renew/
 reactivate/delete need BOTH event:subscription:read AND
-event:subscription:write — every mutating subcommand always reads remote
-state first (for idempotency / conflict / impact analysis) before it may
-write, so read is required even where the underlying platform call alone
-would not strictly need it.
+event:subscription:write — every one of those always reads remote state
+first (for idempotency / conflict / impact analysis) before it may write,
+so read is required even where the underlying platform call alone would
+not strictly need it. 'update' checks no scope at all: its rejection is
+decided purely from the flag value it was given, before any identity,
+scope, or network step.
 
-SAFETY: update/delete are high-risk writes on a resource other identities/
-processes may share and require --yes after a human confirms — without it,
-a typed confirmation-required error (exit code 10); create/renew/reactivate
-never prompt for confirmation. Every subcommand except list/get supports
---dry-run (parse + identity + scope preflight + a remote read + impact
-analysis, zero writes). 'delete' removing the remote Subscription is NOT a
-substitute for stopping a local 'event consume' process still bound to it —
-stop that separately with 'lark-cli event stop'.
+SAFETY: 'delete' is a high-risk write on a resource other identities/
+processes may share and requires --yes after a human confirms — without
+it, a typed confirmation-required error (exit code 10); create/renew/
+reactivate never prompt for confirmation, and 'update' has no successful
+path to confirm into (see above). Every subcommand except list/get/update
+supports --dry-run (parse + identity + scope preflight + a remote read +
+impact analysis, zero writes); 'update' has no --dry-run since it never
+touches the network to begin with. 'delete' removing the remote
+Subscription is NOT a substitute for stopping a local 'event consume'
+process still bound to it — stop that separately with 'lark-cli event
+stop'.
 
 NEXT STEP: after 'create' succeeds, run 'lark-cli event consume <refined
 EventKey>' to actually start receiving events — creating/updating a
@@ -106,11 +117,12 @@ var subscriptionReadScopes = []string{"event:subscription:read"}
 var subscriptionEncryptKeyReadScopes = []string{"event:encrypt_key:read"}
 
 // addAsFlag registers the --as flag shared by every subscription
-// subcommand. list/get/update/renew/
+// subcommand that resolves an identity at all — list/get/renew/
 // reactivate/delete carry no EventKey/KeyTemplate context, so --as resolves
 // to a single effective identity with no per-template AuthTypes check —
 // unlike `consume`/`create`, which do enforce one (cmd/event/consume.go's
-// resolveIdentity).
+// resolveIdentity). 'update' does not call this at all: its rejection is
+// entirely local and takes no --as/identity of any kind.
 func addAsFlag(cmd *cobra.Command) {
 	cmd.Flags().String("as", "auto", "identity type: user | bot | auto")
 	_ = cmd.RegisterFlagCompletionFunc("as", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
@@ -322,16 +334,22 @@ func boolVal(b *bool) bool {
 	return b != nil && *b
 }
 
-// ---- shared pieces for update/renew/reactivate/delete ----
+// ---- shared pieces for renew/reactivate/delete ----
+//
+// update used to share this shape too, back when the platform's update API
+// still accepted payload_options. Now that update.go is a pure-local
+// reject with no remote read and no --dry-run at all (the update API is
+// filter-only, and this CLI does not support filter updates yet), it no
+// longer uses any of the helpers below.
 //
 // Unlike create (which keys off a refined EventKey with no remote identity
-// yet, and so branches into create/reuse/conflict/suspended), these four
+// yet, and so branches into create/reuse/conflict/suspended), these three
 // commands all key off an already-existing remote_subscription_id: their
 // --dry-run "parse/identity/scope preflight/remote read/impact analysis"
-// shape is therefore identical across all four, differing only
+// shape is therefore identical across all three, differing only
 // in the operation name, the planned_change.action string, and the
 // local_impact note text — so it is built and rendered once here rather
-// than four times. list/get/create keep their own bespoke shapes unchanged.
+// than three times. list/get/create keep their own bespoke shapes unchanged.
 
 // errEmptyRemoteSubscriptionID rejects an empty remote_subscription_id
 // before any identity/scope/network work — the shared counterpart of
@@ -345,25 +363,27 @@ func errEmptyRemoteSubscriptionID() error {
 		WithHint("pass the remote_subscription_id from `lark-cli event subscription list --json`")
 }
 
-// mutationPreflight is the `preflight` sub-object shared by update/renew/
-// reactivate/delete's --dry-run JSON. Unlike create's createPreflight, these
-// commands carry no EventKey/KeyTemplate context (they
-// resolve --as to a single identity with no per-template
+// mutationPreflight is the `preflight` sub-object shared by renew/
+// reactivate/delete's --dry-run JSON (update has no --dry-run at all
+// anymore — see the section comment above). Unlike create's
+// createPreflight, these commands carry no EventKey/KeyTemplate context
+// (they resolve --as to a single identity with no per-template
 // AuthTypes check), so there is no MatchedTemplate field.
 type mutationPreflight struct {
 	Identity string `json:"identity"`
 	ScopesOK bool   `json:"scopes_ok"`
 }
 
-// mutationDryRunResult is the shared --dry-run JSON shape for update/renew/
+// mutationDryRunResult is the shared --dry-run JSON shape for renew/
 // reactivate/delete (operation/dry_run/required_scopes/
-// preflight/remote_before/planned_change/local_impact/next_action). All
-// four always have a non-nil RemoteBefore by the time this is built: unlike
-// create's target (which may legitimately not exist yet), these commands
-// operate on an id the caller already believes exists, and the shared
-// getSubscription (get.go) helper that supplies RemoteBefore already
-// returns a typed error rather than a nil detail when the remote side
-// disagrees.
+// preflight/remote_before/planned_change/local_impact/next_action). update
+// has no --dry-run at all anymore (see the section comment above), so it
+// never builds one of these. All three always have a non-nil RemoteBefore
+// by the time this is built: unlike create's target (which may
+// legitimately not exist yet), these commands operate on an id the caller
+// already believes exists, and the shared getSubscription (get.go) helper
+// that supplies RemoteBefore already returns a typed error rather than a
+// nil detail when the remote side disagrees.
 type mutationDryRunResult struct {
 	Operation            string            `json:"operation"`
 	DryRun               bool              `json:"dry_run"`
@@ -380,7 +400,7 @@ type mutationDryRunResult struct {
 // already passed the scope preflight by the time this is called, so
 // Preflight.ScopesOK is unconditionally true here — mirroring create.go's
 // buildDryRunResult's own ScopesOK comment. plannedAction is the
-// planned_change.action value (e.g. "update", or a blocked-state variant
+// planned_change.action value (e.g. "renew", or a blocked-state variant
 // such as "blocked_suspended" — the dry-run always reports the plan
 // informationally rather than erroring on remote business state; only the
 // preflight steps themselves are real dry-run failures, mirroring create's
@@ -418,11 +438,13 @@ func writeMutationDryRunText(out io.Writer, result *mutationDryRunResult) {
 }
 
 // mutationResult is the shared non-dry-run success JSON shape for
-// update/renew/reactivate: each of those three SDK calls
-// (Patch/Renew/Reactivate) returns a fresh SubscriptionDetail to echo back.
-// delete has its own deleteResult in delete.go — DeleteSubscriptionResp
-// carries no Data/SubscriptionDetail at all, so there is nothing
-// fresh to map here.
+// renew/reactivate: each of those two SDK calls (Renew/Reactivate) returns
+// a fresh SubscriptionDetail to echo back. update no longer has any
+// successful path at all (the platform's update API is filter-only now,
+// and this CLI does not support filter updates yet — see update.go), so it
+// never builds one of these either. delete has its own deleteResult in
+// delete.go — DeleteSubscriptionResp carries no Data/SubscriptionDetail at
+// all, so there is nothing fresh to map here.
 type mutationResult struct {
 	Operation            string          `json:"operation"`
 	RemoteSubscriptionID string          `json:"remote_subscription_id"`

@@ -36,14 +36,14 @@ type renewOpts struct {
 }
 
 // NewCmdRenew builds `event subscription renew <remote_subscription_id>`.
-// Like create/update/reactivate/delete, renew requires
+// Like create/reactivate/delete, renew requires
 // BOTH event:subscription:read and event:subscription:write:
 // this command always reads the current remote state first (Get) to report
 // remote_before/impact for --dry-run — a CLI-side design invariant, not an
 // OAPI requirement (a bare Renew call needs no prior read at the API
 // level).
 //
-// Unlike update/delete, renew is not a high-risk confirmation-gated action
+// Unlike delete, renew is not a high-risk confirmation-gated action
 // — it does not expose --yes and never returns
 // a ConfirmationRequiredError.
 func NewCmdRenew(f *cmdutil.Factory) *cobra.Command {

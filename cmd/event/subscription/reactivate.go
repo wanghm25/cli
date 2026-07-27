@@ -36,13 +36,13 @@ type reactivateOpts struct {
 }
 
 // NewCmdReactivate builds `event subscription reactivate
-// <remote_subscription_id>`. Like create/update/renew/
+// <remote_subscription_id>`. Like create/renew/
 // delete, reactivate requires BOTH event:subscription:read and
 // event:subscription:write: this command always reads the
 // current remote state first (Get) to report remote_before/impact for
 // --dry-run — a CLI-side design invariant, not an OAPI requirement.
 //
-// Unlike update/delete, reactivate is not a high-risk confirmation-gated
+// Unlike delete, reactivate is not a high-risk confirmation-gated
 // action — it does not expose --yes and
 // never returns a ConfirmationRequiredError. There is no `suspend` command:
 // the server exposes no such operation, so the only path back from
