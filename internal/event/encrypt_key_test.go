@@ -28,8 +28,8 @@ func TestNewEncryptKey_ReturnsNonEmptyString(t *testing.T) {
 // TestNewEncryptKey_DecodesTo32BytesOfEntropy locks the entropy/format
 // contract from the task brief: "crypto/rand ≥32 bytes → base64-encode to a
 // string". The SDK hashes whatever string is supplied
-// (sha256.Sum256([]byte(encrypt_key)), verified in the 4c77bba clone's
-// event/event.go) to derive the actual AES-256 key, so the only thing that
+// (sha256.Sum256([]byte(encrypt_key)), as the SDK's event/event.go
+// does) to derive the actual AES-256 key, so the only thing that
 // matters about encrypt_key's shape is that it carries at least 32 bytes
 // (256 bits) of real entropy before encoding — this test decodes the
 // standard-base64 result back to bytes and checks the byte length directly,

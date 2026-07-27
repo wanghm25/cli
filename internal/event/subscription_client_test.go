@@ -16,7 +16,7 @@ import (
 	"github.com/larksuite/cli/internal/core"
 )
 
-// fakeSubscriptionService is a network-free stand-in for the candidate SDK's
+// fakeSubscriptionService is a network-free stand-in for the SDK's
 // client.Event.V1.Subscription. It implements subscriptionService so tests
 // can construct a SubscriptionClient around it and assert exactly which
 // larkcore.RequestOptionFunc values were passed on each call, without a real
