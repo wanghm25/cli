@@ -326,11 +326,8 @@ func FormatLifecycleAuthority(a *larkeventv1.Authority) string {
 		return ""
 	}
 	principalID := ""
-	switch {
-	case a.OpenId != nil && *a.OpenId != "":
+	if a.OpenId != nil {
 		principalID = *a.OpenId
-	case a.UnionId != nil && *a.UnionId != "":
-		principalID = *a.UnionId
 	}
 	return formatSubscriptionAuthority(*a.Type, principalID)
 }
