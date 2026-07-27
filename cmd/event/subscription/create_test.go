@@ -201,7 +201,7 @@ func suspendedDetail(id, reason string) *larkeventv1.SubscriptionDetail {
 func TestReconcileExisting_NotFound_ReturnsCreateAction(t *testing.T) {
 	fake := &fakeCreateAPI{listFunc: fixedList(okListResp(nil, false, ""), nil)}
 
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestReconcileExisting_ActiveCompatible_ReturnsReuseAction(t *testing.T) {
 		activeDetail("sub_1", false, "user"),
 	}, false, ""), nil)}
 
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestReconcileExisting_ActiveConflicting_ReturnsConflictActionWithFields(t *
 
 	// requested include_resource_data=false (the only value that can reach
 	// this point once the encryption check rejects true) mismatches the existing true.
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestReconcileExisting_Suspended_ReturnsSuspendedAction(t *testing.T) {
 		suspendedDetail("sub_1", "authority_revoked"),
 	}, false, ""), nil)}
 
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestReconcileExisting_ExpiredOrDeleted_TreatedAsNew(t *testing.T) {
 				},
 			}, false, ""), nil)}
 
-			plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+			plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -298,7 +298,7 @@ func TestReconcileExisting_AuthorityMismatch_IgnoresOtherIdentityItems(t *testin
 		activeDetail("sub_app", false, "app"),
 	}, false, ""), nil)}
 
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestReconcileExisting_BotIdentityMatchesAppAuthority_ReturnsReuseAction(t *
 		activeDetail("sub_app", false, "app"),
 	}, false, ""), nil)}
 
-	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsBot, false)
+	plan, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsBot, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestReconcileExisting_TransportError_PropagatesUnchanged(t *testing.T) {
 	sentinel := errors.New("boom: connection reset")
 	fake := &fakeCreateAPI{listFunc: fixedList(nil, sentinel)}
 
-	_, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	_, err := reconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false, nil)
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want it passed through unchanged (%v)", err, sentinel)
 	}
@@ -349,7 +349,7 @@ func TestCreateOrReuseSubscription_NotFound_CallsCreateExactlyOnce(t *testing.T)
 		},
 	}
 
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false)
+	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestCreateOrReuseSubscription_PaginationCapped_PropagatesToOutcome(t *testi
 		},
 	}
 
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false)
+	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestCreateOrReuseSubscription_ActiveCompatible_ReusesWithoutCallingCreate(t
 		}, false, ""), nil),
 	}
 
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false)
+	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -427,7 +427,7 @@ func TestCreateOrReuseSubscription_ActiveConflict_ReturnsTypedFailedPrecondition
 		}, false, ""), nil),
 	}
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false)
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
 	if err == nil {
 		t.Fatal("expected a conflict error, got nil")
 	}
@@ -468,7 +468,7 @@ func TestCreateOrReuseSubscription_Suspended_ReturnsTypedFailedPrecondition_Guid
 		}, false, ""), nil),
 	}
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false)
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
 	if err == nil {
 		t.Fatal("expected a suspended error, got nil")
 	}
@@ -511,7 +511,7 @@ func TestCreateOrReuseSubscription_CreateFails_ReconcileFindsCompatible_ReturnsR
 		},
 	}
 
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false)
+	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -545,7 +545,7 @@ func TestCreateOrReuseSubscription_CreateFails_ReconcileFindsConflict_ReturnsTyp
 		},
 	}
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false)
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -566,7 +566,7 @@ func TestCreateOrReuseSubscription_CreateFails_ReconcileFindsNothing_ReturnsOrig
 		createFunc: func() (*larkeventv1.CreateSubscriptionResp, error) { return nil, sentinel },
 	}
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false)
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, false, nil)
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want the original Create error passed through unchanged (%v)", err, sentinel)
 	}
@@ -634,7 +634,7 @@ func TestDryRun_IncludeResourceDataTrue_NotFound_GeneratesNoKeyAndNoCreateCall(t
 	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return orig() }
 	t.Cleanup(func() { newEncryptKeyFunc = orig })
 
-	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsBot, true)
+	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsBot, true, nil)
 	if err != nil {
 		t.Fatalf("reconcileExisting: unexpected error: %v", err)
 	}
@@ -678,7 +678,7 @@ func TestDryRun_IncludeResourceDataTrue_ActiveMatch_ProbesButGeneratesNoKey(t *t
 	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return orig() }
 	t.Cleanup(func() { newEncryptKeyFunc = orig })
 
-	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsBot, true)
+	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsBot, true, nil)
 	if err != nil {
 		t.Fatalf("reconcileExisting: unexpected error: %v", err)
 	}
@@ -712,7 +712,7 @@ func TestDryRun_IncludeResourceDataTrue_ActiveMatch_ProbesButGeneratesNoKey(t *t
 // is never actually populated by its own builder — verified while writing
 // this test).
 func TestBuildCreateSubscriptionBody_IncludeResourceDataTrueWithKey_SetsBothAtomically(t *testing.T) {
-	body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", true, "the-generated-key")
+	body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", true, "the-generated-key", nil)
 
 	if body.EventType == nil || *body.EventType != "im.message.created_v1" {
 		t.Errorf("EventType = %v, want im.message.created_v1", body.EventType)
@@ -737,13 +737,93 @@ func TestBuildCreateSubscriptionBody_IncludeResourceDataTrueWithKey_SetsBothAtom
 // PayloadOptionsEncrypt is Create-only and must not appear at all when there
 // is no key.
 func TestBuildCreateSubscriptionBody_EmptyKey_OmitsEncrypt(t *testing.T) {
-	body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "")
+	body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", nil)
 
 	if boolVal(body.PayloadOptions.IncludeResourceData) {
 		t.Error("PayloadOptions.IncludeResourceData = true, want false")
 	}
 	if body.PayloadOptions.Encrypt != nil {
 		t.Errorf("PayloadOptions.Encrypt = %+v, want nil when no key is supplied", body.PayloadOptions.Encrypt)
+	}
+}
+
+// ---- --filter (server-side event filter) ----
+
+// validCreatedFilter parses a valid filter for im.message.created_v1 through
+// the real parse/validate path so the projected body carries exactly what a
+// real --filter would.
+func validCreatedFilter(t *testing.T) *eventlib.Filter {
+	t.Helper()
+	f, err := eventlib.ParseAndValidateFilter(
+		`{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"in","list_value":["text"]}}]}}`,
+		eventlib.FilterMetaFor("im.message.created_v1"))
+	if err != nil {
+		t.Fatalf("build valid filter: %v", err)
+	}
+	return f
+}
+
+// TestBuildCreateSubscriptionBody_WithFilter_CarriesProjectedFilter proves a
+// requested filter is projected onto the Create body's Filter field exactly as
+// it would be sent on the wire.
+func TestBuildCreateSubscriptionBody_WithFilter_CarriesProjectedFilter(t *testing.T) {
+	f := validCreatedFilter(t)
+	body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", f)
+	if body.Filter == nil {
+		t.Fatal("body.Filter = nil, want the projected filter")
+	}
+	got, err := json.Marshal(body.Filter)
+	if err != nil {
+		t.Fatalf("marshal body.Filter: %v", err)
+	}
+	want, err := f.Canonicalize()
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("body.Filter = %s, want %s", got, want)
+	}
+}
+
+// TestBuildCreateSubscriptionBody_NoFilter_OmitsFilter locks that with no
+// requested filter the field is omitted entirely — never sent as an empty
+// {"filter":{}} clear form (that is an update-only concept).
+func TestBuildCreateSubscriptionBody_NoFilter_OmitsFilter(t *testing.T) {
+	for name, f := range map[string]*eventlib.Filter{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			body := buildCreateSubscriptionBody("im.message.created_v1", "im.message?chat_id=oc_aaa", false, "", f)
+			if body.Filter != nil {
+				t.Errorf("body.Filter = %+v, want nil (omitted) when no filter is requested", body.Filter)
+			}
+		})
+	}
+}
+
+// TestRunCreate_InvalidFilter_ReturnsInvalidArgumentOnFilterParam locks that an
+// invalid --filter is rejected as a typed invalid_argument on --filter, before
+// any identity/scope resolution or network call (empty Factory proves it never
+// reaches config).
+func TestRunCreate_InvalidFilter_ReturnsInvalidArgumentOnFilterParam(t *testing.T) {
+	registerCreateFixtures(t)
+	f := &cmdutil.Factory{}
+	cmd := NewCmdCreate(f)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{
+		"im.message.created_v1/chat-id/oc_aaa",
+		"--filter", `{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"not_a_real_operand","op":"eq","value":"x"}}]}}`,
+	})
+
+	err := cmd.Execute()
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeInvalidArgument {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeInvalidArgument)
+	}
+	if ve.Param != "--filter" {
+		t.Errorf("Param = %q, want --filter", ve.Param)
 	}
 }
 
@@ -762,7 +842,7 @@ func TestCreateOrReuseSubscription_Encrypted_NotFound_CreatesAtomicallyWithKey(t
 		},
 	}
 
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -790,7 +870,7 @@ func TestCreateOrReuseSubscription_Encrypted_RemoteFalse_ReturnsConflict(t *test
 		}, false, ""), nil),
 	}
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -826,7 +906,7 @@ func TestCreateOrReuseSubscription_Encrypted_RemoteTrueUsableKey_ReusesNoNewCrea
 	newEncryptKeyFunc = func() (string, error) { keyGenCalls++; return orig() }
 	t.Cleanup(func() { newEncryptKeyFunc = orig })
 
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -861,7 +941,7 @@ func TestCreateOrReuseSubscription_Encrypted_RemoteTrueKeyUnavailable_ReturnsCon
 		},
 	}
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -909,7 +989,7 @@ func TestCreateOrReuseSubscription_Encrypted_CreateFails_SecondReconcileStillReq
 		},
 	}
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, true)
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsUser, true, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError (conflict, not a silent plaintext fallback), got %T: %v", err, err)
@@ -936,7 +1016,7 @@ func TestCreateOrReuseSubscription_Encrypted_CreateFails_SecondReconcileStillReq
 // exact create attempt (so the negative assertions below are not vacuous)
 // is TestBuildCreateSubscriptionBody_IncludeResourceDataTrueWithKey_SetsBothAtomically
 // plus this test's own createCalls==1 check: doCreateSubscription always
-// builds its request body via buildCreateSubscriptionBody(..., encryptKey)
+// builds its request body via buildCreateSubscriptionBody(..., encryptKey, nil)
 // with exactly the value newEncryptKeyFunc returned (createOrReuseSubscription
 // threads it straight through with no intermediate transformation).
 func TestEncryptedCreate_Redaction_KeyNeverAppearsInAnyOutput(t *testing.T) {
@@ -953,7 +1033,7 @@ func TestEncryptedCreate_Redaction_KeyNeverAppearsInAnyOutput(t *testing.T) {
 
 	fake := &fakeCreateAPI{listFunc: fixedList(okListResp(nil, false, ""), nil)}
 
-	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	outcome, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1018,7 +1098,7 @@ func TestEncryptedCreate_Redaction_KeyNeverAppearsInErrorOnCreateFailure(t *test
 		},
 	}
 
-	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true)
+	_, err := createOrReuseSubscription(context.Background(), fake, resolved, core.AsBot, true, nil)
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -1043,7 +1123,7 @@ func TestEncryptedCreate_Redaction_KeyNeverAppearsInErrorOnCreateFailure(t *test
 func TestDoCreateSubscription_IncludeResourceDataTrueWithEmptyKey_FailsClosed(t *testing.T) {
 	fake := &fakeCreateAPI{}
 
-	_, err := doCreateSubscription(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", true, "")
+	_, err := doCreateSubscription(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", true, "", nil)
 	if err == nil {
 		t.Fatal("expected an error (fail-closed, no plaintext-fallback), got nil")
 	}
@@ -1509,7 +1589,7 @@ func TestDryRun_NotFound_EndToEndViaFakeService_JSONShapeAndNoCreateCall(t *test
 	resolved := resolveCreatedChatID(t)
 	fake := &fakeCreateAPI{listFunc: fixedList(okListResp(nil, false, ""), nil)}
 
-	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsBot, false)
+	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsBot, false, nil)
 	if err != nil {
 		t.Fatalf("reconcileExisting: unexpected error: %v", err)
 	}
@@ -1563,7 +1643,7 @@ func TestDryRun_ActiveConflicting_EndToEndViaFakeService_ReportsInformationallyN
 
 	// requested include_resource_data=false (the default) mismatches the
 	// existing true -> conflict.
-	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsUser, false)
+	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsUser, false, nil)
 	if err != nil {
 		t.Fatalf("reconcileExisting: unexpected error: %v", err)
 	}
@@ -1596,7 +1676,7 @@ func TestDryRun_Suspended_EndToEndViaFakeService_ReportsInformationallyNoCreateC
 		suspendedDetail("sub_susp", "authority_revoked"),
 	}, false, ""), nil)}
 
-	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsUser, false)
+	plan, err := reconcileExisting(context.Background(), fake, resolved.Definition.EventType, resolved.TargetResource, core.AsUser, false, nil)
 	if err != nil {
 		t.Fatalf("reconcileExisting: unexpected error: %v", err)
 	}

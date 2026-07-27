@@ -33,6 +33,7 @@ type createOpts struct {
 	includeResourceData bool
 	dryRun              bool
 	asJSON              bool
+	filter              string
 }
 
 // NewCmdCreate builds `event subscription create <refined EventKey>`.
@@ -111,6 +112,8 @@ creating, reusing, or changing anything; create never requires --yes
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the plan (identity/scope preflight + remote read + impact analysis) without creating, reusing, or changing anything")
 	cmd.Flags().BoolVar(&o.asJSON, "json", false, "Emit the result as JSON (for AI / scripts)")
+	cmd.Flags().StringVar(&o.filter, "filter", "",
+		"Inline JSON event filter to apply server-side; validated against this event type's filter schema (see `event schema <key> --json`). Omit for no filter.")
 	addAsFlag(cmd)
 	cmdutil.SetRisk(cmd, "write")
 
@@ -140,6 +143,15 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 		// remote Subscription resource concept applies to it at all — `create`
 		// is defined exclusively for a refined EventKey.
 		return errCreateRequiresRefinedKey(eventKeyArg)
+	}
+
+	// Validate --filter against this event type's filter capability. Empty
+	// input is "no filter". A parse/validation failure is already a typed
+	// invalid_argument on --filter — returned unchanged, before identity/scope
+	// or any remote call, alongside the other cheap local rejections above.
+	reqFilter, err := eventlib.ParseAndValidateFilter(o.filter, eventlib.FilterMetaFor(resolved.Definition.EventType))
+	if err != nil {
+		return err
 	}
 
 	identity, err := resolveEffectiveIdentity(cmd, f)
@@ -191,7 +203,7 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 	}
 
 	if o.dryRun {
-		plan, err := reconcileExisting(ctx, client, resolved.Definition.EventType, resolved.TargetResource, identity, o.includeResourceData)
+		plan, err := reconcileExisting(ctx, client, resolved.Definition.EventType, resolved.TargetResource, identity, o.includeResourceData, reqFilter)
 		if err != nil {
 			return err
 		}
@@ -207,7 +219,7 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 		return nil
 	}
 
-	outcome, err := createOrReuseSubscription(ctx, client, resolved, identity, o.includeResourceData)
+	outcome, err := createOrReuseSubscription(ctx, client, resolved, identity, o.includeResourceData, reqFilter)
 	if err != nil {
 		return err
 	}
@@ -338,11 +350,18 @@ const (
 // encryption conflict matrix for an active, include_resource_data=true
 // match. requestedIncludeResourceData=false takes the plaintext path with
 // no encryption probe.
-func reconcileExisting(ctx context.Context, svc createSubscriptionAPI, eventType, targetResource string, identity core.Identity, requestedIncludeResourceData bool) (*reconcilePlan, error) {
+//
+// requestedFilter is the requested server-side filter, forwarded as
+// eventlib.WithRequestedFilter so a filter that differs from an existing active
+// subscription's blocks reuse as a conflict; a nil/empty requestedFilter is
+// compared as "no filter", so an unfiltered request against an unfiltered match
+// still reuses.
+func reconcileExisting(ctx context.Context, svc createSubscriptionAPI, eventType, targetResource string, identity core.Identity, requestedIncludeResourceData bool, requestedFilter *eventlib.Filter) (*reconcilePlan, error) {
+	opts := []eventlib.ReconcileOption{eventlib.WithRequestedFilter(requestedFilter)}
 	if requestedIncludeResourceData {
-		return eventlib.ReconcileExisting(ctx, svc, eventType, targetResource, identity, true, eventlib.WithEncryptKeyProber(svc))
+		opts = append(opts, eventlib.WithEncryptKeyProber(svc))
 	}
-	return eventlib.ReconcileExisting(ctx, svc, eventType, targetResource, identity, false)
+	return eventlib.ReconcileExisting(ctx, svc, eventType, targetResource, identity, requestedIncludeResourceData, opts...)
 }
 
 // newEncryptKeyFunc generates a fresh per-subscription encrypt_key for an
@@ -399,11 +418,11 @@ type createOutcome struct {
 // non-dry-run branch — during --dry-run), and is submitted to
 // doCreateSubscription in the SAME call that carries includeResourceData,
 // so the two are always atomic.
-func createOrReuseSubscription(ctx context.Context, svc createSubscriptionAPI, resolved eventlib.ResolvedEventKey, identity core.Identity, includeResourceData bool) (*createOutcome, error) {
+func createOrReuseSubscription(ctx context.Context, svc createSubscriptionAPI, resolved eventlib.ResolvedEventKey, identity core.Identity, includeResourceData bool, requestedFilter *eventlib.Filter) (*createOutcome, error) {
 	eventType := resolved.Definition.EventType
 	targetResource := resolved.TargetResource
 
-	plan, err := reconcileExisting(ctx, svc, eventType, targetResource, identity, includeResourceData)
+	plan, err := reconcileExisting(ctx, svc, eventType, targetResource, identity, includeResourceData, requestedFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -419,12 +438,12 @@ func createOrReuseSubscription(ctx context.Context, svc createSubscriptionAPI, r
 		}
 	}
 
-	detail, createErr := doCreateSubscription(ctx, svc, eventType, targetResource, includeResourceData, encryptKey)
+	detail, createErr := doCreateSubscription(ctx, svc, eventType, targetResource, includeResourceData, encryptKey, requestedFilter)
 	if createErr == nil {
 		return &createOutcome{Action: "created", Detail: detail, PaginationCapped: plan.PaginationCapped}, nil
 	}
 
-	plan2, listErr := reconcileExisting(ctx, svc, eventType, targetResource, identity, includeResourceData)
+	plan2, listErr := reconcileExisting(ctx, svc, eventType, targetResource, identity, includeResourceData, requestedFilter)
 	if listErr != nil || plan2.Action == planActionCreate {
 		// The reconcile-after-failure found nothing new (or itself failed):
 		// the original Create error is the most useful thing to surface.
@@ -468,7 +487,7 @@ func outcomeFromPlan(plan *reconcilePlan, resolved eventlib.ResolvedEventKey, id
 // Create-only field (Patch has no encrypt) both mean this is the ONLY place
 // in this command that ever sets it. Callers must never log encryptKey —
 // see newEncryptKeyFunc's own doc comment.
-func doCreateSubscription(ctx context.Context, svc createSubscriptionAPI, eventType, targetResource string, includeResourceData bool, encryptKey string) (*larkeventv1.SubscriptionDetail, error) {
+func doCreateSubscription(ctx context.Context, svc createSubscriptionAPI, eventType, targetResource string, includeResourceData bool, encryptKey string, requestedFilter *eventlib.Filter) (*larkeventv1.SubscriptionDetail, error) {
 	if includeResourceData && encryptKey == "" {
 		// Defensive fail-closed (atomic, no
 		// plaintext-fallback path): the sole caller
@@ -480,7 +499,7 @@ func doCreateSubscription(ctx context.Context, svc createSubscriptionAPI, eventT
 		return nil, errs.NewInternalError(errs.SubtypeUnknown,
 			"refusing to create an include_resource_data=true subscription without an encrypt_key")
 	}
-	body := buildCreateSubscriptionBody(eventType, targetResource, includeResourceData, encryptKey)
+	body := buildCreateSubscriptionBody(eventType, targetResource, includeResourceData, encryptKey, requestedFilter)
 	req := larkeventv1.NewCreateSubscriptionReqBuilder().Body(body).Build()
 
 	resp, err := svc.Create(ctx, req)
@@ -515,16 +534,22 @@ func doCreateSubscription(ctx context.Context, svc createSubscriptionAPI, eventT
 // test capturing the built *CreateSubscriptionReq itself therefore cannot
 // read back what it carried; testing this function directly is the reliable
 // way to assert the request's actual content.
-func buildCreateSubscriptionBody(eventType, targetResource string, includeResourceData bool, encryptKey string) *larkeventv1.CreateSubscriptionReqBody {
+func buildCreateSubscriptionBody(eventType, targetResource string, includeResourceData bool, encryptKey string, requestedFilter *eventlib.Filter) *larkeventv1.CreateSubscriptionReqBody {
 	payloadOptions := larkeventv1.NewCreatePayloadOptionsBuilder().IncludeResourceData(includeResourceData)
 	if encryptKey != "" {
 		payloadOptions = payloadOptions.Encrypt(larkeventv1.NewPayloadOptionsEncryptBuilder().EncryptKey(encryptKey).Build())
 	}
-	return larkeventv1.NewCreateSubscriptionReqBodyBuilder().
+	builder := larkeventv1.NewCreateSubscriptionReqBodyBuilder().
 		EventType(eventType).
 		TargetResource(targetResource).
-		PayloadOptions(payloadOptions.Build()).
-		Build()
+		PayloadOptions(payloadOptions.Build())
+	// Only send filter when one was requested. Omitting the field entirely
+	// (rather than sending an empty {"filter":{}}) is how create says "no
+	// server-side filter"; the empty/clear form is an update-only concept.
+	if !requestedFilter.IsEmpty() {
+		builder = builder.Filter(eventlib.FilterToSDK(requestedFilter))
+	}
+	return builder.Build()
 }
 
 // conflictError implements the "active but conflicting" case and
