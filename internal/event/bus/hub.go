@@ -331,10 +331,11 @@ type publishMatch struct {
 // consumers still receive via event_type compat delivery.
 //
 // A matched refined consumer additionally passes refinedCrossCheckMismatch
-// before delivery: additive defense-in-depth on top of the
+// before delivery: fail-closed defense-in-depth on top of the
 // remote_subscription_id match above, never a replacement for it — see that
 // function's own doc comment for exactly what it checks and why an absent
-// dimension is always skipped rather than treated as a mismatch.
+// target_resource/authority is itself treated as a mismatch (drop), not
+// skipped.
 //
 // A fresh *protocol.Event is allocated per subscriber so each consumer sees
 // its own monotonically-increasing Seq (assigned via Conn.NextSeq) — sharing
@@ -492,15 +493,17 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 	}
 }
 
-// refinedCrossCheckMismatch implements the additive defense-in-depth
+// refinedCrossCheckMismatch implements the fail-closed defense-in-depth
 // cross-check for a refined consumer already matched by remote_subscription_id
-// equality: that match alone routed raw to s, so this ONLY ever looks for a
-// CONFIRMED disagreement on a dimension both raw and s actually carry — it
-// must NEVER drop for a dimension either side simply doesn't expose (an
-// absent/empty value is always skipped, never treated as a mismatch).
-// Returns "" (no mismatch — deliver) or a short fixed classification
-// ("event_type" / "target_resource" / "authority") naming which dimension
-// disagreed, so a drop's log line and counter stay consistent.
+// equality: that match alone routed raw to s, but a legit refined event ALWAYS
+// carries its full context (the platform envelope always includes
+// target_resource and authority), so this treats a MISSING dimension as an
+// anomaly to drop, not a reason to deliver blind.
+// Returns "" (no mismatch — deliver) or a short fixed classification naming
+// what went wrong, so a drop's log line and counter stay consistent. The
+// tokens are distinct for "absent context" versus "present-but-disagrees":
+// "event_type" / "target_resource" / "authority" (mismatch) and
+// "target_resource_missing" / "authority_missing" (absent context).
 //
 // event_type is always checkable: raw.EventType and s.EventTypes() are both
 // always populated (refined or not), and a real remote Subscription is
@@ -508,14 +511,15 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 // under an already-matched remote_subscription_id would be a genuine
 // anomaly, not a normal/expected state.
 //
-// target_resource/authority are only cross-checked when raw itself carries
-// them (Resource/Authority are populated only for a refined-native RawEvent)
-// AND s exposes the corresponding stored intent: TargetResource() is
-// *Conn-only (a bare Subscriber — a test fake, never a real registration —
-// has no target_resource concept and is never held to it); authority reuses
-// lifecycle.AuthorityMatchesOwner, the SAME "user:<open_id>"/"app" compare
-// the updated_v1 lifecycle compatibility check already establishes, so the
-// two never drift out of sync.
+// target_resource and authority must be present on a refined-native event;
+// an empty value drops (*_missing). When present, target_resource is compared
+// against the consumer's own stored intent via event.TargetResourceEqual
+// (normalized, so escaping/selector-ordering never false-drops) — and only
+// when s is a *Conn exposing that intent (a bare Subscriber — a test fake,
+// never a real registration — has no target_resource concept and is only held
+// to the presence check). authority reuses lifecycle.AuthorityMatchesOwner,
+// the SAME "user:<open_id>"/"app" compare the updated_v1 lifecycle
+// compatibility check already establishes, so the two never drift out of sync.
 func refinedCrossCheckMismatch(raw *event.RawEvent, s Subscriber) string {
 	matched := false
 	for _, et := range s.EventTypes() {
@@ -528,13 +532,27 @@ func refinedCrossCheckMismatch(raw *event.RawEvent, s Subscriber) string {
 		return "event_type"
 	}
 
-	if raw.Resource != "" {
-		if c, ok := s.(*Conn); ok && c.TargetResource() != "" && raw.Resource != c.TargetResource() {
-			return "target_resource"
-		}
+	// target_resource: a legit refined event always carries its own
+	// target_resource (the platform envelope includes it), so an absent one
+	// under an already-matched remote_subscription_id is an anomaly — fail
+	// closed rather than deliver blind. When present, hold a *Conn to its own
+	// resolved listening intent, comparing NORMALIZED so escaping/selector-
+	// ordering differences don't false-drop (a bare Subscriber — a test fake —
+	// carries no target_resource intent and is never held to one).
+	if raw.Resource == "" {
+		return "target_resource_missing"
+	}
+	if c, ok := s.(*Conn); ok && c.TargetResource() != "" && !event.TargetResourceEqual(raw.Resource, c.TargetResource()) {
+		return "target_resource"
 	}
 
-	if raw.Authority != "" && !lifecycle.AuthorityMatchesOwner(raw.Authority, s.OwnerUserOpenID()) {
+	// authority: likewise always present on a legit refined event, so an absent
+	// one is an anomaly (fail closed). When present it must name THIS consumer's
+	// own owner — "user:<open_id>" for a user, "app" for a bot.
+	if raw.Authority == "" {
+		return "authority_missing"
+	}
+	if !lifecycle.AuthorityMatchesOwner(raw.Authority, s.OwnerUserOpenID()) {
 		return "authority"
 	}
 

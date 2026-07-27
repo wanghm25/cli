@@ -156,7 +156,12 @@ func TestHub_Publish_FourQuadrantRouting(t *testing.T) {
 		EventID:              "evt-with-remote",
 		EventType:            "im.message.receive_v1",
 		RemoteSubscriptionID: "R1",
-		Payload:              json.RawMessage(`{}`),
+		// A refined-native event always carries its full context; the refined
+		// consumers here own "app" authority (test default), so the event's
+		// cross-checked context must agree for delivery.
+		Resource:  "im.message?chat_id=oc_1",
+		Authority: "app",
+		Payload:   json.RawMessage(`{}`),
 	})
 
 	mustReceiveEvent(t, legacy.sendCh, "legacy consumer (event carries remote_subscription_id, routed by event_type)")
@@ -283,8 +288,11 @@ func TestHub_Publish_RefinedCrossCheck_AuthorityMismatch_Dropped(t *testing.T) {
 		EventID:              "evt-1",
 		EventType:            "im.message.receive_v1",
 		RemoteSubscriptionID: "R1",
-		Authority:            "user:ou_SOMEONE_ELSE", // disagrees with refinedR1's own owner
-		Payload:              json.RawMessage(`{}`),
+		// target_resource present so the check reaches the authority dimension
+		// (this mock is not a *Conn, so its value is only presence-checked).
+		Resource:  "im.message?chat_id=oc_1",
+		Authority: "user:ou_SOMEONE_ELSE", // disagrees with refinedR1's own owner
+		Payload:   json.RawMessage(`{}`),
 	})
 
 	mustNotReceive(t, refinedR1.sendCh, "refined R1 consumer (authority cross-check mismatch must drop)")
@@ -324,14 +332,13 @@ func TestHub_Publish_RefinedCrossCheck_AllDimensionsMatch_Delivered(t *testing.T
 	}
 }
 
-// TestHub_Publish_RefinedCrossCheck_RawMissingExtraFields_Delivered is the
-// hard safety rule: raw carrying no target_resource/authority at all (e.g. an
-// older/minimal producer) must NEVER be treated as a mismatch on those
-// dimensions — only event_type is always checked. This consumer's OWN stored
-// target_resource/owner are populated (and would, if compared, disagree with
-// nothing raw even offers) — the point is those dimensions are skipped
-// entirely, not coincidentally satisfied.
-func TestHub_Publish_RefinedCrossCheck_RawMissingExtraFields_Delivered(t *testing.T) {
+// TestHub_Publish_RefinedCrossCheck_MissingTargetResource_Dropped locks the
+// fail-closed rule: a refined event matched by remote_subscription_id but
+// carrying NO target_resource is an anomaly (a legit refined push always
+// includes it) — drop it, and count it, rather than deliver blind. The
+// consumer's own target_resource/owner are fully populated, proving the drop
+// is the event's missing context, not a consumer misconfiguration.
+func TestHub_Publish_RefinedCrossCheck_MissingTargetResource_Dropped(t *testing.T) {
 	h := NewHub()
 	server, client := net.Pipe()
 	defer server.Close()
@@ -348,11 +355,78 @@ func TestHub_Publish_RefinedCrossCheck_RawMissingExtraFields_Delivered(t *testin
 		EventID:              "evt-1",
 		EventType:            "im.message.receive_v1",
 		RemoteSubscriptionID: "R1",
-		// Resource and Authority both intentionally left empty.
+		// Resource intentionally empty; Authority present so the drop is
+		// unambiguously the missing target_resource, not the authority.
+		Authority: "user:ou_abc123",
+		Payload:   json.RawMessage(`{}`),
+	})
+
+	mustNotReceive(t, c.sendCh, "conn (refined event without target_resource must fail closed)")
+	if got := h.CrossCheckDroppedCount(); got != 1 {
+		t.Errorf("CrossCheckDroppedCount() = %d, want 1", got)
+	}
+}
+
+// TestHub_Publish_RefinedCrossCheck_MissingAuthority_Dropped is the authority
+// half of the same fail-closed rule: full target_resource, but no authority ->
+// drop + count.
+func TestHub_Publish_RefinedCrossCheck_MissingAuthority_Dropped(t *testing.T) {
+	h := NewHub()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	c := NewConn(server, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "")
+	c.SetRemoteSubscriptionID("R1")
+	c.SetListenIntent("im.message?chat_id=oc_1", false)
+	c.SetOwnerIdentity("user", "cli_app", "ou_abc123")
+	c.sendCh = make(chan interface{}, 1)
+	h.RegisterAndIsFirst(c)
+
+	h.Publish(&event.RawEvent{
+		EventID:              "evt-1",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		Resource:             "im.message?chat_id=oc_1",
+		// Authority intentionally empty.
 		Payload: json.RawMessage(`{}`),
 	})
 
-	mustReceiveEvent(t, c.sendCh, "conn (raw carries no target_resource/authority to cross-check)")
+	mustNotReceive(t, c.sendCh, "conn (refined event without authority must fail closed)")
+	if got := h.CrossCheckDroppedCount(); got != 1 {
+		t.Errorf("CrossCheckDroppedCount() = %d, want 1", got)
+	}
+}
+
+// TestHub_Publish_RefinedCrossCheck_BotPush_Delivered proves the fail-closed
+// gate still delivers a legit BOT push: authority "app" matches a bot consumer
+// (empty owner user), and the platform's echoed target_resource matches this
+// consumer's own — even across URL-escaping differences (normalized compare).
+func TestHub_Publish_RefinedCrossCheck_BotPush_Delivered(t *testing.T) {
+	h := NewHub()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	c := NewConn(server, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "")
+	c.SetRemoteSubscriptionID("R1")
+	// Locally-built intent uses url.QueryEscape (space -> '+').
+	c.SetListenIntent("im.message?chat_id=oc+1", false)
+	c.SetOwnerIdentity("bot", "cli_app", "") // bot: empty owner user
+	c.sendCh = make(chan interface{}, 1)
+	h.RegisterAndIsFirst(c)
+
+	h.Publish(&event.RawEvent{
+		EventID:              "evt-1",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		// Platform echoes the same selector with %20 escaping.
+		Resource:  "im.message?chat_id=oc%201",
+		Authority: "app",
+		Payload:   json.RawMessage(`{}`),
+	})
+
+	mustReceiveEvent(t, c.sendCh, "bot consumer (authority app + normalized target_resource match)")
 	if got := h.CrossCheckDroppedCount(); got != 0 {
 		t.Errorf("CrossCheckDroppedCount() = %d, want 0", got)
 	}
@@ -377,14 +451,118 @@ func TestHub_Publish_RefinedCrossCheck_MultiConsumerFanOutUnaffected(t *testing.
 		EventID:              "evt-1",
 		EventType:            "im.message.receive_v1",
 		RemoteSubscriptionID: "R1",
-		Authority:            "user:ou_abc123",
-		Payload:              json.RawMessage(`{}`),
+		// Full refined context present; the two consumers differ only on owner,
+		// so the cross-check judges them independently on authority alone.
+		Resource:  "im.message?chat_id=oc_1",
+		Authority: "user:ou_abc123",
+		Payload:   json.RawMessage(`{}`),
 	})
 
 	mustReceiveEvent(t, good.sendCh, "good consumer (owner matches — unaffected by bad's mismatch)")
 	mustNotReceive(t, bad.sendCh, "bad consumer (owner mismatch must drop)")
 	if got := h.CrossCheckDroppedCount(); got != 1 {
 		t.Errorf("CrossCheckDroppedCount() = %d, want 1 (only the mismatched consumer)", got)
+	}
+}
+
+// newCrossCheckConn builds a refined *Conn for the whitebox
+// refinedCrossCheckMismatch table below: remoteSubID set, a fixed owner
+// (ownerOpenID=="" registers a bot owner, non-empty registers that user), and
+// an optional resolved target_resource intent.
+func newCrossCheckConn(t *testing.T, eventTypes []string, remoteSubID, ownerOpenID, targetResource string) *Conn {
+	t.Helper()
+	server, client := net.Pipe()
+	t.Cleanup(func() { server.Close(); client.Close() })
+	c := NewConn(server, nil, "k", eventTypes, 1, "")
+	c.SetRemoteSubscriptionID(remoteSubID)
+	if ownerOpenID == "" {
+		c.SetOwnerIdentity("bot", "cli_app", "")
+	} else {
+		c.SetOwnerIdentity("user", "cli_app", ownerOpenID)
+	}
+	if targetResource != "" {
+		c.SetListenIntent(targetResource, false)
+	}
+	return c
+}
+
+// TestRefinedCrossCheckMismatch_Reasons pins the exact fixed reason token for
+// each dimension — distinct tokens for "absent context" (*_missing, fail
+// closed) versus "present-but-disagrees", and "" for the delivered cases
+// (user push, bot push, and an escaping-equivalent target_resource that must
+// normalize equal). Whitebox because these tokens feed only the internal
+// counter/log, never the wire.
+func TestRefinedCrossCheckMismatch_Reasons(t *testing.T) {
+	const et = "im.message.receive_v1"
+	tests := []struct {
+		name           string
+		ownerOpenID    string // consumer owner ("" = bot)
+		targetResource string // consumer intent ("" = none stored)
+		raw            *event.RawEvent
+		want           string
+	}{
+		{
+			name: "event_type_mismatch",
+			raw:  &event.RawEvent{EventType: "im.message.OTHER_v1", Resource: "im.message?chat_id=oc_1", Authority: "app"},
+			want: "event_type",
+		},
+		{
+			name:           "target_resource_missing",
+			ownerOpenID:    "ou_alice",
+			targetResource: "im.message?chat_id=oc_1",
+			raw:            &event.RawEvent{EventType: et, Authority: "user:ou_alice"},
+			want:           "target_resource_missing",
+		},
+		{
+			name:           "target_resource_mismatch",
+			ownerOpenID:    "ou_alice",
+			targetResource: "im.message?chat_id=oc_1",
+			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc_2", Authority: "user:ou_alice"},
+			want:           "target_resource",
+		},
+		{
+			name:           "target_resource_escaping_equivalent_ok",
+			ownerOpenID:    "ou_alice",
+			targetResource: "im.message?chat_id=oc+1", // local url.QueryEscape form
+			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc%201", Authority: "user:ou_alice"},
+			want:           "",
+		},
+		{
+			name:           "authority_missing",
+			ownerOpenID:    "ou_alice",
+			targetResource: "im.message?chat_id=oc_1",
+			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc_1"},
+			want:           "authority_missing",
+		},
+		{
+			name:           "authority_mismatch",
+			ownerOpenID:    "ou_alice",
+			targetResource: "im.message?chat_id=oc_1",
+			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc_1", Authority: "user:ou_bob"},
+			want:           "authority",
+		},
+		{
+			name:           "user_push_all_match",
+			ownerOpenID:    "ou_alice",
+			targetResource: "im.message?chat_id=oc_1",
+			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc_1", Authority: "user:ou_alice"},
+			want:           "",
+		},
+		{
+			name:           "bot_push_all_match",
+			ownerOpenID:    "", // bot
+			targetResource: "im.message?chat_id=oc_1",
+			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc_1", Authority: "app"},
+			want:           "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newCrossCheckConn(t, []string{et}, "R1", tt.ownerOpenID, tt.targetResource)
+			if got := refinedCrossCheckMismatch(tt.raw, c); got != tt.want {
+				t.Errorf("refinedCrossCheckMismatch() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -409,6 +587,8 @@ func TestHub_Publish_SplitDedupAcrossRemoteSubscriptions(t *testing.T) {
 		EventType:            "im.message.receive_v1",
 		RemoteSubscriptionID: "R1",
 		SubscriptionEventID:  "sub-evt-r1",
+		Resource:             "im.message?chat_id=oc_1",
+		Authority:            "app",
 		Payload:              json.RawMessage(`{}`),
 	})
 	h.Publish(&event.RawEvent{
@@ -416,6 +596,8 @@ func TestHub_Publish_SplitDedupAcrossRemoteSubscriptions(t *testing.T) {
 		EventType:            "im.message.receive_v1",
 		RemoteSubscriptionID: "R2",
 		SubscriptionEventID:  "sub-evt-r2",
+		Resource:             "im.message?chat_id=oc_2",
+		Authority:            "app",
 		Payload:              json.RawMessage(`{}`),
 	})
 
@@ -445,6 +627,8 @@ func TestHub_Publish_RefinedDedupSameKeyTwice(t *testing.T) {
 		EventType:            "im.message.receive_v1",
 		RemoteSubscriptionID: "R1",
 		SubscriptionEventID:  "sub-evt-1",
+		Resource:             "im.message?chat_id=oc_1",
+		Authority:            "app",
 		Payload:              json.RawMessage(`{}`),
 	}
 	h.Publish(raw)
@@ -467,6 +651,8 @@ func TestHub_Publish_RefinedNoDedupKeyDeliversEveryTimeAndWarns(t *testing.T) {
 	raw := &event.RawEvent{
 		EventType:            "im.message.receive_v1",
 		RemoteSubscriptionID: "R1",
+		Resource:             "im.message?chat_id=oc_1",
+		Authority:            "app",
 		// EventID and SubscriptionEventID both intentionally empty.
 		Payload: json.RawMessage(`{}`),
 	}
@@ -509,6 +695,8 @@ func TestHub_Publish_FanOutMultipleConsumersSameRemoteSubID(t *testing.T) {
 		EventType:            "im.message.receive_v1",
 		RemoteSubscriptionID: "R1",
 		SubscriptionEventID:  "sub-evt-fanout",
+		Resource:             "im.message?chat_id=oc_1",
+		Authority:            "app",
 		Payload:              json.RawMessage(`{"x":1}`),
 	})
 
