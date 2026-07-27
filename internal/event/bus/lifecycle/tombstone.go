@@ -8,54 +8,66 @@ import (
 	"time"
 )
 
-// TombstoneTTL bounds how long a deleted remote_subscription_id is remembered,
-// purely in-memory, so a late/out-of-order activated_v1 or updated_v1 for the
-// SAME id arriving shortly after a deleted_v1 cannot resurrect it. A package
-// var (not const) so tests shrink it; deliberately a fixed default rather than
-// env-configurable — mirrors ExecutorWorkers/ExecutorSlots's own "control-plane
-// housekeeping, not a scalable data path" rationale.
+// TombstoneTTL bounds how long a TERMINAL phase (deleted / expired) is
+// remembered for one remote_subscription_id, purely in-memory, so a
+// late/out-of-order activated_v1 or updated_v1 arriving shortly after cannot
+// resurrect it. A package var (not const) so tests shrink it; deliberately a
+// fixed default rather than env-configurable — mirrors ExecutorWorkers/
+// ExecutorSlots's own "control-plane housekeeping, not a scalable data path"
+// rationale. (Named Tombstone* for continuity: a terminal phase IS the
+// tombstone.)
 var TombstoneTTL = 10 * time.Minute
 
-// tombstoneStore is a TTL in-memory map[remote_subscription_id]expiry. Purely
-// in-memory: a bus restart clears it entirely, exactly like the executor's own
-// pending/busy maps — there is nothing to persist or recover across a process
-// boundary here (the no-persistence rule applies equally to this bookkeeping).
-type tombstoneStore struct {
-	mu     sync.Mutex
-	expiry map[string]time.Time
+// phaseEntry is one remote_subscription_id's last reduced Phase plus its
+// expiry.
+type phaseEntry struct {
+	phase  Phase
+	expiry time.Time
 }
 
-func newTombstoneStore() *tombstoneStore {
-	return &tombstoneStore{expiry: make(map[string]time.Time)}
+// phaseStore is the reducer's per-remote_subscription_id state: the last Phase
+// each id folded into, TTL-bounded and purely in-memory (a bus restart clears
+// it entirely, exactly like the executor's own pending/busy maps — nothing to
+// persist or recover across a process boundary). It is the source of truth for
+// terminal-state priority: once an id's phase is terminal (deleted/expired), a
+// later activated/updated for it is dropped rather than allowed to revive it.
+type phaseStore struct {
+	mu      sync.Mutex
+	entries map[string]phaseEntry
 }
 
-// mark records/refreshes a live tombstone for remoteSubID (called on every
-// deleted_v1, hit or miss — both table columns keep a TTL in-memory tombstone).
-func (t *tombstoneStore) mark(remoteSubID string) {
-	if remoteSubID == "" {
+func newPhaseStore() *phaseStore {
+	return &phaseStore{entries: make(map[string]phaseEntry)}
+}
+
+// record stores/refreshes id's phase with a fresh TTL. A resurrecting event
+// that the reducer DROPS is never recorded, so a terminal phase's TTL is
+// measured from the terminal event, not extended by the dropped resurrection.
+func (s *phaseStore) record(id string, phase Phase) {
+	if id == "" {
 		return
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.expiry[remoteSubID] = time.Now().Add(TombstoneTTL)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries[id] = phaseEntry{phase: phase, expiry: time.Now().Add(TombstoneTTL)}
 }
 
-// isLive reports whether remoteSubID currently has an unexpired tombstone,
-// lazily evicting an expired entry it happens to find (bounded map growth
-// without a separate background sweep).
-func (t *tombstoneStore) isLive(remoteSubID string) bool {
-	if remoteSubID == "" {
-		return false
+// phaseOf returns id's current phase, or PhaseUnknown when it is unknown or its
+// TTL has elapsed (lazily evicting the expired entry — bounded map growth
+// without a separate sweep).
+func (s *phaseStore) phaseOf(id string) Phase {
+	if id == "" {
+		return PhaseUnknown
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	exp, ok := t.expiry[remoteSubID]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[id]
 	if !ok {
-		return false
+		return PhaseUnknown
 	}
-	if time.Now().After(exp) {
-		delete(t.expiry, remoteSubID)
-		return false
+	if time.Now().After(e.expiry) {
+		delete(s.entries, id)
+		return PhaseUnknown
 	}
-	return true
+	return e.phase
 }

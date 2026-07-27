@@ -36,8 +36,8 @@ const (
 // value. suspension.code is otherwise an open string CLI never builds a closed
 // enum for (source/feishu.go's LifecycleEvent.SuspensionCode doc) — any OTHER
 // value (including a future, currently-unknown one) takes the "default branch"
-// (reconcileWithGet) rather than guessing that Reactivate is the right
-// recovery action.
+// (EffectReconcileGet / runReconcileGet) rather than guessing that Reactivate
+// is the right recovery action.
 const suspensionCodeAuthorityRevoked = "authority_revoked"
 
 // --- degraded/next_action classification tokens ---

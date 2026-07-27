@@ -80,36 +80,37 @@ func markActionResult(conns []Conn, action string, err error) {
 // a nil intent and a nil remote filter are equal ("no filter" both sides), and a
 // nil-vs-set pair is a confirmed mismatch. Only when NONE of the four dimensions
 // produces a confirmed mismatch, but at least one couldn't be judged, does this
-// return "unclear" (the caller then issues a single Get to reconcile — see
-// reconcileWithGet) instead of defaulting to "compatible".
-func classifyUpdateCompatibility(le LifecycleEvent, lead Conn) string {
+// return "unclear" (the reducer then returns EffectReconcileGet and the caller
+// issues a single Get to reconcile — see runReconcileGet) instead of defaulting
+// to "compatible".
+func classifyUpdateCompatibility(le LifecycleEvent, intent Intent) string {
 	unclear := false
 
 	switch {
 	case le.Authority == "":
 		unclear = true
-	case !authorityMatchesConn(le.Authority, lead):
+	case !AuthorityMatchesOwner(le.Authority, intent.OwnerUserOpenID):
 		return updateIncompatible
 	}
 
 	switch {
 	case le.TargetResource == "":
 		unclear = true
-	case le.TargetResource != lead.TargetResource():
+	case le.TargetResource != intent.TargetResource:
 		return updateIncompatible
 	}
 
 	switch {
 	case !le.PayloadOptionsPresent:
 		unclear = true
-	case le.IncludeResourceData != lead.IncludeResourceDataIntent():
+	case le.IncludeResourceData != intent.IncludeResourceData:
 		return updateIncompatible
 	}
 
 	switch {
 	case !le.FilterPresent:
 		unclear = true
-	case !event.Equal(le.Filter, lead.FilterIntent()):
+	case !event.Equal(le.Filter, intent.Filter):
 		return updateIncompatible
 	}
 
@@ -117,16 +118,6 @@ func classifyUpdateCompatibility(le LifecycleEvent, lead Conn) string {
 		return updateUnclear
 	}
 	return updateCompatible
-}
-
-// authorityMatchesConn reports whether authority (the updated_v1 event's
-// already-normalized After.Authority, e.g. "user:ou_xxx"/"app") matches lead's
-// OWN fixed owner identity — the same "app" vs "user:<open_id>" vocabulary
-// source/feishu.go's formatLifecycleAuthority/formatSubscriptionAuthority
-// already establish. authority=="" (unclear) must never reach here —
-// classifyUpdateCompatibility's own switch guards that.
-func authorityMatchesConn(authority string, lead Conn) bool {
-	return AuthorityMatchesOwner(authority, lead.OwnerUserOpenID())
 }
 
 // AuthorityMatchesOwner reports whether authority (an already-normalized
@@ -185,7 +176,10 @@ type SubscriptionAction struct {
 	// subscription in memory.
 	encryptKeyRemover func(subID string)
 
-	tombstone *tombstoneStore
+	// phases is the reducer's per-remote_subscription_id state (the ordered
+	// fold's current Phase per id, TTL-bounded). It is the source of truth for
+	// terminal-state priority.
+	phases *phaseStore
 }
 
 // NewSubscriptionAction constructs the action with its deps unconfigured
@@ -193,7 +187,7 @@ type SubscriptionAction struct {
 // SetIdentityProviders/SetSubscriptionClient fill the two dependencies in
 // post-construction via SetIdentityGate/SetNewSubscriptionClient below.
 func NewSubscriptionAction(registry Registry, logger *log.Logger) *SubscriptionAction {
-	return &SubscriptionAction{registry: registry, logger: logger, tombstone: newTombstoneStore()}
+	return &SubscriptionAction{registry: registry, logger: logger, phases: newPhaseStore()}
 }
 
 // SetIdentityGate wires the owner==current gate + bindConsumer dependency.
@@ -225,11 +219,26 @@ func (a *SubscriptionAction) logf(format string, args ...interface{}) {
 	}
 }
 
-// Handle implements Action. Every lifecycle event, hit or miss, eligible or
-// not, ALWAYS gets its summary recorded first (extended: deleted_v1 synthesizes
-// an explicit "deleted" state since its body carries none) — then a live
-// deleted-tombstone drops a resurrecting activated_v1/updated_v1 before any
-// further processing, then the per-event switch runs.
+// Handle implements Action as an ordered per-remote_subscription_id reducer +
+// effect executor. The steps:
+//
+//  1. Summary is recorded first on every matched conn, hit or miss, eligible or
+//     not (deleted_v1 synthesizes an explicit "deleted" state since its body
+//     carries none).
+//  2. eligibleConns applies the IDENTITY-dimension gate (owner==current): every
+//     ineligible USER conn is marked stale/unresolved and excluded; bot/legacy
+//     conns are always eligible. This is a pure identity concern, kept out of
+//     the subscription reducer.
+//  3. reduce() — the PURE fold — turns (current phase, event, eligible-intent)
+//     into (new phase, health decision, single effect). It performs no remote
+//     call and mutates no Conn. Terminal-state priority lives here: a
+//     resurrection against a terminal phase yields a dropped reduction.
+//  4. Handle APPLIES the reduction's Conn mutations (suspension bookkeeping +
+//     the subscription-dimension health decision) and records the new phase.
+//  5. Handle RUNS the returned effect (Reactivate/Renew/Get/release-key). The
+//     effect issues the single remote call and applies its result-dependent
+//     health — the ONLY place a remote call or a client-driven Conn mutation
+//     happens.
 func (a *SubscriptionAction) Handle(ctx context.Context, le LifecycleEvent) error {
 	conns := a.registry.ConnsByRemoteSubscriptionID(le.RemoteSubscriptionID)
 
@@ -241,35 +250,72 @@ func (a *SubscriptionAction) Handle(ctx context.Context, le LifecycleEvent) erro
 		c.SetLifecycleSummary(le.EventType, le.EventID, summaryState)
 	}
 
-	if a.isTombstonedResurrection(le) {
-		a.logf("lifecycle: dropping %s for remote_subscription_id=%s (tombstoned after an earlier deleted_v1)",
+	res := a.eligibleConns(conns)
+	cur := a.phases.phaseOf(le.RemoteSubscriptionID)
+	red := reduce(cur, le, intentOf(res.conns))
+
+	if red.dropped {
+		a.logf("lifecycle: dropping %s for remote_subscription_id=%s (terminal phase — not revived)",
 			le.EventType, le.RemoteSubscriptionID)
 		return nil
 	}
 
-	switch le.EventType {
-	case lifecycleEventTypeActivated:
-		return a.handleActivated(conns)
-	case lifecycleEventTypeUpdated:
-		return a.handleUpdated(ctx, le, conns)
-	case lifecycleEventTypeSuspended:
-		return a.handleSuspended(ctx, le, conns)
-	case lifecycleEventTypeExpirationReminder:
-		return a.handleExpirationReminder(ctx, le, conns)
-	case lifecycleEventTypeExpired:
-		return a.handleExpired(conns)
-	case LifecycleEventTypeDeleted:
-		return a.handleDeleted(le, conns)
-	default:
-		return nil // an unrecognized event type: summary already recorded above.
+	if red.suspension != nil {
+		for _, c := range conns {
+			c.SetSuspensionReason(*red.suspension)
+		}
+	}
+	scopeConns := res.conns
+	if red.scope == scopeAll {
+		scopeConns = conns
+	}
+	applySubDecision(scopeConns, red.sub)
+	a.phases.record(le.RemoteSubscriptionID, red.Phase)
+
+	return a.runEffect(ctx, le, red.effect, res, intentOf(res.conns))
+}
+
+// applySubDecision applies a reduction's subscription-dimension health decision
+// to conns — the ONLY place (besides an effect runner) the Subscription health
+// fact is mutated for a reduction.
+func applySubDecision(conns []Conn, d subDecision) {
+	switch d.op {
+	case subSet:
+		for _, c := range conns {
+			c.SetSubscriptionDegraded(d.reason)
+			c.SetNextAction(d.next)
+		}
+	case subClearIfSuspended:
+		for _, c := range conns {
+			if c.SubscriptionDegradedReason() == ReasonRemoteSubscriptionSuspended {
+				c.ClearSubscriptionDegraded()
+			}
+		}
+	case subClearIfConflict:
+		for _, c := range conns {
+			if c.SubscriptionDegradedReason() == ReasonRemoteSubscriptionConflict {
+				c.ClearSubscriptionDegraded()
+			}
+		}
+	case subLeave:
+		// nothing
 	}
 }
 
-func (a *SubscriptionAction) isTombstonedResurrection(le LifecycleEvent) bool {
-	if le.EventType != lifecycleEventTypeActivated && le.EventType != lifecycleEventTypeUpdated {
-		return false
+// intentOf builds the shared listening Intent from the lead eligible conn (all
+// conns sharing one remote_subscription_id are expected to share one intent);
+// the zero Intent when there is no eligible conn.
+func intentOf(conns []Conn) Intent {
+	if len(conns) == 0 {
+		return Intent{}
 	}
-	return a.tombstone.isLive(le.RemoteSubscriptionID)
+	lead := conns[0]
+	return Intent{
+		OwnerUserOpenID:     lead.OwnerUserOpenID(),
+		TargetResource:      lead.TargetResource(),
+		IncludeResourceData: lead.IncludeResourceDataIntent(),
+		Filter:              lead.FilterIntent(),
+	}
 }
 
 // eligibleConns splits conns into those allowed to trigger a REMOTE action or

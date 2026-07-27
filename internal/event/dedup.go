@@ -62,6 +62,49 @@ func (d *DedupFilter) IsDuplicate(eventID string) bool {
 	return false
 }
 
+// Seen reports whether key was recorded within the TTL, WITHOUT recording it —
+// a read-only check. Pair with Record to implement "check duplicate BEFORE
+// accepting, commit the key only AFTER a successful accept", so an event that
+// is checked but then dropped (e.g. a full bounded queue) is NOT marked seen
+// and a later retry of the same key can still be processed. An expired entry it
+// encounters is lazily evicted (like IsDuplicate) and reported as not-seen.
+func (d *DedupFilter) Seen(eventID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ts, ok := d.seen[eventID]
+	if !ok {
+		return false
+	}
+	if time.Since(ts) < d.ttl {
+		return true
+	}
+	delete(d.seen, eventID)
+	return false
+}
+
+// Record marks key as seen now (idempotent — a re-record just refreshes the
+// timestamp). It performs the same ring/overflow bookkeeping as IsDuplicate's
+// commit half, so Seen()+Record() together are equivalent to IsDuplicate()
+// except the commit is deferred to the caller's discretion.
+func (d *DedupFilter) Record(eventID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	if _, ok := d.seen[eventID]; ok {
+		d.seen[eventID] = now
+		return
+	}
+	d.seen[eventID] = now
+	if old := d.ring[d.pos]; old != "" && old != eventID {
+		delete(d.seen, old)
+	}
+	d.ring[d.pos] = eventID
+	d.pos = (d.pos + 1) % len(d.ring)
+	if d.pos%1000 == 0 {
+		d.cleanupExpired(now)
+	}
+}
+
 func (d *DedupFilter) cleanupExpired(now time.Time) {
 	for id, ts := range d.seen {
 		if now.Sub(ts) >= d.ttl {

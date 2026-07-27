@@ -126,9 +126,6 @@ func (e *Executor) Submit(ctx context.Context, le LifecycleEvent) {
 		e.logf("WARN: lifecycle event could not build a dedup key (type=%s remote_subscription_id=%s); dropping", le.EventType, le.RemoteSubscriptionID)
 		return
 	}
-	if e.dedup.IsDuplicate(key) {
-		return
-	}
 
 	mergeKey := le.RemoteSubscriptionID
 
@@ -137,24 +134,46 @@ func (e *Executor) Submit(ctx context.Context, le LifecycleEvent) {
 		e.mu.Unlock()
 		return
 	}
+	// Dedup is CHECKED here but committed only AFTER the event is accepted
+	// (queued / merged / superseded) below — never before. All Submits hold
+	// e.mu across the check+commit, so the pair is atomic w.r.t. each other. The
+	// point: an event dropped because the bounded queue was full is NOT recorded
+	// as seen, so a later retry of the exact same key can still be processed
+	// (fixing the early-commit bug where a full queue swallowed a retry).
+	if e.dedup.Seen(key) {
+		e.mu.Unlock()
+		return
+	}
+
+	// Terminal-aware merge: never let a resurrection (activated/updated)
+	// overwrite an already-pending terminal (deleted/expired) event before it is
+	// processed. The executor stays action-agnostic — it only asks the Action
+	// (when it implements SupersedePolicy) whether to keep the pending event.
+	if prev, has := e.pending[mergeKey]; has {
+		if sp, okp := e.action.(SupersedePolicy); okp && sp.KeepPending(prev, le) {
+			e.dedup.Record(key) // accepted-and-superseded: keep prev pending, don't re-run this
+			e.mu.Unlock()
+			return
+		}
+	}
+
 	e.pending[mergeKey] = le
 	if e.busy[mergeKey] {
 		// Already queued-or-running for this remote_subscription_id (a merge):
 		// pending[mergeKey] above is now this submission's LATEST value —
-		// whichever run drains this key next (the one already scheduled, or a
-		// re-run after it finishes, see runKey) picks it up. No second queue
-		// send, no blocking wait.
+		// whichever run drains this key next picks it up. No second queue send.
+		e.dedup.Record(key) // accepted via in-flight merge
 		e.mu.Unlock()
 		return
 	}
 	e.busy[mergeKey] = true
-	e.mu.Unlock()
-
 	select {
 	case e.queue <- mergeKey:
+		e.dedup.Record(key) // accepted into the bounded queue
+		e.mu.Unlock()
 	default:
-		// Full: never block, never pile up.
-		e.mu.Lock()
+		// Full: never block, never pile up — and do NOT commit dedup, so a retry
+		// of this exact event can still be processed later.
 		delete(e.busy, mergeKey)
 		delete(e.pending, mergeKey)
 		e.mu.Unlock()
