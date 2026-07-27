@@ -12,10 +12,12 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/session"
 )
 
 // --- Task 14: real-time identity gate + BindUser (spec §4.4) ---
@@ -30,6 +32,21 @@ import (
 // tests.
 
 func discardTestLogger() *log.Logger { return log.New(io.Discard, "", 0) }
+
+// waitForCond polls cond until true or a short deadline, failing the test on
+// timeout. Used to synchronize on an in-flight bind without sleeping a fixed
+// duration.
+func waitForCond(t *testing.T, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
 
 // newIdentityTestConn builds a real *Conn (net.Pipe-backed, like the rest of
 // this package's Hub tests) with its owner identity fixed, ready to register
@@ -102,8 +119,10 @@ func (f *fakeUATResolver) callCount() int {
 
 // staticCurrent builds a resolveCurrent fake that always returns the same
 // identity — the common case for tests that don't care about freshness.
-func staticCurrent(appID, userOpenID string) func() (currentIdentity, error) {
-	return func() (currentIdentity, error) { return currentIdentity{appID: appID, userOpenID: userOpenID}, nil }
+func staticCurrent(appID, userOpenID string) func() (session.CurrentIdentity, error) {
+	return func() (session.CurrentIdentity, error) {
+		return session.CurrentIdentity{AppID: appID, UserOpenID: userOpenID}, nil
+	}
 }
 
 // owner == current: bindUser is called with the resolved UAT, and the
@@ -337,8 +356,8 @@ func TestIdentityGate_OnConnReady_ResolveCurrentErrorDegradesAllUsersButNotBots(
 
 	uat := &fakeUATResolver{uat: "uat-1"}
 	fb := &fakeBindUser{}
-	failingResolveCurrent := func() (currentIdentity, error) {
-		return currentIdentity{}, errors.New("config.json unreadable")
+	failingResolveCurrent := func() (session.CurrentIdentity, error) {
+		return session.CurrentIdentity{}, errors.New("config.json unreadable")
 	}
 	gate := newIdentityGate(h, failingResolveCurrent, uat.resolve, discardTestLogger())
 
@@ -369,12 +388,12 @@ func TestIdentityGate_ResolveCurrent_FreshAcrossCalls(t *testing.T) {
 	c := newIdentityTestConn(t, 100, "", "user", "app1", "ou_alice")
 	h.RegisterAndIsFirst(c)
 
-	identities := []currentIdentity{
-		{appID: "app1", userOpenID: "ou_alice"}, // call 1: matches -> bind
-		{appID: "app1", userOpenID: "ou_bob"},   // call 2: current changed -> mismatch -> stale
+	identities := []session.CurrentIdentity{
+		{AppID: "app1", UserOpenID: "ou_alice"}, // call 1: matches -> bind
+		{AppID: "app1", UserOpenID: "ou_bob"},   // call 2: current changed -> mismatch -> stale
 	}
 	var resolveCalls int
-	resolveCurrent := func() (currentIdentity, error) {
+	resolveCurrent := func() (session.CurrentIdentity, error) {
 		id := identities[resolveCalls]
 		resolveCalls++
 		return id, nil
@@ -494,6 +513,47 @@ func TestIdentityGate_BindConsumer_OwnerMismatch_NoUATNoBind(t *testing.T) {
 	}
 	if fb.callCount() != 0 {
 		t.Errorf("bindUser call count = %d, want 0", fb.callCount())
+	}
+}
+
+// MUST-FIX (source epoch): a slow BindUser from an OLD WS generation must NOT
+// overwrite a NEWER generation's binding when it finally completes. A conn-1
+// bind is held in-flight while a conn-2 reconnect binds the consumer; when the
+// stale conn-1 bind then completes it is dropped (errStaleEpoch), leaving the
+// consumer bound on conn-2, never clobbered back to the dead conn-1.
+func TestIdentityGate_BindConsumer_StaleEpochResultDropped(t *testing.T) {
+	h := NewHub()
+	c := newIdentityTestConn(t, 100, "", "user", "app1", "ou_alice")
+	h.RegisterAndIsFirst(c)
+
+	uat := &fakeUATResolver{uat: "uat-1"}
+	var calls atomic.Int32
+	release := make(chan struct{})
+	bind := func(_ context.Context, _ string) error {
+		if calls.Add(1) == 1 {
+			<-release // the conn-1 (epoch 1) bind blocks until released
+		}
+		return nil
+	}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
+
+	// Epoch 1: onConnReady(conn-1) — its bind blocks in-flight.
+	done1 := make(chan struct{})
+	go func() { gate.onConnReady(context.Background(), "conn-1", bind); close(done1) }()
+	waitForCond(t, func() bool { return calls.Load() == 1 }, "conn-1 bind to be in-flight")
+
+	// Epoch 2: a reconnect binds the consumer on conn-2 instantly.
+	gate.onConnReady(context.Background(), "conn-2", bind)
+	if got := c.BoundConnID(); got != "conn-2" {
+		t.Fatalf("after conn-2 reconnect: BoundConnID() = %q, want %q", got, "conn-2")
+	}
+
+	// Release the stale conn-1 bind: it completes but must be dropped, not
+	// allowed to overwrite the newer conn-2 binding.
+	close(release)
+	<-done1
+	if got := c.BoundConnID(); got != "conn-2" {
+		t.Errorf("after the stale conn-1 bind completed: BoundConnID() = %q, want %q (old epoch must not overwrite the new one)", got, "conn-2")
 	}
 }
 

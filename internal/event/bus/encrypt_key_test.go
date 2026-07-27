@@ -18,6 +18,7 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/event/session"
 )
 
 // ---- test doubles ----------------------------------------------------------
@@ -106,7 +107,7 @@ func ekOwnerConn(t *testing.T, subID, identity, appID, userOpenID string) *Conn 
 
 // gateWith builds an identityGate whose resolveCurrent/resolveUAT are the given
 // closures (the provider only uses those two; hub/logger are inert here).
-func gateWith(h *Hub, resolveCurrent func() (currentIdentity, error), resolveUAT func(ctx context.Context, appID, userOpenID string) (string, error)) *identityGate {
+func gateWith(h *Hub, resolveCurrent func() (session.CurrentIdentity, error), resolveUAT func(ctx context.Context, appID, userOpenID string) (string, error)) *identityGate {
 	return newIdentityGate(h, resolveCurrent, resolveUAT, nil)
 }
 
@@ -115,7 +116,9 @@ func gateWith(h *Hub, resolveCurrent func() (currentIdentity, error), resolveUAT
 // fetch now that resource data is user-only (bot owners never reach a fetch).
 func matchingUserGate(appID, userOpenID string) *identityGate {
 	return gateWith(NewHub(),
-		func() (currentIdentity, error) { return currentIdentity{appID: appID, userOpenID: userOpenID}, nil },
+		func() (session.CurrentIdentity, error) {
+			return session.CurrentIdentity{AppID: appID, UserOpenID: userOpenID}, nil
+		},
 		func(context.Context, string, string) (string, error) { return "uat-fresh", nil })
 }
 
@@ -185,7 +188,9 @@ func TestEncryptKeyProvider_FetchAndSet_UserOwnerMatch_FreshUAT_Caches(t *testin
 	fac := &ekFactory{cli: fake}
 	var uatCalls int
 	gate := gateWith(h,
-		func() (currentIdentity, error) { return currentIdentity{appID: "cli_x", userOpenID: "ou_me"}, nil },
+		func() (session.CurrentIdentity, error) {
+			return session.CurrentIdentity{AppID: "cli_x", UserOpenID: "ou_me"}, nil
+		},
 		func(_ context.Context, appID, userOpenID string) (string, error) {
 			uatCalls++
 			if appID != "cli_x" || userOpenID != "ou_me" {
@@ -225,7 +230,9 @@ func TestEncryptKeyProvider_FetchAndSet_UserOwnerMismatch_NoFetch_NoHistoricalUA
 	fac := &ekFactory{cli: fake}
 	var uatCalls int
 	gate := gateWith(h,
-		func() (currentIdentity, error) { return currentIdentity{appID: "cli_x", userOpenID: "ou_current"}, nil },
+		func() (session.CurrentIdentity, error) {
+			return session.CurrentIdentity{AppID: "cli_x", UserOpenID: "ou_current"}, nil
+		},
 		func(_ context.Context, _, _ string) (string, error) { uatCalls++; return "uat-historical", nil })
 	p := newEncryptKeyProvider()
 	p.setIdentityGate(gate)

@@ -13,7 +13,9 @@ import (
 
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
+	"github.com/larksuite/cli/internal/event/model"
 	"github.com/larksuite/cli/internal/event/protocol"
+	"github.com/larksuite/cli/internal/event/session"
 )
 
 // exclusiveCleanupWaitTimeout bounds how long TryRegisterExclusive waits for an
@@ -104,7 +106,7 @@ type Hub struct {
 	// subscribers snapshot at the top of Publish) rather than a separate
 	// lock/atomic — it changes at most once in practice (bus construction,
 	// before Run starts accepting events).
-	currentResolver func() (currentIdentity, error)
+	currentResolver func() (session.CurrentIdentity, error)
 
 	// crossCheckDropped counts events dropped by Publish's refined
 	// cross-check (refinedCrossCheckMismatch): a remote_subscription_id match
@@ -132,7 +134,7 @@ func (h *Hub) SetLogger(l *log.Logger) { h.logger.Store(l) }
 // resolver into Publish's delivery gate. nil disables gating
 // entirely (the NewHub() default) — this is how every non-gated caller
 // (and every test that never calls this) keeps exactly today's behavior.
-func (h *Hub) SetCurrentResolver(fn func() (currentIdentity, error)) {
+func (h *Hub) SetCurrentResolver(fn func() (session.CurrentIdentity, error)) {
 	h.mu.Lock()
 	h.currentResolver = fn
 	h.mu.Unlock()
@@ -408,7 +410,7 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 	// this cost and are never gated, regardless of currentResolver.
 	var (
 		identityResolved bool
-		identityCur      currentIdentity
+		identityCur      session.CurrentIdentity
 		identityErr      error
 	)
 
@@ -438,17 +440,20 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 				identityCur, identityErr = currentResolver()
 				identityResolved = true
 			}
-			if identityErr != nil {
+			// The shared owner/current gate decides the fail-closed policy; this
+			// site applies the delivery-path side effects.
+			owner := model.OwnerRef{AppID: s.OwnerAppID(), UserOpenID: s.OwnerUserOpenID()}
+			switch session.Gate(owner, identityCur, identityErr) {
+			case session.AdmitUnresolved:
 				// Fail CLOSED: never deliver to a user consumer under an
 				// unresolved identity. A single unresolved lookup degrades
-				// every user consumer matched in THIS Publish call — bot
+				// every user consumer matched in THIS Publish call; bot
 				// consumers never reach this branch at all.
 				if c, ok := s.(*Conn); ok {
 					c.SetDegraded(reasonCurrentIdentityUnresolved)
 				}
 				continue
-			}
-			if !ownerMatchesCurrent(s.OwnerAppID(), s.OwnerUserOpenID(), identityCur) {
+			case session.AdmitStale:
 				// owner != current: NO delivery, NO remote change, marked
 				// stale_identity. This is the core identity-gate invariant.
 				if c, ok := s.(*Conn); ok {

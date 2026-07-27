@@ -17,6 +17,7 @@ import (
 
 	"github.com/larksuite/cli/internal/event"
 	lark "github.com/larksuite/cli/internal/event/platform/lark"
+	"github.com/larksuite/cli/internal/event/session"
 )
 
 // Conn is one consumer connection, as the lifecycle actions need to observe
@@ -63,20 +64,14 @@ type Registry interface {
 	ConnsByRemoteSubscriptionID(remoteSubID string) []Conn
 }
 
-// CurrentIdentity is the CLI's active identity resolved at action time — the
-// (appID, userOpenID) pair an eligible user consumer's owner must match. UAT is
-// never part of it.
-type CurrentIdentity struct {
-	AppID      string
-	UserOpenID string
-}
-
 // IdentityGate is the owner/current identity gate + BindUser wiring the real
-// action relies on. resolveCurrent is read fresh on every resolution (never a
-// bus-startup-cached value); resolveUAT mints a UAT for exactly the resolved
-// current identity; bindConsumer performs the per-consumer bind sequence.
+// action relies on. ResolveCurrent is read fresh on every resolution (never a
+// bus-startup-cached value) and yields the shared session.CurrentIdentity an
+// eligible user consumer's owner must match; resolveUAT mints a UAT for exactly
+// the resolved current identity; bindConsumer performs the per-consumer bind
+// sequence.
 type IdentityGate interface {
-	ResolveCurrent() (CurrentIdentity, error)
+	ResolveCurrent() (session.CurrentIdentity, error)
 	ResolveUAT(ctx context.Context, appID, userOpenID string) (string, error)
 	BindConsumer(ctx context.Context, c Conn) error
 }

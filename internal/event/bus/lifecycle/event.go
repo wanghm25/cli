@@ -40,13 +40,6 @@ const (
 // recovery action.
 const suspensionCodeAuthorityRevoked = "authority_revoked"
 
-// reasonCurrentIdentityUnresolved is the SetDegraded reason used when
-// resolveCurrent itself fails — distinct from stale_identity (which means
-// current WAS resolved but didn't match this consumer's owner). It mirrors the
-// host's identity-gate classification of the same name so a status display sees
-// one consistent token regardless of which gate recorded it.
-const reasonCurrentIdentityUnresolved = "current_identity_unresolved"
-
 // --- degraded/next_action classification tokens ---
 // Reused (never per-branch bespoke strings) so a status display can key off a
 // small, stable vocabulary. reasonRemoteSubscriptionConflict's exact string is
@@ -81,10 +74,3 @@ const (
 	updateIncompatible = "incompatible"
 	updateUnclear      = "unclear"
 )
-
-// ownerMatchesCurrent is the owner comparison: owner_app_id +
-// owner_user_open_id, exactly. Never compares tokens. Mirrors the host's own
-// identically-named comparison against its equivalent current-identity value.
-func ownerMatchesCurrent(ownerAppID, ownerUserOpenID string, cur CurrentIdentity) bool {
-	return ownerAppID == cur.AppID && ownerUserOpenID == cur.UserOpenID
-}

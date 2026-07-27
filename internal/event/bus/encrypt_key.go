@@ -14,6 +14,8 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/event/model"
+	"github.com/larksuite/cli/internal/event/session"
 )
 
 // decrypt_state tokens for failure/observability. A small, stable
@@ -185,14 +187,16 @@ func (p *encryptKeyProvider) fetchAndSet(ctx context.Context, subID string, owne
 // resolveOwnerIdentity turns owner's fixed registration identity into the
 // (identity, uat) GetEncryptKey must run as. Resource data is a user-only
 // capability, so only a user owner can be served:
-//   - user owner -> owner==current gate (reuse ownerMatchesCurrent /
-//     resolveCurrent). owner != current returns errEncryptKeyOwnerMismatch
-//     WITHOUT loading ANY UAT (never a historical owner's UAT). Otherwise a
-//     FRESH, open_id-verified UAT is minted for the current identity.
+//   - user owner -> the shared owner==current session.Gate. owner != current
+//     returns errEncryptKeyOwnerMismatch WITHOUT loading ANY UAT (never a
+//     historical owner's UAT); an unresolved current identity returns the
+//     resolve error. Otherwise a FRESH, open_id-verified UAT is minted for the
+//     current identity.
 //   - bot/legacy owner (OwnerUserOpenID()=="") -> errEncryptKeyBotUnsupported,
 //     fail-closed with NO fetch. An encrypted bot/app subscription is rejected
 //     by create/consume before it can exist; this is the defensive backstop so
-//     the bus never fetches a key as bot.
+//     the bus never fetches a key as bot. This bot case is checked BEFORE the
+//     gate (encrypted-bot is unsupported, not a bot-bypass).
 func (p *encryptKeyProvider) resolveOwnerIdentity(ctx context.Context, owner *Conn) (core.Identity, string, error) {
 	if owner.OwnerUserOpenID() == "" {
 		return "", "", errEncryptKeyBotUnsupported
@@ -201,13 +205,14 @@ func (p *encryptKeyProvider) resolveOwnerIdentity(ctx context.Context, owner *Co
 		return "", "", errEncryptKeyNoGate
 	}
 	cur, err := p.gate.resolveCurrent()
-	if err != nil {
+	ownerRef := model.OwnerRef{AppID: owner.OwnerAppID(), UserOpenID: owner.OwnerUserOpenID()}
+	switch session.Gate(ownerRef, cur, err) {
+	case session.AdmitUnresolved:
 		return "", "", err
-	}
-	if !ownerMatchesCurrent(owner.OwnerAppID(), owner.OwnerUserOpenID(), cur) {
+	case session.AdmitStale:
 		return "", "", errEncryptKeyOwnerMismatch
 	}
-	uat, err := p.gate.resolveUAT(ctx, cur.appID, cur.userOpenID)
+	uat, err := p.gate.resolveUAT(ctx, cur.AppID, cur.UserOpenID)
 	if err != nil {
 		return "", "", err
 	}

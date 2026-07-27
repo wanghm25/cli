@@ -25,6 +25,7 @@ import (
 	"github.com/larksuite/cli/internal/event/busdiscover"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
+	"github.com/larksuite/cli/internal/event/session"
 	"github.com/larksuite/cli/internal/event/source"
 	"github.com/larksuite/cli/internal/event/transport"
 	"github.com/larksuite/cli/internal/lockfile"
@@ -123,9 +124,9 @@ func NewBus(appID, appSecret, domain string, tr transport.IPC, logger *log.Logge
 // this to the credential chain (f.Credential), which this package cannot
 // reach directly without importing internal/credential. Fresh-current
 // resolution itself (LoadMultiAppConfig -> CurrentAppConfig("") ->
-// Users[0]) is always resolveCurrentIdentity (identity.go) —
-// package bus already imports internal/core, so there is no reason for a
-// caller outside this package to ever need to override it.
+// Users[0]) is always session.ResolveCurrentIdentity — the ONE current-identity
+// read every gate shares — so there is no reason for a caller outside this
+// package to ever need to override it.
 //
 // nil disables gating entirely (the default) — call before Run() (single-
 // goroutine setup, same convention as the rest of Bus's construction; not
@@ -134,8 +135,8 @@ func (b *Bus) SetIdentityProviders(resolveUAT func(ctx context.Context, appID, u
 	if resolveUAT == nil {
 		return
 	}
-	b.identityGate = newIdentityGate(b.hub, resolveCurrentIdentity, resolveUAT, b.logger)
-	b.hub.SetCurrentResolver(resolveCurrentIdentity)
+	b.identityGate = newIdentityGate(b.hub, session.ResolveCurrentIdentity, resolveUAT, b.logger)
+	b.hub.SetCurrentResolver(session.ResolveCurrentIdentity)
 	// The real lifecycle action's owner==current gate and
 	// bindConsumer (activated/suspended-recovery) both need this SAME gate.
 	b.lifecycleAction.SetIdentityGate(b.identityGate)
@@ -446,6 +447,18 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 	// REJECTS the Hello — the consumer never registers or readies, leaving no
 	// half-registered consumer behind. The reject reason is a fixed token,
 	// never the raw fetch error or any key material.
+	// Track this consumer's readiness. session.Consumer owns "what does ready
+	// mean for this consumer": the bus states the requirements from its own
+	// capabilities — a user consumer requires BindUser only when an identity
+	// gate is wired, an encrypted consumer requires its encrypt_key only when a
+	// key provider is wired — so the bus acks truly-ready (which is what makes
+	// the consumer print its ready marker) only once those are satisfied, never
+	// merely on admission. On an ungated bus (no gate/provider — the legacy/test
+	// default) nothing is bound or fetched, so readiness reduces to Accepted.
+	requiresBind := b.identityGate != nil && hello.UserOpenID != ""
+	requiresKey := hello.IncludeResourceData && b.encryptKeyProvider != nil
+	sc := session.NewConsumer(requiresBind, requiresKey)
+
 	if hello.IncludeResourceData && b.encryptKeyProvider != nil {
 		if err := b.encryptKeyProvider.fetchAndSet(context.Background(), bc.RemoteSubscriptionID(), bc); err != nil {
 			b.logger.Printf("[encrypt-key] rejecting encrypted consumer pid=%d key=%q: key unavailable (%s)",
@@ -456,6 +469,7 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 			bc.Close()
 			return
 		}
+		sc.MarkKeyReady()
 	}
 
 	// SingleConsumer EventKeys allow only one consumer per SubscriptionID: reject extras at handshake.
@@ -514,28 +528,43 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 	}
 	b.mu.Unlock()
 
-	// Bind a user consumer that joined an ALREADY-ready WS now — before acking —
-	// and fail closed if the bind fails. onConnReady only binds the consumers
-	// present when the WS first became ready (or on each reconnect), so a
-	// consumer registering afterwards — the common "new consume against an
-	// already-running bus" path — would otherwise never be BindUser'd. Because
-	// the WS is already up we can bind here and, on failure, REJECT the Hello:
-	// the consumer must never ack as "ready" while it would silently receive no
-	// events. This runs after the hub + b.conns registration above, so a failed
-	// bind's bc.Close() unwinds both via onClose. The asymmetry with the FIRST
-	// consumer is deliberate: at the first consumer's Hello the WS is not ready
-	// yet, so it cannot bind here and necessarily binds later via onConnReady —
-	// which must not reject an already-acked consumer and so degrades instead.
-	// Bots/legacy consumers (empty owner user_open_id) are never identity-gated.
-	// When the WS is not yet ready, do nothing here and let the next onConnReady
-	// bind this now-registered consumer, avoiding a premature
-	// connection_not_ready degraded on a brand-new consumer.
-	if b.identityGate != nil && bc.OwnerUserOpenID() != "" && b.identityGate.ready() {
-		if err := b.identityGate.bindConsumer(context.Background(), bc); err != nil {
+	// A user consumer must be BOUND before it can ack truly-ready: a user
+	// consumer that acked "ready" while still unbound would silently receive no
+	// events (the readiness bug this closes). So the bus ensures the bind HERE,
+	// before acking, for EVERY user consumer:
+	//   - if the WS source is not up yet (a fresh bus), wait (bounded) for it
+	//     rather than acking early and binding later; a source that never comes
+	//     up within the deadline fails closed as a bind failure.
+	//   - bind under the shared owner==current gate; on any failure REJECT the
+	//     Hello (identity_bind_failed) so the consumer never readies while it
+	//     would receive nothing. A mid-bind WS reconnect (errStaleEpoch) is
+	//     retried on the now-current generation.
+	// This runs after the hub + b.conns registration above, so a failed bind's
+	// bc.Close() unwinds both via onClose. onConnReady still (re)binds this
+	// consumer on later reconnects. Bots/legacy consumers (empty owner
+	// user_open_id) are never identity-gated and skip straight to the ack.
+	if sc.RequiresBind() { // implies b.identityGate != nil (see requiresBind above)
+		if !b.identityGate.ready() && !b.identityGate.awaitWSReady(context.Background(), b.identityGate.wsReadyWait) {
+			b.logger.Printf("WARN: rejecting user consumer pid=%d key=%q: WS source not ready before bind deadline",
+				hello.PID, hello.EventKey)
+			if werr := bc.writeFrame(protocol.NewHelloAckRejected("v1", protocol.RejectReasonBindFailed)); werr != nil {
+				b.logger.Printf("WARN: reject hello_ack (identity_bind_failed) write to pid=%d key=%q failed: %v",
+					hello.PID, hello.EventKey, werr)
+			}
+			bc.Close()
+			return
+		}
+		var bindErr error
+		for attempt := 0; attempt < bindAdmitRetryLimit; attempt++ {
+			bindErr = b.identityGate.bindConsumer(context.Background(), bc)
+			if !errors.Is(bindErr, errStaleEpoch) {
+				break
+			}
+		}
+		if bindErr != nil {
 			// bindConsumer already recorded WHY on the Conn (the status surface
 			// shows it); keep this WARN and the wire reason key-free and
-			// cause-agnostic — no UAT/open_id/key, and no oracle for which check
-			// failed.
+			// cause-agnostic: no UAT/open_id/key, and no oracle for which check failed.
 			b.logger.Printf("WARN: rejecting user consumer pid=%d key=%q: identity bind failed",
 				hello.PID, hello.EventKey)
 			if werr := bc.writeFrame(protocol.NewHelloAckRejected("v1", protocol.RejectReasonBindFailed)); werr != nil {
@@ -545,6 +574,22 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 			bc.Close()
 			return
 		}
+		sc.MarkSourceReady()
+		sc.MarkBound()
+	}
+
+	// Admitted and (for a user/encrypted consumer) truly ready: only now is the
+	// success ack sent. session.Consumer.Ready is the authority on that, so the
+	// ack — and therefore the consumer's ready marker — never fires early.
+	sc.MarkAccepted()
+	if !sc.Ready() {
+		b.logger.Printf("WARN: rejecting consumer pid=%d key=%q: not ready at ack (state=%s)",
+			hello.PID, hello.EventKey, sc.State())
+		if werr := bc.writeFrame(protocol.NewHelloAckRejected("v1", protocol.RejectReasonBindFailed)); werr != nil {
+			b.logger.Printf("WARN: reject hello_ack write to pid=%d key=%q failed: %v", hello.PID, hello.EventKey, werr)
+		}
+		bc.Close()
+		return
 	}
 
 	ack := protocol.NewHelloAck("v1", firstForKey)

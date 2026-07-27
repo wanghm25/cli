@@ -11,6 +11,8 @@ import (
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/model"
+	"github.com/larksuite/cli/internal/event/session"
 )
 
 // SummaryAction is one Action implementation: it performs no remote call and
@@ -161,7 +163,7 @@ var (
 // it, e.g. an all-bot match).
 type eligibilityResult struct {
 	conns []Conn
-	cur   CurrentIdentity
+	cur   session.CurrentIdentity
 }
 
 // SubscriptionAction is the REAL Action: the per-event switch, the
@@ -276,12 +278,12 @@ func (a *SubscriptionAction) isTombstonedResurrection(le LifecycleEvent) bool {
 // onConnReady already establish (bot/legacy consumers are NEVER
 // identity-gated), since there is no separate "historical bot user" concept to
 // mis-recover into. A USER conn is eligible ONLY when a FRESHLY resolved current
-// identity (never cached, never UAT) matches its fixed owner — reusing
-// ownerMatchesCurrent/resolveCurrent exactly. Every ineligible USER conn is
-// marked (SetStaleIdentity on a mismatch; SetDegraded(reasonCurrentIdentityUnresolved)
-// if resolveCurrent itself failed or no identity gate is configured at all) but
-// otherwise left completely untouched: no remote call, no BindUser, no
-// historical UAT load.
+// identity (never cached, never UAT) matches its fixed owner — routed through
+// the shared session.Gate exactly like the other three gates. Every ineligible
+// USER conn is marked (SetStaleIdentity on a mismatch;
+// SetDegraded(session.ReasonCurrentIdentityUnresolved) if resolveCurrent itself
+// failed or no identity gate is configured at all) but otherwise left completely
+// untouched: no remote call, no BindUser, no historical UAT load.
 func (a *SubscriptionAction) eligibleConns(conns []Conn) eligibilityResult {
 	var res eligibilityResult
 	var curErr error
@@ -300,15 +302,15 @@ func (a *SubscriptionAction) eligibleConns(conns []Conn) eligibilityResult {
 			}
 			curResolved = true
 		}
-		if curErr != nil {
-			c.SetDegraded(reasonCurrentIdentityUnresolved)
-			continue
-		}
-		if !ownerMatchesCurrent(c.OwnerAppID(), c.OwnerUserOpenID(), res.cur) {
+		owner := model.OwnerRef{AppID: c.OwnerAppID(), UserOpenID: c.OwnerUserOpenID()}
+		switch session.Gate(owner, res.cur, curErr) {
+		case session.AdmitUnresolved:
+			c.SetDegraded(session.ReasonCurrentIdentityUnresolved)
+		case session.AdmitStale:
 			c.SetStaleIdentity()
-			continue
+		default: // AdmitDeliver
+			res.conns = append(res.conns, c)
 		}
-		res.conns = append(res.conns, c)
 	}
 	return res
 }
@@ -318,7 +320,7 @@ func (a *SubscriptionAction) eligibleConns(conns []Conn) eligibilityResult {
 // uat; user -> core.AsUser with a FRESH uat minted for cur (never a historical
 // identity — c is only ever passed here after eligibleConns already verified
 // ownerMatchesCurrent(c, cur)).
-func (a *SubscriptionAction) buildClientForConn(ctx context.Context, c Conn, cur CurrentIdentity) (SubscriptionClient, error) {
+func (a *SubscriptionAction) buildClientForConn(ctx context.Context, c Conn, cur session.CurrentIdentity) (SubscriptionClient, error) {
 	if a.newSubClient == nil {
 		return nil, errSubscriptionClientUnconfigured
 	}

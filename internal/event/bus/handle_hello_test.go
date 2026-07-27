@@ -18,6 +18,7 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/protocol"
+	"github.com/larksuite/cli/internal/event/session"
 )
 
 // --- R2 #15: bus fetches the encrypt_key ONCE at handleHello for an encrypted
@@ -47,13 +48,13 @@ func readAckFromClient(t *testing.T, b *Bus, hello *protocol.Hello) *protocol.He
 
 // newEncryptedHelloBus builds a Bus with a wired encrypt-key provider (fake
 // GetEncryptKey client + static-identity gate) for the handleHello tests.
-func newEncryptedHelloBus(t *testing.T, logger *log.Logger, cli encryptKeyClient, current currentIdentity) *Bus {
+func newEncryptedHelloBus(t *testing.T, logger *log.Logger, cli encryptKeyClient, current session.CurrentIdentity) *Bus {
 	t.Helper()
 	hub := NewHub()
 	p := newEncryptKeyProvider()
 	p.setNewClient(func(core.Identity, string) (encryptKeyClient, error) { return cli, nil })
 	p.setIdentityGate(gateWith(hub,
-		func() (currentIdentity, error) { return current, nil },
+		func() (session.CurrentIdentity, error) { return current, nil },
 		func(context.Context, string, string) (string, error) { return "uat-fresh", nil }))
 	return &Bus{
 		appID:              "app_123",
@@ -71,7 +72,7 @@ func newEncryptedHelloBus(t *testing.T, logger *log.Logger, cli encryptKeyClient
 // (dispatcher will hit it). Resource data is user-only, so the owner is a user.
 func TestHandleHello_EncryptedConsumer_KeyFetchSuccess_RegistersAndCaches(t *testing.T) {
 	b := newEncryptedHelloBus(t, log.New(io.Discard, "", 0), &fakeEncryptKeyClient{key: "K_OK"},
-		currentIdentity{appID: "app_123", userOpenID: "ou_me"})
+		session.CurrentIdentity{AppID: "app_123", UserOpenID: "ou_me"})
 	hello := &protocol.Hello{
 		PID:                  7001,
 		EventKey:             "im.message.receive_v1/chat-id/oc_1",
@@ -102,7 +103,7 @@ func TestHandleHello_EncryptedConsumer_KeyFetchFailure_RejectsNotRegistered(t *t
 	logger := log.New(&buf, "", 0)
 	const secretish = "leaky-detail-that-must-not-surface"
 	b := newEncryptedHelloBus(t, logger, &fakeEncryptKeyClient{err: errors.New(secretish)},
-		currentIdentity{appID: "app_123", userOpenID: "ou_me"})
+		session.CurrentIdentity{AppID: "app_123", UserOpenID: "ou_me"})
 	hello := &protocol.Hello{
 		PID:                  7002,
 		EventKey:             "im.message.receive_v1/chat-id/oc_2",
@@ -142,7 +143,7 @@ func TestHandleHello_EncryptedUserConsumer_OwnerMismatch_Rejected(t *testing.T) 
 	// current is a DIFFERENT user than the Hello's owner.
 	fake := &fakeEncryptKeyClient{key: "SHOULD_NOT_FETCH"}
 	b := newEncryptedHelloBus(t, log.New(io.Discard, "", 0), fake,
-		currentIdentity{appID: "app_123", userOpenID: "ou_current"})
+		session.CurrentIdentity{AppID: "app_123", UserOpenID: "ou_current"})
 	hello := &protocol.Hello{
 		PID:                  7003,
 		EventKey:             "im.message.receive_v1/chat-id/oc_3",
@@ -170,7 +171,7 @@ func TestHandleHello_EncryptedUserConsumer_OwnerMismatch_Rejected(t *testing.T) 
 // with decrypt_key_unavailable — NO fetch as bot, consumer not registered.
 func TestHandleHello_EncryptedBotConsumer_Unsupported_Rejected(t *testing.T) {
 	fake := &fakeEncryptKeyClient{key: "SHOULD_NOT_FETCH"}
-	b := newEncryptedHelloBus(t, log.New(io.Discard, "", 0), fake, currentIdentity{})
+	b := newEncryptedHelloBus(t, log.New(io.Discard, "", 0), fake, session.CurrentIdentity{})
 	hello := &protocol.Hello{
 		PID:                  7005,
 		EventKey:             "im.message.receive_v1/chat-id/oc_5",
@@ -340,7 +341,7 @@ func TestHandleHello_RefinedHelloWithTargetResource_Accepted(t *testing.T) {
 // the fetch client would error if called, yet the consumer registers fine.
 func TestHandleHello_PlaintextConsumer_NoKeyFetch(t *testing.T) {
 	b := newEncryptedHelloBus(t, log.New(io.Discard, "", 0),
-		&fakeEncryptKeyClient{err: errors.New("must not be called for a plaintext consumer")}, currentIdentity{})
+		&fakeEncryptKeyClient{err: errors.New("must not be called for a plaintext consumer")}, session.CurrentIdentity{})
 	hello := &protocol.Hello{
 		PID:                  7004,
 		EventKey:             "im.message.receive_v1",
@@ -854,8 +855,11 @@ func TestHandleHello_LegacyHello_OwnerFieldsDefaultEmpty(t *testing.T) {
 
 // newBindTestBus builds a Bus with a wired identity gate (and its hub) for the
 // handleHello-bind tests — no encrypt-key provider (plaintext consumers only).
+// The WS-ready wait is shrunk so a fresh-bus consumer whose WS never comes up
+// rejects quickly instead of waiting the production deadline.
 func newBindTestBus(t *testing.T, gate *identityGate) *Bus {
 	t.Helper()
+	gate.wsReadyWait = 100 * time.Millisecond
 	return &Bus{
 		appID:        "app1",
 		hub:          gate.hub,
@@ -1014,45 +1018,130 @@ func TestHandleHello_UserConsumer_WSReady_BindAPIFailure_Rejected(t *testing.T) 
 	}
 }
 
-// A user consumer registered BEFORE the WS is ready must NOT be prematurely
-// degraded — and the next onConnReady must then bind it.
-func TestHandleHello_UserConsumer_WSNotReady_NotDegraded_LaterOnConnReadyBinds(t *testing.T) {
+// Fresh bus (WS not ready at Hello): a user consumer must WAIT to be bound
+// before it acks truly-ready, rather than acking early and binding later.
+// When the WS comes up during that wait and the bind succeeds, the Hello is
+// acked (not rejected) and the consumer ends up bound — so its ready marker,
+// gated on this ack, only fires once it is genuinely ready.
+func TestHandleHello_UserConsumer_FreshBus_WaitsThenBindsThenAcks(t *testing.T) {
 	h := NewHub()
 	uat := &fakeUATResolver{uat: "uat-for-alice"}
 	fb := &fakeBindUser{}
 	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
-
 	b := newBindTestBus(t, gate)
-	ack := runHelloToCompletion(t, b, &protocol.Hello{
-		PID: 5102, EventKey: "im.message.receive_v1", EventTypes: []string{"im.message.receive_v1"},
-		Identity: "user", UserOpenID: "ou_alice",
-	})
-	if ack.Rejected {
-		t.Fatalf("a WS-not-ready consumer must be acked (bound later by onConnReady), got rejected: %q", ack.RejectReason)
+
+	server, client := net.Pipe()
+	t.Cleanup(func() { server.Close(); client.Close() })
+	done := make(chan struct{})
+	go func() {
+		b.handleHello(server, bufio.NewReader(server), &protocol.Hello{
+			PID: 5102, EventKey: "im.message.receive_v1", EventTypes: []string{"im.message.receive_v1"},
+			Identity: "user", UserOpenID: "ou_alice",
+		})
+		close(done)
+	}()
+
+	// handleHello is now parked in awaitWSReady; the WS becomes ready.
+	gate.onConnReady(context.Background(), "conn-1", fb.bind)
+
+	line, err := protocol.ReadFrame(bufio.NewReader(client))
+	if err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	msg, err := protocol.Decode(bytes.TrimRight(line, "\n"))
+	if err != nil {
+		t.Fatalf("decode ack: %v", err)
+	}
+	ack := msg.(*protocol.HelloAck)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleHello did not return within 3s")
 	}
 
+	if ack.Rejected {
+		t.Fatalf("a fresh-bus consumer whose WS came up and bound must be acked, got rejected: %q", ack.RejectReason)
+	}
 	sub, found := findSubscriberByPID(h, 5102)
 	if !found {
 		t.Fatal("user consumer not registered")
 	}
-	c := sub.(*Conn)
-	if got := c.BoundConnID(); got != "" {
-		t.Errorf("BoundConnID() = %q, want \"\" (WS not ready yet)", got)
+	if got := sub.(*Conn).BoundConnID(); got != "conn-1" {
+		t.Errorf("BoundConnID() = %q, want %q (bound before ack once the WS came up)", got, "conn-1")
 	}
-	if got := c.DegradedReason(); got != "" {
-		t.Errorf("DegradedReason() = %q, want \"\" (a brand-new consumer must not be prematurely degraded when the WS is not up)", got)
+	if fb.callCount() < 1 {
+		t.Errorf("bindUser call count = %d, want >= 1 (bound during the wait)", fb.callCount())
 	}
-	if fb.callCount() != 0 {
-		t.Errorf("bindUser call count = %d, want 0 before the WS is ready", fb.callCount())
+}
+
+// MUST-FIX: fresh bus, user consumer, WS comes up but BindUser FAILS -> the
+// Hello is REJECTED (identity_bind_failed) and the consumer is unwound, so the
+// consume side never prints its ready line. This is the readiness bug closed:
+// a user consumer must never appear ready before BindUser succeeds.
+func TestHandleHello_UserConsumer_FreshBus_BindFailure_Rejected(t *testing.T) {
+	h := NewHub()
+	uat := &fakeUATResolver{uat: "uat-for-alice"}
+	fb := &fakeBindUser{failCall: map[int]error{1: errors.New("bind_user: 500"), 2: errors.New("bind_user: 500")}}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
+	b := newBindTestBus(t, gate)
+
+	server, client := net.Pipe()
+	t.Cleanup(func() { server.Close(); client.Close() })
+	done := make(chan struct{})
+	go func() {
+		b.handleHello(server, bufio.NewReader(server), &protocol.Hello{
+			PID: 5107, EventKey: "im.message.receive_v1", EventTypes: []string{"im.message.receive_v1"},
+			Identity: "user", UserOpenID: "ou_alice",
+		})
+		close(done)
+	}()
+	gate.onConnReady(context.Background(), "conn-1", fb.bind) // WS up, but bind will fail
+
+	line, err := protocol.ReadFrame(bufio.NewReader(client))
+	if err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	msg, err := protocol.Decode(bytes.TrimRight(line, "\n"))
+	if err != nil {
+		t.Fatalf("decode ack: %v", err)
+	}
+	ack := msg.(*protocol.HelloAck)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleHello did not return within 3s")
 	}
 
-	// The WS becomes ready: onConnReady binds the now-registered consumer.
-	gate.onConnReady(context.Background(), "conn-1", fb.bind)
-	if got := c.BoundConnID(); got != "conn-1" {
-		t.Errorf("BoundConnID() after onConnReady = %q, want %q", got, "conn-1")
+	if !ack.Rejected || ack.RejectReason != protocol.RejectReasonBindFailed {
+		t.Fatalf("a fresh-bus user consumer whose bind failed must be rejected with %q (so it never readies), got rejected=%v reason=%q",
+			protocol.RejectReasonBindFailed, ack.Rejected, ack.RejectReason)
 	}
-	if fb.callCount() != 1 {
-		t.Errorf("bindUser call count after onConnReady = %d, want 1", fb.callCount())
+	if _, found := findSubscriberByPID(h, 5107); found {
+		t.Error("a rejected consumer must NOT be left registered")
+	}
+	if got := h.ConnCount(); got != 0 {
+		t.Errorf("hub.ConnCount = %d, want 0 (rejected consumer fully unwound)", got)
+	}
+}
+
+// Fresh bus whose WS never comes up: a user consumer fails CLOSED after the
+// bounded wait — rejected, never acked-ready.
+func TestHandleHello_UserConsumer_FreshBus_WSNeverReady_Rejected(t *testing.T) {
+	h := NewHub()
+	uat := &fakeUATResolver{uat: "uat-for-alice"}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
+	b := newBindTestBus(t, gate) // wsReadyWait shrunk to 100ms; onConnReady is never called
+
+	ack := runHelloToCompletion(t, b, &protocol.Hello{
+		PID: 5108, EventKey: "im.message.receive_v1", EventTypes: []string{"im.message.receive_v1"},
+		Identity: "user", UserOpenID: "ou_alice",
+	})
+	if !ack.Rejected || ack.RejectReason != protocol.RejectReasonBindFailed {
+		t.Fatalf("a user consumer whose WS never comes up must fail closed (reject %q), got rejected=%v reason=%q",
+			protocol.RejectReasonBindFailed, ack.Rejected, ack.RejectReason)
+	}
+	if got := h.ConnCount(); got != 0 {
+		t.Errorf("hub.ConnCount = %d, want 0 (fail-closed reject unwinds)", got)
 	}
 }
 

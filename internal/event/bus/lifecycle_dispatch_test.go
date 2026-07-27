@@ -17,6 +17,7 @@ import (
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	"github.com/larksuite/cli/internal/event/session"
 )
 
 // --- Task 18: subscriptionLifecycleAction (spec §5.3/§5.4/§5.5/§8) ---------
@@ -185,7 +186,7 @@ type testActionDeps struct {
 // memoization time -- only (connID, bindUser) get memoized, no bind is
 // actually attempted until the test registers its own conn(s) and calls
 // Handle().
-func newTestAction(t *testing.T, hub *Hub, resolveCurrent func() (currentIdentity, error), wireBind bool) *testActionDeps {
+func newTestAction(t *testing.T, hub *Hub, resolveCurrent func() (session.CurrentIdentity, error), wireBind bool) *testActionDeps {
 	t.Helper()
 	uat := &fakeUATResolver{uat: "uat-current"}
 	fb := &fakeBindUser{}

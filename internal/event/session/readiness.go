@@ -48,18 +48,20 @@ func (r Readiness) String() string {
 }
 
 // Consumer is one consumer's readiness tracker: it owns "what does Ready mean
-// for this identity type" so the bus, rather than hard-coding the answer at the
-// ack site, asks the session. A user consumer requires Bound; an encrypted
-// consumer requires KeyReady; a bot/legacy plaintext consumer is Ready as soon
-// as it is admitted. It is safe for concurrent use.
+// for this consumer" so the bus, rather than hard-coding the answer at the ack
+// site, asks the session. A consumer that requires a bind is Ready only once
+// Bound; one that requires a key only once KeyReady; otherwise Ready as soon as
+// it is admitted. It is safe for concurrent use.
+//
+// The two requirements are stated by the caller rather than inferred from the
+// identity alone, because whether a bind/key is actually performed depends on
+// the bus's configuration (a user consumer on a bus with no identity gate is
+// never bound, so it must not be held un-Ready forever). The bus sets
+// requiresBind = "user owner AND an identity gate is wired" and requiresKey =
+// "include_resource_data AND an encrypt-key provider is wired".
 type Consumer struct {
-	// requiresBind is fixed at construction from the owner's user_open_id: a
-	// user owner (non-empty) must BindUser before it is Ready; a bot/legacy
-	// owner ("") never binds.
 	requiresBind bool
-	// requiresKey is fixed from include_resource_data: an encrypted subscription
-	// must have its encrypt_key cached before it is Ready.
-	requiresKey bool
+	requiresKey  bool
 
 	mu          sync.Mutex
 	accepted    bool
@@ -68,14 +70,14 @@ type Consumer struct {
 	keyReady    bool
 }
 
-// NewConsumer builds a readiness tracker for a consumer whose owner user_open_id
-// and include_resource_data flag are known at Hello time. ownerUserOpenID == ""
-// marks a bot/legacy consumer (never bound); includeResourceData marks an
-// encrypted subscription (needs a key).
-func NewConsumer(ownerUserOpenID string, includeResourceData bool) *Consumer {
+// NewConsumer builds a readiness tracker. requiresBind is true when this
+// consumer must BindUser before it is Ready (a user consumer on a gated bus);
+// requiresKey is true when its subscription encrypt_key must be cached first (an
+// encrypted consumer on a bus with a key provider).
+func NewConsumer(requiresBind, requiresKey bool) *Consumer {
 	return &Consumer{
-		requiresBind: ownerUserOpenID != "",
-		requiresKey:  includeResourceData,
+		requiresBind: requiresBind,
+		requiresKey:  requiresKey,
 	}
 }
 

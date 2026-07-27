@@ -7,6 +7,7 @@ import (
 	"context"
 
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
+	"github.com/larksuite/cli/internal/event/session"
 )
 
 // This file bridges the bus's concrete types to the interfaces the lifecycle
@@ -38,12 +39,12 @@ func (h *Hub) lifecycleRegistry() lifecycle.Registry { return lifecycleRegistry{
 
 // ResolveCurrent/ResolveUAT/BindConsumer make *identityGate satisfy
 // lifecycle.IdentityGate. resolveCurrent/resolveUAT are the gate's injected
-// funcs; the wrappers exist because interface satisfaction needs methods and
-// because ResolveCurrent bridges the bus's currentIdentity to the lifecycle
-// package's equivalent value type.
-func (g *identityGate) ResolveCurrent() (lifecycle.CurrentIdentity, error) {
-	cur, err := g.resolveCurrent()
-	return lifecycle.CurrentIdentity{AppID: cur.appID, UserOpenID: cur.userOpenID}, err
+// funcs; the wrappers exist because interface satisfaction needs methods. Both
+// the gate and the lifecycle interface now speak the shared
+// session.CurrentIdentity, so ResolveCurrent is a straight pass-through — no
+// value-type bridging remains.
+func (g *identityGate) ResolveCurrent() (session.CurrentIdentity, error) {
+	return g.resolveCurrent()
 }
 
 func (g *identityGate) ResolveUAT(ctx context.Context, appID, userOpenID string) (string, error) {

@@ -18,6 +18,7 @@ import (
 
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/protocol"
+	"github.com/larksuite/cli/internal/event/session"
 )
 
 func TestHub_Subscribe(t *testing.T) {
@@ -733,8 +734,8 @@ func TestHub_Publish_IdentityGate_AllowsMatchingOwner(t *testing.T) {
 	c := NewConn(server, nil, "im.msg", []string{"im.message.receive_v1"}, 1, "")
 	c.SetOwnerIdentity("user", "app1", "ou_alice")
 	h.RegisterAndIsFirst(c)
-	h.SetCurrentResolver(func() (currentIdentity, error) {
-		return currentIdentity{appID: "app1", userOpenID: "ou_alice"}, nil
+	h.SetCurrentResolver(func() (session.CurrentIdentity, error) {
+		return session.CurrentIdentity{AppID: "app1", UserOpenID: "ou_alice"}, nil
 	})
 
 	h.Publish(&event.RawEvent{EventID: "evt-1", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
@@ -754,8 +755,8 @@ func TestHub_Publish_IdentityGate_DeniesMismatchedOwner(t *testing.T) {
 	c := NewConn(server, nil, "im.msg", []string{"im.message.receive_v1"}, 1, "")
 	c.SetOwnerIdentity("user", "app1", "ou_alice") // owner fixed at register
 	h.RegisterAndIsFirst(c)
-	h.SetCurrentResolver(func() (currentIdentity, error) {
-		return currentIdentity{appID: "app1", userOpenID: "ou_bob"}, nil // current is now a DIFFERENT user
+	h.SetCurrentResolver(func() (session.CurrentIdentity, error) {
+		return session.CurrentIdentity{AppID: "app1", UserOpenID: "ou_bob"}, nil // current is now a DIFFERENT user
 	})
 
 	h.Publish(&event.RawEvent{EventID: "evt-1", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
@@ -788,8 +789,8 @@ func TestHub_Publish_IdentityGate_BotBypassesGate(t *testing.T) {
 	c := NewConn(server, nil, "im.msg", []string{"im.message.receive_v1"}, 1, "")
 	c.SetOwnerIdentity("bot", "app1", "") // bot: identity fixed, but no owning user
 	h.RegisterAndIsFirst(c)
-	h.SetCurrentResolver(func() (currentIdentity, error) {
-		return currentIdentity{appID: "app1", userOpenID: "ou_alice"}, nil
+	h.SetCurrentResolver(func() (session.CurrentIdentity, error) {
+		return session.CurrentIdentity{AppID: "app1", UserOpenID: "ou_alice"}, nil
 	})
 
 	h.Publish(&event.RawEvent{EventID: "evt-1", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
@@ -819,8 +820,8 @@ func TestHub_Publish_IdentityGate_ResolveCurrentErrorFailsClosedForUsersOnly(t *
 	botConn.SetOwnerIdentity("bot", "app1", "")
 	h.RegisterAndIsFirst(botConn)
 
-	h.SetCurrentResolver(func() (currentIdentity, error) {
-		return currentIdentity{}, errors.New("config.json unreadable")
+	h.SetCurrentResolver(func() (session.CurrentIdentity, error) {
+		return session.CurrentIdentity{}, errors.New("config.json unreadable")
 	})
 
 	h.Publish(&event.RawEvent{EventID: "evt-1", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
@@ -842,9 +843,9 @@ func TestHub_Publish_IdentityGate_ResolvedOncePerPublishCall(t *testing.T) {
 	h.RegisterAndIsFirst(c2)
 
 	var calls int32
-	h.SetCurrentResolver(func() (currentIdentity, error) {
+	h.SetCurrentResolver(func() (session.CurrentIdentity, error) {
 		atomic.AddInt32(&calls, 1)
-		return currentIdentity{appID: "app1", userOpenID: "ou_alice"}, nil
+		return session.CurrentIdentity{AppID: "app1", UserOpenID: "ou_alice"}, nil
 	})
 
 	h.Publish(&event.RawEvent{EventID: "evt-shared", EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
@@ -877,8 +878,8 @@ func TestHub_SetCurrentResolver_ConcurrentWithPublish(t *testing.T) {
 				return
 			default:
 			}
-			h.SetCurrentResolver(func() (currentIdentity, error) {
-				return currentIdentity{appID: "app1", userOpenID: "ou_alice"}, nil
+			h.SetCurrentResolver(func() (session.CurrentIdentity, error) {
+				return session.CurrentIdentity{AppID: "app1", UserOpenID: "ou_alice"}, nil
 			})
 		}
 	}()
