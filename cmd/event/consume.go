@@ -25,6 +25,7 @@ import (
 	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/app"
 	"github.com/larksuite/cli/internal/event/consume"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/transport"
@@ -593,6 +594,20 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 		watchStdinEOF(os.Stdin, cancel, errOut)
 	}
 
+	// The immutable, command-resolved owner: the EXPLICIT --profile/--as
+	// selection (cfg already reflects --profile). This threads end-to-end into
+	// the HelloV2 so the bus fixes the owner from THIS, never from a fresh
+	// global-current read — the runtime "current" is used only by the bus gate.
+	// A bot owner carries no user_open_id.
+	owner := model.OwnerRef{
+		AppID:    cfg.AppID,
+		Identity: string(identity),
+		Profile:  cfg.ProfileName,
+	}
+	if identity == core.AsUser {
+		owner.UserOpenID = cfg.UserOpenId
+	}
+
 	return consume.RunRefined(ctx, transport.New(), cfg.AppID, cfg.ProfileName, domain, resolved, consume.RefinedOptions{
 		Params:              paramMap,
 		JQExpr:              o.jqExpr,
@@ -607,6 +622,7 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 		IsTTY:               f.IOStreams.IsTerminal,
 		DryRun:              o.dryRun,
 		Identity:            identity,
+		OwnerRef:            owner,
 		Controller:          controller,
 		IncludeResourceData: o.includeResourceData,
 		Filter:              reqFilter,

@@ -20,6 +20,7 @@ import (
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/model"
 	"github.com/larksuite/cli/internal/event/protocol"
 	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/transport"
@@ -91,6 +92,15 @@ type RefinedOptions struct {
 	// resolved by the caller, e.g. cmd/event/consume.go's resolveIdentity;
 	// RunRefined never guesses or re-resolves it).
 	Identity core.Identity
+
+	// OwnerRef is the immutable, COMMAND-resolved owner this consumer registers
+	// as — the explicit --profile/--as selection (AppID/Profile/UserOpenID),
+	// captured once by the caller. The HelloV2 establishes the bus-side owner
+	// from THIS, never from a fresh global-current read, so an explicit profile
+	// threads end-to-end: the owner is used for plan/bind/registration, while
+	// the runtime "current" identity is used ONLY by the bus's owner==current
+	// gate. A bot owner carries an empty UserOpenID. Profile is diagnostic.
+	OwnerRef model.OwnerRef
 
 	// Controller is the already-constructed subscription Observe->Plan->Apply
 	// owner (built by the caller over the identity-bound platform/lark gateway).
@@ -164,17 +174,15 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 		hello: func(_ context.Context, conn net.Conn, remoteSubscriptionID string) (*protocol.HelloAck, *bufio.Reader, error) {
 			localSubscriptionID := ComputeSubscriptionID(resolved.Definition, opts.Params)
 
-			// Resolve THIS process's own current profile/user_open_id the
-			// exact same way the bus-side identity gate re-derives "current"
-			// (internal/event/bus/identity.go resolveCurrentIdentity:
-			// core.LoadMultiAppConfig -> CurrentAppConfig("") -> Users[0]) --
-			// so the owner HelloV2 establishes at register time is, by
-			// construction, exactly "current" the instant the bus re-checks
-			// it, with no self-inflicted stale_identity gate.
-			profile, userOpenID, err := resolveCurrentProfileIdentity()
-			if err != nil {
-				return nil, nil, fmt.Errorf("resolve current profile identity for hello: %w", err)
-			}
+			// Establish the owner the HelloV2 registers from the EXPLICIT,
+			// command-resolved OwnerRef (the --profile/--as selection captured
+			// once by the caller) — NOT a fresh global-current read. This is
+			// what threads an explicit profile end-to-end: the bus fixes this
+			// owner at registration and uses runtime "current" ONLY for its
+			// owner==current gate. Previously this re-derived the GLOBAL current
+			// profile here, which silently mixed an explicit --profile with
+			// whoever happened to be the global current.
+			profile, userOpenID := opts.OwnerRef.Profile, opts.OwnerRef.UserOpenID
 
 			// scopeUserOpenID mirrors buildHelloV2's own bot-drops-UserOpenID
 			// rule: a bot consumer's ConsumerScopeID
@@ -576,28 +584,6 @@ func buildHelloV2(resolved event.ResolvedEventKey, identity core.Identity, local
 	h.TargetResource = targetResource
 	h.Capabilities = []string{protocol.CapabilityHelloV2}
 	return h
-}
-
-// resolveCurrentProfileIdentity resolves THIS process's own current
-// profile/user_open_id via the exact same mechanism the bus-side identity
-// gate uses for "current" (internal/event/bus/identity.go
-// resolveCurrentIdentity: core.LoadMultiAppConfig -> CurrentAppConfig("") ->
-// Users[0]) — uncached, reads config.json fresh, never a value cached from
-// earlier in this process's own startup.
-func resolveCurrentProfileIdentity() (profile, userOpenID string, err error) {
-	multi, err := core.LoadMultiAppConfig()
-	if err != nil {
-		return "", "", err
-	}
-	app := multi.CurrentAppConfig("")
-	if app == nil {
-		return "", "", fmt.Errorf("refined consume: no current app config")
-	}
-	profile = app.ProfileName()
-	if len(app.Users) > 0 {
-		userOpenID = app.Users[0].UserOpenId
-	}
-	return profile, userOpenID, nil
 }
 
 // computeConsumerScopeID composes ConsumerScopeID: a

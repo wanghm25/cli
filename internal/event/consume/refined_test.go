@@ -1299,22 +1299,22 @@ func TestRunRefinedChain_HelloRejectedOther_UsesGenericRejectionPath(t *testing.
 
 // ---- prodRefinedDeps: the real production wiring behind RunRefined ----
 
-// TestProdRefinedDeps_HelloClosure_ResolvesRealCurrentIdentity exercises the
-// ONE piece of prodRefinedDeps's wiring that runRefinedChain's fake-deps
-// tests above cannot reach: the hello closure's own
-// resolveCurrentProfileIdentity() call, which reads config.json fresh
-// (mirroring internal/event/bus/identity.go's resolveCurrentIdentity — see
-// buildHelloV2's own doc comment for why that mirroring matters). Sandboxed
-// via LARKSUITE_CLI_CONFIG_DIR, same pattern as
-// cmd/event/consume_test.go's newRefinedConsumeTestFactory — never touches
-// the real host config.
-func TestProdRefinedDeps_HelloClosure_ResolvesRealCurrentIdentity(t *testing.T) {
+// TestProdRefinedDeps_HelloClosure_UsesExplicitOwnerNotGlobalCurrent proves the
+// must-fix: the hello closure establishes the owner from the EXPLICIT,
+// command-resolved OwnerRef (opts.OwnerRef) threaded in by the caller — NEVER a
+// fresh global-current read. The sandboxed config.json's CURRENT profile is
+// deliberately DIFFERENT from the OwnerRef, so if the closure still read global
+// current (the old bug) the Hello would carry the wrong owner. The Hello must
+// carry the OwnerRef's profile/user, not the config's current.
+func TestProdRefinedDeps_HelloClosure_UsesExplicitOwnerNotGlobalCurrent(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
+	// Global current is "personal"/ou_global — NOT what the command resolved.
 	configJSON := `{
-		"currentApp": "test-profile",
+		"currentApp": "personal",
 		"apps": [
-			{"name": "test-profile", "appId": "cli_hello_test", "users": [{"userOpenId": "ou_hello_1"}]}
+			{"name": "personal", "appId": "cli_personal", "users": [{"userOpenId": "ou_global"}]},
+			{"name": "work", "appId": "cli_hello_test", "users": [{"userOpenId": "ou_work"}]}
 		]
 	}`
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(configJSON), 0600); err != nil {
@@ -1322,8 +1322,12 @@ func TestProdRefinedDeps_HelloClosure_ResolvesRealCurrentIdentity(t *testing.T) 
 	}
 
 	resolved := refinedFixture()
-	opts := RefinedOptions{Identity: core.AsUser}
-	deps := prodRefinedDeps(failDialTransport{}, "cli_hello_test", "test-profile", "", resolved, opts)
+	// The command explicitly resolved the "work" owner (e.g. via --profile work).
+	opts := RefinedOptions{
+		Identity: core.AsUser,
+		OwnerRef: model.OwnerRef{AppID: "cli_hello_test", Identity: "user", UserOpenID: "ou_work", Profile: "work"},
+	}
+	deps := prodRefinedDeps(failDialTransport{}, "cli_hello_test", "work", "", resolved, opts)
 
 	client, server := net.Pipe()
 	defer client.Close()
@@ -1356,107 +1360,76 @@ func TestProdRefinedDeps_HelloClosure_ResolvesRealCurrentIdentity(t *testing.T) 
 
 	select {
 	case got := <-recvCh:
-		if got.Profile != "test-profile" {
-			t.Errorf("Profile = %q, want %q (resolved from the sandboxed config.json)", got.Profile, "test-profile")
+		if got.Profile != "work" {
+			t.Errorf("Profile = %q, want %q (the EXPLICIT owner, not the global current %q)", got.Profile, "work", "personal")
 		}
-		if got.UserOpenID != "ou_hello_1" {
-			t.Errorf("UserOpenID = %q, want %q", got.UserOpenID, "ou_hello_1")
+		if got.UserOpenID != "ou_work" {
+			t.Errorf("UserOpenID = %q, want %q (the EXPLICIT owner, not the global current %q)", got.UserOpenID, "ou_work", "ou_global")
 		}
 		if got.RemoteSubscriptionID != "sub_remote_prod" {
 			t.Errorf("RemoteSubscriptionID = %q, want %q", got.RemoteSubscriptionID, "sub_remote_prod")
 		}
-		wantScope := computeConsumerScopeID(resolved.Definition.Key, resolved.MaterializedKey, "user", "cli_hello_test", "ou_hello_1")
+		wantScope := computeConsumerScopeID(resolved.Definition.Key, resolved.MaterializedKey, "user", "cli_hello_test", "ou_work")
 		if got.ConsumerScopeID != wantScope {
-			t.Errorf("ConsumerScopeID = %q, want %q (must match computeConsumerScopeID fed the same real-resolved inputs)", got.ConsumerScopeID, wantScope)
+			t.Errorf("ConsumerScopeID = %q, want %q (computed from the explicit owner)", got.ConsumerScopeID, wantScope)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("bus side never received the Hello frame")
 	}
 }
 
-// TestProdRefinedDeps_HelloClosure_BotIdentity_ConsumerScopeIDIndependentOfUserOpenID
-// is review Fix 2 (Minor #3): prodRefinedDeps's hello closure must feed
-// computeConsumerScopeID an EMPTY user_open_id for a bot identity, matching
-// what buildHelloV2 itself puts on the wire (it drops UserOpenID for a bot —
-// TestBuildHelloV2_BotIdentity_NeverCarriesUserOpenID above). Before the fix,
-// the closure passed resolveCurrentProfileIdentity()'s real userOpenID
-// straight into computeConsumerScopeID regardless of identity, so a bot
-// consumer's scope id varied with whoever happened to be logged in on this
-// host (nondeterministic, fragments app-level fan-out). Proven here by
-// resolving the SAME bot Hello twice against two configs that differ ONLY in
-// user_open_id and asserting the resulting ConsumerScopeID is identical, and
-// that it equals computeConsumerScopeID fed "" — never the real id.
-func TestProdRefinedDeps_HelloClosure_BotIdentity_ConsumerScopeIDIndependentOfUserOpenID(t *testing.T) {
+// TestProdRefinedDeps_HelloClosure_BotIdentity_DropsUserOpenID: a bot
+// identity's hello closure must feed computeConsumerScopeID an EMPTY
+// user_open_id and put none on the wire, matching buildHelloV2's
+// bot-drops-UserOpenID rule (TestBuildHelloV2_BotIdentity_NeverCarriesUserOpenID
+// above) — even if the OwnerRef it was handed carries a stray user_open_id. This
+// keeps a bot consumer's scope id deterministic (independent of any user),
+// rather than fragmenting app-level fan-out.
+func TestProdRefinedDeps_HelloClosure_BotIdentity_DropsUserOpenID(t *testing.T) {
 	resolved := refinedFixture()
 
-	runOnce := func(t *testing.T, configJSON string) string {
-		t.Helper()
-		dir := t.TempDir()
-		t.Setenv("LARKSUITE_CLI_CONFIG_DIR", dir)
-		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(configJSON), 0600); err != nil {
-			t.Fatal(err)
+	// OwnerRef deliberately carries a stray user_open_id; a bot Hello must drop it.
+	opts := RefinedOptions{
+		Identity: core.AsBot,
+		OwnerRef: model.OwnerRef{AppID: "cli_hello_test", Identity: "bot", UserOpenID: "ou_stray", Profile: "test-profile"},
+	}
+	deps := prodRefinedDeps(failDialTransport{}, "cli_hello_test", "test-profile", "", resolved, opts)
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	recvCh := make(chan *protocol.Hello, 1)
+	go func() {
+		br := bufio.NewReader(server)
+		line, err := protocol.ReadFrame(br)
+		if err != nil {
+			return
 		}
-
-		opts := RefinedOptions{Identity: core.AsBot}
-		deps := prodRefinedDeps(failDialTransport{}, "cli_hello_test", "test-profile", "", resolved, opts)
-
-		client, server := net.Pipe()
-		defer client.Close()
-		defer server.Close()
-
-		recvCh := make(chan *protocol.Hello, 1)
-		go func() {
-			br := bufio.NewReader(server)
-			line, err := protocol.ReadFrame(br)
-			if err != nil {
-				return
-			}
-			msg, err := protocol.Decode(bytes.TrimRight(line, "\n"))
-			if err != nil {
-				return
-			}
-			if h, ok := msg.(*protocol.Hello); ok {
-				recvCh <- h
-			}
-			_ = protocol.Encode(server, protocol.NewHelloAck("test-bus", true))
-		}()
-
-		if _, _, err := deps.hello(context.Background(), client, "sub_remote_prod"); err != nil {
-			t.Fatalf("hello closure: unexpected error: %v", err)
+		msg, err := protocol.Decode(bytes.TrimRight(line, "\n"))
+		if err != nil {
+			return
 		}
-
-		var scopeID string
-		select {
-		case got := <-recvCh:
-			if got.UserOpenID != "" {
-				t.Errorf("bot Hello must never carry UserOpenID, got %q", got.UserOpenID)
-			}
-			scopeID = got.ConsumerScopeID
-		case <-time.After(2 * time.Second):
-			t.Fatal("bus side never received the Hello frame")
+		if h, ok := msg.(*protocol.Hello); ok {
+			recvCh <- h
 		}
-		return scopeID
+		_ = protocol.Encode(server, protocol.NewHelloAck("test-bus", true))
+	}()
+
+	if _, _, err := deps.hello(context.Background(), client, "sub_remote_prod"); err != nil {
+		t.Fatalf("hello closure: unexpected error: %v", err)
 	}
 
-	scopeA := runOnce(t, `{
-		"currentApp": "test-profile",
-		"apps": [
-			{"name": "test-profile", "appId": "cli_hello_test", "users": [{"userOpenId": "ou_AAAA"}]}
-		]
-	}`)
-	scopeB := runOnce(t, `{
-		"currentApp": "test-profile",
-		"apps": [
-			{"name": "test-profile", "appId": "cli_hello_test", "users": [{"userOpenId": "ou_BBBB"}]}
-		]
-	}`)
-
-	if scopeA != scopeB {
-		t.Errorf("bot ConsumerScopeID must be independent of user_open_id: %q (ou_AAAA) vs %q (ou_BBBB)", scopeA, scopeB)
-	}
-
-	want := computeConsumerScopeID(resolved.Definition.Key, resolved.MaterializedKey, "app", "cli_hello_test", "")
-	if scopeA != want {
-		t.Errorf("bot ConsumerScopeID = %q, want %q (computed with empty user_open_id, matching buildHelloV2's bot-drops-UserOpenID rule)", scopeA, want)
+	select {
+	case got := <-recvCh:
+		if got.UserOpenID != "" {
+			t.Errorf("bot Hello must never carry UserOpenID, got %q", got.UserOpenID)
+		}
+		want := computeConsumerScopeID(resolved.Definition.Key, resolved.MaterializedKey, "app", "cli_hello_test", "")
+		if got.ConsumerScopeID != want {
+			t.Errorf("bot ConsumerScopeID = %q, want %q (computed with empty user_open_id despite the stray OwnerRef user)", got.ConsumerScopeID, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("bus side never received the Hello frame")
 	}
 }
