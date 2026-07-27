@@ -14,7 +14,7 @@ import (
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
-	eventlib "github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/app"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
@@ -184,65 +184,34 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 	return applyUpdate(ctx, client, f.IOStreams.Out, remoteSubscriptionID, identity, o)
 }
 
-// applyUpdate is the read+decide+write core of update's flow, factored out of
-// runUpdate (which only handles the purely-local flag rejections and builds
-// the real network-capable client) so the whole sequence — the mandatory
-// remote read, the no-op guard, --dry-run, and the actual Patch — is directly
-// testable against a fake updateSubscriptionAPI, mirroring delete.go's
-// applyDelete.
-//
-// The remote read comes first and is mandatory: update carries no EventKey,
-// so the fetched subscription is the only source of the event type --filter
-// must be validated against, and of the current filter the no-op guard
-// compares the requested one against.
+// applyUpdate is update's testable core: it hands the request to the
+// SubscriptionUseCase's Update flow (the mandatory remote read, the desired-
+// filter build + validation, the no-op guard, --dry-run, and the Patch) and
+// renders the domain outcome — the --dry-run preview, the unchanged no-op, or
+// the patched result. It never itself reads remote state, validates the filter,
+// decides the no-op, or issues the Patch; the use case owns all of that, and
+// this function only renders (against a fake updateSubscriptionAPI in tests).
 func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, remoteSubscriptionID string, identity core.Identity, o updateOpts) error {
-	before, err := readSubscriptionForUpdate(ctx, svc, remoteSubscriptionID)
+	outcome, err := app.NewSubscriptionUseCase().Update(ctx, svc, remoteSubscriptionID, o.filter, o.clearFilter, o.dryRun)
 	if err != nil {
 		return err
 	}
 
-	eventType := before.EventType
-	if eventType == "" {
-		// A subscription with no event_type can't be mapped to a filter
-		// capability, so --filter cannot be validated against it. Treat a
-		// successful Get that omits it as a wire anomaly rather than guessing.
-		return errs.NewInternalError(errs.SubtypeInvalidResponse,
-			"subscription %s did not report an event_type, so its filter capability cannot be determined", remoteSubscriptionID)
-	}
-
-	// Build the desired filter. --clear-filter is the empty filter (wired as
-	// the {"filter":{}} clear form). --filter is parsed and validated against
-	// this event type's capability; a parse/validation failure is already a
-	// typed invalid_argument on --filter — returned unchanged, before any
-	// write, and it never echoes the filter's contents.
-	var desired *eventlib.Filter
-	if o.clearFilter {
-		desired = &eventlib.Filter{}
-	} else {
-		desired, err = eventlib.ParseAndValidateFilter(o.filter, eventlib.FilterMetaFor(eventType))
-		if err != nil {
-			return err
-		}
-	}
-
-	current := before.Filter
-	noChange := eventlib.Equal(desired, current)
-
-	if o.dryRun {
-		beforeRow := mapRemoteSubscription(*before)
-		localAffected, impactNote := updateLocalImpact(noChange)
+	switch outcome.Kind {
+	case app.UpdatePreview:
+		beforeRow := mapRemoteSubscription(outcome.Before)
+		localAffected, impactNote := updateLocalImpact(outcome.NoChange)
 		result := buildMutationDryRunResult("update", remoteSubscriptionID, identity, &beforeRow,
-			updatePlannedAction(noChange), localAffected, impactNote,
-			updateDryRunNextAction(remoteSubscriptionID, o.clearFilter, noChange))
+			updatePlannedAction(outcome.NoChange), localAffected, impactNote,
+			updateDryRunNextAction(remoteSubscriptionID, o.clearFilter, outcome.NoChange))
 		if o.asJSON {
 			output.PrintJson(out, result)
 			return nil
 		}
 		writeMutationDryRunText(out, result)
 		return nil
-	}
 
-	if noChange {
+	case app.UpdateNoop:
 		// The requested filter already matches the current one — report the
 		// unchanged subscription without issuing a Patch. Mirrors
 		// updateDryRunNextAction's noop wording: a --clear-filter no-op says
@@ -252,7 +221,7 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		if o.clearFilter {
 			already = "already has no filter"
 		}
-		result := buildMutationResult("update", *before,
+		result := buildMutationResult("update", outcome.Before,
 			fmt.Sprintf("no change: remote_subscription_id=%s %s; run `lark-cli event subscription get %s --as %s --json` to confirm", remoteSubscriptionID, already, remoteSubscriptionID, identity))
 		if o.asJSON {
 			output.PrintJson(out, result)
@@ -260,41 +229,17 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		}
 		writeMutationResultText(out, "Unchanged", result)
 		return nil
-	}
 
-	sub, err := doUpdateSubscription(ctx, svc, remoteSubscriptionID, desired)
-	if err != nil {
-		return err
-	}
-	result := buildMutationResult("update", *sub,
-		updateSuccessNextAction(remoteSubscriptionID, identity, o.clearFilter))
-	if o.asJSON {
-		output.PrintJson(out, result)
+	default: // app.UpdateApplied
+		result := buildMutationResult("update", outcome.After,
+			updateSuccessNextAction(remoteSubscriptionID, identity, o.clearFilter))
+		if o.asJSON {
+			output.PrintJson(out, result)
+			return nil
+		}
+		writeMutationResultText(out, "Updated", result)
 		return nil
 	}
-	writeMutationResultText(out, "Updated", result)
-	return nil
-}
-
-// readSubscriptionForUpdate fetches the current remote subscription. Unlike the
-// shared, row-returning getSubscription (get.go), update needs the whole
-// RemoteSubscription: its EventType selects the filter capability --filter is
-// validated against, and its Filter is what the no-op guard compares the
-// requested one against via eventlib.Equal. Any error svc.Get returns
-// (transport, an already-classified business failure such as an unknown
-// remote_subscription_id, or the gateway's own required-field validation) is
-// passed through unchanged.
-func readSubscriptionForUpdate(ctx context.Context, svc updateSubscriptionAPI, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error) {
-	return svc.Get(ctx, remoteSubscriptionID)
-}
-
-// doUpdateSubscription issues the actual Patch via the gateway, passing the
-// desired filter as a PatchSpec (the gateway projects it onto the request body —
-// an empty/cleared filter becomes the {"filter":{}} clear form, distinct on the
-// wire from "leave the filter unchanged" — and validates the response's required
-// fields). Any error it returns is passed through unchanged.
-func doUpdateSubscription(ctx context.Context, svc updateSubscriptionAPI, remoteSubscriptionID string, desired *eventlib.Filter) (*larkgw.RemoteSubscription, error) {
-	return svc.Patch(ctx, remoteSubscriptionID, larkgw.PatchSpec{Filter: desired})
 }
 
 // updatePlannedAction is the --dry-run planned_change.action: "noop" when the

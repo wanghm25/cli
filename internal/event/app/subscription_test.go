@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/larksuite/cli/errs"
+	event "github.com/larksuite/cli/internal/event"
+	lark "github.com/larksuite/cli/internal/event/platform/lark"
 	subscription "github.com/larksuite/cli/internal/event/subscription"
 )
 
@@ -183,5 +185,168 @@ func TestProvision_NonWritableAction_InternalError(t *testing.T) {
 	}
 	if c.applyCalls != 0 {
 		t.Errorf("Apply calls = %d for a non-writable action, want 0", c.applyCalls)
+	}
+}
+
+// ---- Update (owns the read -> validate -> no-op-guard -> patch flow) ----
+
+// init seeds a filter capability for the app.update.test_v1 event type so the
+// Update tests can build a non-empty "current" filter via ParseAndValidateFilter
+// (mirroring the self-contained registration internal/event/consume's
+// refined_test.go uses).
+func init() {
+	event.RegisterFilterMeta("app.update.test_v1", event.FilterMeta{
+		Supported:     true,
+		LogicOps:      []string{"and", "or"},
+		Operators:     []string{"eq"},
+		MaxDepth:      2,
+		MaxConditions: 10,
+		MaxBytes:      1024,
+		Operands: []event.FilterOperandMeta{
+			{Key: "message_type", Operators: []string{"eq"}},
+		},
+	})
+}
+
+const updateTestEventType = "app.update.test_v1"
+
+// nonEmptyFilter builds a valid, non-empty filter for updateTestEventType.
+func nonEmptyFilter(t *testing.T) *event.Filter {
+	t.Helper()
+	f, err := event.ParseAndValidateFilter(
+		`{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"eq","value":"text"}}]}}`,
+		event.FilterMetaFor(updateTestEventType))
+	if err != nil {
+		t.Fatalf("ParseAndValidateFilter: %v", err)
+	}
+	if f.IsEmpty() {
+		t.Fatal("nonEmptyFilter built an empty filter")
+	}
+	return f
+}
+
+// fakeUpdatePort is a network-free UpdatePort: Get hands back a canned
+// subscription; Patch captures its spec and returns a canned result.
+type fakeUpdatePort struct {
+	getSub    *lark.RemoteSubscription
+	getErr    error
+	patchResp *lark.RemoteSubscription
+	patchErr  error
+
+	patchCalls int
+	patchSpec  lark.PatchSpec
+}
+
+func (f *fakeUpdatePort) Get(context.Context, string) (*lark.RemoteSubscription, error) {
+	return f.getSub, f.getErr
+}
+
+func (f *fakeUpdatePort) Patch(_ context.Context, _ string, spec lark.PatchSpec) (*lark.RemoteSubscription, error) {
+	f.patchCalls++
+	f.patchSpec = spec
+	return f.patchResp, f.patchErr
+}
+
+func emptyFilterSub() *lark.RemoteSubscription {
+	return &lark.RemoteSubscription{EventType: updateTestEventType, Filter: &event.Filter{}}
+}
+
+// TestUpdate_GetError_Propagates locks that the mandatory read's error
+// short-circuits before any Patch.
+func TestUpdate_GetError_Propagates(t *testing.T) {
+	sentinel := errors.New("get failed")
+	svc := &fakeUpdatePort{getErr: sentinel}
+	_, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want the Get error", err)
+	}
+	if svc.patchCalls != 0 {
+		t.Errorf("patchCalls = %d after a Get error, want 0", svc.patchCalls)
+	}
+}
+
+// TestUpdate_MissingEventType_TypedError locks the wire-anomaly guard: a Get
+// that omits event_type is an InvalidResponse, never a guess, and never patches.
+func TestUpdate_MissingEventType_TypedError(t *testing.T) {
+	svc := &fakeUpdatePort{getSub: &lark.RemoteSubscription{EventType: "", Filter: &event.Filter{}}}
+	_, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
+	var ie *errs.InternalError
+	if !errors.As(err, &ie) || ie.Subtype != errs.SubtypeInvalidResponse {
+		t.Fatalf("err = %v, want InternalError/invalid_response", err)
+	}
+	if svc.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0", svc.patchCalls)
+	}
+}
+
+// TestUpdate_DryRun_Preview_NoPatch locks that --dry-run computes the outcome
+// (including NoChange) without ever patching.
+func TestUpdate_DryRun_Preview_NoPatch(t *testing.T) {
+	svc := &fakeUpdatePort{getSub: emptyFilterSub()}
+	out, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Kind != UpdatePreview {
+		t.Errorf("Kind = %v, want UpdatePreview", out.Kind)
+	}
+	if !out.NoChange {
+		t.Error("clearing an already-empty filter should preview NoChange=true")
+	}
+	if svc.patchCalls != 0 {
+		t.Errorf("patchCalls = %d on a dry-run, want 0", svc.patchCalls)
+	}
+}
+
+// TestUpdate_ClearFilter_Noop_WhenAlreadyEmpty locks the no-op guard: clearing
+// an already-empty filter issues no Patch.
+func TestUpdate_ClearFilter_Noop_WhenAlreadyEmpty(t *testing.T) {
+	svc := &fakeUpdatePort{getSub: emptyFilterSub()}
+	out, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Kind != UpdateNoop {
+		t.Errorf("Kind = %v, want UpdateNoop", out.Kind)
+	}
+	if svc.patchCalls != 0 {
+		t.Errorf("patchCalls = %d for a no-op, want 0", svc.patchCalls)
+	}
+}
+
+// TestUpdate_ClearFilter_Patches locks the write path: clearing a present filter
+// issues exactly one Patch with the empty/clear form and returns the fresh
+// subscription as After.
+func TestUpdate_ClearFilter_Patches(t *testing.T) {
+	after := &lark.RemoteSubscription{EventType: updateTestEventType, Filter: &event.Filter{}}
+	svc := &fakeUpdatePort{
+		getSub:    &lark.RemoteSubscription{EventType: updateTestEventType, Filter: nonEmptyFilter(t)},
+		patchResp: after,
+	}
+	out, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Kind != UpdateApplied {
+		t.Fatalf("Kind = %v, want UpdateApplied", out.Kind)
+	}
+	if svc.patchCalls != 1 {
+		t.Errorf("patchCalls = %d, want 1", svc.patchCalls)
+	}
+	if svc.patchSpec.Filter == nil || !svc.patchSpec.Filter.IsEmpty() {
+		t.Errorf("Patch spec filter = %v, want the empty/clear form", svc.patchSpec.Filter)
+	}
+}
+
+// TestUpdate_PatchError_Propagates locks that a Patch failure surfaces unchanged.
+func TestUpdate_PatchError_Propagates(t *testing.T) {
+	sentinel := errors.New("patch failed")
+	svc := &fakeUpdatePort{
+		getSub:   &lark.RemoteSubscription{EventType: updateTestEventType, Filter: nonEmptyFilter(t)},
+		patchErr: sentinel,
+	}
+	_, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want the Patch error unchanged", err)
 	}
 }

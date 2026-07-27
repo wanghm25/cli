@@ -8,6 +8,8 @@ import (
 	"errors"
 
 	"github.com/larksuite/cli/errs"
+	event "github.com/larksuite/cli/internal/event"
+	lark "github.com/larksuite/cli/internal/event/platform/lark"
 	subscription "github.com/larksuite/cli/internal/event/subscription"
 )
 
@@ -124,4 +126,99 @@ func (SubscriptionUseCase) Provision(ctx context.Context, controller Subscriptio
 		return ProvisionOutcome{}, errs.NewInternalError(errs.SubtypeUnknown,
 			"subscription use case: Provision reached a non-writable plan action %q", plan.Action)
 	}
+}
+
+// UpdatePort is the subset of the platform/lark gateway the update flow drives:
+// Get (the mandatory remote read — update carries no EventKey, so the fetched
+// subscription is the only source of the event type --filter is validated
+// against, and of the current filter the no-op guard compares against) and
+// Patch (the write, which changes only the server-side filter). The command's
+// updateSubscriptionAPI seam satisfies it.
+type UpdatePort interface {
+	Get(ctx context.Context, remoteSubscriptionID string) (*lark.RemoteSubscription, error)
+	Patch(ctx context.Context, remoteSubscriptionID string, spec lark.PatchSpec) (*lark.RemoteSubscription, error)
+}
+
+// UpdateKind classifies an Update outcome for the command to render.
+type UpdateKind int
+
+const (
+	// UpdatePreview: --dry-run stopped after computing the desired filter and
+	// the no-op comparison. Render from Before + NoChange; nothing was written.
+	UpdatePreview UpdateKind = iota
+	// UpdateNoop: the requested filter already matches the current one, so no
+	// Patch was issued. Render the unchanged Before.
+	UpdateNoop
+	// UpdateApplied: the filter changed and was patched. After is the fresh
+	// subscription the Patch returned.
+	UpdateApplied
+)
+
+// UpdateOutcome is the domain result the update command renders. Before is the
+// subscription as read (always present). After is meaningful only for
+// UpdateApplied. NoChange is meaningful only for UpdatePreview — it reports
+// whether a real run would no-op (already matches) or patch.
+type UpdateOutcome struct {
+	Kind     UpdateKind
+	Before   lark.RemoteSubscription
+	After    lark.RemoteSubscription
+	NoChange bool
+}
+
+// Update runs the filter-update flow and returns an UpdateOutcome the command
+// renders:
+//
+//   - Read the subscription (svc.Get). Its event_type selects the filter
+//     capability the desired filter is validated against; its current filter is
+//     the no-op comparison base. A success response with no event_type is a wire
+//     anomaly (typed InvalidResponse).
+//   - Build the desired filter: --clear-filter is the empty/clear form;
+//     otherwise parse+validate filterInput against the event type (a parse/rule
+//     violation is the gateway/eventlib typed invalid_argument on --filter,
+//     returned unchanged, and never echoes the filter contents).
+//   - dryRun: stop (UpdatePreview) — no Patch.
+//   - already matches: stop (UpdateNoop) — no Patch.
+//   - otherwise: Patch (svc.Patch) and return UpdateApplied.
+//
+// include_resource_data is never touched here (Patch is filter-only). This is
+// the one place the update decision lives, so the command only renders.
+func (SubscriptionUseCase) Update(ctx context.Context, svc UpdatePort, remoteSubscriptionID, filterInput string, clearFilter, dryRun bool) (UpdateOutcome, error) {
+	before, err := svc.Get(ctx, remoteSubscriptionID)
+	if err != nil {
+		return UpdateOutcome{}, err
+	}
+
+	eventType := before.EventType
+	if eventType == "" {
+		// A subscription with no event_type can't be mapped to a filter
+		// capability, so --filter cannot be validated against it. Treat a
+		// successful Get that omits it as a wire anomaly rather than guessing.
+		return UpdateOutcome{}, errs.NewInternalError(errs.SubtypeInvalidResponse,
+			"subscription %s did not report an event_type, so its filter capability cannot be determined", remoteSubscriptionID)
+	}
+
+	var desired *event.Filter
+	if clearFilter {
+		desired = &event.Filter{}
+	} else {
+		desired, err = event.ParseAndValidateFilter(filterInput, event.FilterMetaFor(eventType))
+		if err != nil {
+			return UpdateOutcome{}, err
+		}
+	}
+
+	noChange := event.Equal(desired, before.Filter)
+
+	if dryRun {
+		return UpdateOutcome{Kind: UpdatePreview, Before: *before, NoChange: noChange}, nil
+	}
+	if noChange {
+		return UpdateOutcome{Kind: UpdateNoop, Before: *before}, nil
+	}
+
+	after, err := svc.Patch(ctx, remoteSubscriptionID, lark.PatchSpec{Filter: desired})
+	if err != nil {
+		return UpdateOutcome{}, err
+	}
+	return UpdateOutcome{Kind: UpdateApplied, Before: *before, After: *after}, nil
 }

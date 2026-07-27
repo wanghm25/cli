@@ -93,37 +93,11 @@ func (f *fakeUpdateAPI) Patch(_ context.Context, _ string, spec larkgw.PatchSpec
 // form) now lives at the gateway — see platform/lark's
 // TestBuildPatchBody_SetFilter/ClearFilter; the gateway also validates a Patch
 // response's required fields (TestGateway_Patch_NilData_ReturnsInvalidResponse).
+// The Patch-call/error-propagation coverage that lived here (the old
+// doUpdateSubscription tests) now sits at the update flow's owner — see
+// internal/event/app's TestUpdate_ClearFilter_Patches / TestUpdate_PatchError_Propagates.
 
-// ---- doUpdateSubscription ----
-
-func TestDoUpdateSubscription_CallsPatchAndReturnsSubscription(t *testing.T) {
-	fake := &fakeUpdateAPI{patchFunc: func(larkgw.PatchSpec) (*larkgw.RemoteSubscription, error) {
-		return subPtr(activeSub("sub_1", false, "user")), nil
-	}}
-
-	sub, err := doUpdateSubscription(context.Background(), fake, "sub_1", &eventlib.Filter{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if fake.patchCalls != 1 {
-		t.Errorf("patchCalls = %d, want 1", fake.patchCalls)
-	}
-	if sub.ID.String() != "sub_1" {
-		t.Errorf("sub.ID = %q, want sub_1", sub.ID)
-	}
-}
-
-func TestDoUpdateSubscription_TransportError_PropagatesUnchanged(t *testing.T) {
-	sentinel := errors.New("boom: connection reset")
-	fake := &fakeUpdateAPI{patchFunc: func(larkgw.PatchSpec) (*larkgw.RemoteSubscription, error) { return nil, sentinel }}
-
-	_, err := doUpdateSubscription(context.Background(), fake, "sub_1", &eventlib.Filter{})
-	if !errors.Is(err, sentinel) {
-		t.Errorf("err = %v, want it passed through unchanged (%v)", err, sentinel)
-	}
-}
-
-// ---- applyUpdate (read + decide + write core, against the fake) ----
+// ---- applyUpdate (renders the SubscriptionUseCase.Update outcome, against the fake) ----
 
 func TestApplyUpdate_SetFilter_PatchesWhenChanged(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
