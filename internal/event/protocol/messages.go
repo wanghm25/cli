@@ -196,8 +196,8 @@ type Event struct {
 	TargetResource string `json:"target_resource,omitempty"`
 
 	// Authority is the normalized subscription authority descriptor (e.g.
-	// "user:ou_xxx" or "app"), derived from
-	// header.subscription.Authority{Type, PrincipalID}.
+	// "user:ou_xxx" or "app"), derived from the 通用事件信封 (general event
+	// envelope) push header.subscription.authority{type, app_id, open_id}.
 	Authority string `json:"authority,omitempty"`
 
 	// SubscriptionEventID is header.subscription.SubscriptionEventID: the

@@ -43,11 +43,13 @@ type RawEvent struct {
 	// this event, from header.subscription.subscription_id.
 	RemoteSubscriptionID string `json:"remote_subscription_id,omitempty"`
 	// Resource is the target resource this event was delivered for (e.g.
-	// "im.message?chat_id=oc_xxx"), from header.subscription.resource, verbatim.
+	// "im.message?chat_id=oc_xxx"), from the 通用事件信封 (general event
+	// envelope) push key header.subscription.target_resource, verbatim.
 	Resource string `json:"resource,omitempty"`
 	// Authority is the normalized subscription authority descriptor (e.g.
-	// "user:ou_xxx" or "app"), derived from
-	// header.subscription.authority{type,principal_id}.
+	// "user:ou_xxx" or "app"), derived from the 通用事件信封 push
+	// header.subscription.authority{type, app_id, open_id} — a "user" authority
+	// keyed by its open_id, an "app" authority as the bare "app".
 	Authority string `json:"authority,omitempty"`
 	// SubscriptionEventID is header.subscription.subscription_event_id: the
 	// preferred component of the refined dedup key, paired with
