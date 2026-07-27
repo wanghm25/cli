@@ -233,19 +233,8 @@ func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, t
 
 	switch strVal(match.State) {
 	case "active":
-		var existingIncluded bool
-		if match.PayloadOptions != nil {
-			existingIncluded = boolVal(match.PayloadOptions.IncludeResourceData)
-		}
-		if existingIncluded != requestedIncludeResourceData {
-			return &ReconcilePlan{
-				Action:   PlanActionConflict,
-				Existing: match,
-				ConflictFields: []errs.InvalidParam{{
-					Name:   "include_resource_data",
-					Reason: fmt.Sprintf("existing subscription has include_resource_data=%t, this request has include_resource_data=%t", existingIncluded, requestedIncludeResourceData),
-				}},
-			}, nil
+		if p := includeResourceDataConflictPlan(match, requestedIncludeResourceData); p != nil {
+			return p, nil
 		}
 		// Filter is a second reuse dimension. An active match may only be reused
 		// when the requested filter equals the remote one; any difference
@@ -287,12 +276,16 @@ func ReconcileExisting(ctx context.Context, svc SubscriptionLister, eventType, t
 				"reconcile: requestedIncludeResourceData=true requires WithEncryptKeyProber (classify now) or WithDeferredEncryptKeyConfirmation (defer to the bus) to resolve an existing include_resource_data=true match; neither was supplied")
 		}
 	case "suspended":
-		// Filter is a reuse dimension on the suspended path too. A suspended
-		// match is reactivated and reused by the caller; reactivating one whose
-		// remote filter differs from the requested filter would bind the caller
-		// to the wrong event stream, so a filter mismatch is a conflict a human
-		// resolves (via update or a new subscription), never a silent
-		// reactivate-reuse — the same fail-closed rule the active path enforces.
+		// A suspended match is reactivated and reused by the caller, so it must
+		// agree with the request on the same reuse dimensions the active path
+		// checks: reactivating a subscription whose include_resource_data or
+		// filter differs would bind the caller to the wrong encryption/event
+		// stream. Each mismatch is a conflict a human resolves (via update or a
+		// new subscription), never a silent reactivate-reuse — the same
+		// fail-closed rule the active path enforces.
+		if p := includeResourceDataConflictPlan(match, requestedIncludeResourceData); p != nil {
+			return p, nil
+		}
 		if !Equal(cfg.requestedFilter, FilterFromSDK(match.Filter)) {
 			return filterConflictPlan(match), nil
 		}
@@ -351,6 +344,28 @@ func probeEncryptedActiveMatch(ctx context.Context, prober EncryptKeyProber, req
 // dimension so they can steer recovery to the non-destructive update path (a
 // filter is changeable in place) rather than delete-and-recreate.
 const FilterConflictField = "filter"
+
+// includeResourceDataConflictPlan returns a PlanActionConflict when an existing
+// match's include_resource_data differs from the request, or nil when they
+// agree. Extracted so the active and suspended reuse paths apply the identical
+// check; the reason names only the boolean flags, never any payload.
+func includeResourceDataConflictPlan(match *larkeventv1.SubscriptionDetail, requested bool) *ReconcilePlan {
+	existing := false
+	if match.PayloadOptions != nil {
+		existing = boolVal(match.PayloadOptions.IncludeResourceData)
+	}
+	if existing == requested {
+		return nil
+	}
+	return &ReconcilePlan{
+		Action:   PlanActionConflict,
+		Existing: match,
+		ConflictFields: []errs.InvalidParam{{
+			Name:   "include_resource_data",
+			Reason: fmt.Sprintf("existing subscription has include_resource_data=%t, this request has include_resource_data=%t", existing, requested),
+		}},
+	}
+}
 
 // filterConflictPlan builds the PlanActionConflict returned when a remote
 // match's filter differs from the requested filter. The reason names

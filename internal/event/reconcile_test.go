@@ -800,3 +800,24 @@ func TestReconcileExisting_Suspended_FilterEqual_ReturnsSuspended(t *testing.T) 
 		t.Errorf("Existing = %+v, want sub_1", plan.Existing)
 	}
 }
+
+func TestReconcileExisting_Suspended_IncludeResourceDataMismatch_ReturnsConflict(t *testing.T) {
+	sub := suspendedSub("sub_1", "authority_revoked")
+	sub.PayloadOptions = &larkeventv1.PayloadOptions{IncludeResourceData: boolPtr(true)}
+	fake := &fakeLister{resp: listResp([]*larkeventv1.SubscriptionDetail{sub})}
+
+	// Requested include_resource_data=false mismatches the suspended sub's true.
+	// Like the filter dimension, a suspended sub must not be silently
+	// reactivated/reused when a reuse dimension differs — the same fail-closed
+	// rule the active path enforces.
+	plan, err := ReconcileExisting(context.Background(), fake, "im.message.created_v1", "im.message?chat_id=oc_aaa", core.AsUser, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.Action != PlanActionConflict {
+		t.Fatalf("Action = %q, want %q (an include_resource_data-incompatible suspended sub must not be silently reactivated/reused)", plan.Action, PlanActionConflict)
+	}
+	if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Name != "include_resource_data" {
+		t.Fatalf("ConflictFields = %+v, want one entry naming include_resource_data", plan.ConflictFields)
+	}
+}
