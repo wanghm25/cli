@@ -408,10 +408,13 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 	// the BUS's own AppID: a bus is per-app, so Hello carries no separate
 	// app_id field to read instead.
 	bc.SetOwnerIdentity(hello.Identity, b.appID, hello.UserOpenID)
-	// Store this consumer's local listening intent. Legacy Hello frames leave
-	// these fields empty/false; lifecycle compatibility checks only compare
-	// refined consumers, whose RemoteSubscriptionID is non-empty.
-	bc.SetListenIntent(hello.TargetResource, hello.IncludeResourceData)
+	// Store this consumer's local listening intent (target_resource,
+	// include_resource_data, and the requested server-side filter). Capture only
+	// for the filter: it has no key-fetch side effect and is optional, so it
+	// never gates the Hello. Legacy Hello frames leave these empty/false/nil;
+	// lifecycle compatibility checks only compare refined consumers, whose
+	// RemoteSubscriptionID is non-empty.
+	bc.SetListenIntent(hello.TargetResource, hello.IncludeResourceData, hello.Filter)
 	bc.SetLogger(b.logger)
 
 	// Reject an INCOMPLETE refined registration before acking: a refined

@@ -256,7 +256,7 @@ func TestHub_Publish_RefinedCrossCheck_TargetResourceMismatch_Dropped(t *testing
 
 	c := NewConn(server, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "")
 	c.SetRemoteSubscriptionID("R1")
-	c.SetListenIntent("im.message?chat_id=oc_1", false)
+	c.SetListenIntent("im.message?chat_id=oc_1", false, nil)
 	c.sendCh = make(chan interface{}, 1)
 	h.RegisterAndIsFirst(c)
 
@@ -312,7 +312,7 @@ func TestHub_Publish_RefinedCrossCheck_AllDimensionsMatch_Delivered(t *testing.T
 
 	c := NewConn(server, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "")
 	c.SetRemoteSubscriptionID("R1")
-	c.SetListenIntent("im.message?chat_id=oc_1", false)
+	c.SetListenIntent("im.message?chat_id=oc_1", false, nil)
 	c.SetOwnerIdentity("user", "cli_app", "ou_abc123")
 	c.sendCh = make(chan interface{}, 1)
 	h.RegisterAndIsFirst(c)
@@ -346,7 +346,7 @@ func TestHub_Publish_RefinedCrossCheck_MissingTargetResource_Dropped(t *testing.
 
 	c := NewConn(server, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "")
 	c.SetRemoteSubscriptionID("R1")
-	c.SetListenIntent("im.message?chat_id=oc_1", false)
+	c.SetListenIntent("im.message?chat_id=oc_1", false, nil)
 	c.SetOwnerIdentity("user", "cli_app", "ou_abc123")
 	c.sendCh = make(chan interface{}, 1)
 	h.RegisterAndIsFirst(c)
@@ -378,7 +378,7 @@ func TestHub_Publish_RefinedCrossCheck_MissingAuthority_Dropped(t *testing.T) {
 
 	c := NewConn(server, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "")
 	c.SetRemoteSubscriptionID("R1")
-	c.SetListenIntent("im.message?chat_id=oc_1", false)
+	c.SetListenIntent("im.message?chat_id=oc_1", false, nil)
 	c.SetOwnerIdentity("user", "cli_app", "ou_abc123")
 	c.sendCh = make(chan interface{}, 1)
 	h.RegisterAndIsFirst(c)
@@ -411,7 +411,7 @@ func TestHub_Publish_RefinedCrossCheck_BotPush_Delivered(t *testing.T) {
 	c := NewConn(server, nil, "im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, 1, "")
 	c.SetRemoteSubscriptionID("R1")
 	// Locally-built intent uses url.QueryEscape (space -> '+').
-	c.SetListenIntent("im.message?chat_id=oc+1", false)
+	c.SetListenIntent("im.message?chat_id=oc+1", false, nil)
 	c.SetOwnerIdentity("bot", "cli_app", "") // bot: empty owner user
 	c.sendCh = make(chan interface{}, 1)
 	h.RegisterAndIsFirst(c)
@@ -481,7 +481,7 @@ func newCrossCheckConn(t *testing.T, eventTypes []string, remoteSubID, ownerOpen
 		c.SetOwnerIdentity("user", "cli_app", ownerOpenID)
 	}
 	if targetResource != "" {
-		c.SetListenIntent(targetResource, false)
+		c.SetListenIntent(targetResource, false, nil)
 	}
 	return c
 }

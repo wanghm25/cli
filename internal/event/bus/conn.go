@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
@@ -55,20 +56,22 @@ type Conn struct {
 	ownerAppID      string
 	ownerUserOpenID string
 
-	// listenTargetResource/listenIncludeResourceData record this consumer's
-	// own local listening INTENT for its remote Subscription — target_resource
-	// and payload_options.include_resource_data — populated from a refined
-	// consumer's HelloV2 (Hello.TargetResource/Hello.IncludeResourceData) in
+	// listenTargetResource/listenIncludeResourceData/listenFilter record this
+	// consumer's own local listening INTENT for its remote Subscription —
+	// target_resource, payload_options.include_resource_data, and the requested
+	// server-side filter — populated from a refined consumer's HelloV2
+	// (Hello.TargetResource/Hello.IncludeResourceData/Hello.Filter) in
 	// handleHello. Same zero-lock, write-once-before-Start()-then-read-only
 	// convention as remoteSubscriptionID/owner* above. Together with
 	// ownerIdentity/ownerAppID/ownerUserOpenID (this consumer's registered
 	// AUTHORITY) these form the complete "local listening intent" the
 	// updated_v1 lifecycle handler (lifecycle.go's classifyUpdateCompatibility)
 	// compares an incoming event's After snapshot against field-by-field,
-	// rather than comparing Authority alone. ""/false (the zero value) for a
+	// rather than comparing Authority alone. ""/false/nil (the zero value) for a
 	// legacy consumer that never calls SetListenIntent.
 	listenTargetResource      string
 	listenIncludeResourceData bool
+	listenFilter              *event.Filter
 
 	// identityMu guards the mutable post-registration identity-gate state
 	// below. Unlike remoteSubscriptionID/owner* (write-once-then-read-only),
@@ -227,12 +230,14 @@ func (c *Conn) OwnerAppID() string { return c.ownerAppID }
 func (c *Conn) OwnerUserOpenID() string { return c.ownerUserOpenID }
 
 // SetListenIntent records this consumer's own local listening intent —
-// target_resource + include_resource_data — from Hello.TargetResource/
-// Hello.IncludeResourceData. Call before Start() (same convention as
-// SetRemoteSubscriptionID/SetOwnerIdentity) — set once, read-only afterward.
-func (c *Conn) SetListenIntent(targetResource string, includeResourceData bool) {
+// target_resource + include_resource_data + the requested server-side filter —
+// from Hello.TargetResource/Hello.IncludeResourceData/Hello.Filter. Call before
+// Start() (same convention as SetRemoteSubscriptionID/SetOwnerIdentity) — set
+// once, read-only afterward.
+func (c *Conn) SetListenIntent(targetResource string, includeResourceData bool, filter *event.Filter) {
 	c.listenTargetResource = targetResource
 	c.listenIncludeResourceData = includeResourceData
+	c.listenFilter = filter
 }
 
 // TargetResource returns this consumer's own local listening intent's
@@ -243,6 +248,11 @@ func (c *Conn) TargetResource() string { return c.listenTargetResource }
 // intent's include_resource_data (false for a legacy consumer / never set,
 // or a genuine plaintext subscription).
 func (c *Conn) IncludeResourceDataIntent() bool { return c.listenIncludeResourceData }
+
+// FilterIntent returns this consumer's own local listening intent's requested
+// server-side filter (nil for a legacy consumer / never set, or a genuine
+// no-filter subscription).
+func (c *Conn) FilterIntent() *event.Filter { return c.listenFilter }
 
 // BoundConnID returns the WS connection_id this consumer's owner was last
 // successfully BindUser'd on ("" = never bound). identity.go's onConnReady

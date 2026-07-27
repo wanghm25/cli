@@ -6,6 +6,7 @@ package source
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -751,6 +752,67 @@ func TestBuildDispatcher_LifecycleEvents_NormalizeFields(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBuildDispatcher_LifecycleUpdated_CapturesFilter locks that updated_v1's
+// after.filter flows into LifecycleEvent (Filter + FilterPresent) so the
+// bus-side compatibility check can compare it against the consumer's own
+// requested filter, and that an after snapshot with no filter section leaves
+// FilterPresent false — resolved later via a Get, never guessed as a confirmed
+// "no filter". A separate test (not a row in the table above) because the
+// filter dimension must be compared with event.Equal, not the table's struct
+// equality.
+func TestBuildDispatcher_LifecycleUpdated_CapturesFilter(t *testing.T) {
+	wantFilter := &event.Filter{Root: &event.FilterNode{
+		LogicOp:  "and",
+		Children: []*event.FilterNode{{Condition: &event.FilterCond{Operand: "chat_id", Op: "eq", Value: "oc_f"}}},
+	}}
+	filterJSON, err := json.Marshal(event.FilterToSDK(wantFilter))
+	if err != nil {
+		t.Fatalf("marshal filter: %v", err)
+	}
+
+	t.Run("after snapshot carries a filter", func(t *testing.T) {
+		body := fmt.Sprintf(`{"after":{"subscription_id":"sub_f","state":"active","filter":%s}}`, filterJSON)
+		got := dispatchOneLifecycleEvent(t, lifecycleEventTypeUpdated, body)
+		if !got.FilterPresent {
+			t.Error("FilterPresent = false, want true (after snapshot carried a filter)")
+		}
+		if !event.Equal(got.Filter, wantFilter) {
+			t.Errorf("Filter = %+v, want a filter equal to %+v", got.Filter, wantFilter)
+		}
+	})
+
+	t.Run("after snapshot omits the filter section", func(t *testing.T) {
+		body := `{"after":{"subscription_id":"sub_g","state":"active"}}`
+		got := dispatchOneLifecycleEvent(t, lifecycleEventTypeUpdated, body)
+		if got.FilterPresent {
+			t.Error("FilterPresent = true, want false (no filter section on the wire)")
+		}
+		if got.Filter != nil {
+			t.Errorf("Filter = %+v, want nil (no filter section on the wire)", got.Filter)
+		}
+	})
+}
+
+// dispatchOneLifecycleEvent drives buildDispatcher's lifecycle handler for one
+// event body and returns the single normalized LifecycleEvent it produced.
+func dispatchOneLifecycleEvent(t *testing.T, eventType, body string) LifecycleEvent {
+	t.Helper()
+	s := &FeishuSource{}
+	var got LifecycleEvent
+	var calls int
+	s.OnLifecycleEvent = func(_ context.Context, le LifecycleEvent) { got = le; calls++ }
+	d := s.buildDispatcher(nil, func(e *event.RawEvent) {
+		t.Fatalf("emit must never be called for a lifecycle event, got %+v", e)
+	})
+	if _, err := d.Do(context.Background(), lifecyclePayload(eventType, body)); err != nil {
+		t.Fatalf("Do failed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("OnLifecycleEvent called %d times, want 1", calls)
+	}
+	return got
 }
 
 // TestBuildDispatcher_LifecycleCollisionWithBusinessType_SkipsLifecycleHandler

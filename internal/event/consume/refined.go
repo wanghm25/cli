@@ -215,6 +215,10 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 			// encrypt_key once (under the owner==current gate) before acking.
 			// The plaintext path leaves this false — no key fetch on the bus.
 			hello.IncludeResourceData = opts.IncludeResourceData
+			// Carry this consumer's requested server-side filter as declared
+			// intent so the bus can compare a later remote filter change against
+			// it. nil (no --filter) is omitted on the wire and read as "no filter".
+			hello.Filter = opts.Filter
 			return doHelloV2(conn, hello)
 		},
 	}

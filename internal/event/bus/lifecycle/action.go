@@ -10,6 +10,7 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/event"
 )
 
 // SummaryAction is one Action implementation: it performs no remote call and
@@ -63,20 +64,22 @@ func markActionResult(conns []Conn, action string, err error) {
 
 // classifyUpdateCompatibility compares the updated_v1 event's AFTER snapshot
 // against lead's own stored local listening intent: target_resource,
-// include_resource_data, and authority. A remote change to just the
-// subscription's target_resource or payload_options, with Authority left
-// untouched, must not be mis-judged as compatible.
+// include_resource_data, authority, and the server-side filter. A remote change
+// to just the subscription's target_resource, payload_options, or filter — with
+// Authority left untouched — must not be mis-judged as compatible.
 //
-// Each of the three dimensions is checked independently: an EMPTY/absent value
-// on the EVENT side (le.Authority=="", le.TargetResource=="", or
-// !le.PayloadOptionsPresent) means that ONE dimension can't be judged, but
-// never by itself forces "unclear" — a CONFIRMED mismatch found on any OTHER
-// dimension is conclusive on its own and wins immediately (no reason to wait on
-// a Get to double-check a dimension we already know disagrees). Only when NONE
-// of the three dimensions produces a confirmed mismatch, but at least one
-// couldn't be judged, does this return "unclear" (the caller then issues a
-// single Get to reconcile — see reconcileWithGet) instead of defaulting to
-// "compatible".
+// Each of the four dimensions is checked independently: an EMPTY/absent value
+// on the EVENT side (le.Authority=="", le.TargetResource=="",
+// !le.PayloadOptionsPresent, or !le.FilterPresent) means that ONE dimension
+// can't be judged, but never by itself forces "unclear" — a CONFIRMED mismatch
+// found on any OTHER dimension is conclusive on its own and wins immediately (no
+// reason to wait on a Get to double-check a dimension we already know
+// disagrees). The filter is compared with event.Equal (a struct, not a scalar):
+// a nil intent and a nil remote filter are equal ("no filter" both sides), and a
+// nil-vs-set pair is a confirmed mismatch. Only when NONE of the four dimensions
+// produces a confirmed mismatch, but at least one couldn't be judged, does this
+// return "unclear" (the caller then issues a single Get to reconcile — see
+// reconcileWithGet) instead of defaulting to "compatible".
 func classifyUpdateCompatibility(le LifecycleEvent, lead Conn) string {
 	unclear := false
 
@@ -98,6 +101,13 @@ func classifyUpdateCompatibility(le LifecycleEvent, lead Conn) string {
 	case !le.PayloadOptionsPresent:
 		unclear = true
 	case le.IncludeResourceData != lead.IncludeResourceDataIntent():
+		return updateIncompatible
+	}
+
+	switch {
+	case !le.FilterPresent:
+		unclear = true
+	case !event.Equal(le.Filter, lead.FilterIntent()):
 		return updateIncompatible
 	}
 

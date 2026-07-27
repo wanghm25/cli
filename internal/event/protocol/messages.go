@@ -3,7 +3,11 @@
 
 package protocol
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/larksuite/cli/internal/event"
+)
 
 const (
 	MsgTypeHello            = "hello"
@@ -149,6 +153,17 @@ type Hello struct {
 	// hot-path network. Empty/false is the plaintext path (no key fetch). Only
 	// meaningful alongside a non-empty RemoteSubscriptionID.
 	IncludeResourceData bool `json:"include_resource_data,omitempty"`
+
+	// Filter is this consumer's requested server-side event filter (nil when no
+	// filter was requested). The platform applies the filter server-side and
+	// pushes only matching events, so the bus never filters on it — it is carried
+	// here purely as this consumer's declared intent. The bus stores it on the
+	// registered Conn so a later updated_v1 lifecycle event that changes the
+	// subscription's filter can be judged against what this consumer asked for,
+	// exactly like TargetResource/IncludeResourceData above. Serialized via the
+	// CLI filter model across this internal IPC boundary (both ends are the same
+	// build). Only meaningful alongside a non-empty RemoteSubscriptionID.
+	Filter *event.Filter `json:"filter,omitempty"`
 
 	// Capabilities lists protocol/feature markers this Hello's sender
 	// understands, e.g. "hello_v2". This is the chosen capability/version

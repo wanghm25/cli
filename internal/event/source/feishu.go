@@ -139,6 +139,21 @@ type LifecycleEvent struct {
 	// from "unknown" rather than silently treating a missing field as a
 	// confirmed false.
 	PayloadOptionsPresent bool
+
+	// Filter is the AFTER snapshot's server-side event filter, projected into
+	// the CLI filter model and populated ONLY for updated_v1
+	// (handleSubscriptionUpdated) — meaningful ONLY when FilterPresent is true.
+	// nil means the after snapshot carried no filter section.
+	Filter *event.Filter
+
+	// FilterPresent distinguishes "the after snapshot carried a filter section"
+	// (true) from "it did not" (false). A nil Filter is ALSO what an absent
+	// filter normalizes to, so this flag is what lets a caller tell a genuine
+	// "no filter" apart from "unknown". Like PayloadOptionsPresent, an
+	// updated_v1 that omits the filter stays FilterPresent==false and is
+	// resolved authoritatively via a Get, never guessed as a confirmed
+	// "no filter"; a Get-projected snapshot always sets it true.
+	FilterPresent bool
 }
 
 func (s *FeishuSource) Name() string { return "feishu-websocket" }
@@ -426,6 +441,15 @@ func (s *FeishuSource) handleSubscriptionUpdated(ctx context.Context, e *larkeve
 	if after.PayloadOptions != nil && after.PayloadOptions.IncludeResourceData != nil {
 		le.PayloadOptionsPresent = true
 		le.IncludeResourceData = *after.PayloadOptions.IncludeResourceData
+	}
+	// The filter is applied server-side, so an updated_v1 that changes it away
+	// from what this consumer asked for is a compatibility break too. Capture it
+	// only when the after snapshot actually carried a filter section; an absent
+	// one stays FilterPresent==false (resolved authoritatively via a Get later),
+	// never guessed as a confirmed "no filter".
+	if after.Filter != nil {
+		le.Filter = event.FilterFromSDK(after.Filter)
+		le.FilterPresent = true
 	}
 	s.dispatchLifecycleEvent(ctx, le)
 	return nil

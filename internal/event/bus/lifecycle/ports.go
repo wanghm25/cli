@@ -16,6 +16,8 @@ import (
 	"context"
 
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
+
+	"github.com/larksuite/cli/internal/event"
 )
 
 // Conn is one consumer connection, as the lifecycle actions need to observe
@@ -47,10 +49,12 @@ type Conn interface {
 	// registration; OwnerUserOpenID()=="" marks a bot or legacy consumer.
 	OwnerAppID() string
 	OwnerUserOpenID() string
-	// TargetResource / IncludeResourceDataIntent are this consumer's own local
-	// listening intent, compared against an updated_v1 event's after snapshot.
+	// TargetResource / IncludeResourceDataIntent / FilterIntent are this
+	// consumer's own local listening intent, compared against an updated_v1
+	// event's after snapshot.
 	TargetResource() string
 	IncludeResourceDataIntent() bool
+	FilterIntent() *event.Filter
 }
 
 // Registry looks up the consumers bound to a remote Subscription. The host

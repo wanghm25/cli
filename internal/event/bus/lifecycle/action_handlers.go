@@ -8,6 +8,7 @@ import (
 
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
+	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/source"
 )
 
@@ -242,7 +243,7 @@ func (a *SubscriptionAction) handleDeleted(le LifecycleEvent, conns []Conn) erro
 // updated (target_resource/authority/include_resource_data) without ever
 // producing an observed updated_v1 (e.g. this bus was offline when it fired).
 // So "active" additionally projects the fetched Subscription into the same
-// 3-dimension shape classifyUpdateCompatibility already compares an
+// 4-dimension shape classifyUpdateCompatibility already compares an
 // updated_v1's After snapshot through, and reuses that identical compare
 // against lead's stored intent — degraded is cleared ONLY when active AND
 // compatible; active-but-incompatible degrades exactly like updated_v1's own
@@ -318,11 +319,12 @@ func (a *SubscriptionAction) reconcileWithGet(ctx context.Context, le LifecycleE
 
 // projectSubscriptionCompatibility turns a Get response's Subscription
 // snapshot into the same {Authority,TargetResource,IncludeResourceData,
-// PayloadOptionsPresent} shape classifyUpdateCompatibility already compares
-// an updated_v1 event's After snapshot through — using the SAME authority
-// normalization (source.FormatLifecycleAuthority) an actual lifecycle event
-// would carry — so reconcileWithGet's "active" branch can reuse that
-// identical 3-dimension compare rather than re-deriving it or trusting
+// PayloadOptionsPresent,Filter,FilterPresent} shape
+// classifyUpdateCompatibility already compares an updated_v1 event's After
+// snapshot through — using the SAME authority normalization
+// (source.FormatLifecycleAuthority) an actual lifecycle event would carry — so
+// reconcileWithGet's "active" branch can reuse that identical 4-dimension
+// compare rather than re-deriving it or trusting
 // state=="active" alone. d==nil (a malformed/empty Get response) projects to
 // the zero value: every dimension reads as "absent", which
 // classifyUpdateCompatibility already treats as "unclear" rather than a
@@ -339,5 +341,10 @@ func projectSubscriptionCompatibility(d *larkeventv1.SubscriptionDetail) Lifecyc
 		le.PayloadOptionsPresent = true
 		le.IncludeResourceData = *d.PayloadOptions.IncludeResourceData
 	}
+	// A Get carries the authoritative filter, so this dimension is always known
+	// here: d.Filter==nil projects to an empty (no-filter) model — distinct from
+	// the updated_v1 path, where an absent filter means "unknown".
+	le.FilterPresent = true
+	le.Filter = event.FilterFromSDK(d.Filter)
 	return le
 }

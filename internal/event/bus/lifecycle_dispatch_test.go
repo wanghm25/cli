@@ -14,6 +14,7 @@ import (
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 )
 
@@ -123,6 +124,15 @@ func buildGetRespActive(targetResource, authorityUserOpenID string, includeResou
 		PayloadOptions(larkeventv1.NewPayloadOptionsBuilder().IncludeResourceData(includeResourceData).Build()).
 		Build()
 	return &larkeventv1.GetSubscriptionResp{Data: &larkeventv1.GetSubscriptionRespData{Subscription: d}}
+}
+
+// buildGetRespActiveWithFilter is buildGetRespActive plus a server-side filter
+// on the returned snapshot, for exercising the filter dimension of
+// reconcileWithGet's "active" projection.
+func buildGetRespActiveWithFilter(targetResource, authorityUserOpenID string, includeResourceData bool, f *event.Filter) *larkeventv1.GetSubscriptionResp {
+	resp := buildGetRespActive(targetResource, authorityUserOpenID, includeResourceData)
+	resp.Data.Subscription.Filter = event.FilterToSDK(f)
+	return resp
 }
 
 // newLifecycleDispatchTestConn builds a *Conn registered on hub with BOTH a
@@ -640,12 +650,15 @@ func TestSubscriptionLifecycleAction_Updated_Compatible_Continue(t *testing.T) {
 	// This consumer's own local listening intent (issue #7) — the event
 	// below must match ALL THREE dimensions (authority + target_resource +
 	// include_resource_data) for this to classify compatible.
-	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
 	le := lifecycle.LifecycleEvent{
 		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
 		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
 		IncludeResourceData: true, PayloadOptionsPresent: true,
+		// FilterPresent with a nil Filter matches this consumer's own nil filter
+		// intent, so all four dimensions are determinate and compatible — no Get.
+		FilterPresent: true,
 	}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
 		t.Fatalf("Handle returned err: %v", err)
@@ -666,7 +679,7 @@ func TestSubscriptionLifecycleAction_Updated_DifferingTargetResource_DegradedCon
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
-	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
 
 	le := lifecycle.LifecycleEvent{
@@ -692,7 +705,7 @@ func TestSubscriptionLifecycleAction_Updated_DifferingIncludeResourceData_Degrad
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
-	c.SetListenIntent("im.message?chat_id=oc_1", true) // this consumer's own ENCRYPTED intent
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil) // this consumer's own ENCRYPTED intent
 	hub.RegisterAndIsFirst(c)
 
 	le := lifecycle.LifecycleEvent{
@@ -719,7 +732,7 @@ func TestSubscriptionLifecycleAction_Updated_MissingPayloadOptions_SingleGetReco
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
-	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
 	deps.client.getResp = buildGetResp("active", "")
 
@@ -780,6 +793,146 @@ func TestSubscriptionLifecycleAction_Updated_UnclearAuthority_SingleGetReconcile
 }
 
 // =========================================================================
+// updated -- filter dimension (the 4th compatibility dimension). The filter is
+// applied server-side, so a remote filter change away from what this consumer
+// asked for degrades it exactly like the other three dimensions. Compared with
+// event.Equal (a struct, never ==), and a nil filter distinguished from an
+// absent one (FilterPresent).
+// =========================================================================
+
+// TestSubscriptionLifecycleAction_Updated_MatchingFilter_Compatible: an
+// updated_v1 whose after snapshot carries a filter Equal to this consumer's own
+// filter intent (all other dimensions matching too) classifies compatible --
+// no reconcile Get.
+func TestSubscriptionLifecycleAction_Updated_MatchingFilter_Compatible(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true, newListenIntentTestFilter("oc_1"))
+	hub.RegisterAndIsFirst(c)
+	le := lifecycle.LifecycleEvent{
+		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
+		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
+		IncludeResourceData: true, PayloadOptionsPresent: true,
+		Filter: newListenIntentTestFilter("oc_1"), FilterPresent: true,
+	}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := c.DegradedReason(); got != "" {
+		t.Errorf("DegradedReason() = %q, want \"\" (filter Equal intent -> compatible)", got)
+	}
+	if deps.client.getCount() != 0 {
+		t.Errorf("Get call count = %d, want 0 (compatible -- no reconcile)", deps.client.getCount())
+	}
+}
+
+// TestSubscriptionLifecycleAction_Updated_DifferingFilter_DegradedConflict: a
+// remote filter change (all other dimensions still matching) is caught as a
+// conflict -- proving the filter is a real 4th dimension and a clear mismatch
+// needs no reconcile Get.
+func TestSubscriptionLifecycleAction_Updated_DifferingFilter_DegradedConflict(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true, newListenIntentTestFilter("oc_1"))
+	hub.RegisterAndIsFirst(c)
+	le := lifecycle.LifecycleEvent{
+		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
+		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
+		IncludeResourceData: true, PayloadOptionsPresent: true,
+		Filter: newListenIntentTestFilter("oc_DIFFERENT"), FilterPresent: true,
+	}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q (filter changed remotely)", got, lifecycle.ReasonRemoteSubscriptionConflict)
+	}
+	if got := c.NextAction(); got != lifecycle.NextActionGet {
+		t.Errorf("NextAction() = %q, want %q", got, lifecycle.NextActionGet)
+	}
+	if deps.client.getCount() != 0 {
+		t.Errorf("Get call count = %d, want 0 (a clear filter mismatch needs no reconcile)", deps.client.getCount())
+	}
+}
+
+// TestSubscriptionLifecycleAction_Updated_NilIntentFilteredRemote_DegradedConflict:
+// a consumer that asked for NO filter is a conflict once the remote
+// subscription is updated to add one (nil intent vs a set remote filter).
+func TestSubscriptionLifecycleAction_Updated_NilIntentFilteredRemote_DegradedConflict(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil) // no filter intent
+	hub.RegisterAndIsFirst(c)
+	le := lifecycle.LifecycleEvent{
+		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
+		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
+		IncludeResourceData: true, PayloadOptionsPresent: true,
+		Filter: newListenIntentTestFilter("oc_1"), FilterPresent: true,
+	}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q (nil intent vs a set remote filter)", got, lifecycle.ReasonRemoteSubscriptionConflict)
+	}
+}
+
+// TestSubscriptionLifecycleAction_Updated_FilteredIntentClearedRemote_DegradedConflict:
+// the inverse -- a consumer that asked FOR a filter is a conflict once the
+// remote is updated to a definitively no-filter state (a set intent vs an empty
+// remote filter). FilterPresent=true with a nil Filter is exactly how a
+// no-filter subscription projects.
+func TestSubscriptionLifecycleAction_Updated_FilteredIntentClearedRemote_DegradedConflict(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true, newListenIntentTestFilter("oc_1"))
+	hub.RegisterAndIsFirst(c)
+	le := lifecycle.LifecycleEvent{
+		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
+		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
+		IncludeResourceData: true, PayloadOptionsPresent: true,
+		FilterPresent: true, // a definitive no-filter (nil Filter) remote state
+	}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q (a set intent vs a cleared remote filter)", got, lifecycle.ReasonRemoteSubscriptionConflict)
+	}
+}
+
+// TestSubscriptionLifecycleAction_Updated_MissingFilter_SingleGetReconcile: all
+// three prior dimensions match, but the after snapshot didn't carry a filter
+// section (FilterPresent=false) -> unknown, so a single Get reconciles rather
+// than guessing compatible.
+func TestSubscriptionLifecycleAction_Updated_MissingFilter_SingleGetReconcile(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
+	hub.RegisterAndIsFirst(c)
+	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_1", "ou_alice", true)
+
+	le := lifecycle.LifecycleEvent{
+		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
+		Authority: "user:ou_alice", TargetResource: "im.message?chat_id=oc_1",
+		IncludeResourceData: true, PayloadOptionsPresent: true,
+		// FilterPresent deliberately left false: the after snapshot carried no
+		// filter section, so the filter dimension is unknown.
+	}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := deps.client.getCount(); got != 1 {
+		t.Errorf("Get call count = %d, want 1 (filter unknown -> single Get reconcile, never guessed compatible)", got)
+	}
+}
+
+// =========================================================================
 // reconcileWithGet's "active" branch (issue #23): state=="active" alone is
 // not proof this consumer's own local intent is still honored -- the Get
 // response is additionally projected into the same 3-dimension shape
@@ -795,7 +948,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveCompatible_ClearsDeg
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
-	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	c.SetDegraded(lifecycle.ReasonRemoteSubscriptionConflict) // simulate an earlier degraded evaluation
 	hub.RegisterAndIsFirst(c)
 	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_1", "ou_alice", true)
@@ -822,7 +975,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleTargetRe
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
-	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
 	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_DIFFERENT", "ou_alice", true)
 
@@ -844,7 +997,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleIncludeR
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
-	c.SetListenIntent("im.message?chat_id=oc_1", true) // this consumer's own ENCRYPTED intent
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil) // this consumer's own ENCRYPTED intent
 	hub.RegisterAndIsFirst(c)
 	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_1", "ou_alice", false) // Get reports plaintext
 
@@ -863,7 +1016,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleAuthorit
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
-	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
 	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_1", "ou_SOMEONE_ELSE", true)
 
@@ -876,6 +1029,36 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleAuthorit
 	}
 }
 
+// TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleFilter_StaysDegraded
+// locks the negative case for the filter dimension: the Get response reports
+// active, but its own server-side filter disagrees with this consumer's stored
+// filter intent -- proving projectSubscriptionCompatibility captures d.Filter
+// (always FilterPresent) and state=="active" does not by itself clear degraded.
+func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleFilter_StaysDegraded(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	c.SetListenIntent("im.message?chat_id=oc_1", true, newListenIntentTestFilter("oc_1"))
+	hub.RegisterAndIsFirst(c)
+	deps.client.getResp = buildGetRespActiveWithFilter("im.message?chat_id=oc_1", "ou_alice", true, newListenIntentTestFilter("oc_DIFFERENT"))
+
+	// Authority=="" forces classifyUpdateCompatibility to "unclear", triggering
+	// the single Get reconcile this test exercises.
+	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
+	if err := deps.action.Handle(context.Background(), le); err != nil {
+		t.Fatalf("Handle returned err: %v", err)
+	}
+	if got := deps.client.getCount(); got != 1 {
+		t.Fatalf("Get call count = %d, want 1", got)
+	}
+	if got := c.DegradedReason(); got != lifecycle.ReasonRemoteSubscriptionConflict {
+		t.Errorf("DegradedReason() = %q, want %q (Get's own filter disagrees)", got, lifecycle.ReasonRemoteSubscriptionConflict)
+	}
+	if got := c.NextAction(); got != lifecycle.NextActionGet {
+		t.Errorf("NextAction() = %q, want %q", got, lifecycle.NextActionGet)
+	}
+}
+
 // TestSubscriptionLifecycleAction_ReconcileWithGet_Suspended_Unchanged locks
 // that the suspended branch is untouched by the active-only compatibility
 // check above — it never even looks at target_resource/authority/
@@ -884,7 +1067,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_Suspended_Unchanged(t *tes
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
-	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
 	deps.client.getResp = buildGetResp("suspended", "some_future_unrecognized_code")
 
@@ -906,7 +1089,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_Expired_Unchanged(t *testi
 	hub := NewHub()
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
-	c.SetListenIntent("im.message?chat_id=oc_1", true)
+	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
 	deps.client.getResp = buildGetResp("expired", "")
 

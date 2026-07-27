@@ -14,6 +14,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/larksuite/cli/internal/event"
 )
 
 // Every NewXxx helper must set the Type discriminator (Decode rejects messages without it).
@@ -189,6 +191,52 @@ func TestHello_V2FieldsRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Capabilities, h.Capabilities) {
 		t.Errorf("Capabilities = %v, want %v", got.Capabilities, h.Capabilities)
+	}
+}
+
+// TestHello_FilterRoundTrip pins that a Hello carrying a requested server-side
+// filter survives the internal IPC Encode/Decode intact — both ends are the
+// same build, so the CLI filter model round-trips through the wire — and that
+// an absent filter is omitted, keeping a no-filter consumer byte-identical on
+// the wire.
+func TestHello_FilterRoundTrip(t *testing.T) {
+	filter := &event.Filter{Root: &event.FilterNode{
+		LogicOp:  "and",
+		Children: []*event.FilterNode{{Condition: &event.FilterCond{Operand: "chat_id", Op: "eq", Value: "oc_xxx"}}},
+	}}
+	h := &Hello{
+		Type:                 MsgTypeHello,
+		PID:                  7,
+		EventKey:             "im.message.created_v1/chat-id/oc_xxx",
+		EventTypes:           []string{"im.message.created_v1"},
+		Version:              "v1",
+		RemoteSubscriptionID: "sub_filter",
+		TargetResource:       "im.message?chat_id=oc_xxx",
+		Filter:               filter,
+	}
+	var buf bytes.Buffer
+	if err := Encode(&buf, h); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	msg, err := Decode(bytes.TrimRight(buf.Bytes(), "\n"))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got, ok := msg.(*Hello)
+	if !ok {
+		t.Fatalf("decoded type = %T, want *Hello", msg)
+	}
+	if !event.Equal(got.Filter, filter) {
+		t.Errorf("Filter did not round-trip: got %+v, want %+v", got.Filter, filter)
+	}
+
+	h.Filter = nil
+	data, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(data, []byte(`"filter"`)) {
+		t.Errorf("nil filter leaked onto wire: %s", data)
 	}
 }
 

@@ -221,6 +221,7 @@ func TestHandleHello_PopulatesListenIntentFromHelloV2(t *testing.T) {
 		RemoteSubscriptionID: "sub_listen_intent",
 		TargetResource:       "im.message?chat_id=oc_1",
 		IncludeResourceData:  true,
+		Filter:               newListenIntentTestFilter("oc_1"),
 	}
 	ack := readAckFromClient(t, b, hello)
 	if ack.Rejected {
@@ -237,6 +238,9 @@ func TestHandleHello_PopulatesListenIntentFromHelloV2(t *testing.T) {
 	}
 	if got := c.IncludeResourceDataIntent(); !got {
 		t.Errorf("IncludeResourceDataIntent() = %v, want true", got)
+	}
+	if got := c.FilterIntent(); !event.Equal(got, hello.Filter) {
+		t.Errorf("FilterIntent() = %+v, want the Hello's filter %+v", got, hello.Filter)
 	}
 }
 
@@ -266,6 +270,9 @@ func TestHandleHello_LegacyHello_LeavesListenIntentEmpty(t *testing.T) {
 	}
 	if got := found.IncludeResourceDataIntent(); got {
 		t.Errorf("IncludeResourceDataIntent() = %v, want false for a legacy Hello", got)
+	}
+	if got := found.FilterIntent(); got != nil {
+		t.Errorf("FilterIntent() = %+v, want nil for a legacy Hello", got)
 	}
 }
 

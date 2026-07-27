@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
@@ -237,6 +238,9 @@ func TestConn_ListenIntent_DefaultEmpty(t *testing.T) {
 	if got := conn.IncludeResourceDataIntent(); got {
 		t.Errorf("IncludeResourceDataIntent() on a fresh Conn = %v, want false (legacy default)", got)
 	}
+	if got := conn.FilterIntent(); got != nil {
+		t.Errorf("FilterIntent() on a fresh Conn = %v, want nil (legacy default)", got)
+	}
 }
 
 func TestConn_SetListenIntent_RoundTrips(t *testing.T) {
@@ -244,13 +248,26 @@ func TestConn_SetListenIntent_RoundTrips(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
-	conn.SetListenIntent("im.message?chat_id=oc_1", true)
+	filter := newListenIntentTestFilter("oc_1")
+	conn.SetListenIntent("im.message?chat_id=oc_1", true, filter)
 	if got := conn.TargetResource(); got != "im.message?chat_id=oc_1" {
 		t.Errorf("TargetResource() = %q, want %q", got, "im.message?chat_id=oc_1")
 	}
 	if got := conn.IncludeResourceDataIntent(); !got {
 		t.Errorf("IncludeResourceDataIntent() = %v, want true", got)
 	}
+	if got := conn.FilterIntent(); !event.Equal(got, filter) {
+		t.Errorf("FilterIntent() = %+v, want the stored filter %+v", got, filter)
+	}
+}
+
+// newListenIntentTestFilter builds a small, valid CLI filter for listen-intent
+// round-trip assertions.
+func newListenIntentTestFilter(chatID string) *event.Filter {
+	return &event.Filter{Root: &event.FilterNode{
+		LogicOp:  "and",
+		Children: []*event.FilterNode{{Condition: &event.FilterCond{Operand: "chat_id", Op: "eq", Value: chatID}}},
+	}}
 }
 
 func TestConn_BoundConnID_DefaultEmpty(t *testing.T) {
