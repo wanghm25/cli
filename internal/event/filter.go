@@ -63,7 +63,7 @@ func (f *Filter) IsEmpty() bool {
 // unordered/set semantics later if the platform confirms order-insensitive
 // matching.
 func (f *Filter) Canonicalize() ([]byte, error) {
-	return json.Marshal(filterToSDK(f))
+	return json.Marshal(FilterToSDK(f))
 }
 
 // Equal reports whether two filters are semantically equal via their canonical

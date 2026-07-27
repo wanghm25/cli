@@ -9,12 +9,16 @@ import (
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 )
 
-// filterToSDK projects the CLI filter model onto the SDK filter type at the API
+// FilterToSDK projects the CLI filter model onto the SDK filter type at the API
 // boundary. An empty (or cleared) filter becomes a non-nil empty *Filter, which
 // serializes to the product's clear-filter wire form {"filter":{}} — returning
 // nil instead would be omitted by the request encoder and read as "leave the
 // filter unchanged", which is a different intent.
-func filterToSDK(f *Filter) *larkeventv1.Filter {
+//
+// It is exported so the command layer (create/consume/reads) can project a CLI
+// filter to the SDK request type at its own API boundary without duplicating
+// this mapping; those packages already import the SDK type to build requests.
+func FilterToSDK(f *Filter) *larkeventv1.Filter {
 	if f.IsEmpty() {
 		return &larkeventv1.Filter{}
 	}
@@ -52,9 +56,13 @@ func condToSDK(c *FilterCond) *larkeventv1.Contidion {
 	return out
 }
 
-// filterFromSDK builds the CLI filter model from the SDK filter type. A nil or
+// FilterFromSDK builds the CLI filter model from the SDK filter type. A nil or
 // empty SDK filter yields an empty (no-filter) CLI model.
-func filterFromSDK(sf *larkeventv1.Filter) *Filter {
+//
+// Exported alongside FilterToSDK so callers can project a remote SDK filter
+// back into the CLI model — to compare it against a requested filter, or to
+// surface it (canonicalized) in read output.
+func FilterFromSDK(sf *larkeventv1.Filter) *Filter {
 	if sf == nil || sf.CompositeCondition == nil {
 		return &Filter{}
 	}

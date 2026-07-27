@@ -22,7 +22,7 @@ func sampleFilter() *Filter {
 }
 
 func TestFilterToSDK_SerializationContract(t *testing.T) {
-	raw, err := json.Marshal(filterToSDK(sampleFilter()))
+	raw, err := json.Marshal(FilterToSDK(sampleFilter()))
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestFilterToSDK_SerializationContract(t *testing.T) {
 func TestFilterProjection_RoundTrip(t *testing.T) {
 	original := sampleFilter()
 
-	back := filterFromSDK(filterToSDK(original))
+	back := FilterFromSDK(FilterToSDK(original))
 
 	if !Equal(original, back) {
 		oc, _ := original.Canonicalize()
@@ -68,7 +68,7 @@ func TestFilterToSDK_ClearForm(t *testing.T) {
 		"empty-model": {},
 	} {
 		t.Run(name, func(t *testing.T) {
-			sdk := filterToSDK(f)
+			sdk := FilterToSDK(f)
 			if sdk == nil {
 				t.Fatal("clear filter must project to a non-nil &Filter{}, not nil")
 			}
@@ -87,10 +87,10 @@ func TestFilterToSDK_ClearForm(t *testing.T) {
 }
 
 func TestFilterFromSDK_NilAndEmptyAreEmpty(t *testing.T) {
-	if !filterFromSDK(nil).IsEmpty() {
-		t.Error("filterFromSDK(nil) should be empty")
+	if !FilterFromSDK(nil).IsEmpty() {
+		t.Error("FilterFromSDK(nil) should be empty")
 	}
-	if !filterFromSDK(filterToSDK(&Filter{})).IsEmpty() {
+	if !FilterFromSDK(FilterToSDK(&Filter{})).IsEmpty() {
 		t.Error("round-tripped empty filter should be empty")
 	}
 }
