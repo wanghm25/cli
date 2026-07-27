@@ -1195,6 +1195,9 @@ func TestRunRefinedChain_HelloRejectedDecryptKeyUnavailable_TypedError_NotReady(
 	if strings.Contains(ve.Hint, "only one consumer") {
 		t.Errorf("a decrypt_key_unavailable rejection must NOT reuse the single-consumer hint, got: %v", ve.Hint)
 	}
+	if !strings.Contains(ve.Hint, "created_by_this_attempt") || !strings.Contains(ve.Hint, "next_action") {
+		t.Errorf("hint must carry the created_by_this_attempt/next_action recovery fields (Apply may have written remote state before the reject), got: %v", ve.Hint)
+	}
 	if strings.Contains(stderr.String(), "ready") {
 		t.Errorf("consumer must NOT emit the ready marker on a decrypt_key_unavailable rejection; stderr:\n%s", stderr.String())
 	}
@@ -1243,6 +1246,9 @@ func TestRunRefinedChain_HelloRejectedBindFailed_TypedError_NotReady(t *testing.
 	if strings.Contains(ve.Hint, "only one consumer") {
 		t.Errorf("an identity_bind_failed rejection must NOT reuse the single-consumer hint, got: %v", ve.Hint)
 	}
+	if !strings.Contains(ve.Hint, "created_by_this_attempt") || !strings.Contains(ve.Hint, "next_action") {
+		t.Errorf("hint must carry the created_by_this_attempt/next_action recovery fields, got: %v", ve.Hint)
+	}
 	if strings.Contains(stderr.String(), "ready") {
 		t.Errorf("consumer must NOT emit the ready marker on an identity_bind_failed rejection; stderr:\n%s", stderr.String())
 	}
@@ -1287,6 +1293,9 @@ func TestRunRefinedChain_HelloRejectedIncompleteRefinedHello_TypedError_NotReady
 	}
 	if strings.Contains(ie.Hint, "only one consumer") {
 		t.Errorf("an incomplete_refined_hello rejection must NOT reuse the single-consumer hint, got: %v", ie.Hint)
+	}
+	if !strings.Contains(ie.Hint, "created_by_this_attempt") || !strings.Contains(ie.Hint, "next_action") {
+		t.Errorf("hint must carry the created_by_this_attempt/next_action recovery fields, got: %v", ie.Hint)
 	}
 	if strings.Contains(stderr.String(), "ready") {
 		t.Errorf("consumer must NOT emit the ready marker on an incomplete_refined_hello rejection; stderr:\n%s", stderr.String())
