@@ -1,0 +1,140 @@
+{
+  "key": "im.message.created_v1",
+  "display_name": "Message created (refined)",
+  "description": "监听指定资源上的新消息创建事件；必须结合模板使用",
+  "event_type": "im.message.created_v1",
+  "subscription_type": "event",
+  "schema": {
+    "custom": {
+      "raw": {
+        "type": "object",
+        "description": "meta-swap placeholder: minimal mock output schema for im.message.created_v1, pending the fetch_meta-driven refined catalog (design spec section 2.2). Not the final resolved_output_schema.",
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "description": "Message ID; placeholder mock field only"
+          }
+        }
+      }
+    }
+  },
+  "scopes": [
+    "event:subscription:read",
+    "event:subscription:write"
+  ],
+  "auth_types": [
+    "user",
+    "bot"
+  ],
+  "buffer_size": 100,
+  "workers": 1,
+  "refined_subscription": true,
+  "resource_type": "im.message",
+  "key_templates": [
+    {
+      "template": "im.message.created_v1/chat-id/{chat_id}",
+      "example": "im.message.created_v1/chat-id/oc_9f3b1c2d8a",
+      "description": "监听指定会话内的新消息",
+      "selector_key": "chat_id",
+      "path_segment": "chat-id",
+      "auth_types": [
+        "user",
+        "bot"
+      ]
+    },
+    {
+      "template": "im.message.created_v1/owner/me",
+      "example": "im.message.created_v1/owner/me",
+      "description": "监听当前登录用户可见的新消息；me 是固定值，按订阅身份解析",
+      "selector_key": "owner",
+      "path_segment": "owner",
+      "fixed_value": "me",
+      "auth_types": [
+        "user"
+      ]
+    }
+  ],
+  "resolved_output_schema": {
+    "type": "object",
+    "description": "meta-swap placeholder: minimal mock output schema for im.message.created_v1, pending the fetch_meta-driven refined catalog (design spec section 2.2). Not the final resolved_output_schema.",
+    "properties": {
+      "message_id": {
+        "type": "string",
+        "description": "Message ID; placeholder mock field only"
+      }
+    }
+  },
+  "jq_root_path": ".",
+  "conditional_scopes": [
+    {
+      "scope": "event:encrypt_key:read",
+      "when": "--include-resource-data set with --as user"
+    }
+  ],
+  "risk": {
+    "ordinary_event_key": "read",
+    "effective": "write",
+    "reason": "refined consume may create, reuse, reactivate, or bind remote resources",
+    "dry_run_recommended": true
+  },
+  "subscription": {
+    "payload_options": {
+      "include_resource_data_default": false,
+      "include_resource_data_flag": "--include-resource-data"
+    },
+    "dry_run": {
+      "supported": true,
+      "example": "lark-cli event subscription create im.message.created_v1/chat-id/oc_9f3b1c2d8a --dry-run --json"
+    },
+    "filter": {
+      "supported": true,
+      "optional": true,
+      "input_flag": "--filter",
+      "format": "json",
+      "logic_ops": [
+        "and",
+        "or"
+      ],
+      "operators": [
+        "eq",
+        "in",
+        "contains"
+      ],
+      "max_depth": 2,
+      "max_conditions": 10,
+      "max_bytes": 1024,
+      "operands": [
+        {
+          "key": "sender",
+          "operators": [
+            "eq"
+          ],
+          "input_value_type": "open_id"
+        },
+        {
+          "key": "message_type",
+          "operators": [
+            "eq",
+            "in"
+          ],
+          "list_value_max_items": 10
+        }
+      ],
+      "example": {
+        "composite_condition": {
+          "logic_op": "and",
+          "composite_conditions": [
+            {
+              "condition": {
+                "operand": "sender",
+                "op": "eq",
+                "value": "ou_xxx"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "next_action": "run `lark-cli event subscription create im.message.created_v1/chat-id/oc_9f3b1c2d8a --dry-run --json` before consume"
+}

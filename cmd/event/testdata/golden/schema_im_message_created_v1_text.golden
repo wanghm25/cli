@@ -1,0 +1,31 @@
+Key:         im.message.created_v1
+Description: 监听指定资源上的新消息创建事件；必须结合模板使用
+Event:       im.message.created_v1
+
+Required Scopes:
+  - event:subscription:read
+  - event:subscription:write
+
+Refined Subscription: yes
+Resource Type: im.message
+Conditional Scopes:
+  - event:encrypt_key:read (when --include-resource-data set with --as user)
+Risk: ordinary read, effective write — refined consume may create, reuse, reactivate, or bind remote resources (dry-run recommended)
+Payload Options: --include-resource-data (include_resource_data default: false)
+Dry Run: supported — lark-cli event subscription create im.message.created_v1/chat-id/oc_9f3b1c2d8a --dry-run --json
+Next Action: run `lark-cli event subscription create im.message.created_v1/chat-id/oc_9f3b1c2d8a --dry-run --json` before consume
+Filter: supported — --filter (optional, json); logic and/or; operators eq/in/contains; max depth 2, max conditions 10, max bytes 1024
+  - sender: eq (open_id)
+  - message_type: eq/in [list<=10]
+
+Output Schema:
+  {
+    "type": "object",
+    "description": "meta-swap placeholder: minimal mock output schema for im.message.created_v1, pending the fetch_meta-driven refined catalog (design spec section 2.2). Not the final resolved_output_schema.",
+    "properties": {
+      "message_id": {
+        "type": "string",
+        "description": "Message ID; placeholder mock field only"
+      }
+    }
+  }

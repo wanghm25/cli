@@ -1,0 +1,113 @@
+{
+  "key": "approval.instance.status_changed_v4",
+  "display_name": "Approval instance status changed",
+  "description": "Triggered after an approval instance status becomes visible to the requester or approval participants",
+  "event_type": "approval.instance.status_changed_v4",
+  "subscription_type": "event",
+  "params": [
+    {
+      "name": "subscription_type",
+      "type": "multi",
+      "required": false,
+      "description": "Approval subscription relation type(s) to register for the current authorized user. Omit to register both involved and managed approval relations.",
+      "values": [
+        {
+          "value": "INVOLVED_APPROVAL",
+          "desc": "Receive events where the current user is the approval requester or approver."
+        },
+        {
+          "value": "MANAGED_APPROVAL",
+          "desc": "Receive events under approval definitions managed by the current user."
+        }
+      ]
+    }
+  ],
+  "schema": {
+    "custom": {}
+  },
+  "scopes": [
+    "approval:instance:read"
+  ],
+  "auth_types": [
+    "user"
+  ],
+  "required_console_events": [
+    "approval.instance.status_changed_v4"
+  ],
+  "buffer_size": 100,
+  "workers": 1,
+  "resolved_output_schema": {
+    "type": "object",
+    "properties": {
+      "approval_code": {
+        "type": "string",
+        "description": "Approval definition code; not a subscription dimension"
+      },
+      "event_id": {
+        "type": "string",
+        "description": "Globally unique event ID; safe for deduplication"
+      },
+      "external_id": {
+        "type": "string",
+        "description": "Third-party approval instance id; present only for third-party approvals"
+      },
+      "instance_code": {
+        "type": "string",
+        "description": "Approval instance code"
+      },
+      "operate_time": {
+        "type": "string",
+        "description": "Status change time in milliseconds",
+        "format": "timestamp_ms"
+      },
+      "start_user": {
+        "type": "object",
+        "description": "Approval instance starter; omitted when unavailable",
+        "properties": {
+          "open_id": {
+            "type": "string",
+            "description": "User open_id; prefixed with ou_",
+            "format": "open_id"
+          },
+          "union_id": {
+            "type": "string",
+            "description": "User union_id",
+            "format": "union_id"
+          },
+          "user_id": {
+            "type": "string",
+            "description": "User id within the tenant",
+            "format": "user_id"
+          }
+        }
+      },
+      "status": {
+        "type": "string",
+        "description": "Approval instance status",
+        "enum": [
+          "PENDING",
+          "APPROVED",
+          "REJECTED",
+          "CANCELED",
+          "DELETED",
+          "REVERTED",
+          "OVERTIME_CLOSE",
+          "OVERTIME_RECOVER"
+        ]
+      },
+      "timestamp": {
+        "type": "string",
+        "description": "Event delivery time (ms timestamp string); taken from header.create_time when present",
+        "format": "timestamp_ms"
+      },
+      "type": {
+        "type": "string",
+        "description": "Event type; always approval.instance.status_changed_v4",
+        "enum": [
+          "approval.instance.status_changed_v4"
+        ]
+      }
+    }
+  },
+  "jq_root_path": "."
+}
