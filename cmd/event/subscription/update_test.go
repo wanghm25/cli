@@ -4,27 +4,34 @@
 package subscription
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 
+	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/credential"
+	eventlib "github.com/larksuite/cli/internal/event"
 )
 
-// rowFromDetail maps d through the exact same getSubscription seam
-// runDelete uses, so tests build a *subscriptionRow fixture identically to
-// how production code obtains "before" rather than hand-constructing one
-// that could drift from the real mapping. update itself no longer needs
-// this (its rejection is pure local, with no remote read), but
-// delete_test.go still does, and this file was its one definition site —
-// kept here for that.
+// rowFromDetail maps d through the exact same getSubscription seam runDelete
+// uses, so tests build a *subscriptionRow fixture identically to how
+// production code obtains "before" rather than hand-constructing one that
+// could drift from the real mapping. update itself no longer needs it (it
+// reads the raw *larkeventv1.SubscriptionDetail via readSubscriptionForUpdate,
+// since its no-op guard compares SDK filters), but delete_test.go still does,
+// and this file is its one definition site — kept here for that.
 func rowFromDetail(t *testing.T, d *larkeventv1.SubscriptionDetail) *subscriptionRow {
 	t.Helper()
 	fake := &fakeGetAPI{resp: okGetResp(d)}
@@ -35,22 +42,381 @@ func rowFromDetail(t *testing.T, d *larkeventv1.SubscriptionDetail) *subscriptio
 	return row
 }
 
+// ---- fixtures ----
+
+// sampleUpdateFilterJSON is a wire-valid filter for im.message.created_v1 (the
+// event_type activeDetail reports): a single message_type=text condition.
+const sampleUpdateFilterJSON = `{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"eq","value":"text"}}]}}`
+
+// mustParseCreatedFilter parses raw against im.message.created_v1's filter
+// capability, failing the test on any error — for fixtures that need a valid
+// *eventlib.Filter to seed a remote detail or compare against.
+func mustParseCreatedFilter(t *testing.T, raw string) *eventlib.Filter {
+	t.Helper()
+	f, err := eventlib.ParseAndValidateFilter(raw, eventlib.FilterMetaFor("im.message.created_v1"))
+	if err != nil {
+		t.Fatalf("mustParseCreatedFilter: unexpected error: %v", err)
+	}
+	return f
+}
+
+// activeDetailWithFilter is activeDetail carrying an existing server-side
+// filter (projected to the SDK type exactly as a remote read would surface
+// it), for the no-op / clear-a-present-filter cases.
+func activeDetailWithFilter(id string, f *eventlib.Filter) *larkeventv1.SubscriptionDetail {
+	d := activeDetail(id, false, "user")
+	d.Filter = eventlib.FilterToSDK(f)
+	return d
+}
+
+// ---- fake updateSubscriptionAPI ----
+
+// fakeUpdateAPI is a network-free stand-in for *eventlib.SubscriptionClient's
+// Get+Patch — the updateSubscriptionAPI test seam.
+type fakeUpdateAPI struct {
+	getResp *larkeventv1.GetSubscriptionResp
+	getErr  error
+
+	patchFunc  func() (*larkeventv1.PatchSubscriptionResp, error)
+	patchCalls int
+}
+
+func (f *fakeUpdateAPI) Get(_ context.Context, _ *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error) {
+	return f.getResp, f.getErr
+}
+
+func (f *fakeUpdateAPI) Patch(_ context.Context, _ *larkeventv1.PatchSubscriptionReq) (*larkeventv1.PatchSubscriptionResp, error) {
+	f.patchCalls++
+	if f.patchFunc == nil {
+		return okPatchResp(activeDetail("sub_1", false, "user")), nil
+	}
+	return f.patchFunc()
+}
+
+func okPatchResp(d *larkeventv1.SubscriptionDetail) *larkeventv1.PatchSubscriptionResp {
+	return &larkeventv1.PatchSubscriptionResp{
+		ApiResp: &larkcore.ApiResp{RawBody: []byte(`{"code":0}`)},
+		Data:    &larkeventv1.PatchSubscriptionRespData{Subscription: d},
+	}
+}
+
+// ---- buildPatchSubscriptionBody (the Patch body's filter projection) ----
+
+func TestBuildPatchSubscriptionBody_SetFilter_ProjectsParsedFilter(t *testing.T) {
+	desired := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
+	body := buildPatchSubscriptionBody(desired)
+	if body.Filter == nil {
+		t.Fatal("body.Filter is nil, want the projected filter")
+	}
+	if !reflect.DeepEqual(body.Filter, eventlib.FilterToSDK(desired)) {
+		t.Errorf("body.Filter = %+v, want the FilterToSDK projection of the parsed filter", body.Filter)
+	}
+	gotJSON, err := json.Marshal(body.Filter)
+	if err != nil {
+		t.Fatalf("marshal body.Filter: %v", err)
+	}
+	wantJSON, err := desired.Canonicalize()
+	if err != nil {
+		t.Fatalf("canonicalize desired: %v", err)
+	}
+	if !bytes.Equal(gotJSON, wantJSON) {
+		t.Errorf("body.Filter JSON = %s, want %s", gotJSON, wantJSON)
+	}
+}
+
+// TestBuildPatchSubscriptionBody_ClearFilter_IsClearForm locks that clearing
+// sends the documented {"filter":{}} clear form (a non-nil empty filter) —
+// distinct from omitting the field, which the server reads as "leave the
+// filter unchanged".
+func TestBuildPatchSubscriptionBody_ClearFilter_IsClearForm(t *testing.T) {
+	body := buildPatchSubscriptionBody(&eventlib.Filter{})
+	if body.Filter == nil {
+		t.Fatal(`clear form must send a non-nil empty filter ({"filter":{}}), not omit the field`)
+	}
+	if body.Filter.CompositeCondition != nil {
+		t.Errorf("clear form must have a nil CompositeCondition, got %+v", body.Filter.CompositeCondition)
+	}
+	gotJSON, err := json.Marshal(body.Filter)
+	if err != nil {
+		t.Fatalf("marshal body.Filter: %v", err)
+	}
+	if string(gotJSON) != "{}" {
+		t.Errorf("clear-form filter JSON = %s, want {}", gotJSON)
+	}
+}
+
+// ---- doUpdateSubscription ----
+
+func TestDoUpdateSubscription_CallsPatchAndReturnsDetail(t *testing.T) {
+	fake := &fakeUpdateAPI{patchFunc: func() (*larkeventv1.PatchSubscriptionResp, error) {
+		return okPatchResp(activeDetail("sub_1", false, "user")), nil
+	}}
+
+	detail, err := doUpdateSubscription(context.Background(), fake, "sub_1", &eventlib.Filter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 1 {
+		t.Errorf("patchCalls = %d, want 1", fake.patchCalls)
+	}
+	if strVal(detail.SubscriptionId) != "sub_1" {
+		t.Errorf("detail.SubscriptionId = %q, want sub_1", strVal(detail.SubscriptionId))
+	}
+}
+
+func TestDoUpdateSubscription_TransportError_PropagatesUnchanged(t *testing.T) {
+	sentinel := errors.New("boom: connection reset")
+	fake := &fakeUpdateAPI{patchFunc: func() (*larkeventv1.PatchSubscriptionResp, error) { return nil, sentinel }}
+
+	_, err := doUpdateSubscription(context.Background(), fake, "sub_1", &eventlib.Filter{})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("err = %v, want it passed through unchanged (%v)", err, sentinel)
+	}
+}
+
+func TestDoUpdateSubscription_SuccessWithNoData_ReturnsTypedInternalError(t *testing.T) {
+	fake := &fakeUpdateAPI{patchFunc: func() (*larkeventv1.PatchSubscriptionResp, error) { return okPatchResp(nil), nil }}
+
+	_, err := doUpdateSubscription(context.Background(), fake, "sub_1", &eventlib.Filter{})
+	if _, ok := errs.ProblemOf(err); !ok {
+		t.Fatalf("expected a typed errs.* error, got %T: %v", err, err)
+	}
+}
+
+// ---- applyUpdate (read + decide + write core, against the fake) ----
+
+func TestApplyUpdate_SetFilter_PatchesWhenChanged(t *testing.T) {
+	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))}
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 1 {
+		t.Errorf("patchCalls = %d, want 1 (a real filter change must patch)", fake.patchCalls)
+	}
+}
+
+func TestApplyUpdate_MalformedFilterJSON_RejectedNoPatch(t *testing.T) {
+	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))}
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: `{"composite_condition":`})
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeInvalidArgument {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeInvalidArgument)
+	}
+	if ve.Param != "--filter" {
+		t.Errorf("Param = %q, want --filter", ve.Param)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0 (an invalid filter must never patch)", fake.patchCalls)
+	}
+}
+
+// TestApplyUpdate_InvalidFilterRule_RejectedNoPatch_NeverLeaksValue locks two
+// things at once: a rule violation is a typed invalid_argument on --filter
+// with no Patch, and the rejected filter's own value never leaks into the
+// error text (the never-leak guarantee for filter contents).
+func TestApplyUpdate_InvalidFilterRule_RejectedNoPatch_NeverLeaksValue(t *testing.T) {
+	const secret = "sekret-not-an-openid"
+	// sender requires an open_id value; this one is not, so it is rejected by
+	// rule (not by JSON parsing).
+	raw := `{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"sender","op":"eq","value":"` + secret + `"}}]}}`
+	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))}
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: raw})
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Param != "--filter" {
+		t.Errorf("Param = %q, want --filter", ve.Param)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0", fake.patchCalls)
+	}
+	if strings.Contains(ve.Error(), secret) || strings.Contains(ve.Hint, secret) {
+		t.Errorf("error text leaked the filter value %q: %v (hint=%q)", secret, ve.Error(), ve.Hint)
+	}
+}
+
+func TestApplyUpdate_ClearFilter_PatchesWhenFilterPresent(t *testing.T) {
+	present := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
+	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetailWithFilter("sub_1", present))}
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{clearFilter: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 1 {
+		t.Errorf("patchCalls = %d, want 1 (clearing a present filter must patch)", fake.patchCalls)
+	}
+}
+
+func TestApplyUpdate_ClearFilter_NoOpWhenAlreadyEmpty(t *testing.T) {
+	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))} // no filter
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{clearFilter: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0 (clearing an already-unfiltered subscription is a no-op)", fake.patchCalls)
+	}
+}
+
+func TestApplyUpdate_SetFilter_NoOpWhenEqualsCurrent(t *testing.T) {
+	current := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
+	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetailWithFilter("sub_1", current))}
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0 (desired filter equals current — no-op)", fake.patchCalls)
+	}
+}
+
+func TestApplyUpdate_DryRun_ReadsButDoesNotPatch(t *testing.T) {
+	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetail("sub_1", false, "user"))}
+	var buf bytes.Buffer
+
+	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON, dryRun: true, asJSON: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0: --dry-run must never issue a write", fake.patchCalls)
+	}
+
+	var generic map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &generic); err != nil {
+		t.Fatalf("json.Unmarshal dry-run output: %v; raw: %s", err, buf.Bytes())
+	}
+	for _, field := range []string{"operation", "dry_run", "remote_subscription_id", "required_scopes", "preflight", "remote_before", "planned_change", "local_impact", "next_action"} {
+		if _, ok := generic[field]; !ok {
+			t.Errorf("dry-run JSON missing field %q; got: %s", field, buf.Bytes())
+		}
+	}
+	if generic["operation"] != "update" {
+		t.Errorf(`"operation" = %v, want "update"`, generic["operation"])
+	}
+	if generic["dry_run"] != true {
+		t.Errorf(`"dry_run" = %v, want true`, generic["dry_run"])
+	}
+	pc, _ := generic["planned_change"].(map[string]interface{})
+	if pc["action"] != "update" {
+		t.Errorf(`planned_change.action = %v, want "update"`, pc["action"])
+	}
+}
+
+// TestApplyUpdate_DryRun_NoOp_ReportsNoopAction locks that a --dry-run whose
+// requested filter already matches previews a "noop" plan (and still never
+// patches).
+func TestApplyUpdate_DryRun_NoOp_ReportsNoopAction(t *testing.T) {
+	current := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
+	fake := &fakeUpdateAPI{getResp: okGetResp(activeDetailWithFilter("sub_1", current))}
+	var buf bytes.Buffer
+
+	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON, dryRun: true, asJSON: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0", fake.patchCalls)
+	}
+	var generic map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &generic); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	pc, _ := generic["planned_change"].(map[string]interface{})
+	if pc["action"] != "noop" {
+		t.Errorf(`planned_change.action = %v, want "noop" for an already-matching filter`, pc["action"])
+	}
+}
+
+// TestApplyUpdate_EventTypeComesFromGet proves --filter is validated against
+// the FETCHED subscription's event_type (update carries no EventKey): the same
+// filter that is valid for im.message.created_v1 is rejected when the fetched
+// detail reports an event_type with no filter capability — and nothing is
+// patched.
+func TestApplyUpdate_EventTypeComesFromGet(t *testing.T) {
+	detail := activeDetail("sub_1", false, "user")
+	detail.EventType = strPtr("im.message.receive_v1") // no filter capability
+	fake := &fakeUpdateAPI{getResp: okGetResp(detail)}
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON})
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Param != "--filter" {
+		t.Errorf("Param = %q, want --filter", ve.Param)
+	}
+	if !strings.Contains(ve.Error(), "does not support") {
+		t.Errorf("Error() = %q, want it to say the event type does not support --filter", ve.Error())
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0", fake.patchCalls)
+	}
+}
+
+func TestApplyUpdate_MissingEventType_TypedError(t *testing.T) {
+	detail := activeDetail("sub_1", false, "user")
+	detail.EventType = nil
+	fake := &fakeUpdateAPI{getResp: okGetResp(detail)}
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{clearFilter: true})
+	if _, ok := errs.ProblemOf(err); !ok {
+		t.Fatalf("expected a typed errs.* error, got %T: %v", err, err)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0", fake.patchCalls)
+	}
+}
+
+func TestApplyUpdate_GetError_Propagates(t *testing.T) {
+	sentinel := errors.New("boom: subscription not found")
+	fake := &fakeUpdateAPI{getErr: sentinel}
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{clearFilter: true})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("err = %v, want the Get error passed through unchanged (%v)", err, sentinel)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0", fake.patchCalls)
+	}
+}
+
 // ---- runUpdate wiring (cobra-level) ----
 //
-// update has no successful path: the platform's update API is filter-only
-// now, and this CLI does not support filter updates yet. Every case below
-// must be rejected before any identity/scope/network work — each uses a
-// zero-value *cmdutil.Factory (no config, credential, or client wiring), so
-// any attempt to resolve an identity or build a network-capable client
-// would panic or surface an unrelated error instead of the typed
-// errs.ValidationError asserted below.
+// Every rejection below must short-circuit before any identity/scope/network
+// work — each uses a zero-value *cmdutil.Factory (no config, credential, or
+// client wiring), so any attempt to resolve an identity or build a
+// network-capable client would panic or surface an unrelated error instead of
+// the typed error asserted here.
 
 func TestRunUpdate_EmptyID_RejectedBeforeNetwork(t *testing.T) {
 	f := &cmdutil.Factory{}
 	cmd := NewCmdUpdate(f)
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
-	cmd.SetArgs([]string{"", "--include-resource-data=false"})
+	cmd.SetArgs([]string{"", "--clear-filter"})
 
 	err := cmd.Execute()
 	var ve *errs.ValidationError
@@ -65,32 +431,12 @@ func TestRunUpdate_EmptyID_RejectedBeforeNetwork(t *testing.T) {
 	}
 }
 
-func TestRunUpdate_MissingIncludeResourceDataFlag_ReturnsInvalidArgument(t *testing.T) {
-	f := &cmdutil.Factory{}
-	cmd := NewCmdUpdate(f)
-	cmd.SetOut(io.Discard)
-	cmd.SetErr(io.Discard)
-	cmd.SetArgs([]string{"sub_1"}) // --include-resource-data never passed
-
-	err := cmd.Execute()
-	var ve *errs.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
-	}
-	if ve.Subtype != errs.SubtypeInvalidArgument {
-		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeInvalidArgument)
-	}
-	if ve.Param != "--include-resource-data" {
-		t.Errorf("Param = %q, want --include-resource-data", ve.Param)
-	}
-}
-
-// TestRunUpdate_IncludeResourceData_AlwaysRejectedWithNoNetworkCall locks the
-// filter-only SDK's consequence: include_resource_data can never be changed
-// via update in either direction anymore, so both explicit values return the
-// same typed not-updatable failed_precondition, purely locally — no remote
-// Get, no confirmation gate, no client ever built.
-func TestRunUpdate_IncludeResourceData_AlwaysRejectedWithNoNetworkCall(t *testing.T) {
+// TestRunUpdate_IncludeResourceData_RejectedBeforeNetwork locks that trying to
+// change include_resource_data via update is refused, in either direction,
+// with a typed failed_precondition — purely locally, before any
+// identity/scope/network step (it short-circuits ahead of even the filter-flag
+// checks).
+func TestRunUpdate_IncludeResourceData_RejectedBeforeNetwork(t *testing.T) {
 	for _, value := range []string{"true", "false"} {
 		t.Run(value, func(t *testing.T) {
 			f := &cmdutil.Factory{}
@@ -113,9 +459,6 @@ func TestRunUpdate_IncludeResourceData_AlwaysRejectedWithNoNetworkCall(t *testin
 			if !strings.Contains(ve.Error(), "include_resource_data") {
 				t.Errorf("Error() = %q, want it to mention include_resource_data", ve.Error())
 			}
-			// Guides to delete + recreate, after a human confirms, naming
-			// this remote_subscription_id and echoing back the caller's own
-			// requested value.
 			for _, want := range []string{"delete", "create", "confirm", "sub_1", "--include-resource-data=" + value} {
 				if !strings.Contains(ve.Hint, want) {
 					t.Errorf("Hint = %q, want it to mention %q", ve.Hint, want)
@@ -125,11 +468,85 @@ func TestRunUpdate_IncludeResourceData_AlwaysRejectedWithNoNetworkCall(t *testin
 	}
 }
 
+func TestRunUpdate_BothFilterFlags_RejectedBeforeNetwork(t *testing.T) {
+	f := &cmdutil.Factory{}
+	cmd := NewCmdUpdate(f)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"sub_1", "--filter", sampleUpdateFilterJSON, "--clear-filter"})
+
+	err := cmd.Execute()
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeInvalidArgument {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeInvalidArgument)
+	}
+	if ve.Param != "--filter" {
+		t.Errorf("Param = %q, want --filter", ve.Param)
+	}
+}
+
+func TestRunUpdate_NoFilterFlag_RejectedBeforeNetwork(t *testing.T) {
+	f := &cmdutil.Factory{}
+	cmd := NewCmdUpdate(f)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"sub_1"}) // neither --filter nor --clear-filter
+
+	err := cmd.Execute()
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeInvalidArgument {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeInvalidArgument)
+	}
+	if ve.Param != "--filter" {
+		t.Errorf("Param = %q, want --filter", ve.Param)
+	}
+}
+
+// TestRunUpdate_MissingWriteScope_ReturnsPermissionError locks that update —
+// like renew/reactivate/delete — hard-requires event:subscription:write on top
+// of read (it reads the current filter before patching). It reaches the scope
+// preflight only past the local flag checks, so it passes --clear-filter.
+func TestRunUpdate_MissingWriteScope_ReturnsPermissionError(t *testing.T) {
+	f, _, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "cli_x"})
+	f.Credential = credential.NewCredentialProvider(nil, nil, &fakeTokenResolver{
+		result: &credential.TokenResult{Token: "u-tok", Scopes: "event:subscription:read"},
+	}, nil)
+
+	cmd := NewCmdUpdate(f)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"sub_1", "--clear-filter", "--as", "user"})
+
+	err := cmd.Execute()
+	var permErr *errs.PermissionError
+	if !errors.As(err, &permErr) {
+		t.Fatalf("expected *errs.PermissionError, got %T: %v", err, err)
+	}
+	if len(permErr.MissingScopes) != 1 || permErr.MissingScopes[0] != "event:subscription:write" {
+		t.Errorf("MissingScopes = %v, want [event:subscription:write]", permErr.MissingScopes)
+	}
+}
+
+// TestNewCmdUpdate_HasExpectedFlags locks update's flag surface: the two
+// filter flags, the kept-for-a-clear-rejection --include-resource-data,
+// --dry-run/--json/--as, no --yes (update is not confirmation-gated), and
+// risk=write.
 func TestNewCmdUpdate_HasExpectedFlags(t *testing.T) {
 	f := &cmdutil.Factory{}
 	cmd := NewCmdUpdate(f)
-	if cmd.Flags().Lookup("include-resource-data") == nil {
-		t.Error("NewCmdUpdate missing --include-resource-data flag")
+	for _, name := range []string{"filter", "clear-filter", "include-resource-data", "dry-run", "json", "as"} {
+		if cmd.Flags().Lookup(name) == nil {
+			t.Errorf("NewCmdUpdate missing --%s flag", name)
+		}
+	}
+	if cmd.Flags().Lookup("yes") != nil {
+		t.Error("NewCmdUpdate must not expose --yes (a filter change is reversible, not confirmation-gated)")
 	}
 	if level, ok := cmdutil.GetRisk(cmd); !ok || level != cmdutil.RiskWrite {
 		t.Errorf("risk = (%q, %v), want (%q, true)", level, ok, cmdutil.RiskWrite)

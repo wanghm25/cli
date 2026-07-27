@@ -51,8 +51,8 @@ type createOpts struct {
 // active+conflicting (including the encryption dimension) -> typed
 // failed_precondition, suspended -> guide reactivate. It never exposes
 // --yes: create is additive and pre-checked for conflicts, so it is not a
-// high-risk confirmation-gated action — that is reserved for
-// update/delete.
+// high-risk confirmation-gated action — that is reserved for delete (update
+// changes only a reversible filter and is not confirmation-gated either).
 func NewCmdCreate(f *cmdutil.Factory) *cobra.Command {
 	var o createOpts
 	cmd := &cobra.Command{
