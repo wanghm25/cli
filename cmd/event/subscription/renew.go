@@ -126,7 +126,7 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 
 	if o.dryRun {
 		result := buildMutationDryRunResult("renew", remoteSubscriptionID, identity, before,
-			"renew", renewLocalImpactNote,
+			"renew", false, renewLocalImpactNote,
 			fmt.Sprintf("run without --dry-run to renew remote_subscription_id=%s", remoteSubscriptionID))
 		if o.asJSON {
 			output.PrintJson(f.IOStreams.Out, result)

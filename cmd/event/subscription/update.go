@@ -102,7 +102,7 @@ delivery cannot be changed here — see --include-resource-data.`,
 	}
 
 	cmd.Flags().StringVar(&o.filter, "filter", "",
-		"Inline JSON event filter to set server-side, replacing any current filter; validated against this subscription's event type (see `event schema <key> --json`). Mutually exclusive with --clear-filter.")
+		"Inline `json` event filter to set server-side, replacing any current filter; validated against this subscription's event type (see 'event schema <key> --json'). Mutually exclusive with --clear-filter.")
 	cmd.Flags().BoolVar(&o.clearFilter, "clear-filter", false,
 		"Remove the server-side event filter from this subscription so every matching event is delivered. Mutually exclusive with --filter.")
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
@@ -231,8 +231,9 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 
 	if o.dryRun {
 		beforeRow := mapSubscriptionDetail(before)
+		localAffected, impactNote := updateLocalImpact(noChange)
 		result := buildMutationDryRunResult("update", remoteSubscriptionID, identity, &beforeRow,
-			updatePlannedAction(noChange), updateLocalImpactNote,
+			updatePlannedAction(noChange), localAffected, impactNote,
 			updateDryRunNextAction(remoteSubscriptionID, o.clearFilter, noChange))
 		if o.asJSON {
 			output.PrintJson(out, result)
@@ -363,9 +364,9 @@ func updateDryRunNextAction(remoteSubscriptionID string, clearFilter, noChange b
 	case noChange:
 		return fmt.Sprintf("remote_subscription_id=%s already has the requested filter; running without --dry-run makes no change", remoteSubscriptionID)
 	case clearFilter:
-		return fmt.Sprintf("run without --dry-run to remove the server-side filter from remote_subscription_id=%s", remoteSubscriptionID)
+		return fmt.Sprintf("run without --dry-run to remove the server-side filter from remote_subscription_id=%s; any running local `event consume` process receives the widened event stream only after it re-syncs — check `lark-cli event status` and restart it if needed", remoteSubscriptionID)
 	default:
-		return fmt.Sprintf("run without --dry-run to apply the new server-side filter to remote_subscription_id=%s", remoteSubscriptionID)
+		return fmt.Sprintf("run without --dry-run to apply the new server-side filter to remote_subscription_id=%s; any running local `event consume` process receives the new event stream only after it re-syncs — check `lark-cli event status` and restart it if needed", remoteSubscriptionID)
 	}
 }
 
@@ -397,4 +398,20 @@ func errUpdateCannotSwitchEncryption(remoteSubscriptionID string, desiredInclude
 		WithHint("resource-data delivery (and the encryption it implies) is decided when a subscription is created and cannot be changed via update; after human confirmation, delete this subscription and create a new one (or create a separate new subscription) — e.g. `lark-cli event subscription delete %s` then `lark-cli event subscription create <refined-event-key> --include-resource-data=%t`", remoteSubscriptionID, desiredIncludeResourceData)
 }
 
-const updateLocalImpactNote = "`event subscription update` only changes the remote Subscription's server-side filter; it never starts, stops, or changes a local `event consume` process — a running local consumer keeps its current filter until it re-syncs."
+// updateLocalImpact returns the honest local-consumer impact for update's
+// --dry-run. A real filter change alters the delivered event stream, so any
+// local consumer of this subscription is affected once it re-syncs; update
+// cannot cheaply tell whether one is actually running, so it discloses the
+// possible impact via the note rather than asserting none. A no-op (the
+// requested filter already matches the current one) changes nothing and so
+// reports no impact — this command never claims impact it does not cause.
+func updateLocalImpact(noChange bool) (bool, string) {
+	if noChange {
+		return false, updateNoopLocalImpactNote
+	}
+	return true, updateLocalImpactNote
+}
+
+const updateLocalImpactNote = "a filter change affects any local consumer of this subscription — it will receive the new event stream and should be re-synced; this command cannot tell whether a consumer is running, so run `lark-cli event status` and restart the consumer if needed"
+
+const updateNoopLocalImpactNote = "the requested filter already matches the current one, so no change is planned and no local consumer is affected"

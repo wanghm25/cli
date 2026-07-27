@@ -131,7 +131,7 @@ func runDelete(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 
 	if o.dryRun {
 		result := buildMutationDryRunResult("delete", remoteSubscriptionID, identity, before,
-			"delete", deleteLocalImpactNote,
+			"delete", false, deleteLocalImpactNote,
 			fmt.Sprintf("run with --yes (after a human confirms) to permanently delete remote_subscription_id=%s; this does not stop any local `event consume` process", remoteSubscriptionID))
 		if o.asJSON {
 			output.PrintJson(f.IOStreams.Out, result)

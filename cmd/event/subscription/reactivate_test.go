@@ -101,7 +101,7 @@ func TestReactivateDryRun_EndToEndViaFakeService_JSONShapeAndNoReactivateCall(t 
 	if err != nil {
 		t.Fatalf("getSubscription: unexpected error: %v", err)
 	}
-	result := buildMutationDryRunResult("reactivate", "sub_1", core.AsUser, before, "reactivate", reactivateLocalImpactNote,
+	result := buildMutationDryRunResult("reactivate", "sub_1", core.AsUser, before, "reactivate", false, reactivateLocalImpactNote,
 		"run without --dry-run to reactivate remote_subscription_id=sub_1")
 
 	raw, err := json.Marshal(result)

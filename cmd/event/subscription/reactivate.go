@@ -126,7 +126,7 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 
 	if o.dryRun {
 		result := buildMutationDryRunResult("reactivate", remoteSubscriptionID, identity, before,
-			"reactivate", reactivateLocalImpactNote,
+			"reactivate", false, reactivateLocalImpactNote,
 			fmt.Sprintf("run without --dry-run to reactivate remote_subscription_id=%s", remoteSubscriptionID))
 		if o.asJSON {
 			output.PrintJson(f.IOStreams.Out, result)

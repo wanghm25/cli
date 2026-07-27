@@ -65,9 +65,10 @@ func runList(f *cmdutil.Factory, asJSON bool) error {
 	}
 
 	// Global widths (not per-section) keep "── domain ──" dividers aligned across groups.
-	headers := []string{"KEY", "AUTH", "PARAMS", "DESCRIPTION"}
+	headers := []string{"KEY", "AUTH", "PARAMS", "REFINED", "DESCRIPTION"}
 	rowsByDomain := make(map[string][][]string, len(order))
 	var allRows [][]string
+	hasRefined := false
 	for _, domain := range order {
 		for _, def := range groups[domain].keys {
 			auth := "-"
@@ -78,10 +79,14 @@ func runList(f *cmdutil.Factory, asJSON bool) error {
 			if desc == "" {
 				desc = "-"
 			}
+			if def.RefinedSubscription {
+				hasRefined = true
+			}
 			row := []string{
 				def.Key,
 				auth,
 				fmt.Sprintf("%d", len(def.Params)),
+				fmt.Sprintf("%t", def.RefinedSubscription),
 				desc,
 			}
 			rowsByDomain[domain] = append(rowsByDomain[domain], row)
@@ -100,26 +105,12 @@ func runList(f *cmdutil.Factory, asJSON bool) error {
 		}
 	}
 
-	// Refined-subscription keys manage a remote resource and carry extra setup
-	// (scopes) and write-level risk that legacy keys don't; surface the same
-	// signal the --json output carries so the text path is at parity. Only
-	// refined keys appear here, so legacy key output stays unchanged.
-	var refined []*eventlib.KeyDefinition
-	for _, def := range all {
-		if def.RefinedSubscription {
-			refined = append(refined, def)
-		}
-	}
-	if len(refined) > 0 {
-		fmt.Fprintf(out, "\nRefined subscriptions (manage a remote resource — run `event schema <key>` for setup/risk):\n")
-		for _, def := range refined {
-			resource := def.ResourceType
-			if resource == "" {
-				resource = "-"
-			}
-			fmt.Fprintf(out, "  %s  (resource: %s, dry-run supported)  →  run `lark-cli event schema %s --json` before consume\n",
-				def.Key, resource, def.Key)
-		}
+	// The REFINED column flags per-key which entries back a remote resource;
+	// this footer explains what REFINED=true means and how to act on it. Shown
+	// only when at least one refined key is present, so an all-legacy catalog's
+	// output stays unchanged.
+	if hasRefined {
+		fmt.Fprintln(out, "\nREFINED=true means this is a refined-subscription base key. Do not consume it directly; run 'lark-cli event schema <KEY> --json' to see key_templates, then consume a materialized key.")
 	}
 
 	// stderr keeps stdout pipe-clean for `event list | jq`.

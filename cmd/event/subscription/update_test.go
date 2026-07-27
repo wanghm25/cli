@@ -338,6 +338,12 @@ func TestApplyUpdate_DryRun_ReadsButDoesNotPatch(t *testing.T) {
 	if pc["action"] != "update" {
 		t.Errorf(`planned_change.action = %v, want "update"`, pc["action"])
 	}
+	// A real filter change affects any running local consumer's stream, so the
+	// dry-run must disclose that rather than assert none.
+	li, _ := generic["local_impact"].(map[string]interface{})
+	if li["local_consumer_affected"] != true {
+		t.Errorf("local_impact.local_consumer_affected = %v, want true for a real filter change", li["local_consumer_affected"])
+	}
 }
 
 // TestApplyUpdate_DryRun_NoOp_ReportsNoopAction locks that a --dry-run whose
@@ -363,6 +369,11 @@ func TestApplyUpdate_DryRun_NoOp_ReportsNoopAction(t *testing.T) {
 	pc, _ := generic["planned_change"].(map[string]interface{})
 	if pc["action"] != "noop" {
 		t.Errorf(`planned_change.action = %v, want "noop" for an already-matching filter`, pc["action"])
+	}
+	// A no-op changes nothing, so it must not claim local-consumer impact.
+	li, _ := generic["local_impact"].(map[string]interface{})
+	if li["local_consumer_affected"] != false {
+		t.Errorf("local_impact.local_consumer_affected = %v, want false for a no-op", li["local_consumer_affected"])
 	}
 }
 

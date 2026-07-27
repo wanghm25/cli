@@ -401,7 +401,15 @@ type mutationDryRunResult struct {
 // informationally rather than erroring on remote business state; only the
 // preflight steps themselves are real dry-run failures, mirroring create's
 // own conflict/suspended dry-run handling).
-func buildMutationDryRunResult(operation, remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, plannedAction, impactNote, nextAction string) *mutationDryRunResult {
+//
+// localConsumerAffected is caller-supplied rather than hardcoded because the
+// four operations differ: renew/reactivate/delete never change the delivered
+// event stream, so they pass false; a real update changes the server-side
+// filter and therefore the stream any local consumer receives, so it passes
+// true and lets impactNote carry the "re-sync a running consumer" guidance
+// (update cannot cheaply tell whether one is actually running, so it discloses
+// the possible impact rather than asserting none).
+func buildMutationDryRunResult(operation, remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, plannedAction string, localConsumerAffected bool, impactNote, nextAction string) *mutationDryRunResult {
 	return &mutationDryRunResult{
 		Operation:            operation,
 		DryRun:               true,
@@ -417,7 +425,7 @@ func buildMutationDryRunResult(operation, remoteSubscriptionID string, identity 
 			RemoteSubscriptionID: remoteSubscriptionID,
 		},
 		LocalImpact: localImpact{
-			LocalConsumerAffected: false,
+			LocalConsumerAffected: localConsumerAffected,
 			Note:                  impactNote,
 		},
 		NextAction: nextAction,

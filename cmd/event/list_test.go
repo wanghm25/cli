@@ -240,10 +240,10 @@ func TestListJSON_LegacyKeyUnchanged(t *testing.T) {
 	}
 }
 
-// TestRunList_RefinedSubscription_Text pins the text (non-JSON) parity half of
-// `event list`: refined keys are surfaced with the same signal the --json
-// output carries (refined, resource type, dry-run, next action), while the
-// legacy table rows above are unchanged.
+// TestRunList_RefinedSubscription_Text pins the text (non-JSON) half of
+// `event list`: a refined base key carries REFINED=true in the new column, a
+// legacy key carries REFINED=false, and an explanatory footer describes what
+// REFINED=true means. The --json parity is asserted separately.
 func TestRunList_RefinedSubscription_Text(t *testing.T) {
 	f, stdout, _, _ := cmdutil.TestFactory(t, &core.CliConfig{AppID: "test"})
 
@@ -253,11 +253,29 @@ func TestRunList_RefinedSubscription_Text(t *testing.T) {
 
 	out := stdout.String()
 	for _, want := range []string{
-		"Refined subscriptions (manage a remote resource",
-		"im.message.created_v1  (resource: im.message, dry-run supported)  →  run `lark-cli event schema im.message.created_v1 --json` before consume",
+		"REFINED", // the new column header
+		"REFINED=true means this is a refined-subscription base key. Do not consume it directly; run 'lark-cli event schema <KEY> --json' to see key_templates, then consume a materialized key.",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("refined list text missing %q; full output:\n%s", want, out)
 		}
 	}
+
+	assertRowRefinedColumn(t, out, "im.message.created_v1", "true")  // refined base key
+	assertRowRefinedColumn(t, out, "im.message.receive_v1", "false") // legacy key
+}
+
+// assertRowRefinedColumn checks the table row beginning with key carries the
+// expected REFINED boolean token.
+func assertRowRefinedColumn(t *testing.T, out, key, want string) {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, key) {
+			if !strings.Contains(line, want) {
+				t.Errorf("row for %q = %q, want REFINED=%s", key, line, want)
+			}
+			return
+		}
+	}
+	t.Errorf("no table row found for key %q; full output:\n%s", key, out)
 }

@@ -157,7 +157,7 @@ func TestDeleteDryRun_EndToEndViaFakeService_JSONShapeAndNoDeleteCall(t *testing
 	if err != nil {
 		t.Fatalf("getSubscription: unexpected error: %v", err)
 	}
-	result := buildMutationDryRunResult("delete", "sub_1", core.AsUser, before, "delete", deleteLocalImpactNote,
+	result := buildMutationDryRunResult("delete", "sub_1", core.AsUser, before, "delete", false, deleteLocalImpactNote,
 		"run with --yes (after a human confirms) to permanently delete remote_subscription_id=sub_1")
 
 	raw, err := json.Marshal(result)
