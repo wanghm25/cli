@@ -53,26 +53,36 @@ func WriteSuccessEnvelope(data interface{}, opts SuccessEnvelopeOptions) error {
 // needs to carry business data and a machine-readable completion/error state
 // in one stdout document.
 func WriteEnvelope(env Envelope, opts SuccessEnvelopeOptions) error {
-	if env.Identity == "" {
-		env.Identity = opts.Identity
+	identity := env.Identity
+	if identity == "" {
+		identity = opts.Identity
 	}
-	if env.Notice == nil {
-		env.Notice = GetNotice()
-	}
-	scanResult := ScanForSafety(opts.CommandPath, env.Data, opts.ErrOut)
-	if scanResult.Blocked {
-		return scanResult.BlockErr
-	}
-
-	if scanResult.Alert != nil {
-		env.ContentSafetyAlert = scanResult.Alert
-	}
-	if opts.JqExpr != "" {
-		if scanResult.Alert != nil && opts.ErrOut != nil {
-			WriteAlertWarning(opts.ErrOut, scanResult.Alert)
+	noticeProvider := GetNotice
+	if env.Notice != nil {
+		notice := env.Notice
+		noticeProvider = func() map[string]interface{} {
+			return notice
 		}
-		return JqFilter(opts.Out, env, opts.JqExpr)
 	}
-	PrintJson(opts.Out, env)
-	return nil
+	emitter := NewEmitter(EmitterConfig{
+		Out:            opts.Out,
+		ErrOut:         opts.ErrOut,
+		CommandPath:    opts.CommandPath,
+		Identity:       identity,
+		NoticeProvider: noticeProvider,
+	})
+	emitOpts := EmitOptions{
+		Format:          "",
+		Raw:             false,
+		JQ:              opts.JqExpr,
+		DryRun:          env.DryRun || opts.DryRun,
+		Meta:            env.Meta,
+		Error:           env.Error,
+		Hint:            env.Hint,
+		JQSafetyWarning: true,
+	}
+	if env.OK {
+		return emitter.Success(env.Data, emitOpts)
+	}
+	return emitter.PartialFailure(env.Data, emitOpts)
 }

@@ -46,7 +46,7 @@ var ImChatList = common.Shortcut{
 	Scopes:      []string{"im:chat:read"},
 	AuthTypes:   []string{"user", "bot"},
 	HasFormat:   true,
-	Flags: []common.Flag{
+	Flags: append([]common.Flag{
 		{Name: "user-id-type", Default: "open_id", Desc: "ID type for owner_id in response", Enum: []string{"open_id", "union_id", "user_id"}},
 		{Name: "sort", Default: "create_time", Desc: "sort field: create_time (ascending) | active_time (descending)", Enum: []string{"create_time", "active_time"}},
 		{Name: "sort-type", Hidden: true, Desc: "alias of --sort (hidden)", Enum: []string{"ByCreateTimeAsc", "ByActiveTimeDesc"}},
@@ -54,7 +54,7 @@ var ImChatList = common.Shortcut{
 		{Name: "page-size", Type: "int", Default: "20", Desc: "page size (1-100)"},
 		{Name: "page-token", Desc: "pagination token for next page"},
 		{Name: "exclude-muted", Type: "bool", Desc: "(user identity only) drop chats the current user has muted (do-not-disturb); bot identity returns all chats unfiltered"},
-	},
+	}, imPaginationFlags(imReadDefaultPageLimit)...),
 	Tips: []string{
 		`Example: lark-cli im +chat-list`,
 		`Example: lark-cli im +chat-list --sort active_time`,
@@ -87,7 +87,7 @@ var ImChatList = common.Shortcut{
 			return errs.NewValidationError(errs.SubtypeInvalidArgument,
 				`--types=p2p (single chats) is only supported with user identity (--as user). To protect user privacy, bot identity cannot list p2p chats. Use --as user, or include "group" in --types.`).WithParam("--types")
 		}
-		return nil
+		return validateIMPagination(runtime)
 	},
 	// Execute fetches one page of chats, optionally applies --exclude-muted
 	// via MaybeApplyMuteFilter, and renders the result. outData["filter"] is
@@ -100,14 +100,23 @@ var ImChatList = common.Shortcut{
 		if stripped {
 			writeBotStripP2pWarning(runtime.IO().ErrOut)
 		}
-		params := buildChatListParams(runtime, effective)
-		resData, err := runtime.CallAPITyped("GET", imChatListPath, params, nil)
-		if err != nil {
-			return err
+		pages, status, pageErr := paginateIM(runtime, func(pageToken string) (map[string]any, error) {
+			params := buildChatListParams(runtime, effective)
+			if pageToken == "" {
+				delete(params, "page_token")
+			} else {
+				params["page_token"] = pageToken
+			}
+			return runtime.CallAPITyped("GET", imChatListPath, params, nil)
+		})
+		if len(pages) == 0 {
+			return pageErr
 		}
+		runtime.RecordPagination(status)
+		resData := mergeIMPageArrays(pages, "items")
 
 		rawItems, _ := resData["items"].([]interface{})
-		hasMore, pageToken := common.PaginationMeta(resData)
+		hasMore, pageToken := status.HasMore, status.NextPageToken
 
 		var items []map[string]interface{}
 		for _, raw := range rawItems {

@@ -27,7 +27,7 @@ var ImChatMessageList = common.Shortcut{
 	BotScopes:   []string{"im:message.group_msg", "im:message.p2p_msg:readonly", "im:message.reactions:read"},
 	AuthTypes:   []string{"user", "bot"},
 	HasFormat:   true,
-	Flags: []common.Flag{
+	Flags: append([]common.Flag{
 		{Name: "chat-id", Desc: "(required, mutually exclusive with --user-id) chat ID (oc_xxx)"},
 		{Name: "user-id", Desc: "(required, mutually exclusive with --chat-id; user identity only) user open_id (ou_xxx)"},
 		{Name: "start", Desc: "start time (ISO 8601)"},
@@ -38,7 +38,7 @@ var ImChatMessageList = common.Shortcut{
 		{Name: "page-token", Desc: "pagination token for next page"},
 		{Name: "no-reactions", Type: "bool", Desc: "skip auto-fetching reactions for each message (default: enrichment enabled)"},
 		downloadResourcesFlag,
-	},
+	}, imPaginationFlags(imReadDefaultPageLimit)...),
 	Tips: []string{
 		`Example: lark-cli im +chat-messages-list --chat-id <chat_id>`,
 		`Example: lark-cli im +chat-messages-list --chat-id <chat_id> --start 2026-07-01 --end 2026-07-08 --order asc`,
@@ -106,25 +106,37 @@ var ImChatMessageList = common.Shortcut{
 		if chatId == "" {
 			chatId = "<resolved_chat_id>"
 		}
-		_, err := buildChatMessageListRequest(runtime, chatId)
-		return err
+		if _, err := buildChatMessageListRequest(runtime, chatId); err != nil {
+			return err
+		}
+		return validateIMPagination(runtime)
 	},
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
 		chatId, err := resolveChatIDForMessagesList(runtime, false)
 		if err != nil {
 			return err
 		}
-		params, err := buildChatMessageListRequest(runtime, chatId)
+		baseParams, err := buildChatMessageListRequest(runtime, chatId)
 		if err != nil {
 			return err
 		}
 
-		data, err := runtime.DoAPIJSONTyped(http.MethodGet, "/open-apis/im/v1/messages", params, nil)
-		if err != nil {
-			return err
+		pages, status, pageErr := paginateIM(runtime, func(pageToken string) (map[string]any, error) {
+			params := cloneQueryParams(baseParams)
+			if pageToken == "" {
+				delete(params, "page_token")
+			} else {
+				params["page_token"] = []string{pageToken}
+			}
+			return runtime.DoAPIJSONTyped(http.MethodGet, "/open-apis/im/v1/messages", params, nil)
+		})
+		if len(pages) == 0 {
+			return pageErr
 		}
+		runtime.RecordPagination(status)
+		data := mergeIMPageArrays(pages, "items")
 		rawItems, _ := data["items"].([]interface{})
-		hasMore, nextPageToken := common.PaginationMeta(data)
+		hasMore, nextPageToken := status.HasMore, status.NextPageToken
 
 		nameCache := make(map[string]string)
 		// Pre-fetch merge_forward sub-messages concurrently before the per-item

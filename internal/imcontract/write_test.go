@@ -473,3 +473,14 @@ func TestCompletionIsClosedOverRequestedItems(t *testing.T) {
 		})
 	}
 }
+
+func TestWriteSessionUnknownStrategyFailsClosed(t *testing.T) {
+	session := NewSession(Contract{
+		Key:      "im future write",
+		Strategy: Strategy{Kind: StrategyKind("future_write")},
+	})
+	_, err := session.FinalizeSuccess(map[string]any{"accepted": true})
+	if err == nil || !errs.IsInternal(err) {
+		t.Fatalf("expected typed internal error, got %v", err)
+	}
+}

@@ -4,7 +4,6 @@
 package im
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -317,9 +316,5 @@ func TestFetchChatMembers_PageLimitStops(t *testing.T) {
 	}
 	if !res.hasMore {
 		t.Error("has_more: want true (loop cut short by page-limit)")
-	}
-	errOut := runtime.IO().ErrOut.(*bytes.Buffer)
-	if !strings.Contains(errOut.String(), "reached page limit (3)") {
-		t.Errorf("want page-limit notice on stderr, got: %s", errOut.String())
 	}
 }

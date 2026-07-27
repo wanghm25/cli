@@ -28,7 +28,7 @@ var ImChatSearch = common.Shortcut{
 	Scopes:      []string{"im:chat:read"},
 	AuthTypes:   []string{"user", "bot"},
 	HasFormat:   true,
-	Flags: []common.Flag{
+	Flags: append([]common.Flag{
 		{Name: "query", Desc: "search keyword (server may return data.notice for overly long input)"},
 		{Name: "search-types", Desc: "chat types, comma-separated (private, external, public_joined, public_not_joined)"},
 		{Name: "chat-modes", Desc: "filter by chat mode, comma-separated (group, topic)"},
@@ -40,7 +40,7 @@ var ImChatSearch = common.Shortcut{
 		{Name: "page-size", Type: "int", Default: "20", Desc: "page size (1-100)"},
 		{Name: "page-token", Desc: "pagination token for next page"},
 		{Name: "exclude-muted", Type: "bool", Desc: "(user identity only) drop chats the current user has muted (do-not-disturb); bot identity returns all chats unfiltered"},
-	},
+	}, imPaginationFlags(imReadDefaultPageLimit)...),
 	Tips: []string{
 		`Example: lark-cli im +chat-search --query "project"`,
 	},
@@ -95,7 +95,7 @@ var ImChatSearch = common.Shortcut{
 		if n := runtime.Int("page-size"); n < 1 || n > 100 {
 			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--page-size must be an integer between 1 and 100").WithParam("--page-size")
 		}
-		return nil
+		return validateIMPagination(runtime)
 	},
 	// Execute fetches one page, extracts per-item meta_data, optionally applies
 	// the --exclude-muted client-side filter (with a PreSkipReason when
@@ -103,16 +103,25 @@ var ImChatSearch = common.Shortcut{
 	// outData["filter"] is populated only when --exclude-muted is set.
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
 		body := buildSearchChatBody(runtime)
-		params := buildSearchChatParams(runtime)
-		resData, err := runtime.CallAPITyped("POST", "/open-apis/im/v2/chats/search", params, body)
-		if err != nil {
-			return err
+		pages, status, pageErr := paginateIM(runtime, func(pageToken string) (map[string]any, error) {
+			params := buildSearchChatParams(runtime)
+			if pageToken == "" {
+				delete(params, "page_token")
+			} else {
+				params["page_token"] = pageToken
+			}
+			return runtime.CallAPITyped("POST", "/open-apis/im/v2/chats/search", params, body)
+		})
+		if len(pages) == 0 {
+			return pageErr
 		}
+		runtime.RecordPagination(status)
+		resData := mergeIMPageArrays(pages, "items")
 
 		rawItems, _ := resData["items"].([]interface{})
 		totalF, _ := util.ToFloat64(resData["total"])
 		total := totalF
-		hasMore, pageToken := common.PaginationMeta(resData)
+		hasMore, pageToken := status.HasMore, status.NextPageToken
 
 		// Extract MetaData from each item
 		var items []map[string]interface{}

@@ -106,7 +106,11 @@ func (s *Session) FinalizeSuccess(data any) (Result, error) {
 		}
 		return Result{OK: true, Data: m, Hint: hintAcceptedUnverified}, nil
 	default:
-		return Result{OK: true, Data: data}, nil
+		return Result{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"unsupported IM write contract strategy %q",
+			s.contract.Strategy.Kind,
+		)
 	}
 }
 

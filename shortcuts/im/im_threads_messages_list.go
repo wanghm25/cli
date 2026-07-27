@@ -29,7 +29,7 @@ var ImThreadsMessagesList = common.Shortcut{
 	BotScopes:   []string{"im:message.group_msg", "im:message.p2p_msg:readonly", "im:message.reactions:read"},
 	AuthTypes:   []string{"user", "bot"},
 	HasFormat:   true,
-	Flags: []common.Flag{
+	Flags: append([]common.Flag{
 		{Name: "thread", Desc: "thread ID (om_xxx or omt_xxx)", Required: true},
 		{Name: "order", Default: "asc", Desc: "sort order: asc | desc", Enum: []string{"asc", "desc"}},
 		{Name: "sort", Hidden: true, Desc: "alias of --order (hidden)", Enum: []string{"asc", "desc"}},
@@ -37,7 +37,7 @@ var ImThreadsMessagesList = common.Shortcut{
 		{Name: "page-token", Desc: "page token"},
 		{Name: "no-reactions", Type: "bool", Desc: "skip auto-fetching reactions for each message (default: enrichment enabled)"},
 		downloadResourcesFlag,
-	},
+	}, imPaginationFlags(imReadDefaultPageLimit)...),
 	Tips: []string{
 		`Example: lark-cli im +threads-messages-list --thread <thread_id>`,
 	},
@@ -79,8 +79,10 @@ var ImThreadsMessagesList = common.Shortcut{
 		if !strings.HasPrefix(threadId, "om_") && !strings.HasPrefix(threadId, "omt_") {
 			return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid --thread %q: must start with om_ or omt_", threadId).WithParam("--thread")
 		}
-		_, err := common.ValidatePageSizeTyped(runtime, "page-size", threadsMessagesMaxPageSize, 1, threadsMessagesMaxPageSize)
-		return err
+		if _, err := common.ValidatePageSizeTyped(runtime, "page-size", threadsMessagesMaxPageSize, 1, threadsMessagesMaxPageSize); err != nil {
+			return err
+		}
+		return validateIMPagination(runtime)
 	},
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
 		threadId, err := resolveThreadID(runtime, runtime.Str("thread"))
@@ -88,18 +90,19 @@ var ImThreadsMessagesList = common.Shortcut{
 			return err
 		}
 		dir := resolveThreadsOrder(runtime)
-		pageToken := runtime.Str("page-token")
-
 		pageSize, _ := common.ValidatePageSizeTyped(runtime, "page-size", threadsMessagesMaxPageSize, 1, threadsMessagesMaxPageSize)
 
-		params := buildThreadsMessagesListParams(dir, threadId, pageSize, pageToken)
-
-		data, err := runtime.DoAPIJSONTyped(http.MethodGet, "/open-apis/im/v1/messages", params, nil)
-		if err != nil {
-			return err
+		pages, status, pageErr := paginateIM(runtime, func(pageToken string) (map[string]any, error) {
+			params := buildThreadsMessagesListParams(dir, threadId, pageSize, pageToken)
+			return runtime.DoAPIJSONTyped(http.MethodGet, "/open-apis/im/v1/messages", params, nil)
+		})
+		if len(pages) == 0 {
+			return pageErr
 		}
+		runtime.RecordPagination(status)
+		data := mergeIMPageArrays(pages, "items")
 		rawItems, _ := data["items"].([]interface{})
-		hasMore, nextPageToken := common.PaginationMeta(data)
+		hasMore, nextPageToken := status.HasMore, status.NextPageToken
 
 		nameCache := make(map[string]string)
 		// Pre-fetch merge_forward sub-messages concurrently before the per-item

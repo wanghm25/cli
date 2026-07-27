@@ -45,10 +45,13 @@ type EmitterConfig struct {
 type EmitOptions struct {
 	Raw             bool
 	Meta            *Meta
+	Error           interface{}
+	Hint            string
 	Format          string
 	JQ              string
 	DryRun          bool
 	Pretty          PrettyRenderer
+	HintToStderr    bool
 	JQSafetyWarning bool
 }
 
@@ -101,18 +104,23 @@ func (e *Emitter) Success(data interface{}, opts EmitOptions) error {
 		return err
 	}
 
+	var err error
 	if opts.JQ != "" {
-		return e.emitEnvelope(data, true, opts)
+		err = e.emitEnvelope(data, true, opts)
+	} else {
+		switch opts.Format {
+		case "", "json":
+			err = e.emitEnvelope(data, true, opts)
+		case "pretty":
+			err = e.emitPretty(data, opts)
+		default:
+			err = e.emitFormatted(data, opts.Format)
+		}
 	}
-
-	switch opts.Format {
-	case "", "json":
-		return e.emitEnvelope(data, true, opts)
-	case "pretty":
-		return e.emitPretty(data, opts)
-	default:
-		return e.emitFormatted(data, opts.Format)
+	if err != nil {
+		return err
 	}
+	return e.emitHint(opts)
 }
 
 // PartialFailure emits a multi-status result whose envelope honestly reports
@@ -125,7 +133,10 @@ func (e *Emitter) PartialFailure(data interface{}, opts EmitOptions) error {
 	if err := e.requireOutput(); err != nil {
 		return err
 	}
-	return e.emitEnvelope(data, false, opts)
+	if err := e.emitEnvelope(data, false, opts); err != nil {
+		return err
+	}
+	return e.emitHint(opts)
 }
 
 // StreamPage scans and emits one page while retaining table/csv columns from
@@ -178,6 +189,12 @@ func (e *Emitter) StreamPage(data interface{}, opts StreamOptions) error {
 	})
 }
 
+// Hint writes recovery guidance to stderr through the same command-scoped
+// output owner used for result emission.
+func (e *Emitter) Hint(hint string) error {
+	return e.emitHint(EmitOptions{Hint: hint, HintToStderr: true})
+}
+
 func (e *Emitter) emitEnvelope(data interface{}, ok bool, opts EmitOptions) error {
 	scanResult := ScanForSafety(e.commandPath, data, e.errOut)
 	if scanResult.Blocked {
@@ -190,6 +207,8 @@ func (e *Emitter) emitEnvelope(data interface{}, ok bool, opts EmitOptions) erro
 		DryRun:   opts.DryRun,
 		Data:     data,
 		Meta:     opts.Meta,
+		Error:    opts.Error,
+		Hint:     opts.Hint,
 		Notice:   e.notice(),
 	}
 	if scanResult.Alert != nil {
@@ -311,6 +330,16 @@ func (e *Emitter) emit(render func(io.Writer) error) error {
 		return wrapOutputError("render", err)
 	}
 	if _, err := io.Copy(e.out, &buf); err != nil {
+		return wrapOutputError("write", err)
+	}
+	return nil
+}
+
+func (e *Emitter) emitHint(opts EmitOptions) error {
+	if !opts.HintToStderr || opts.Hint == "" {
+		return nil
+	}
+	if _, err := fmt.Fprintf(e.errOut, "hint: %s\n", opts.Hint); err != nil {
 		return wrapOutputError("write", err)
 	}
 	return nil

@@ -458,6 +458,12 @@ func TestServiceMethod_BotMode_Success(t *testing.T) {
 	if _, hasCode := got["code"]; hasCode {
 		t.Fatalf("success envelope leaked outer code: %s", stdout.String())
 	}
+	if _, hasMeta := got["meta"]; hasMeta {
+		t.Fatalf("non-IM response unexpectedly gained completeness metadata: %s", stdout.String())
+	}
+	if _, hasHint := got["hint"]; hasHint {
+		t.Fatalf("non-IM response unexpectedly gained an IM recovery hint: %s", stdout.String())
+	}
 	data, ok := got["data"].(map[string]interface{})
 	if !ok || data["result"] != "success" {
 		t.Fatalf("data = %#v, want result=success", got["data"])
@@ -1239,6 +1245,152 @@ func TestGeneratedIMWriteRejectsOutputBeforeAPI(t *testing.T) {
 	if !strings.Contains(p.Hint, "completion result from stdout") {
 		t.Fatalf("hint = %q", p.Hint)
 	}
+}
+
+func TestGeneratedIMCollectionSinglePageReportsIncomplete(t *testing.T) {
+	f, stdout, stderr, reg := cmdutil.TestFactory(t, testConfig)
+	reg.Register(&httpmock.Stub{
+		URL: "/open-apis/im/v1/messages/om_x/read_users",
+		Body: map[string]any{"code": 0, "data": map[string]any{
+			"items": []any{map[string]any{"user_id": "ou_a"}}, "has_more": true, "page_token": "next",
+		}},
+	})
+	method := generatedIMReadUsersMethod()
+	cmd := NewCmdServiceMethod(f, imSpec(), method, "read_users", "messages", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--params", `{"message_id":"om_x"}`})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %s", stderr.String())
+	}
+	var env map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	metaOut := env["meta"].(map[string]any)
+	if env["ok"] != true || metaOut["complete"] != false || metaOut["stop_reason"] != "single_page" {
+		t.Fatalf("unexpected envelope: %#v", env)
+	}
+	if _, exists := env["error"]; exists {
+		t.Fatalf("successful IM read emitted error field: %#v", env)
+	}
+	if !strings.Contains(env["hint"].(string), "--page-all --page-limit 0") {
+		t.Fatalf("missing recovery hint: %#v", env)
+	}
+}
+
+func TestGeneratedIMCollectionPageAllExhausted(t *testing.T) {
+	f, stdout, stderr, reg := cmdutil.TestFactory(t, testConfig)
+	reg.Register(&httpmock.Stub{
+		URL: "/open-apis/im/v1/messages/om_x/read_users",
+		Body: map[string]any{"code": 0, "data": map[string]any{
+			"items": []any{map[string]any{"user_id": "ou_a"}}, "has_more": true, "page_token": "next",
+		}},
+	})
+	reg.Register(&httpmock.Stub{
+		URL: "/open-apis/im/v1/messages/om_x/read_users",
+		Body: map[string]any{"code": 0, "data": map[string]any{
+			"items": []any{map[string]any{"user_id": "ou_b"}}, "has_more": false,
+		}},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), generatedIMReadUsersMethod(), "read_users", "messages", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--params", `{"message_id":"om_x"}`, "--page-all", "--page-limit", "0", "--page-delay", "-1"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %s", stderr.String())
+	}
+	var env map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	metaOut := env["meta"].(map[string]any)
+	items := env["data"].(map[string]any)["items"].([]any)
+	if len(items) != 2 || metaOut["complete"] != true || metaOut["stop_reason"] != "exhausted" {
+		t.Fatalf("unexpected envelope: %#v", env)
+	}
+}
+
+func TestGeneratedIMCollectionPageAllLateErrorKeepsPartialJSON(t *testing.T) {
+	f, stdout, stderr, reg := cmdutil.TestFactory(t, testConfig)
+	reg.Register(&httpmock.Stub{
+		URL: "/open-apis/im/v1/messages/om_x/read_users",
+		Body: map[string]any{"code": 0, "data": map[string]any{
+			"items": []any{map[string]any{"user_id": "ou_a"}}, "has_more": true, "page_token": "next",
+		}},
+	})
+	reg.Register(&httpmock.Stub{
+		URL:  "/open-apis/im/v1/messages/om_x/read_users",
+		Body: map[string]any{"code": 230027, "msg": "not authorized"},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), generatedIMReadUsersMethod(), "read_users", "messages", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--params", `{"message_id":"om_x"}`, "--page-all", "--page-limit", "0", "--page-delay", "-1"})
+
+	err := cmd.Execute()
+	var partial *output.PartialFailureError
+	if !errors.As(err, &partial) || partial.Code != output.ExitAuth {
+		t.Fatalf("error = %T %v", err, err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %s", stderr.String())
+	}
+	var env map[string]any
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &env); jsonErr != nil {
+		t.Fatal(jsonErr)
+	}
+	items := env["data"].(map[string]any)["items"].([]any)
+	metaOut := env["meta"].(map[string]any)
+	rawProblem, exists := env["error"]
+	if !exists {
+		t.Fatalf("late failure omitted structured error: %#v", env)
+	}
+	problem, ok := rawProblem.(map[string]any)
+	if !ok {
+		t.Fatalf("late failure error = %T, want object: %#v", rawProblem, env)
+	}
+	if len(items) != 1 || env["ok"] != false || metaOut["complete"] != false ||
+		metaOut["stop_reason"] != "api_error" || problem["type"] != "authorization" {
+		t.Fatalf("unexpected envelope: %#v", env)
+	}
+}
+
+func TestGeneratedIMCollectionStartTokenNeverClaimsComplete(t *testing.T) {
+	f, stdout, _, reg := cmdutil.TestFactory(t, testConfig)
+	reg.Register(&httpmock.Stub{
+		URL: "/open-apis/im/v1/messages/om_x/read_users",
+		Body: map[string]any{"code": 0, "data": map[string]any{
+			"items": []any{}, "has_more": false,
+		}},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), generatedIMReadUsersMethod(), "read_users", "messages", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--params", `{"message_id":"om_x","page_token":"middle"}`})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var env map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	metaOut := env["meta"].(map[string]any)
+	if metaOut["complete"] != false || metaOut["stop_reason"] != "start_page_token" {
+		t.Fatalf("unexpected envelope: %#v", env)
+	}
+}
+
+func generatedIMReadUsersMethod() meta.Method {
+	return meta.FromMap(map[string]any{
+		"id": "messages.read_users", "path": "messages/{message_id}/read_users", "httpMethod": "GET",
+		"risk": "read", "accessTokens": []any{"tenant"},
+		"parameters": map[string]any{
+			"message_id": map[string]any{"type": "string", "location": "path", "required": true},
+			"page_token": map[string]any{"type": "string", "location": "query"},
+		},
+	})
 }
 
 func TestNonIMWriteOutputKeepsExistingFilePath(t *testing.T) {

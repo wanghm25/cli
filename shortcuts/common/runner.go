@@ -52,6 +52,7 @@ type RuntimeContext struct {
 	larkSDK         *lark.Client                      // eagerly initialized in mountDeclarative
 	stdinConsumed   bool                              // set when an Input flag has consumed stdin (`-`); guards against a second flag also using `-` within the same call
 	contractSession *imcontract.Session
+	readSession     *imcontract.ReadSession
 }
 
 // ── Identity ──
@@ -550,6 +551,15 @@ func (ctx *RuntimeContext) RecordContractFact(f imcontract.Fact) {
 	}
 }
 
+// RecordPagination gives the IM read contract the neutral reason why paging
+// stopped. The shortcut does not interpret this status as complete or
+// incomplete; that decision belongs to internal/imcontract.
+func (ctx *RuntimeContext) RecordPagination(status client.PaginationStatus) {
+	if ctx.readSession != nil {
+		ctx.readSession.ObservePagination(status)
+	}
+}
+
 // logIDFromHeader extracts x-tt-logid from response headers and returns it as a detail map.
 // Returns nil if the header is absent.
 func logIDFromHeader(resp *larkcore.ApiResp) map[string]any {
@@ -736,32 +746,14 @@ func wrapLegacyPrettyRenderer(prettyFn func(w io.Writer)) output.PrettyRenderer 
 
 // Out prints a success JSON envelope to stdout.
 func (ctx *RuntimeContext) Out(data interface{}, meta *output.Meta) {
-	if ctx.contractSession != nil {
-		ctx.emit(data, meta, false, true)
-		return
-	}
-	ctx.handleEmitterError(ctx.newEmitter().Success(data, output.EmitOptions{
-		Format: "",
-		Raw:    false,
-		JQ:     ctx.JqExpr,
-		Meta:   meta,
-	}))
+	ctx.emitFinalized(data, meta, false, true, "", nil)
 }
 
 // OutRaw prints a success JSON envelope to stdout with HTML escaping disabled.
 // Use this instead of Out when the data contains XML/HTML content (e.g. document bodies)
 // that should be preserved as-is in JSON output.
 func (ctx *RuntimeContext) OutRaw(data interface{}, meta *output.Meta) {
-	if ctx.contractSession != nil {
-		ctx.emit(data, meta, true, true)
-		return
-	}
-	ctx.handleEmitterError(ctx.newEmitter().Success(data, output.EmitOptions{
-		Format: "",
-		Raw:    true,
-		JQ:     ctx.JqExpr,
-		Meta:   meta,
-	}))
+	ctx.emitFinalized(data, meta, true, true, "", nil)
 }
 
 // OutPartialFailure writes an ok:false multi-status result envelope to stdout
@@ -775,34 +767,28 @@ func (ctx *RuntimeContext) OutRaw(data interface{}, meta *output.Meta) {
 // ok:true, and the exit signal is distinct from ErrBare (the
 // stdout-carries-the-answer silent-exit signal).
 func (ctx *RuntimeContext) OutPartialFailure(data interface{}, meta *output.Meta) error {
-	if ctx.contractSession != nil {
-		ctx.emit(data, meta, false, false)
-		if ctx.outputErr != nil {
-			return ctx.outputErr
-		}
-		return output.PartialFailure(output.ExitAPI)
-	}
-	ctx.handleEmitterError(ctx.newEmitter().PartialFailure(data, output.EmitOptions{
-		Format: "",
-		Raw:    false,
-		JQ:     ctx.JqExpr,
-		Meta:   meta,
-	}))
+	ctx.emitFinalized(data, meta, false, false, "", nil)
 	if ctx.outputErr != nil {
 		return ctx.outputErr
 	}
 	return output.PartialFailure(output.ExitAPI)
 }
 
-// emit is the shared stdout envelope emitter; ok sets the envelope's ok field
-// (true for success, false for a partial-failure result). raw=true disables JSON
-// HTML escaping so XML/HTML payloads (e.g. DocxXML bodies) are preserved
-// verbatim; otherwise behavior
-// is identical — content-safety scanning and race-safe first-error capture via
-// outputErrOnce apply in both modes.
-func (ctx *RuntimeContext) emit(data interface{}, meta *output.Meta, raw, ok bool) {
+// emitFinalized lets an IM contract determine the business result before the
+// command-scoped Emitter performs all safety checks, projection, formatting,
+// buffering, and stdout/stderr writes. Non-IM commands pass through unchanged.
+func (ctx *RuntimeContext) emitFinalized(
+	data interface{},
+	meta *output.Meta,
+	raw bool,
+	ok bool,
+	format string,
+	pretty output.PrettyRenderer,
+) {
 	hint := ""
 	var resultExit int
+	var resultError interface{}
+	var resultCause error
 	if ctx.contractSession != nil {
 		result, err := ctx.contractSession.FinalizeSuccess(data)
 		if err != nil {
@@ -814,46 +800,64 @@ func (ctx *RuntimeContext) emit(data interface{}, meta *output.Meta, raw, ok boo
 		hint = result.Hint
 		resultExit = result.ExitCode
 	}
-	scanResult := output.ScanForSafety(ctx.Cmd.CommandPath(), data, ctx.IO().ErrOut)
-	if scanResult.Blocked {
-		ctx.outputErrOnce.Do(func() { ctx.outputErr = scanResult.BlockErr })
-		return
-	}
-
-	env := output.Envelope{OK: ok, Identity: string(ctx.As()), Data: data, Meta: meta, Hint: hint, Notice: output.GetNotice()}
-	if scanResult.Alert != nil {
-		env.ContentSafetyAlert = scanResult.Alert
-	}
-
-	if ctx.JqExpr != "" {
-		filter := output.JqFilter
-		if raw {
-			filter = output.JqFilterRaw
-		}
-		if err := filter(ctx.IO().Out, env, ctx.JqExpr); err != nil {
-			fmt.Fprintf(ctx.IO().ErrOut, "error: %v\n", err)
+	if ctx.readSession != nil {
+		result, err := ctx.readSession.Finalize(data)
+		if err != nil {
 			ctx.outputErrOnce.Do(func() { ctx.outputErr = err })
+			return
 		}
-		if resultExit != 0 {
-			ctx.outputErrOnce.Do(func() { ctx.outputErr = output.PartialFailure(resultExit) })
+		data = result.Data
+		ok = result.OK
+		meta = mergeIMReadMeta(meta, result.Meta)
+		hint = result.Hint
+		resultExit = result.ExitCode
+		if result.Error != nil {
+			resultError = result.Error
 		}
-		return
+		resultCause = result.Cause
 	}
 
-	if raw {
-		enc := json.NewEncoder(ctx.IO().Out)
-		enc.SetEscapeHTML(false)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(env)
-		if resultExit != 0 {
-			ctx.outputErrOnce.Do(func() { ctx.outputErr = output.PartialFailure(resultExit) })
-		}
+	// Legacy OutFormat falls back to the JSON envelope when a command does not
+	// provide a pretty renderer. Preserve that behavior without re-finalizing
+	// the contract or introducing another output path.
+	if format == "pretty" && pretty == nil {
+		format = ""
+	}
+
+	emitOpts := output.EmitOptions{
+		Format: format,
+		Raw:    raw,
+		JQ:     ctx.JqExpr,
+		Meta:   meta,
+		Error:  resultError,
+		Hint:   hint,
+		Pretty: pretty,
+		// Structured JSON carries the hint in-band. Projected reads and naked
+		// formats need the recovery guidance on stderr so it is not discarded.
+		HintToStderr: hint != "" &&
+			((ctx.readSession != nil && ctx.JqExpr != "") ||
+				(ctx.JqExpr == "" && format != "" && format != "json")),
+	}
+	emitter := ctx.newEmitter()
+	var emitErr error
+	if !ok && (ctx.JqExpr != "" || format == "" || format == "json") {
+		emitErr = emitter.PartialFailure(data, emitOpts)
+	} else {
+		emitErr = emitter.Success(data, emitOpts)
+	}
+	ctx.handleEmitterError(emitErr)
+	if emitErr != nil {
 		return
 	}
-	b, _ := json.MarshalIndent(env, "", "  ")
-	fmt.Fprintln(ctx.IO().Out, string(b))
 	if resultExit != 0 {
-		ctx.outputErrOnce.Do(func() { ctx.outputErr = output.PartialFailure(resultExit) })
+		ctx.outputErrOnce.Do(func() {
+			if resultCause != nil &&
+				(ctx.JqExpr != "" || (format != "" && format != "json")) {
+				ctx.outputErr = resultCause
+				return
+			}
+			ctx.outputErr = output.PartialFailure(resultExit)
+		})
 	}
 }
 
@@ -862,94 +866,13 @@ func (ctx *RuntimeContext) emit(data interface{}, meta *output.Meta, raw, ok boo
 // When JqExpr is set, envelope filtering takes precedence over format.
 // The Emitter handles content safety scanning for every format.
 func (ctx *RuntimeContext) OutFormat(data interface{}, meta *output.Meta, prettyFn func(w io.Writer)) {
-	if ctx.contractSession != nil {
-		ctx.outFormat(data, meta, prettyFn, false)
-		return
-	}
-	ctx.handleEmitterError(ctx.newEmitter().Success(data, output.EmitOptions{
-		Format: ctx.Format,
-		Raw:    false,
-		JQ:     ctx.JqExpr,
-		Meta:   meta,
-		Pretty: wrapLegacyPrettyRenderer(prettyFn),
-	}))
+	ctx.emitFinalized(data, meta, false, true, ctx.Format, wrapLegacyPrettyRenderer(prettyFn))
 }
 
 // OutFormatRaw is like OutFormat but with HTML escaping disabled in JSON output.
 // Use this when the data contains XML/HTML content that should be preserved as-is.
 func (ctx *RuntimeContext) OutFormatRaw(data interface{}, meta *output.Meta, prettyFn func(w io.Writer)) {
-	if ctx.contractSession != nil {
-		ctx.outFormat(data, meta, prettyFn, true)
-		return
-	}
-	ctx.handleEmitterError(ctx.newEmitter().Success(data, output.EmitOptions{
-		Format: ctx.Format,
-		Raw:    true,
-		JQ:     ctx.JqExpr,
-		Meta:   meta,
-		Pretty: wrapLegacyPrettyRenderer(prettyFn),
-	}))
-}
-
-func (ctx *RuntimeContext) outFormat(data interface{}, meta *output.Meta, prettyFn func(w io.Writer), raw bool) {
-	outFn := ctx.Out
-	if raw {
-		outFn = ctx.OutRaw
-	}
-	if ctx.JqExpr != "" || ctx.Format == "json" || ctx.Format == "" {
-		outFn(data, meta)
-		return
-	}
-	hint := ""
-	var resultExit int
-	if ctx.contractSession != nil {
-		result, err := ctx.contractSession.FinalizeSuccess(data)
-		if err != nil {
-			ctx.outputErrOnce.Do(func() { ctx.outputErr = err })
-			return
-		}
-		data = result.Data
-		hint = result.Hint
-		resultExit = result.ExitCode
-	}
-	switch ctx.Format {
-	case "pretty":
-		scanResult := output.ScanForSafety(ctx.Cmd.CommandPath(), data, ctx.IO().ErrOut)
-		if scanResult.Blocked {
-			ctx.outputErrOnce.Do(func() { ctx.outputErr = scanResult.BlockErr })
-			return
-		}
-		if scanResult.Alert != nil {
-			output.WriteAlertWarning(ctx.IO().ErrOut, scanResult.Alert)
-		}
-		if prettyFn != nil {
-			prettyFn(ctx.IO().Out)
-		} else {
-			outFn(data, meta)
-		}
-	default:
-		// table, csv, ndjson — pass data directly; FormatValue handles both
-		// plain arrays and maps with array fields (e.g. {"members":[…]})
-		scanResult := output.ScanForSafety(ctx.Cmd.CommandPath(), data, ctx.IO().ErrOut)
-		if scanResult.Blocked {
-			ctx.outputErrOnce.Do(func() { ctx.outputErr = scanResult.BlockErr })
-			return
-		}
-		if scanResult.Alert != nil {
-			output.WriteAlertWarning(ctx.IO().ErrOut, scanResult.Alert)
-		}
-		format, formatOK := output.ParseFormat(ctx.Format)
-		if !formatOK {
-			fmt.Fprintf(ctx.IO().ErrOut, "warning: unknown format %q, falling back to json\n", ctx.Format)
-		}
-		output.FormatValue(ctx.IO().Out, data, format)
-	}
-	if hint != "" {
-		fmt.Fprintf(ctx.IO().ErrOut, "hint: %s\n", hint)
-	}
-	if resultExit != 0 {
-		ctx.outputErrOnce.Do(func() { ctx.outputErr = output.PartialFailure(resultExit) })
-	}
+	ctx.emitFinalized(data, meta, true, true, ctx.Format, wrapLegacyPrettyRenderer(prettyFn))
 }
 
 // ── Scope pre-check ──
@@ -1176,7 +1099,18 @@ func newRuntimeContext(cmd *cobra.Command, f *cmdutil.Factory, s *Shortcut, conf
 	ctx = cmdutil.ContextWithShortcut(ctx, s.Service+":"+s.Command, uuid.New().String())
 	rctx := &RuntimeContext{ctx: ctx, Config: config, Cmd: cmd, botOnly: botOnly, resolvedAs: as, Factory: f}
 	if contract, ok := imcontract.Lookup(imcontract.ContractKey(s.Service + " " + s.Command)); ok {
-		rctx.contractSession = imcontract.NewSession(contract)
+		switch {
+		case contract.Strategy.Kind.IsWrite():
+			rctx.contractSession = imcontract.NewSession(contract)
+		case contract.Strategy.Kind.IsRead():
+			readSession, readErr := imcontract.NewReadSession(contract, imcontract.ReadOptions{
+				FullRead: shortcutBoolFlag(cmd, "page-all"),
+			})
+			if readErr != nil {
+				return nil, readErr
+			}
+			rctx.readSession = readSession
+		}
 	}
 	rctx.apiClientFunc = sync.OnceValues(func() (*client.APIClient, error) {
 		return f.NewAPIClientWithConfig(config)
@@ -1193,6 +1127,31 @@ func newRuntimeContext(cmd *cobra.Command, f *cmdutil.Factory, s *Shortcut, conf
 	rctx.Format = rctx.Str("format")
 	rctx.JqExpr, _ = cmd.Flags().GetString("jq")
 	return rctx, nil
+}
+
+func shortcutBoolFlag(cmd *cobra.Command, name string) bool {
+	if cmd == nil || cmd.Flags().Lookup(name) == nil {
+		return false
+	}
+	value, _ := cmd.Flags().GetBool(name)
+	return value
+}
+
+func mergeIMReadMeta(base, contract *output.Meta) *output.Meta {
+	if base == nil && contract == nil {
+		return nil
+	}
+	merged := output.Meta{}
+	if base != nil {
+		merged = *base
+	}
+	if contract != nil {
+		merged.Complete = contract.Complete
+		merged.PagesFetched = contract.PagesFetched
+		merged.StopReason = contract.StopReason
+		merged.NextPageToken = contract.NextPageToken
+	}
+	return &merged
 }
 
 // stripUTF8BOM removes a leading UTF-8 byte-order mark from content read from a

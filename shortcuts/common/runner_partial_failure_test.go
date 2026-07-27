@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/larksuite/cli/errs"
 	"github.com/spf13/cobra"
 
+	"github.com/larksuite/cli/internal/client"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/imcontract"
@@ -63,6 +65,22 @@ func TestOutPartialFailure(t *testing.T) {
 	items, _ := env.Data["items"].([]interface{})
 	if len(items) != 2 {
 		t.Fatalf("both succeeded and failed items must ride on stdout, got %d items\nstdout: %s", len(items), stdout.String())
+	}
+}
+
+func TestNonIMShortcutSuccessOmitsErrorField(t *testing.T) {
+	cfg := &core.CliConfig{Brand: core.BrandFeishu, AppID: "cli_x"}
+	f, stdout, _, _ := cmdutil.TestFactory(t, cfg)
+	rt := TestNewRuntimeContextForAPI(context.Background(), &cobra.Command{Use: "+fetch"}, cfg, f, core.AsUser)
+
+	rt.Out(map[string]any{"document_id": "docx_x"}, nil)
+
+	var env map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := env["error"]; exists {
+		t.Fatalf("successful non-IM shortcut emitted error field: %#v", env)
 	}
 }
 
@@ -178,5 +196,122 @@ func TestIMContractAlsoAppliesToPrettyOutput(t *testing.T) {
 	}
 	if output.ExitCodeOf(rt.outputErr) != output.ExitInternal {
 		t.Fatalf("exit = %d, want 5; err=%v", output.ExitCodeOf(rt.outputErr), rt.outputErr)
+	}
+}
+
+func TestIMReadLateFailureWritesOneSelfContainedJSONEnvelope(t *testing.T) {
+	cfg := &core.CliConfig{Brand: core.BrandFeishu, AppID: "cli_x"}
+	f, stdout, stderr, _ := cmdutil.TestFactory(t, cfg)
+	rt := TestNewRuntimeContextForAPI(context.Background(), &cobra.Command{Use: "+chat-list"}, cfg, f, core.AsUser)
+	contract, _ := imcontract.Lookup("im +chat-list")
+	rt.readSession, _ = imcontract.NewReadSession(contract, imcontract.ReadOptions{FullRead: true})
+	cause := errs.NewNetworkError(errs.SubtypeNetworkTransport, "request failed").WithRetryable()
+	rt.RecordPagination(client.PaginationStatus{
+		PagesFetched: 1, HasMore: true, NextPageToken: "next",
+		StopReason: client.StopReasonTransportError, Cause: cause,
+	})
+
+	rt.Out(map[string]any{"items": []any{"kept"}}, nil)
+
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr must stay empty for unprojected JSON, got %s", stderr.String())
+	}
+	var env map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	meta := env["meta"].(map[string]any)
+	rawProblem, exists := env["error"]
+	if !exists {
+		t.Fatalf("late failure omitted structured error: %#v", env)
+	}
+	problem, ok := rawProblem.(map[string]any)
+	if !ok {
+		t.Fatalf("late failure error = %T, want object: %#v", rawProblem, env)
+	}
+	if env["ok"] != false || meta["complete"] != false ||
+		meta["stop_reason"] != "transport_error" || problem["type"] != "network" {
+		t.Fatalf("unexpected envelope: %#v", env)
+	}
+	var partial *output.PartialFailureError
+	if !errors.As(rt.outputErr, &partial) || partial.Code != output.ExitNetwork {
+		t.Fatalf("output error = %T %v", rt.outputErr, rt.outputErr)
+	}
+}
+
+func TestIMReadLateFailureKeepsPresentationAndTypedErrorOutsideJSON(t *testing.T) {
+	cfg := &core.CliConfig{Brand: core.BrandFeishu, AppID: "cli_x"}
+	f, stdout, stderr, _ := cmdutil.TestFactory(t, cfg)
+	rt := TestNewRuntimeContextForAPI(context.Background(), &cobra.Command{Use: "+chat-list"}, cfg, f, core.AsUser)
+	rt.Format = "pretty"
+	contract, _ := imcontract.Lookup("im +chat-list")
+	rt.readSession, _ = imcontract.NewReadSession(contract, imcontract.ReadOptions{FullRead: true})
+	cause := errs.NewNetworkError(errs.SubtypeNetworkTransport, "request failed").WithRetryable()
+	rt.RecordPagination(client.PaginationStatus{
+		PagesFetched: 1, HasMore: true, NextPageToken: "next",
+		StopReason: client.StopReasonTransportError, Cause: cause,
+	})
+
+	rt.OutFormat(map[string]any{"items": []any{"kept"}}, nil, func(w io.Writer) {
+		fmt.Fprintln(w, "kept")
+	})
+
+	if stdout.String() != "kept\n" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "hint: The read is incomplete") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if !errors.Is(rt.outputErr, cause) {
+		t.Fatalf("output error = %T %v, want original cause", rt.outputErr, rt.outputErr)
+	}
+}
+
+func TestMergeIMReadMetaHandlesNilInputsAndPreservesBaseFields(t *testing.T) {
+	if got := mergeIMReadMeta(nil, nil); got != nil {
+		t.Fatalf("mergeIMReadMeta(nil, nil) = %#v, want nil", got)
+	}
+	base := &output.Meta{Count: 7, Rollback: "undo-token"}
+	baseOnly := mergeIMReadMeta(base, nil)
+	if baseOnly == nil || baseOnly.Count != 7 || baseOnly.Rollback != "undo-token" {
+		t.Fatalf("base-only meta = %#v", baseOnly)
+	}
+	complete := false
+	contract := &output.Meta{
+		Complete: &complete, PagesFetched: 1, StopReason: "single_page", NextPageToken: "next",
+	}
+	contractOnly := mergeIMReadMeta(nil, contract)
+	if contractOnly == nil || contractOnly.Complete == nil || *contractOnly.Complete ||
+		contractOnly.PagesFetched != 1 || contractOnly.StopReason != "single_page" {
+		t.Fatalf("contract-only meta = %#v", contractOnly)
+	}
+	merged := mergeIMReadMeta(base, contract)
+	if merged.Count != 7 || merged.Rollback != "undo-token" ||
+		merged.Complete == nil || *merged.Complete || merged.NextPageToken != "next" {
+		t.Fatalf("merged meta = %#v", merged)
+	}
+}
+
+func TestIMChatMembersReadPreservesCountMeta(t *testing.T) {
+	cfg := &core.CliConfig{Brand: core.BrandFeishu, AppID: "cli_x"}
+	f, stdout, _, _ := cmdutil.TestFactory(t, cfg)
+	rt := TestNewRuntimeContextForAPI(context.Background(), &cobra.Command{Use: "+chat-members-list"}, cfg, f, core.AsUser)
+	contract, _ := imcontract.Lookup("im +chat-members-list")
+	rt.readSession, _ = imcontract.NewReadSession(contract, imcontract.ReadOptions{})
+	rt.RecordPagination(client.PaginationStatus{
+		PagesFetched: 1, HasMore: true, NextPageToken: "next", StopReason: client.StopReasonSinglePage,
+	})
+
+	rt.Out(map[string]any{"users": []any{"ou_a"}, "bots": []any{"cli_a"}}, &output.Meta{Count: 2})
+
+	var env struct {
+		Meta output.Meta `json:"meta"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Meta.Count != 2 || env.Meta.Complete == nil || *env.Meta.Complete ||
+		env.Meta.StopReason != "single_page" {
+		t.Fatalf("meta = %#v, want count plus incomplete contract fields", env.Meta)
 	}
 }

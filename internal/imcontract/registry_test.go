@@ -56,7 +56,9 @@ func TestWriteRegistryCoverage(t *testing.T) {
 	}
 	gotKeys := make([]ContractKey, 0, len(All()))
 	for _, c := range All() {
-		gotKeys = append(gotKeys, c.Key)
+		if c.Strategy.Kind.IsWrite() {
+			gotKeys = append(gotKeys, c.Key)
+		}
 	}
 	if !slices.Equal(gotKeys, wantKeys) {
 		t.Fatalf("write registry keys differ:\ngot  %v\nwant %v", gotKeys, wantKeys)
@@ -70,5 +72,60 @@ func TestModerationExemption(t *testing.T) {
 	}
 	if c.Exemption.Owner != "IM backend" || c.Exemption.Expiry != "2026-10-25" {
 		t.Fatalf("unexpected exemption: %#v", c.Exemption)
+	}
+}
+
+func TestReadRegistryCoverage(t *testing.T) {
+	counts := map[StrategyKind]int{}
+	var gotKeys []ContractKey
+	for _, contract := range All() {
+		if !contract.Strategy.Kind.IsRead() {
+			continue
+		}
+		counts[contract.Strategy.Kind]++
+		gotKeys = append(gotKeys, contract.Key)
+	}
+	if len(gotKeys) != 24 {
+		t.Fatalf("read contracts = %d, want 24", len(gotKeys))
+	}
+	wantCounts := map[StrategyKind]int{
+		EntityReadKind:      7,
+		CollectionReadKind:  14,
+		SearchReadKind:      2,
+		MaterializeReadKind: 1,
+	}
+	for kind, want := range wantCounts {
+		if got := counts[kind]; got != want {
+			t.Errorf("%s = %d, want %d", kind, got, want)
+		}
+	}
+	wantKeys := []ContractKey{
+		"im +chat-list",
+		"im +chat-members-list",
+		"im +chat-messages-list",
+		"im +chat-search",
+		"im +feed-group-list",
+		"im +feed-group-list-item",
+		"im +feed-group-query-item",
+		"im +feed-shortcut-list",
+		"im +flag-list",
+		"im +messages-mget",
+		"im +messages-resources-download",
+		"im +messages-search",
+		"im +threads-messages-list",
+		"im chat.members bots",
+		"im chat.members get",
+		"im chat.moderation get",
+		"im chat.nickname get",
+		"im chat.user_setting batch_query",
+		"im chats get",
+		"im feed.groups batch_query",
+		"im messages read_users",
+		"im pins list",
+		"im reactions batch_query",
+		"im reactions list",
+	}
+	if !slices.Equal(gotKeys, wantKeys) {
+		t.Fatalf("read registry keys differ:\ngot  %v\nwant %v", gotKeys, wantKeys)
 	}
 }

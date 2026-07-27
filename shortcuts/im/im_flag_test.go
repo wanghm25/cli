@@ -271,6 +271,20 @@ func newFlagScopeTestCmd(t *testing.T) *cobra.Command {
 	return cmd
 }
 
+func newFlagListTestCmd(t *testing.T) *cobra.Command {
+	t.Helper()
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().Int("page-size", 50, "")
+	cmd.Flags().String("page-token", "", "")
+	cmd.Flags().Bool("enrich-feed-thread", false, "")
+	cmd.Flags().Bool("page-all", false, "")
+	cmd.Flags().Int("page-limit", imReadDefaultPageLimit, "")
+	if err := cmd.ParseFlags(nil); err != nil {
+		t.Fatalf("ParseFlags() error = %v", err)
+	}
+	return cmd
+}
+
 type scopedTokenResolver struct {
 	scopes string
 }
@@ -536,6 +550,153 @@ func TestFlagShortcutStaticScopesIncludeLookupRequirements(t *testing.T) {
 	}
 	if got := ImFlagList.ScopesForIdentity("user"); len(got) != 1 || got[0] != flagReadScope {
 		t.Fatalf("ImFlagList scopes = %#v, want only %s", got, flagReadScope)
+	}
+}
+
+func TestImFlagListFormatsPreserveBothBucketsAndReadContract(t *testing.T) {
+	tests := []struct {
+		name       string
+		format     string
+		jq         string
+		wantOutput []string
+	}{
+		{
+			name:       "pretty",
+			format:     "pretty",
+			wantOutput: []string{"om_active", "om_deleted", "1 active bookmark(s), 1 deleted bookmark(s)"},
+		},
+		{
+			name:       "table",
+			format:     "table",
+			wantOutput: []string{"list_state", "om_active", "om_deleted", "active", "deleted"},
+		},
+		{
+			name:       "csv",
+			format:     "csv",
+			wantOutput: []string{"list_state", "om_active", "om_deleted", "active", "deleted"},
+		},
+		{
+			name:       "ndjson",
+			format:     "ndjson",
+			wantOutput: []string{`"item_id":"om_active"`, `"item_id":"om_deleted"`, `"list_state":"active"`, `"list_state":"deleted"`},
+		},
+		{
+			name:       "jq",
+			format:     "json",
+			jq:         ".data.flag_items[0].item_id",
+			wantOutput: []string{"om_active"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if !strings.Contains(req.URL.Path, "/open-apis/im/v1/flags") {
+					return nil, fmt.Errorf("unexpected request: %s", req.URL.Path)
+				}
+				return shortcutJSONResponse(200, map[string]any{
+					"code": 0,
+					"data": map[string]any{
+						"flag_items": []any{
+							map[string]any{"item_id": "om_active", "item_type": "0", "flag_type": "2"},
+						},
+						"delete_flag_items": []any{
+							map[string]any{"item_id": "om_deleted", "item_type": "0", "flag_type": "2"},
+						},
+						"messages":   []any{},
+						"has_more":   true,
+						"page_token": "next",
+					},
+				}), nil
+			}))
+			cmd := newFlagListTestCmd(t)
+			setRuntimeField(t, rt, "Cmd", cmd)
+			rt.Format = tt.format
+			rt.JqExpr = tt.jq
+			contract, ok := imcontract.Lookup("im +flag-list")
+			if !ok {
+				t.Fatal("read contract not found")
+			}
+			session, err := imcontract.NewReadSession(contract, imcontract.ReadOptions{})
+			if err != nil {
+				t.Fatalf("NewReadSession() error = %v", err)
+			}
+			setRuntimeField(t, rt, "readSession", session)
+
+			if err := ImFlagList.Execute(context.Background(), rt); err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			out := rt.Factory.IOStreams.Out.(*bytes.Buffer).String()
+			for _, want := range tt.wantOutput {
+				if !strings.Contains(out, want) {
+					t.Fatalf("stdout = %q, want %q", out, want)
+				}
+			}
+			errOut := rt.Factory.IOStreams.ErrOut.(*bytes.Buffer).String()
+			if !strings.Contains(errOut, "hint: Result is incomplete.") {
+				t.Fatalf("stderr = %q, want incomplete-read hint", errOut)
+			}
+		})
+	}
+}
+
+func TestImFlagListJSONIncludesCompletenessEnvelopeAndBothBuckets(t *testing.T) {
+	rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return shortcutJSONResponse(200, map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"flag_items":        []any{map[string]any{"item_id": "om_active"}},
+				"delete_flag_items": []any{map[string]any{"item_id": "om_deleted"}},
+				"messages":          []any{},
+				"has_more":          true,
+				"page_token":        "next",
+			},
+		}), nil
+	}))
+	cmd := newFlagListTestCmd(t)
+	setRuntimeField(t, rt, "Cmd", cmd)
+	rt.Format = "json"
+	contract, ok := imcontract.Lookup("im +flag-list")
+	if !ok {
+		t.Fatal("read contract not found")
+	}
+	session, err := imcontract.NewReadSession(contract, imcontract.ReadOptions{})
+	if err != nil {
+		t.Fatalf("NewReadSession() error = %v", err)
+	}
+	setRuntimeField(t, rt, "readSession", session)
+
+	if err := ImFlagList.Execute(context.Background(), rt); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var envelope struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			Active  []map[string]any `json:"flag_items"`
+			Deleted []map[string]any `json:"delete_flag_items"`
+		} `json:"data"`
+		Meta *output.Meta `json:"meta"`
+		Hint string       `json:"hint"`
+	}
+	out := rt.Factory.IOStreams.Out.(*bytes.Buffer).Bytes()
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, out)
+	}
+	if !envelope.OK || len(envelope.Data.Active) != 1 || len(envelope.Data.Deleted) != 1 ||
+		envelope.Data.Active[0]["item_id"] != "om_active" ||
+		envelope.Data.Deleted[0]["item_id"] != "om_deleted" {
+		t.Fatalf("envelope data = %#v, ok = %v", envelope.Data, envelope.OK)
+	}
+	if envelope.Meta == nil || envelope.Meta.Complete == nil || *envelope.Meta.Complete ||
+		envelope.Meta.PagesFetched != 1 || envelope.Meta.StopReason != "single_page" ||
+		envelope.Meta.NextPageToken != "next" {
+		t.Fatalf("meta = %#v, want incomplete single_page", envelope.Meta)
+	}
+	if !strings.Contains(envelope.Hint, "Result is incomplete.") {
+		t.Fatalf("hint = %q, want incomplete-read hint", envelope.Hint)
+	}
+	if errOut := rt.Factory.IOStreams.ErrOut.(*bytes.Buffer).String(); errOut != "" {
+		t.Fatalf("stderr = %q, want JSON hint in envelope only", errOut)
 	}
 }
 
@@ -1003,7 +1164,7 @@ func TestListQuery(t *testing.T) {
 	}
 }
 
-func TestFlagListRejectsInvalidPageLimit(t *testing.T) {
+func TestFlagListAcceptsUnlimitedPageLimit(t *testing.T) {
 	cmd := &cobra.Command{Use: "test"}
 	cmd.Flags().Int("page-size", 50, "")
 	cmd.Flags().String("page-token", "", "")
@@ -1017,16 +1178,13 @@ func TestFlagListRejectsInvalidPageLimit(t *testing.T) {
 	}
 	runtime := &common.RuntimeContext{Cmd: cmd}
 
-	if err := ImFlagList.Validate(context.Background(), runtime); err == nil {
-		t.Fatalf("Validate() expected page-limit error, got nil")
+	if err := ImFlagList.Validate(context.Background(), runtime); err != nil {
+		t.Fatalf("Validate() error = %v, want --page-limit 0 to mean unlimited", err)
 	}
 
 	got := ImFlagList.DryRun(context.Background(), runtime).Format()
-	if !strings.Contains(got, "--page-limit") {
-		t.Fatalf("DryRun output = %q, want page-limit validation error", got)
-	}
-	if strings.Contains(got, "/open-apis/im/v1/flags") {
-		t.Fatalf("DryRun output = %q, should not include request for invalid input", got)
+	if !strings.Contains(got, "/open-apis/im/v1/flags") {
+		t.Fatalf("DryRun output = %q, want request preview for valid unlimited input", got)
 	}
 }
 
@@ -1631,6 +1789,7 @@ func TestExecuteListAllPages(t *testing.T) {
 	cmd := &cobra.Command{Use: "test"}
 	cmd.Flags().Int("page-size", 50, "")
 	cmd.Flags().Int("page-limit", 10, "")
+	cmd.Flags().Bool("page-all", true, "")
 	cmd.Flags().Bool("enrich-feed-thread", false, "")
 	if err := cmd.ParseFlags(nil); err != nil {
 		t.Fatalf("ParseFlags() error = %v", err)
@@ -1688,6 +1847,7 @@ func TestExecuteListAllPages_EnrichFeedThread(t *testing.T) {
 	cmd := &cobra.Command{Use: "test"}
 	cmd.Flags().Int("page-size", 50, "")
 	cmd.Flags().Int("page-limit", 10, "")
+	cmd.Flags().Bool("page-all", true, "")
 	cmd.Flags().Bool("enrich-feed-thread", true, "")
 	if err := cmd.ParseFlags(nil); err != nil {
 		t.Fatalf("ParseFlags() error = %v", err)
@@ -1722,6 +1882,7 @@ func TestExecuteListAllPages_PageLimit(t *testing.T) {
 	cmd := &cobra.Command{Use: "test"}
 	cmd.Flags().Int("page-size", 50, "")
 	cmd.Flags().Int("page-limit", 3, "") // limit to 3 pages
+	cmd.Flags().Bool("page-all", true, "")
 	cmd.Flags().Bool("enrich-feed-thread", false, "")
 	if err := cmd.ParseFlags(nil); err != nil {
 		t.Fatalf("ParseFlags() error = %v", err)
@@ -1813,6 +1974,7 @@ func TestExecuteListAllPages_APIError(t *testing.T) {
 	cmd := &cobra.Command{Use: "test"}
 	cmd.Flags().Int("page-size", 50, "")
 	cmd.Flags().Int("page-limit", 10, "")
+	cmd.Flags().Bool("page-all", true, "")
 	cmd.Flags().Bool("enrich-feed-thread", false, "")
 	if err := cmd.ParseFlags(nil); err != nil {
 		t.Fatalf("ParseFlags() error = %v", err)

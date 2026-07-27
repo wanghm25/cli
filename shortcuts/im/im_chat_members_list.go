@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/output"
@@ -44,16 +43,14 @@ var ImChatMembersList = common.Shortcut{
 	// im:chat.members:read are honored (same rationale as +chat-list).
 	Scopes:    []string{"im:chat.members:read"},
 	AuthTypes: []string{"user", "bot"},
-	Flags: []common.Flag{
+	Flags: append([]common.Flag{
 		{Name: "chat-id", Required: true, Desc: "chat ID (oc_xxx)"},
 		{Name: "member-types", Type: "string_slice", Desc: "member types to return (user, bot); omit = all"},
 		{Name: "member-id-type", Default: "open_id", Desc: "ID type for member_id in response", Enum: []string{"open_id", "union_id", "user_id"}},
 		{Name: "page-size", Type: "int", Default: fmt.Sprintf("%d", chatMembersListDefaultPageSize), Desc: fmt.Sprintf("page size, 1-%d", chatMembersListMaxPageSize)},
 		{Name: "page-token", Desc: "page token; implies single-page fetch (no auto-pagination)"},
-		{Name: "page-all", Type: "bool", Desc: "automatically paginate through all pages (capped by --page-limit)"},
-		{Name: "page-limit", Type: "int", Default: "10", Desc: "max pages to fetch with --page-all (default 10, 0 = unlimited)"},
 		{Name: "page-delay", Type: "int", Default: fmt.Sprintf("%d", chatMembersListDefaultPageDelay), Desc: "delay in ms between pages when --page-all (0 = no delay)"},
-	},
+	}, imPaginationFlags(10)...),
 	Tips: []string{
 		`Example: lark-cli im +chat-members-list --chat-id <chat_id>`,
 		`Example: lark-cli im +chat-members-list --chat-id <chat_id> --page-all`,
@@ -72,14 +69,11 @@ var ImChatMembersList = common.Shortcut{
 		if n := runtime.Int("page-size"); n < 1 || n > chatMembersListMaxPageSize {
 			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--page-size must be an integer between 1 and %d", chatMembersListMaxPageSize).WithParam("--page-size")
 		}
-		if n := runtime.Int("page-limit"); n < 0 {
-			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--page-limit must be a non-negative integer").WithParam("--page-limit")
-		}
-		if n := runtime.Int("page-delay"); n < 0 {
-			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--page-delay must be a non-negative integer").WithParam("--page-delay")
-		}
 		_, err := normalizeMemberTypes(runtime.StrSlice("member-types"))
-		return err
+		if err != nil {
+			return err
+		}
+		return validateIMPagination(runtime)
 	},
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
 		chatID := strings.TrimSpace(runtime.Str("chat-id"))
@@ -195,59 +189,20 @@ func buildChatMembersParams(runtime *common.RuntimeContext, startToken string) (
 // page), so peak memory is just the aggregated members plus the single most
 // recent page — important for large groups under --page-limit 0.
 func fetchChatMembers(ctx context.Context, runtime *common.RuntimeContext, chatID string) (*chatMembersResult, error) {
-	auto := chatMembersShouldAutoPaginate(runtime)
-	pageLimit := runtime.Int("page-limit")
-	pageDelay := runtime.Int("page-delay")
 	apiPath := fmt.Sprintf(imChatMembersListPathFmt, validate.EncodePathSegment(chatID))
 
-	params, err := buildChatMembersParams(runtime, strings.TrimSpace(runtime.Str("page-token")))
-	if err != nil {
-		return nil, err
-	}
-
-	res := newChatMembersResult()
-	var lastData map[string]interface{}
-	pageToken := strings.TrimSpace(runtime.Str("page-token"))
-	for page := 0; ; page++ {
-		if pageToken != "" {
-			params["page_token"] = pageToken
-		}
-		fmt.Fprintf(runtime.IO().ErrOut, "[page %d] fetching...\n", page+1)
-		data, err := runtime.CallAPITyped("GET", apiPath, params, nil)
+	pages, status, pageErr := paginateIM(runtime, func(pageToken string) (map[string]any, error) {
+		params, err := buildChatMembersParams(runtime, pageToken)
 		if err != nil {
 			return nil, err
 		}
-		addMemberBuckets(res, data)
-		lastData = data
-
-		hasMore, nextToken := common.PaginationMeta(data)
-		if !auto {
-			break
-		}
-		if !hasMore || nextToken == "" {
-			break
-		}
-		if nextToken == pageToken {
-			// Guard against a buggy server echoing the same cursor with
-			// has_more=true: without --page-limit we would loop forever.
-			fmt.Fprintln(runtime.IO().ErrOut, "Stopping pagination: server returned a non-advancing page_token.")
-			break
-		}
-		if pageLimit > 0 && page+1 >= pageLimit {
-			fmt.Fprintf(runtime.IO().ErrOut, "[pagination] reached page limit (%d), stopping. Use --page-all --page-limit 0 to fetch all pages.\n", pageLimit)
-			break
-		}
-		pageToken = nextToken
-		// Throttle between pages (only reached when another page follows), so
-		// draining a large untruncated list doesn't hammer the API.
-		if pageDelay > 0 {
-			time.Sleep(time.Duration(pageDelay) * time.Millisecond)
-		}
+		return runtime.CallAPITyped("GET", apiPath, params, nil)
+	})
+	if len(pages) == 0 {
+		return nil, pageErr
 	}
-	if lastData != nil {
-		applyLastPageSignals(res, lastData)
-	}
-	return res, nil
+	runtime.RecordPagination(status)
+	return mergeChatMemberPages(pages), nil
 }
 
 // newChatMembersResult returns an empty aggregate with non-nil buckets so the

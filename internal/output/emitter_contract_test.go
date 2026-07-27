@@ -63,6 +63,92 @@ func TestEmitterSuccessWritesAllBytes(t *testing.T) {
 	}
 }
 
+func TestEmitterPartialFailureCarriesContractFields(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONTENT_SAFETY_MODE", "off")
+	stdout := &bytes.Buffer{}
+	complete := false
+	emitter := output.NewEmitter(output.EmitterConfig{
+		Out:         stdout,
+		ErrOut:      io.Discard,
+		CommandPath: "lark-cli im fixture",
+		Identity:    "bot",
+	})
+	problem := errs.NewNetworkError(errs.SubtypeNetworkTransport, "request failed")
+
+	err := emitter.PartialFailure(
+		map[string]interface{}{"items": []interface{}{"kept"}},
+		output.EmitOptions{
+			Format: "json",
+			Meta: &output.Meta{
+				Complete:     &complete,
+				PagesFetched: 1,
+				StopReason:   "transport_error",
+			},
+			Error: problem,
+			Hint:  "Retry the read.",
+		},
+	)
+	if err != nil {
+		t.Fatalf("Emitter.PartialFailure() error = %v", err)
+	}
+	var env output.Envelope
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if env.OK || env.Hint != "Retry the read." || env.Meta == nil ||
+		env.Meta.Complete == nil || *env.Meta.Complete {
+		t.Fatalf("envelope = %#v, want typed incomplete result", env)
+	}
+	if env.Error == nil {
+		t.Fatalf("envelope = %#v, want structured error", env)
+	}
+}
+
+func TestEmitterJQProjectsContractHint(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONTENT_SAFETY_MODE", "off")
+	stdout := &bytes.Buffer{}
+	emitter := output.NewEmitter(output.EmitterConfig{
+		Out:         stdout,
+		ErrOut:      io.Discard,
+		CommandPath: "lark-cli im fixture",
+	})
+
+	err := emitter.Success(map[string]interface{}{"id": "1"}, output.EmitOptions{
+		Format: "json",
+		JQ:     ".hint",
+		Hint:   "Use the same read entry point.",
+	})
+	if err != nil {
+		t.Fatalf("Emitter.Success() error = %v", err)
+	}
+	if got := strings.TrimSpace(stdout.String()); got != "Use the same read entry point." {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestEmitterNakedFormatWritesHintToStderr(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONTENT_SAFETY_MODE", "off")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	emitter := output.NewEmitter(output.EmitterConfig{
+		Out:         stdout,
+		ErrOut:      stderr,
+		CommandPath: "lark-cli im fixture",
+	})
+
+	err := emitter.Success([]interface{}{map[string]interface{}{"id": "1"}}, output.EmitOptions{
+		Format:       "table",
+		Hint:         "Result is incomplete.",
+		HintToStderr: true,
+	})
+	if err != nil {
+		t.Fatalf("Emitter.Success() error = %v", err)
+	}
+	if !strings.Contains(stderr.String(), "hint: Result is incomplete.") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
 func TestEmitterMarshalFailureReturnsTypedErrorWithoutOutput(t *testing.T) {
 	t.Setenv("LARKSUITE_CLI_CONTENT_SAFETY_MODE", "off")
 	stdout := &bytes.Buffer{}

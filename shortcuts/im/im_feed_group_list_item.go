@@ -5,7 +5,6 @@ package im
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strconv"
 
@@ -26,15 +25,13 @@ var ImFeedGroupListItem = common.Shortcut{
 	UserScopes:  []string{feedGroupReadScope, chatReadScope},
 	AuthTypes:   []string{"user"},
 	HasFormat:   true,
-	Flags: []common.Flag{
+	Flags: append([]common.Flag{
 		{Name: "feed-group-id", Desc: "feed group ID (ofg_xxx); path parameter (required)"},
 		{Name: "page-size", Type: "int", Default: "50", Desc: "page size (1-50)"},
 		{Name: "page-token", Desc: "pagination token for next page"},
-		{Name: "page-all", Type: "bool", Desc: "automatically paginate through all pages"},
-		{Name: "page-limit", Type: "int", Default: "20", Desc: "max pages when auto-pagination is enabled (default 20, max 1000)"},
 		{Name: "start-time", Desc: "update-time window start (Unix milliseconds as a decimal string)"},
 		{Name: "end-time", Desc: "update-time window end (Unix milliseconds as a decimal string)"},
-	},
+	}, imPaginationFlags(imReadDefaultPageLimit)...),
 	Tips: []string{
 		`Example: lark-cli im +feed-group-list-item --feed-group-id <feed_group_id> --as user`,
 	},
@@ -51,23 +48,7 @@ var ImFeedGroupListItem = common.Shortcut{
 			Desc("will also POST /open-apis/im/v1/chats/batch_query to resolve chat_name from feed_id; requires im:chat:read")
 	},
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
-		// When --page-token is explicitly provided, the user wants a specific page —
-		// no auto-pagination regardless of --page-all.
-		if runtime.Bool("page-all") && !runtime.Cmd.Flags().Changed("page-token") {
-			return executeFeedGroupListAllPages(runtime)
-		}
-
-		data, err := runtime.DoAPIJSONTyped("GET", feedGroupListItemPath(runtime), feedGroupListQuery(runtime), nil)
-		if err != nil {
-			return err
-		}
-		enrichFeedGroupItemsChatName(runtime, data)
-
-		hasMore, _ := data["has_more"].(bool)
-		runtime.OutFormat(data, nil, func(w io.Writer) {
-			renderFeedGroupItemsTable(w, data, hasMore)
-		})
-		return nil
+		return executeFeedGroupListAllPages(runtime)
 	},
 }
 
@@ -78,8 +59,8 @@ func validateFeedGroupListOptions(rt *common.RuntimeContext) error {
 	if n := rt.Int("page-size"); n < 1 || n > 50 {
 		return errs.NewValidationError(errs.SubtypeInvalidArgument, "--page-size must be an integer between 1 and 50").WithParam("--page-size")
 	}
-	if n := rt.Int("page-limit"); n < 1 || n > 1000 {
-		return errs.NewValidationError(errs.SubtypeInvalidArgument, "--page-limit must be an integer between 1 and 1000").WithParam("--page-limit")
+	if n := rt.Int("page-limit"); n > 1000 {
+		return errs.NewValidationError(errs.SubtypeInvalidArgument, "--page-limit must be at most 1000 (0 = unlimited)").WithParam("--page-limit")
 	}
 	if v := rt.Str("start-time"); v != "" {
 		if _, err := strconv.ParseInt(v, 10, 64); err != nil {
@@ -91,7 +72,7 @@ func validateFeedGroupListOptions(rt *common.RuntimeContext) error {
 			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--end-time must be Unix milliseconds (a decimal integer string)").WithParam("--end-time")
 		}
 	}
-	return nil
+	return validateIMPagination(rt)
 }
 
 // feedGroupListItemPath builds the list_item endpoint path with the feed_group_id
@@ -137,27 +118,12 @@ func feedGroupListDryRunParams(rt *common.RuntimeContext) map[string]any {
 // executeFeedGroupListAllPages fetches all pages and merges items/deleted_items
 // into a single response, then enriches the merged result.
 func executeFeedGroupListAllPages(rt *common.RuntimeContext) error {
-	maxPages := rt.Int("page-limit")
-	if maxPages < 1 {
-		maxPages = 20
-	}
-	if maxPages > 1000 {
-		maxPages = 1000
-	}
-
-	// Use make([]any, 0) so empty arrays serialize as [] not null.
-	allItems := make([]any, 0)
-	allDeletedItems := make([]any, 0)
-	var lastHasMore bool
-	var lastPageToken string
-	prevPageToken := "__START__"
-
-	for page := 0; page < maxPages; page++ {
+	pages, status, pageErr := paginateIM(rt, func(pageToken string) (map[string]any, error) {
 		params := larkcore.QueryParams{
 			"page_size": []string{strconv.Itoa(rt.Int("page-size"))},
 		}
-		if page > 0 {
-			params["page_token"] = []string{lastPageToken}
+		if pageToken != "" {
+			params["page_token"] = []string{pageToken}
 		}
 		if start := rt.Str("start-time"); start != "" {
 			params["start_time"] = []string{start}
@@ -166,43 +132,17 @@ func executeFeedGroupListAllPages(rt *common.RuntimeContext) error {
 			params["end_time"] = []string{end}
 		}
 
-		data, err := rt.DoAPIJSONTyped("GET", feedGroupListItemPath(rt), params, nil)
-		if err != nil {
-			return err
-		}
-
-		if v, ok := data["items"].([]any); ok {
-			allItems = append(allItems, v...)
-		}
-		if v, ok := data["deleted_items"].([]any); ok {
-			allDeletedItems = append(allDeletedItems, v...)
-		}
-
-		lastHasMore, _ = data["has_more"].(bool)
-		lastPageToken, _ = data["page_token"].(string)
-
-		fmt.Fprintf(rt.IO().ErrOut, "page %d: %d items, %d deleted\n",
-			page+1, len(allItems), len(allDeletedItems))
-
-		if !lastHasMore || lastPageToken == "" {
-			break
-		}
-		if lastPageToken == prevPageToken {
-			fmt.Fprintf(rt.IO().ErrOut, "warning: page_token did not change, stopping pagination to avoid infinite loop\n")
-			break
-		}
-		prevPageToken = lastPageToken
+		return rt.DoAPIJSONTyped("GET", feedGroupListItemPath(rt), params, nil)
+	})
+	if len(pages) == 0 {
+		return pageErr
 	}
 
-	merged := map[string]any{
-		"items":         allItems,
-		"deleted_items": allDeletedItems,
-		"has_more":      lastHasMore,
-		"page_token":    lastPageToken,
-	}
-
+	rt.RecordPagination(status)
+	merged := mergeIMPageArrays(pages, "items", "deleted_items")
 	enrichFeedGroupItemsChatName(rt, merged)
 
+	lastHasMore, _ := merged["has_more"].(bool)
 	rt.OutFormat(merged, nil, func(w io.Writer) {
 		renderFeedGroupItemsTable(w, merged, lastHasMore)
 	})

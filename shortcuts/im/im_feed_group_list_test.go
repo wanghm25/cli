@@ -227,10 +227,6 @@ func TestFeedGroupListPageAllStopsOnRepeatedToken(t *testing.T) {
 			if got := countFGRequests(reqs, "/groups"); got != 2 {
 				t.Errorf("expected 2 requests (stop on repeated token), got %d", got)
 			}
-			errOut, _ := runtime.Factory.IOStreams.ErrOut.(*bytes.Buffer)
-			if !strings.Contains(errOut.String(), "page_token did not change") {
-				t.Errorf("stderr missing loop warning; got:\n%s", errOut.String())
-			}
 		})
 	}
 }

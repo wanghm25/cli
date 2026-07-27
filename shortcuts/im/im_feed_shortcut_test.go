@@ -17,6 +17,7 @@ import (
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/imcontract"
 	"github.com/larksuite/cli/internal/output"
 	"github.com/larksuite/cli/shortcuts/common"
 	"github.com/spf13/cobra"
@@ -51,6 +52,8 @@ func newFeedShortcutListCmd(t *testing.T) *cobra.Command {
 	t.Helper()
 	cmd := &cobra.Command{Use: "test"}
 	cmd.Flags().String("page-token", "", "")
+	cmd.Flags().Bool("page-all", false, "")
+	cmd.Flags().Int("page-limit", imReadDefaultPageLimit, "")
 	// Default true (skip enrichment) in tests so non-enrichment-focused tests
 	// don't trigger the batch_query path; tests that exercise detail
 	// enrichment flip this off.
@@ -732,15 +735,239 @@ func TestImFeedShortcutListDryRunMentionsDetailScope(t *testing.T) {
 	}
 }
 
-func TestImFeedShortcutListDoesNotExposeAutoPaginationFlags(t *testing.T) {
-	// Locks in the design decision: this shortcut is a one-page wrapper.
-	// If any of these reappear, callers/AI agents will assume auto-walking
-	// is supported and write code that silently double-fetches.
-	banned := map[string]bool{"page-all": true, "page-limit": true, "page-size": true}
+func TestImFeedShortcutListExposesAutoPaginationWithoutInventingPageSize(t *testing.T) {
+	found := map[string]bool{}
 	for _, fl := range ImFeedShortcutList.Flags {
-		if banned[fl.Name] {
-			t.Fatalf("ImFeedShortcutList must not expose --%s", fl.Name)
+		found[fl.Name] = true
+	}
+	for _, name := range []string{"page-all", "page-limit"} {
+		if !found[name] {
+			t.Fatalf("ImFeedShortcutList must expose --%s", name)
 		}
+	}
+	if found["page-size"] {
+		t.Fatal("ImFeedShortcutList must not invent --page-size; the server controls page size")
+	}
+}
+
+func TestImFeedShortcutListPageAllCarriesVersionLockedTokenForward(t *testing.T) {
+	var tokens []string
+	rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		tokens = append(tokens, req.URL.Query().Get("page_token"))
+		if len(tokens) == 1 {
+			return shortcutJSONResponse(200, map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"shortcuts":  []any{map[string]any{"feed_card_id": "oc_first", "type": float64(1)}},
+					"has_more":   true,
+					"page_token": "version-locked-next",
+				},
+			}), nil
+		}
+		return shortcutJSONResponse(200, map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"shortcuts":  []any{map[string]any{"feed_card_id": "oc_second", "type": float64(1)}},
+				"has_more":   false,
+				"page_token": "",
+			},
+		}), nil
+	}))
+	cmd := newFeedShortcutListCmd(t)
+	if err := cmd.Flags().Set("page-all", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("page-limit", "0"); err != nil {
+		t.Fatal(err)
+	}
+	setRuntimeField(t, rt, "Cmd", cmd)
+
+	if err := ImFeedShortcutList.Execute(context.Background(), rt); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got, want := strings.Join(tokens, ","), ",version-locked-next"; got != want {
+		t.Fatalf("page tokens = %q, want %q", got, want)
+	}
+}
+
+func TestImFeedShortcutListTokenFailureDoesNotRestartFromFirstPage(t *testing.T) {
+	var tokens []string
+	rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		tokens = append(tokens, req.URL.Query().Get("page_token"))
+		if len(tokens) == 1 {
+			return shortcutJSONResponse(200, map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"shortcuts":  []any{map[string]any{"feed_card_id": "oc_first", "type": float64(1)}},
+					"has_more":   true,
+					"page_token": "stale-version-token",
+				},
+			}), nil
+		}
+		return shortcutJSONResponse(200, map[string]any{
+			"code": 230001,
+			"msg":  "version changed",
+		}), nil
+	}))
+	cmd := newFeedShortcutListCmd(t)
+	if err := cmd.Flags().Set("page-all", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("page-limit", "0"); err != nil {
+		t.Fatal(err)
+	}
+	setRuntimeField(t, rt, "Cmd", cmd)
+
+	if err := ImFeedShortcutList.Execute(context.Background(), rt); err != nil {
+		t.Fatalf("Execute() with a preserved first page error = %v, want deferred read-contract error", err)
+	}
+	if got, want := strings.Join(tokens, ","), ",stale-version-token"; got != want {
+		t.Fatalf("page tokens = %q, want %q; pagination must not restart", got, want)
+	}
+}
+
+func TestImFeedShortcutListFormatsPreserveReadContract(t *testing.T) {
+	tests := []struct {
+		name       string
+		format     string
+		jq         string
+		wantOutput []string
+		wantHint   bool
+	}{
+		{
+			name:       "pretty",
+			format:     "pretty",
+			wantOutput: []string{"oc_format", "1 feed shortcut(s)"},
+			wantHint:   true,
+		},
+		{
+			name:       "table",
+			format:     "table",
+			wantOutput: []string{"feed_card_id", "oc_format"},
+			wantHint:   true,
+		},
+		{
+			name:       "csv",
+			format:     "csv",
+			wantOutput: []string{"feed_card_id", "oc_format"},
+			wantHint:   true,
+		},
+		{
+			name:       "ndjson",
+			format:     "ndjson",
+			wantOutput: []string{`"feed_card_id":"oc_format"`},
+			wantHint:   true,
+		},
+		{
+			name:       "jq",
+			format:     "json",
+			jq:         ".data.shortcuts[0].feed_card_id",
+			wantOutput: []string{"oc_format"},
+			wantHint:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if !strings.Contains(req.URL.Path, "/open-apis/im/v2/feed_shortcuts") {
+					return nil, fmt.Errorf("unexpected request: %s", req.URL.Path)
+				}
+				return shortcutJSONResponse(200, map[string]any{
+					"code": 0,
+					"data": map[string]any{
+						"shortcuts": []any{
+							map[string]any{"feed_card_id": "oc_format", "type": float64(1)},
+						},
+						"has_more":   true,
+						"page_token": "next",
+					},
+				}), nil
+			}))
+			cmd := newFeedShortcutListCmd(t)
+			setRuntimeField(t, rt, "Cmd", cmd)
+			rt.Format = tt.format
+			rt.JqExpr = tt.jq
+			contract, ok := imcontract.Lookup("im +feed-shortcut-list")
+			if !ok {
+				t.Fatal("read contract not found")
+			}
+			session, err := imcontract.NewReadSession(contract, imcontract.ReadOptions{})
+			if err != nil {
+				t.Fatalf("NewReadSession() error = %v", err)
+			}
+			setRuntimeField(t, rt, "readSession", session)
+
+			if err := ImFeedShortcutList.Execute(context.Background(), rt); err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			out := rt.Factory.IOStreams.Out.(*bytes.Buffer).String()
+			for _, want := range tt.wantOutput {
+				if !strings.Contains(out, want) {
+					t.Fatalf("stdout = %q, want %q", out, want)
+				}
+			}
+			errOut := rt.Factory.IOStreams.ErrOut.(*bytes.Buffer).String()
+			if tt.wantHint && !strings.Contains(errOut, "hint: Result is incomplete.") {
+				t.Fatalf("stderr = %q, want incomplete-read hint", errOut)
+			}
+		})
+	}
+}
+
+func TestImFeedShortcutListJSONIncludesCompletenessEnvelope(t *testing.T) {
+	rt := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return shortcutJSONResponse(200, map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"shortcuts":  []any{map[string]any{"feed_card_id": "oc_json", "type": float64(1)}},
+				"has_more":   true,
+				"page_token": "next",
+			},
+		}), nil
+	}))
+	cmd := newFeedShortcutListCmd(t)
+	setRuntimeField(t, rt, "Cmd", cmd)
+	rt.Format = "json"
+	contract, ok := imcontract.Lookup("im +feed-shortcut-list")
+	if !ok {
+		t.Fatal("read contract not found")
+	}
+	session, err := imcontract.NewReadSession(contract, imcontract.ReadOptions{})
+	if err != nil {
+		t.Fatalf("NewReadSession() error = %v", err)
+	}
+	setRuntimeField(t, rt, "readSession", session)
+
+	if err := ImFeedShortcutList.Execute(context.Background(), rt); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var envelope struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			Shortcuts []map[string]any `json:"shortcuts"`
+		} `json:"data"`
+		Meta *output.Meta `json:"meta"`
+		Hint string       `json:"hint"`
+	}
+	out := rt.Factory.IOStreams.Out.(*bytes.Buffer).Bytes()
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, out)
+	}
+	if !envelope.OK || len(envelope.Data.Shortcuts) != 1 ||
+		envelope.Data.Shortcuts[0]["feed_card_id"] != "oc_json" {
+		t.Fatalf("envelope data = %#v, ok = %v", envelope.Data, envelope.OK)
+	}
+	if envelope.Meta == nil || envelope.Meta.Complete == nil || *envelope.Meta.Complete ||
+		envelope.Meta.PagesFetched != 1 || envelope.Meta.StopReason != "single_page" ||
+		envelope.Meta.NextPageToken != "next" {
+		t.Fatalf("meta = %#v, want incomplete single_page", envelope.Meta)
+	}
+	if !strings.Contains(envelope.Hint, "Result is incomplete.") {
+		t.Fatalf("hint = %q, want incomplete-read hint", envelope.Hint)
+	}
+	if errOut := rt.Factory.IOStreams.ErrOut.(*bytes.Buffer).String(); errOut != "" {
+		t.Fatalf("stderr = %q, want JSON hint in envelope only", errOut)
 	}
 }
 

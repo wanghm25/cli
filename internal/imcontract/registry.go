@@ -33,6 +33,23 @@ func batch(key string, request evidenceSpec, failures ...evidenceSpec) Contract 
 	}
 }
 
+func read(key string, kind StrategyKind) Contract {
+	return Contract{
+		Key:      ContractKey(key),
+		Strategy: Strategy{Kind: kind},
+	}
+}
+
+func search(key, collectionField string) Contract {
+	return Contract{
+		Key: ContractKey(key),
+		Strategy: Strategy{
+			Kind:            SearchReadKind,
+			collectionField: collectionField,
+		},
+	}
+}
+
 func topString(field string) requiredSpec {
 	return requiredSpec{shape: requiredTopString, field: field}
 }
@@ -75,6 +92,38 @@ var contracts = buildContracts()
 
 func buildContracts() map[ContractKey]Contract {
 	all := []Contract{
+		read("im +feed-group-query-item", EntityReadKind),
+		read("im +messages-mget", EntityReadKind),
+		read("im chat.nickname get", EntityReadKind),
+		read("im chat.user_setting batch_query", EntityReadKind),
+		read("im chats get", EntityReadKind),
+		read("im feed.groups batch_query", EntityReadKind),
+		func() Contract {
+			c := read("im reactions batch_query", EntityReadKind)
+			c.Strategy.readHint = hintBatchReactions
+			return c
+		}(),
+
+		read("im +chat-list", CollectionReadKind),
+		read("im +chat-members-list", CollectionReadKind),
+		read("im +chat-messages-list", CollectionReadKind),
+		read("im +feed-group-list", CollectionReadKind),
+		read("im +feed-group-list-item", CollectionReadKind),
+		read("im +feed-shortcut-list", CollectionReadKind),
+		read("im +flag-list", CollectionReadKind),
+		read("im +threads-messages-list", CollectionReadKind),
+		read("im chat.members bots", CollectionReadKind),
+		read("im chat.members get", CollectionReadKind),
+		read("im chat.moderation get", CollectionReadKind),
+		read("im messages read_users", CollectionReadKind),
+		read("im pins list", CollectionReadKind),
+		read("im reactions list", CollectionReadKind),
+
+		search("im +chat-search", "chats"),
+		search("im +messages-search", "messages"),
+
+		read("im +messages-resources-download", MaterializeReadKind),
+
 		ack("im +chat-update"),
 		ack("im +flag-create"),
 		ack("im chat.nickname delete"),

@@ -747,7 +747,7 @@ func TestShortcutValidateBranches(t *testing.T) {
 			"page-limit": "41",
 		}, nil)
 		err := ImMessagesSearch.Validate(context.Background(), runtime)
-		if err == nil || !strings.Contains(err.Error(), "--page-limit must be an integer between 1 and 40") {
+		if err == nil || !strings.Contains(err.Error(), "--page-limit must be between 0 and 40") {
 			t.Fatalf("ImMessagesSearch.Validate() error = %v", err)
 		}
 	})
@@ -797,7 +797,7 @@ func TestMessagesSearchPaginationConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("page all uses max limit", func(t *testing.T) {
+	t.Run("page all keeps the safe default limit", func(t *testing.T) {
 		runtime := newMessagesSearchTestRuntimeContext(t, nil, map[string]bool{
 			"page-all": true,
 		})
@@ -805,19 +805,33 @@ func TestMessagesSearchPaginationConfig(t *testing.T) {
 		if !autoPaginate {
 			t.Fatal("messagesSearchPaginationConfig() autoPaginate = false, want true")
 		}
-		if pageLimit != messagesSearchMaxPageLimit {
-			t.Fatalf("messagesSearchPaginationConfig() pageLimit = %d, want %d", pageLimit, messagesSearchMaxPageLimit)
+		if pageLimit != messagesSearchDefaultPageLimit {
+			t.Fatalf("messagesSearchPaginationConfig() pageLimit = %d, want %d", pageLimit, messagesSearchDefaultPageLimit)
 		}
 	})
 
-	t.Run("explicit page limit enables auto pagination", func(t *testing.T) {
+	t.Run("explicit page all honors page limit", func(t *testing.T) {
+		runtime := newMessagesSearchTestRuntimeContext(t, map[string]string{
+			"query":      "incident",
+			"page-limit": "3",
+		}, map[string]bool{"page-all": true})
+		if err := ImMessagesSearch.Validate(context.Background(), runtime); err != nil {
+			t.Fatalf("ImMessagesSearch.Validate() error = %v, want valid explicit --page-limit", err)
+		}
+		autoPaginate, pageLimit := messagesSearchPaginationConfig(runtime)
+		if !autoPaginate {
+			t.Fatal("messagesSearchPaginationConfig() autoPaginate = false, want true")
+		}
+		if pageLimit != 3 {
+			t.Fatalf("messagesSearchPaginationConfig() pageLimit = %d, want 3", pageLimit)
+		}
+	})
+
+	t.Run("explicit page limit preserves legacy auto pagination", func(t *testing.T) {
 		runtime := newMessagesSearchTestRuntimeContext(t, map[string]string{
 			"query":      "incident",
 			"page-limit": "3",
 		}, nil)
-		if err := ImMessagesSearch.Validate(context.Background(), runtime); err != nil {
-			t.Fatalf("ImMessagesSearch.Validate() error = %v, want valid explicit --page-limit", err)
-		}
 		autoPaginate, pageLimit := messagesSearchPaginationConfig(runtime)
 		if !autoPaginate {
 			t.Fatal("messagesSearchPaginationConfig() autoPaginate = false, want true")

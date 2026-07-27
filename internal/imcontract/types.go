@@ -33,6 +33,15 @@ func (k StrategyKind) IsWrite() bool {
 	}
 }
 
+func (k StrategyKind) IsRead() bool {
+	switch k {
+	case EntityReadKind, CollectionReadKind, SearchReadKind, MaterializeReadKind:
+		return true
+	default:
+		return false
+	}
+}
+
 type ReplayMode string
 
 const (
@@ -89,6 +98,11 @@ type Strategy struct {
 	responseSets []evidenceSpec
 	assertion    AssertionMode
 	resultLedger *evidenceSpec
+	// collectionField is only used by the two fixed IM search strategies to
+	// determine whether an exhausted search returned no candidates. It is not
+	// a general response path or field extractor.
+	collectionField string
+	readHint        string
 }
 
 type HelpPolicy string
