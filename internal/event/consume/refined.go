@@ -528,12 +528,19 @@ func refinedIncompleteHelloError(resolved event.ResolvedEventKey, identity core.
 // reuse, and suspended all proceed to Apply instead).
 func refinedConflictError(resolved event.ResolvedEventKey, identity core.Identity, plan event.ReconcilePlan) error {
 	id := strVal(plan.Existing.SubscriptionId)
+	hint := fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before consuming", id, identity, id)
+	if event.ConflictOnFilter(plan.ConflictFields) {
+		// A filter difference is resolvable in place — change it with `update`
+		// rather than deleting a possibly-shared subscription. Guide inspect ->
+		// preview -> apply -> re-run consume; the filter values are never named.
+		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, preview the change with `lark-cli event subscription update %s --filter <json> --dry-run --as %s`, apply it with `lark-cli event subscription update %s --filter <json> --as %s`, then re-run consume — a filter change is reversible, so there is no need to delete a possibly-shared subscription", id, identity, id, id, identity, id, identity)
+	}
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"an active remote subscription already exists for %s with a conflicting configuration (remote_subscription_id=%s)",
 		resolved.MaterializedKey, id).
 		WithParam("event_key").
 		WithParams(plan.ConflictFields...).
-		WithHint("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before consuming", id, identity, id)
+		WithHint("%s", hint)
 }
 
 // applyOkRecoveryHint builds the recovery guidance shared by EVERY

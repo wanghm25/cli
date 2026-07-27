@@ -132,7 +132,7 @@ no-op there.`,
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
 		"Include resource data in delivered events for a refined key. Requires --as user and scope event:encrypt_key:read; the platform delivers resource data encrypted and the CLI decrypts it before output. Always rejected as invalid_argument on an ordinary (non-refined) key.")
 	cmd.Flags().StringVar(&o.filter, "filter", "",
-		"Inline JSON event filter to apply server-side for a refined key; validated against this event type's filter schema (see `event schema <key> --json`). Omit for no filter. Rejected as invalid_argument on an ordinary (non-refined) key.")
+		"Inline `json` event filter to apply server-side for a refined key; validated against this event type's filter schema (see 'event schema <key> --json'). Omit for no filter. Rejected as invalid_argument on an ordinary (non-refined) key.")
 	// Static default: "write", not "read". A single risk_level annotation
 	// can't vary by the EventKey argument (unknown until RunE resolves it),
 	// and a refined key's consume startup chain has REAL write side effects

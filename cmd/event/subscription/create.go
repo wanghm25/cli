@@ -113,7 +113,7 @@ creating, reusing, or changing anything; create never requires --yes
 		"Preview the plan (identity/scope preflight + remote read + impact analysis) without creating, reusing, or changing anything")
 	cmd.Flags().BoolVar(&o.asJSON, "json", false, "Emit the result as JSON (for AI / scripts)")
 	cmd.Flags().StringVar(&o.filter, "filter", "",
-		"Inline JSON event filter to apply server-side; validated against this event type's filter schema (see `event schema <key> --json`). Omit for no filter.")
+		"Inline `json` event filter to apply server-side; validated against this event type's filter schema (see 'event schema <key> --json'). Omit for no filter.")
 	addAsFlag(cmd)
 	cmdutil.SetRisk(cmd, "write")
 
@@ -564,9 +564,17 @@ func buildCreateSubscriptionBody(eventType, targetResource string, includeResour
 // scope), or delete and recreate.
 func conflictError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan *reconcilePlan, includeResourceData bool) error {
 	id := strVal(plan.Existing.SubscriptionId)
-	hint := fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before creating a differently-configured one", id, identity, id)
-	if includeResourceData {
+	var hint string
+	switch {
+	case eventlib.ConflictOnFilter(plan.ConflictFields):
+		// A filter difference is resolvable in place — change it with `update`
+		// rather than deleting a possibly-shared subscription. Guide inspect ->
+		// preview -> apply -> re-run; the filter values are never named here.
+		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, preview the change with `lark-cli event subscription update %s --filter <json> --dry-run --as %s`, apply it with `lark-cli event subscription update %s --filter <json> --as %s`, then re-run create to reuse the now-matching subscription — a filter change is reversible, so there is no need to delete a possibly-shared subscription", id, identity, id, id, identity, id, identity)
+	case includeResourceData:
 		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s; include_resource_data cannot be changed in place, so after human confirmation either keep the existing subscription, ensure this identity has scope `event:encrypt_key:read`, or delete it and create a new one with the desired resource-data setting", id, identity, id)
+	default:
+		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before creating a differently-configured one", id, identity, id)
 	}
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"an active subscription already exists for %s with a conflicting configuration (remote_subscription_id=%s)",
