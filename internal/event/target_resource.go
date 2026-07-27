@@ -3,12 +3,7 @@
 
 package event
 
-import (
-	"net/url"
-	"reflect"
-	"sort"
-	"strings"
-)
+import "github.com/larksuite/cli/internal/event/model"
 
 // TargetResourceEqual reports whether two target_resource strings denote the
 // same resource + selector, tolerating URL-escaping and selector-ordering
@@ -26,37 +21,13 @@ import (
 //
 // If EITHER side's selector query cannot be parsed, it falls back to an exact
 // string comparison, so the result is never more lenient than a plain == on an
-// input it cannot normalize.
+// input it cannot normalize. The normalization itself is owned by
+// internal/event/model.CanonicalTarget.
 func TargetResourceEqual(a, b string) bool {
-	aType, aSel, aOK := splitTargetResource(a)
-	bType, bSel, bOK := splitTargetResource(b)
+	ca, aOK := model.ParseCanonicalTarget(a)
+	cb, bOK := model.ParseCanonicalTarget(b)
 	if !aOK || !bOK {
 		return a == b
 	}
-	if aType != bType {
-		return false
-	}
-	return reflect.DeepEqual(aSel, bSel)
-}
-
-// splitTargetResource splits s into its resource_type (everything before the
-// first '?') and its decoded selector map. Each selector's decoded values are
-// sorted so the comparison in TargetResourceEqual is order-independent even for
-// a repeated key. ok is false when the selector query cannot be parsed, which
-// signals the caller to fall back to an exact string comparison.
-func splitTargetResource(s string) (resourceType string, selectors url.Values, ok bool) {
-	resourceType = s
-	query := ""
-	if i := strings.IndexByte(s, '?'); i >= 0 {
-		resourceType = s[:i]
-		query = s[i+1:]
-	}
-	values, err := url.ParseQuery(query)
-	if err != nil {
-		return "", nil, false
-	}
-	for _, v := range values {
-		sort.Strings(v)
-	}
-	return resourceType, values, true
+	return ca.Equal(cb)
 }
