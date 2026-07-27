@@ -12,10 +12,11 @@ import (
 	"time"
 
 	"github.com/larksuite/cli/internal/event"
-	"github.com/larksuite/cli/internal/event/bus/lifecycle"
+	"github.com/larksuite/cli/internal/event/delivery"
 	"github.com/larksuite/cli/internal/event/health"
 	"github.com/larksuite/cli/internal/event/model"
 	"github.com/larksuite/cli/internal/event/protocol"
+	"github.com/larksuite/cli/internal/event/routing"
 	"github.com/larksuite/cli/internal/event/session"
 )
 
@@ -56,7 +57,7 @@ type Subscriber interface {
 	// is the ONLY comparison key against the freshly-resolved "current"
 	// identity — UAT is never compared. OwnerUserOpenID()=="" marks a bot
 	// consumer OR a legacy registration (Hello.Identity/
-	// UserOpenID arrive "" until a refined client populates them); Hub.Publish's
+	// UserOpenID arrive "" until a refined client populates them); the routing
 	// identity gate (and identity.go's bind gate) bypass these entirely —
 	// bot consumers are NEVER identity-gated or BindUser'd.
 	OwnerAppID() string
@@ -86,16 +87,19 @@ type Hub struct {
 	cleanupInProgress map[string]chan struct{}
 	logger            atomic.Pointer[log.Logger]
 
-	// legacyDedup and refinedDedup are separate dedup domains:
-	// dedup runs AFTER
-	// routing-domain identification, never as one global gate at the source
-	// entry). legacyDedup keys by event_id alone (today's behavior, applied
-	// to every event regardless of remote_subscription_id — legacy consumers
+	// legacyDedup and refinedDedup are separate dedup domains, checked and
+	// committed by Publish AFTER routing has chosen the eligible destinations —
+	// never as one global gate at the source entry, and (the §七 fix) never
+	// committed before an eligible destination has actually accepted the event.
+	// legacyDedup keys by event_id alone (today's behavior, applied to every
+	// legacy delivery regardless of remote_subscription_id — legacy consumers
 	// receive refined events too). refinedDedup keys by RefinedDedupKey
-	// (remote_subscription_id-scoped), so the SAME event_id delivered under
-	// two different remote_subscription_id contexts dedups independently in
-	// each, rather than the second delivery being swallowed globally. Each
-	// *event.DedupFilter is self-locking; do not add locking around them.
+	// (remote_subscription_id-scoped), so the SAME event_id delivered under two
+	// different remote_subscription_id contexts dedups independently in each,
+	// rather than the second delivery being swallowed globally. Each
+	// *event.DedupFilter is self-locking; do not add locking around them. Publish
+	// checks Seen (read-only) before delivery and commits with Record only once
+	// a destination has accepted, so a no-recipient event stays re-processable.
 	legacyDedup  *event.DedupFilter
 	refinedDedup *event.DedupFilter
 
@@ -104,18 +108,27 @@ type Hub struct {
 	// nil (the zero value — every non-gated NewHub()/NewBus() caller)
 	// means NO identity gating: every consumer is delivered according to the
 	// legacy ungated behavior. Guarded by mu (read together with the
-	// subscribers snapshot at the top of Publish) rather than a separate
-	// lock/atomic — it changes at most once in practice (bus construction,
-	// before Run starts accepting events).
+	// subscribers snapshot when Publish builds the routing snapshot) rather than
+	// a separate lock/atomic — it changes at most once in practice (bus
+	// construction, before Run starts accepting events). Handed to the pure
+	// router as the read-only identity port; the router owns no I/O of its own.
 	currentResolver func() (session.CurrentIdentity, error)
 
-	// crossCheckDropped counts events dropped by Publish's refined
-	// cross-check (refinedCrossCheckMismatch): a remote_subscription_id match
-	// that, on closer inspection, disagreed with the matched consumer's own
-	// stored intent on event_type/target_resource/authority. Distinct from
-	// per-consumer DroppedCount (backpressure evictions) — this is a
-	// routing-integrity signal, expected to stay at 0 in normal operation.
+	// crossCheckDropped counts events dropped by the refined cross-check
+	// (routing's DropCrossCheck): a remote_subscription_id match that, on closer
+	// inspection, disagreed with the matched consumer's own stored intent on
+	// event_type/target_resource/authority. Distinct from per-consumer
+	// DroppedCount (backpressure evictions) — this is a routing-integrity
+	// signal, expected to stay at 0 in normal operation. The router DECIDES the
+	// drop; Publish applies this counter and the WARN log.
 	crossCheckDropped atomic.Int64
+
+	// router and broker are the pure routing decision and the delivery
+	// transport this Hub delegates to. Both are stateless (the zero value is
+	// ready). Publish is the thin pipeline: build a snapshot -> router.Plan ->
+	// broker.Deliver -> dedup-commit-after-accept.
+	router routing.Router
+	broker delivery.Broker
 }
 
 func NewHub() *Hub {
@@ -132,7 +145,7 @@ func NewHub() *Hub {
 func (h *Hub) SetLogger(l *log.Logger) { h.logger.Store(l) }
 
 // SetCurrentResolver wires the identity gate's fresh-current-identity
-// resolver into Publish's delivery gate. nil disables gating
+// resolver into the routing snapshot's identity port. nil disables gating
 // entirely (the NewHub() default) — this is how every non-gated caller
 // (and every test that never calls this) keeps exactly today's behavior.
 func (h *Hub) SetCurrentResolver(fn func() (session.CurrentIdentity, error)) {
@@ -315,254 +328,152 @@ func (h *Hub) existingPIDForSubscriptionLocked(sid string) int {
 	return 0
 }
 
-// publishMatch pairs a matched Subscriber with which routing domain matched it,
-// so the dedup gate (computed once per domain per Publish, below) is applied
-// per-recipient without re-deriving refined-vs-legacy from scratch.
-type publishMatch struct {
-	sub     Subscriber
-	refined bool
+// snapshot builds an immutable routing.Snapshot of the currently registered
+// consumers, plus the identity port, under a single RLock. The identity
+// resolver is captured alongside the subscribers under the SAME lock so a
+// concurrent SetCurrentResolver can never interleave with a snapshot read;
+// the router calls it later (outside the lock, at most once, lazily) exactly as
+// the old inline gate did. TargetResource is *Conn-only listening intent — a
+// bare Subscriber (a test fake, never a real registration) carries none, so it
+// snapshots "" and the cross-check holds it only to the presence check.
+func (h *Hub) snapshot() routing.Snapshot {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	consumers := make([]routing.Consumer, 0, len(h.subscribers))
+	for s := range h.subscribers {
+		c := routing.Consumer{
+			Ref:                  s,
+			EventTypes:           s.EventTypes(),
+			RemoteSubscriptionID: s.RemoteSubscriptionID(),
+			Owner:                model.OwnerRef{AppID: s.OwnerAppID(), UserOpenID: s.OwnerUserOpenID()},
+		}
+		if conn, ok := s.(*Conn); ok {
+			c.TargetResource = conn.TargetResource()
+		}
+		consumers = append(consumers, c)
+	}
+	return routing.Snapshot{Consumers: consumers, Identity: h.currentResolver}
 }
 
-// Publish fans out a RawEvent to all matching subscribers (non-blocking).
+// Publish is the thin bus pipeline: snapshot the consumers, ask the pure Router
+// which are eligible, apply the side effects the Router decided (the identity
+// marks and the cross-check counter/log), then fan the event out through the
+// delivery Broker and commit dedup ONLY after an eligible destination has
+// actually accepted it.
 //
-// Dual-index routing: a refined consumer (Subscriber.RemoteSubscriptionID()
-// != "") is matched ONLY by remote_subscription_id equality — never by
-// event_type alone, and never when raw has no remote_subscription_id (never
-// guess which resource an unqualified event belongs to). A legacy
-// consumer (RemoteSubscriptionID() == "") keeps today's event_type matching
-// unconditionally — including for refined-native events, which legacy
-// consumers still receive via event_type compat delivery.
+// Dual-index routing and the fail-closed gate now live in internal/event/routing;
+// the fan-out/backpressure/counting in internal/event/delivery. Externally the
+// behavior is identical: events reach the same consumers, with the same v2
+// fields and the same per-consumer monotonic Seq.
 //
-// A matched refined consumer additionally passes refinedCrossCheckMismatch
-// before delivery: fail-closed defense-in-depth on top of the
-// remote_subscription_id match above, never a replacement for it — see that
-// function's own doc comment for exactly what it checks and why an absent
-// target_resource/authority is itself treated as a mismatch (drop), not
-// skipped.
-//
-// A fresh *protocol.Event is allocated per subscriber so each consumer sees
-// its own monotonically-increasing Seq (assigned via Conn.NextSeq) — sharing
-// a single msg struct across subscribers would alias Seq and defeat the
-// gap-detection at the consume side. The extra allocation per fan-out is
-// cheap compared to the socket write that follows.
+// Dedup is per-domain and commit-after-accept (the §七 fix). A legacy delivery
+// dedups by event_id; a refined delivery by the remote_subscription_id-scoped
+// RefinedDedupKey. For each domain Publish checks Seen (read-only) before
+// delivering and commits with Record only when the Broker reports an accepted
+// (queued) delivery — so an event that reached NO eligible destination (nothing
+// matched, or everything was cross-checked/gated out) commits nothing and
+// stays re-processable, rather than being silently swallowed by an early gate.
 func (h *Hub) Publish(raw *event.RawEvent) {
-	h.mu.RLock()
-	matches := make([]publishMatch, 0, len(h.subscribers))
-	for s := range h.subscribers {
-		if remoteSubID := s.RemoteSubscriptionID(); remoteSubID != "" {
-			if raw.RemoteSubscriptionID != "" && remoteSubID == raw.RemoteSubscriptionID {
-				matches = append(matches, publishMatch{sub: s, refined: true})
+	plan := h.router.Plan(h.snapshot(), raw)
+
+	lg := h.logger.Load()
+
+	// Apply the side effects the Router decided. Routing writes no state; the
+	// Hub owns the cross-check counter/log and the per-consumer identity marks.
+	for _, d := range plan.Drops {
+		switch d.Reason {
+		case routing.DropCrossCheck:
+			h.crossCheckDropped.Add(1)
+			if lg != nil {
+				lg.Printf("WARN: refined event dropped: remote_subscription_id=%s cross_check_mismatch=%s",
+					raw.RemoteSubscriptionID, d.Detail)
 			}
-			continue
-		}
-		for _, et := range s.EventTypes() {
-			if et == raw.EventType {
-				matches = append(matches, publishMatch{sub: s, refined: false})
-				break
+		case routing.DropStaleIdentity:
+			// owner != current: NO delivery, NO remote change, marked
+			// stale_identity. The core identity-gate invariant.
+			if c, ok := d.Ref.(*Conn); ok {
+				c.SetStaleIdentity()
+			}
+		case routing.DropUnresolvedIdentity:
+			// Fail CLOSED: never deliver to a user consumer under an unresolved
+			// identity; mark it degraded on the identity dimension.
+			if c, ok := d.Ref.(*Conn); ok {
+				c.SetIdentityDegraded(reasonCurrentIdentityUnresolved)
 			}
 		}
 	}
-	// Snapshotted alongside subscribers under the same RLock:
-	// nil means no identity gating configured (every non-gated caller).
-	currentResolver := h.currentResolver
-	h.mu.RUnlock()
 
-	// Resolve source time once per Publish (not per subscriber) — same value
-	// across the fan-out. Prefer the upstream header create_time
-	// (raw.SourceTime) over the local arrival timestamp so consumers see
-	// original publisher intent; fall back to Timestamp when SourceTime
-	// wasn't populated (e.g. test-only sources, pre-4.4 RawEvent producers).
+	if len(plan.Deliveries) == 0 {
+		return
+	}
+
+	// Build the per-fan-out message template once. The Broker clones it per
+	// endpoint, assigning that endpoint's own monotonically-increasing Seq —
+	// aliasing a single Seq across subscribers would defeat gap-detection on
+	// the consume side. Resolve source time once (not per subscriber): prefer
+	// the upstream header create_time (raw.SourceTime) over the local arrival
+	// timestamp so consumers see original publisher intent, falling back to
+	// Timestamp when SourceTime wasn't populated.
 	sourceTime := raw.SourceTime
 	if sourceTime == "" && !raw.Timestamp.IsZero() {
 		sourceTime = fmt.Sprintf("%d", raw.Timestamp.UnixMilli())
 	}
-
-	// Split dedup: runs AFTER routing-domain identification, not
-	// as one global event_id gate at the source entry — otherwise the same
-	// physical event delivered under two remote_subscription_id contexts
-	// would have its second delivery swallowed before Hub.Publish even got to
-	// route it to the second refined consumer. Each IsDuplicate call is
-	// self-locking and has side effects (marks the key seen); called exactly
-	// once per domain per Publish, regardless of how many subscribers match.
-	//
-	// legacyDup is evaluated unconditionally: legacy consumers receive
-	// refined events too (routed by event_type above), so the legacy domain
-	// must dedup by event_id across BOTH kinds of raw events.
-	legacyDup := h.legacyDedup.IsDuplicate(raw.EventID)
-
-	// refinedDrop only applies when raw actually carries a
-	// remote_subscription_id (that's the domain gate — there is no refined
-	// domain otherwise). Priority ①②③ per RefinedDedupKey; ③ (ok=false) means
-	// no key could be built — deliver unconditionally (never silently drop)
-	// and log a warning instead.
-	var refinedDrop bool
+	tmpl := protocol.NewEvent(raw.EventType, raw.EventID, sourceTime, 0, raw.Payload)
+	// v2 fields: populated whenever the RAW event is refined, regardless of
+	// which domain a given recipient matched in — a legacy consumer receiving a
+	// refined-native event via event_type compat delivery gets them too
+	// (harmless: omitempty on the wire). Resource -> TargetResource name
+	// difference is intentional (see RawEvent/Event doc comments).
 	if raw.RemoteSubscriptionID != "" {
-		if key, ok := event.RefinedDedupKey(raw.RemoteSubscriptionID, raw.SubscriptionEventID, raw.EventID); ok {
-			refinedDrop = h.refinedDedup.IsDuplicate(key)
-		} else if lg := h.logger.Load(); lg != nil {
-			lg.Printf("WARN: refined event undeduplicated: remote_subscription_id=%s event_id=%s has no subscription_event_id and no event_id (cannot build a dedup key); delivering without dedup",
-				raw.RemoteSubscriptionID, raw.EventID)
+		tmpl.RemoteSubscriptionID = raw.RemoteSubscriptionID
+		tmpl.TargetResource = raw.Resource
+		tmpl.Authority = raw.Authority
+		tmpl.SubscriptionEventID = raw.SubscriptionEventID
+	}
+	build := func(seq uint64) interface{} {
+		msg := *tmpl
+		msg.Seq = seq
+		return &msg
+	}
+
+	// Partition the eligible destinations by dedup domain (RouteKind).
+	var legacyEps, refinedEps []delivery.Endpoint
+	for _, dst := range plan.Deliveries {
+		ep := dst.Ref.(delivery.Endpoint)
+		if dst.Kind == routing.RouteRefined {
+			refinedEps = append(refinedEps, ep)
+		} else {
+			legacyEps = append(legacyEps, ep)
 		}
 	}
 
-	// Identity gate state, resolved AT MOST ONCE per Publish
-	// call — lazily, only when a matched subscriber is actually a USER
-	// consumer (OwnerUserOpenID() != ""); bot/legacy consumers never pay
-	// this cost and are never gated, regardless of currentResolver.
-	var (
-		identityResolved bool
-		identityCur      session.CurrentIdentity
-		identityErr      error
-	)
-
-	for _, m := range matches {
-		if m.refined {
-			if refinedDrop {
-				continue
-			}
-		} else if legacyDup {
-			continue
+	// LEGACY domain: dedup by event_id. Check-before, commit-after-accept.
+	if len(legacyEps) > 0 && !h.legacyDedup.Seen(raw.EventID) {
+		if h.broker.Deliver(legacyEps, build, lg) > 0 {
+			h.legacyDedup.Record(raw.EventID)
 		}
-		s := m.sub
+	}
 
-		if m.refined {
-			if reason := refinedCrossCheckMismatch(raw, s); reason != "" {
-				h.crossCheckDropped.Add(1)
-				if lg := h.logger.Load(); lg != nil {
-					lg.Printf("WARN: refined event dropped: remote_subscription_id=%s cross_check_mismatch=%s",
-						raw.RemoteSubscriptionID, reason)
-				}
-				continue
+	// REFINED domain: dedup by RefinedDedupKey (priority ①②③). ③ (ok=false)
+	// means no key could be built — deliver unconditionally (never silently
+	// drop), commit nothing, and log a warning.
+	if len(refinedEps) > 0 {
+		key, ok := event.RefinedDedupKey(raw.RemoteSubscriptionID, raw.SubscriptionEventID, raw.EventID)
+		switch {
+		case !ok:
+			h.broker.Deliver(refinedEps, build, lg)
+			if lg != nil {
+				lg.Printf("WARN: refined event undeduplicated: remote_subscription_id=%s event_id=%s has no subscription_event_id and no event_id (cannot build a dedup key); delivering without dedup",
+					raw.RemoteSubscriptionID, raw.EventID)
 			}
-		}
-
-		if currentResolver != nil && s.OwnerUserOpenID() != "" {
-			if !identityResolved {
-				identityCur, identityErr = currentResolver()
-				identityResolved = true
-			}
-			// The shared owner/current gate decides the fail-closed policy; this
-			// site applies the delivery-path side effects.
-			owner := model.OwnerRef{AppID: s.OwnerAppID(), UserOpenID: s.OwnerUserOpenID()}
-			switch session.Gate(owner, identityCur, identityErr) {
-			case session.AdmitUnresolved:
-				// Fail CLOSED: never deliver to a user consumer under an
-				// unresolved identity. A single unresolved lookup degrades
-				// every user consumer matched in THIS Publish call; bot
-				// consumers never reach this branch at all.
-				if c, ok := s.(*Conn); ok {
-					c.SetIdentityDegraded(reasonCurrentIdentityUnresolved)
-				}
-				continue
-			case session.AdmitStale:
-				// owner != current: NO delivery, NO remote change, marked
-				// stale_identity. This is the core identity-gate invariant.
-				if c, ok := s.(*Conn); ok {
-					c.SetStaleIdentity()
-				}
-				continue
+		case h.refinedDedup.Seen(key):
+			// duplicate within this refined domain: skip.
+		default:
+			if h.broker.Deliver(refinedEps, build, lg) > 0 {
+				h.refinedDedup.Record(key)
 			}
 		}
-
-		msg := protocol.NewEvent(
-			raw.EventType,
-			raw.EventID,
-			sourceTime,
-			s.NextSeq(),
-			raw.Payload,
-		)
-		// v2 fields: populated whenever the RAW event is refined,
-		// regardless of which domain THIS recipient matched in — a legacy
-		// consumer receiving a refined-native event via event_type compat
-		// delivery gets them too (harmless: omitempty on the wire, and this
-		// recipient just ignores fields it doesn't look at). Resource ->
-		// TargetResource name difference is intentional (see RawEvent/Event
-		// doc comments) — do not rename either to match the other.
-		if raw.RemoteSubscriptionID != "" {
-			msg.RemoteSubscriptionID = raw.RemoteSubscriptionID
-			msg.TargetResource = raw.Resource
-			msg.Authority = raw.Authority
-			msg.SubscriptionEventID = raw.SubscriptionEventID
-		}
-
-		enqueued, dropped := s.PushDropOldest(msg)
-		if dropped {
-			s.IncrementDropped()
-			if lg := h.logger.Load(); lg != nil {
-				lg.Printf("WARN: backpressure on conn pid=%d event_key=%s dropped_total=%d",
-					s.PID(), s.EventKey(), s.DroppedCount())
-			}
-		}
-		if enqueued {
-			s.IncrementReceived()
-		}
 	}
-}
-
-// refinedCrossCheckMismatch implements the fail-closed defense-in-depth
-// cross-check for a refined consumer already matched by remote_subscription_id
-// equality: that match alone routed raw to s, but a legit refined event ALWAYS
-// carries its full context (the platform envelope always includes
-// target_resource and authority), so this treats a MISSING dimension as an
-// anomaly to drop, not a reason to deliver blind.
-// Returns "" (no mismatch — deliver) or a short fixed classification naming
-// what went wrong, so a drop's log line and counter stay consistent. The
-// tokens are distinct for "absent context" versus "present-but-disagrees":
-// "event_type" / "target_resource" / "authority" (mismatch) and
-// "target_resource_missing" / "authority_missing" (absent context).
-//
-// event_type is always checkable: raw.EventType and s.EventTypes() are both
-// always populated (refined or not), and a real remote Subscription is
-// permanently bound to one event_type at Create time — so a mismatch here
-// under an already-matched remote_subscription_id would be a genuine
-// anomaly, not a normal/expected state.
-//
-// target_resource and authority must be present on a refined-native event;
-// an empty value drops (*_missing). When present, target_resource is compared
-// against the consumer's own stored intent via event.TargetResourceEqual
-// (normalized, so escaping/selector-ordering never false-drops) — and only
-// when s is a *Conn exposing that intent (a bare Subscriber — a test fake,
-// never a real registration — has no target_resource concept and is only held
-// to the presence check). authority reuses lifecycle.AuthorityMatchesOwner,
-// the SAME "user:<open_id>"/"app" compare the updated_v1 lifecycle
-// compatibility check already establishes, so the two never drift out of sync.
-func refinedCrossCheckMismatch(raw *event.RawEvent, s Subscriber) string {
-	matched := false
-	for _, et := range s.EventTypes() {
-		if et == raw.EventType {
-			matched = true
-			break
-		}
-	}
-	if !matched {
-		return "event_type"
-	}
-
-	// target_resource: a legit refined event always carries its own
-	// target_resource (the platform envelope includes it), so an absent one
-	// under an already-matched remote_subscription_id is an anomaly — fail
-	// closed rather than deliver blind. When present, hold a *Conn to its own
-	// resolved listening intent, comparing NORMALIZED so escaping/selector-
-	// ordering differences don't false-drop (a bare Subscriber — a test fake —
-	// carries no target_resource intent and is never held to one).
-	if raw.Resource == "" {
-		return "target_resource_missing"
-	}
-	if c, ok := s.(*Conn); ok && c.TargetResource() != "" && !event.TargetResourceEqual(raw.Resource, c.TargetResource()) {
-		return "target_resource"
-	}
-
-	// authority: likewise always present on a legit refined event, so an absent
-	// one is an anomaly (fail closed). When present it must name THIS consumer's
-	// own owner — "user:<open_id>" for a user, "app" for a bot.
-	if raw.Authority == "" {
-		return "authority_missing"
-	}
-	if !lifecycle.AuthorityMatchesOwner(raw.Authority, s.OwnerUserOpenID()) {
-		return "authority"
-	}
-
-	return ""
 }
 
 // ConnCount returns the current number of registered subscribers.
@@ -572,9 +483,9 @@ func (h *Hub) ConnCount() int {
 	return len(h.subscribers)
 }
 
-// CrossCheckDroppedCount returns how many events Publish's refined
-// cross-check (refinedCrossCheckMismatch) has dropped so far (0 in normal
-// operation — see crossCheckDropped's own doc comment).
+// CrossCheckDroppedCount returns how many events the refined cross-check
+// (routing's DropCrossCheck) has dropped so far (0 in normal operation — see
+// crossCheckDropped's own doc comment).
 func (h *Hub) CrossCheckDroppedCount() int64 {
 	return h.crossCheckDropped.Load()
 }
@@ -649,11 +560,11 @@ func (h *Hub) BroadcastSourceStatus(source, state, detail string) {
 // bus (it is just that bus's own AppID), not only refined ones.
 // OwnerIdentity/StaleIdentity/per-dimension health are *Conn-only state (not
 // part of Subscriber — see Conn's own doc comment on identityMu), so they need
-// the same s.(*Conn) type-assert the Publish delivery gate already uses
-// (hub.go's Publish, "if c, ok := s.(*Conn); ok"): this keeps the Subscriber
-// interface untouched (no mock churn) while still surfacing them for every
-// real registration, which is always a *Conn in production. A non-*Conn
-// Subscriber (test fakes only) simply leaves those three fields at zero.
+// the same s.(*Conn) type-assert the Publish delivery gate already uses:
+// this keeps the Subscriber interface untouched (no mock churn) while still
+// surfacing them for every real registration, which is always a *Conn in
+// production. A non-*Conn Subscriber (test fakes only) simply leaves those
+// three fields at zero.
 func (h *Hub) Consumers() []protocol.ConsumerInfo {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

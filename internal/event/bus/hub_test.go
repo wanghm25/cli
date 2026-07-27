@@ -466,106 +466,11 @@ func TestHub_Publish_RefinedCrossCheck_MultiConsumerFanOutUnaffected(t *testing.
 	}
 }
 
-// newCrossCheckConn builds a refined *Conn for the whitebox
-// refinedCrossCheckMismatch table below: remoteSubID set, a fixed owner
-// (ownerOpenID=="" registers a bot owner, non-empty registers that user), and
-// an optional resolved target_resource intent.
-func newCrossCheckConn(t *testing.T, eventTypes []string, remoteSubID, ownerOpenID, targetResource string) *Conn {
-	t.Helper()
-	server, client := net.Pipe()
-	t.Cleanup(func() { server.Close(); client.Close() })
-	c := NewConn(server, nil, "k", eventTypes, 1, "")
-	c.SetRemoteSubscriptionID(remoteSubID)
-	if ownerOpenID == "" {
-		c.SetOwnerIdentity("bot", "cli_app", "")
-	} else {
-		c.SetOwnerIdentity("user", "cli_app", ownerOpenID)
-	}
-	if targetResource != "" {
-		c.SetListenIntent(targetResource, false, nil)
-	}
-	return c
-}
-
-// TestRefinedCrossCheckMismatch_Reasons pins the exact fixed reason token for
-// each dimension — distinct tokens for "absent context" (*_missing, fail
-// closed) versus "present-but-disagrees", and "" for the delivered cases
-// (user push, bot push, and an escaping-equivalent target_resource that must
-// normalize equal). Whitebox because these tokens feed only the internal
-// counter/log, never the wire.
-func TestRefinedCrossCheckMismatch_Reasons(t *testing.T) {
-	const et = "im.message.receive_v1"
-	tests := []struct {
-		name           string
-		ownerOpenID    string // consumer owner ("" = bot)
-		targetResource string // consumer intent ("" = none stored)
-		raw            *event.RawEvent
-		want           string
-	}{
-		{
-			name: "event_type_mismatch",
-			raw:  &event.RawEvent{EventType: "im.message.OTHER_v1", Resource: "im.message?chat_id=oc_1", Authority: "app"},
-			want: "event_type",
-		},
-		{
-			name:           "target_resource_missing",
-			ownerOpenID:    "ou_alice",
-			targetResource: "im.message?chat_id=oc_1",
-			raw:            &event.RawEvent{EventType: et, Authority: "user:ou_alice"},
-			want:           "target_resource_missing",
-		},
-		{
-			name:           "target_resource_mismatch",
-			ownerOpenID:    "ou_alice",
-			targetResource: "im.message?chat_id=oc_1",
-			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc_2", Authority: "user:ou_alice"},
-			want:           "target_resource",
-		},
-		{
-			name:           "target_resource_escaping_equivalent_ok",
-			ownerOpenID:    "ou_alice",
-			targetResource: "im.message?chat_id=oc+1", // local url.QueryEscape form
-			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc%201", Authority: "user:ou_alice"},
-			want:           "",
-		},
-		{
-			name:           "authority_missing",
-			ownerOpenID:    "ou_alice",
-			targetResource: "im.message?chat_id=oc_1",
-			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc_1"},
-			want:           "authority_missing",
-		},
-		{
-			name:           "authority_mismatch",
-			ownerOpenID:    "ou_alice",
-			targetResource: "im.message?chat_id=oc_1",
-			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc_1", Authority: "user:ou_bob"},
-			want:           "authority",
-		},
-		{
-			name:           "user_push_all_match",
-			ownerOpenID:    "ou_alice",
-			targetResource: "im.message?chat_id=oc_1",
-			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc_1", Authority: "user:ou_alice"},
-			want:           "",
-		},
-		{
-			name:           "bot_push_all_match",
-			ownerOpenID:    "", // bot
-			targetResource: "im.message?chat_id=oc_1",
-			raw:            &event.RawEvent{EventType: et, Resource: "im.message?chat_id=oc_1", Authority: "app"},
-			want:           "",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := newCrossCheckConn(t, []string{et}, "R1", tt.ownerOpenID, tt.targetResource)
-			if got := refinedCrossCheckMismatch(tt.raw, c); got != tt.want {
-				t.Errorf("refinedCrossCheckMismatch() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
+// NOTE: the whitebox refined cross-check reason table that used to live here
+// moved to internal/event/routing (TestPlan_RefinedCrossCheckReasons), where the
+// decision now lives. The Hub's integration with it — that a mismatch drops the
+// event AND increments CrossCheckDroppedCount — is still pinned by the
+// TestHub_Publish_RefinedCrossCheck_* cases above.
 
 // Split dedup (spec §4.3): the same event_id delivered under two DIFFERENT
 // remote_subscription_id contexts (the underlying event matched two separate
@@ -666,6 +571,85 @@ func TestHub_Publish_RefinedNoDedupKeyDeliversEveryTimeAndWarns(t *testing.T) {
 	if !strings.Contains(logBuf.String(), "WARN") {
 		t.Errorf("expected a WARN log for the un-dedupable refined event, got log: %q", logBuf.String())
 	}
+}
+
+// --- §七 fix: dedup commits ONLY after an eligible destination has accepted the
+// event. A no-recipient (or matched-but-not-accepted) event must stay
+// re-processable, never swallowed by an early dedup commit. ---
+
+// A legacy event delivered while NO consumer matches must not commit its
+// event_id: a consumer that registers afterward and receives the SAME event_id
+// must still get it.
+func TestHub_Publish_NoRecipientLegacyEventStaysReprocessable(t *testing.T) {
+	h := NewHub()
+	const eventID = "evt-no-recipient"
+
+	// No consumer for this event type yet — the event reaches nobody.
+	h.Publish(&event.RawEvent{EventID: eventID, EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
+
+	// A consumer registers afterward and the SAME event_id is redelivered.
+	c := newTestConn("im.msg", []string{"im.message.receive_v1"})
+	h.RegisterAndIsFirst(c)
+	h.Publish(&event.RawEvent{EventID: eventID, EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
+
+	mustReceiveEvent(t, c.sendCh, "consumer must receive a redelivered event whose first delivery had NO recipient (no early dedup commit)")
+}
+
+// The refined half of the same rule: a refined event delivered while no consumer
+// is bound to its remote_subscription_id must not commit its refined dedup key.
+func TestHub_Publish_NoRecipientRefinedEventStaysReprocessable(t *testing.T) {
+	h := NewHub()
+	other := newRefinedTestConn("im.msg/chat-id/oc_2", []string{"im.message.receive_v1"}, "R2")
+	h.RegisterAndIsFirst(other)
+
+	raw := &event.RawEvent{
+		EventID:              "evt-1",
+		EventType:            "im.message.receive_v1",
+		RemoteSubscriptionID: "R1",
+		SubscriptionEventID:  "sub-evt-1",
+		Resource:             "im.message?chat_id=oc_1",
+		Authority:            "app",
+		Payload:              json.RawMessage(`{}`),
+	}
+	// No R1 consumer yet: nothing eligible in the refined domain, so the refined
+	// dedup key must NOT be committed.
+	h.Publish(raw)
+
+	// R1 consumer registers and the SAME refined event (same dedup key) arrives.
+	r1 := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
+	h.RegisterAndIsFirst(r1)
+	h.Publish(raw)
+
+	mustReceiveEvent(t, r1.sendCh, "R1 must receive a redelivered refined event whose first delivery had no R1 recipient")
+	mustNotReceive(t, other.sendCh, "R2 must never receive an R1-scoped event")
+}
+
+// "Accepted" means queued, not merely matched: an eligible destination that
+// exists but cannot enqueue (PushDropOldest fails) must also commit no dedup, so
+// a later working consumer still receives the same event_id.
+func TestHub_Publish_UnacceptedDeliveryDoesNotCommitDedup(t *testing.T) {
+	h := NewHub()
+	const eventID = "evt-unaccepted"
+
+	// The first consumer can never enqueue.
+	failing := &alwaysFailSubscriber{
+		eventKey:   "im.msg",
+		eventTypes: []string{"im.message.receive_v1"},
+		sendCh:     make(chan interface{}, 1),
+	}
+	h.RegisterAndIsFirst(failing)
+	h.Publish(&event.RawEvent{EventID: eventID, EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
+	if failing.Received() != 0 {
+		t.Fatalf("precondition: always-fail subscriber should have Received 0, got %d", failing.Received())
+	}
+
+	// A working consumer registers; the SAME event_id must still reach it,
+	// because the earlier unaccepted delivery committed no dedup key.
+	working := newTestConn("im.msg2", []string{"im.message.receive_v1"})
+	h.RegisterAndIsFirst(working)
+	h.Publish(&event.RawEvent{EventID: eventID, EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
+
+	mustReceiveEvent(t, working.sendCh, "a working consumer must receive the event_id an earlier unaccepted delivery failed to commit")
 }
 
 // fan-out: multiple LOCAL consumers may share one remote_subscription_id
