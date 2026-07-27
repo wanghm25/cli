@@ -18,7 +18,7 @@
 - `preview`：预览图片。推荐 `--output ./preview` 这类无后缀文件路径，CLI 会按实际图片类型保存为 `./preview.png` 或 `./preview.jpg`。如果 `--output` 是目录，会保存为该目录下的 `whiteboard_<whiteboard-token>.png/.jpg`；如果显式写了后缀，需要和实际图片类型匹配。`--overwrite` 检查的是补齐后缀后的最终路径，例如返回 PNG 时 `--output ./preview` 对应覆盖 `./preview.png`。
 - `svg`：导出画板为标准 SVG 矢量图。可用于 SVG 编辑后回写画板（见 [`routes/svg-edit.md`](../routes/svg-edit.md)）。注意：导出为纯视觉快照，思维导图层级、表格结构、连接器绑定等语义信息会丢失。
 - `source`：PlantUML/Mermaid 代码。仅限画板内有且仅有一个 PlantUML/Mermaid 图时，才可导出代码，否则会在返回值中告知不存在/有多个节点。
-- `raw`：飞书 OpenAPI 原生画板节点格式。这一 json 格式不适合直接编辑复杂布局或内容，建议仅限于需要修改简单的文本内容/颜色等细节时使用。需要进行更复杂的设计/修改时，建议参考 [§ 渲染 & 写入画板](../SKILL.md#渲染--写入画板)。
+- `raw`：飞书 OpenAPI 原生画板节点格式。主要用于定位 `data.nodes[].id` 和核对节点字段。已知 node id 的局部修改优先用 [`+node-update`](./lark-whiteboard-node-update.md)，删除用 [`+node-delete`](./lark-whiteboard-node-delete.md)；不要手动改 raw JSON 后用 `+update --input_format raw` 做节点级微调。复杂设计/修改参考 [§ 渲染 & 写入画板](../SKILL.md#渲染--写入画板)。
 
 ## 示例
 

@@ -2,7 +2,7 @@
 name: lark-whiteboard
 version: 1.0.0
 description: >
-  飞书画板：查询和编辑飞书云文档中的画板。支持导出画板为预览图片、导出原始节点结构、使用多种格式更新画板内容。
+  飞书画板：查询和编辑飞书云文档中的画板。支持导出画板为预览图片、导出原始节点结构、使用多种格式更新画板内容，并支持按节点增量创建、更新和删除。
   当用户需要查看画板内容、导出画板图片、编辑画板时使用此 skill。不负责：飞书云文档内容编辑（lark-doc）、文档内嵌电子表格/Base（lark-sheets / lark-base）。
 metadata:
   requires:
@@ -28,7 +28,10 @@ metadata:
 | 导出 SVG 矢量图 | [`+export --output-type svg`](references/lark-whiteboard-export.md)                       |
 | 获取画板的 Mermaid/PlantUML 代码               | [`+export --output-type source`](references/lark-whiteboard-export.md)                             |
 | 检查画板是否由代码绘制                             | [`+export --output-type source`](references/lark-whiteboard-export.md)                             |
-| 仅微调节点文字/颜色                         | `+export --output-type raw` → 手动改 JSON → `+update --input_format raw`                             |
+| 定位节点 id / 查看原始节点结构                         | [`+export --output-type raw`](references/lark-whiteboard-export.md)                             |
+| 已知 node id, 微调文字/颜色/样式                         | [`+node-update`](references/lark-whiteboard-node-update.md); 先用 `+export --output-type raw` 定位节点 |
+| 追加已编译好的 OpenAPI 节点                         | [`+node-create`](references/lark-whiteboard-node-create.md); 节点建议由 `npx -y @larksuite/whiteboard-cli@^0.2.13 --to openapi` 生成后整理成 `{ "nodes": [...] }` |
+| 删除已知节点                         | [`+node-delete`](references/lark-whiteboard-node-delete.md); 删除前先确认 node id, 真实执行需要 `--yes` |
 | 用户**已提供** Mermaid/PlantUML/SVG 代码，或明确指定用该格式 | 自己生成/使用代码 → [`+update --input_format mermaid/plantuml/svg`](references/lark-whiteboard-update.md) |
 | 新建/创作复杂图表（架构/流程/组织等）                    | → **[§ 创作 Workflow](references/lark-whiteboard-workflow.md#创作-workflow)**                         |
 | 修改/重绘已有画板                               | → **[§ 修改 Workflow](references/lark-whiteboard-workflow.md#修改-workflow)**                         |
@@ -39,6 +42,9 @@ metadata:
 |---------------------------------------------------|---|
 | [`+export`](references/lark-whiteboard-export.md) | 导出画板为预览图片、SVG 矢量图、代码或原始节点结构。 |
 | [`+update`](references/lark-whiteboard-update.md) | 更新画板，支持 PlantUML、Mermaid、SVG 或 OpenAPI 原生格式 |
+| [`+node-create`](references/lark-whiteboard-node-create.md) | 向已有画板追加 OpenAPI 节点；适合已由工具生成节点数据的增量新增 |
+| [`+node-update`](references/lark-whiteboard-node-update.md) | 按节点 id 更新已有节点；当前批量输入会逐节点执行，非原子 |
+| [`+node-delete`](references/lark-whiteboard-node-delete.md) | 按节点 id 删除已有节点；高风险写操作，执行前必须确认目标节点 |
 
 ---
 

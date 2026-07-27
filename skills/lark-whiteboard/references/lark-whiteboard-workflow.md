@@ -30,6 +30,12 @@
   ├─ 返回 Mermaid/PlantUML 代码
   │   → 在原代码上修改 → +update --input_format mermaid/plantuml
   ├─ 无代码（SVG/DSL 或其他方式绘制的画板）
+  │   ├─ 已知 node id, 只需局部微调
+  │   │    → +export --output-type raw 确认节点 → +node-update → +export --output-type raw 或 preview 复验
+  │   ├─ 已知 node id, 需要删除局部节点
+  │   │    → +export --output-type raw 确认节点 → +node-delete --dry-run → +node-delete --yes → preview 复验
+  │   ├─ 已生成 OpenAPI nodes[] 且只需追加
+  │   │    → +node-create --dry-run → +node-create → +export --output-type raw 或 preview 复验
   │   ├─ 需纯新增（思维导图、流程图、时序图、类图、饼图、甘特图）图表节点
   │   │    → +export --output-type preview → 看图 → +export --output-type raw → 确定新节点坐标和层级  → [§ 渲染 & 写入画板]
   │   └─ 其他改动（几何变动/增删元素/结构调整/混合编辑等）
@@ -83,5 +89,6 @@ diagram.png           ← 渲染结果
 
 - Mermaid / PlantUML / SVG 产物直接用对应的 `mermaid` / `plantuml` / `svg` 写入。
 - 只有 DSL 产物或已明确需要 OpenAPI 原生节点格式时，才先用 `npx -y @larksuite/whiteboard-cli@^0.2.13 --to openapi --format json` 转换，再用 `raw` 写入。
+- 如果目标是向已有画板追加已编译好的 OpenAPI `nodes[]`, 优先用 [`whiteboard +node-create`](./lark-whiteboard-node-create.md), 不要为了追加节点覆盖整图。
 
 具体命令示例、`--overwrite`、`--idempotent-token` 和 `--as user/bot` 的使用方式，统一参考 [`whiteboard +update`](./lark-whiteboard-update.md)。
