@@ -16,6 +16,7 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
 // --- Task 18: subscriptionLifecycleAction (spec §5.3/§5.4/§5.5/§8) ---------
@@ -46,37 +47,33 @@ type fakeSubscriptionActionClient struct {
 	reactivateCalls int
 	renewCalls      int
 
-	getResp       *larkeventv1.GetSubscriptionResp
+	getSub        *larkgw.RemoteSubscription
 	getErr        error
 	reactivateErr error
 	renewErr      error
 }
 
-func (f *fakeSubscriptionActionClient) Get(_ context.Context, _ *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error) {
+func (f *fakeSubscriptionActionClient) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.getCalls++
-	return f.getResp, f.getErr
+	return f.getSub, f.getErr
 }
 
-func (f *fakeSubscriptionActionClient) Reactivate(_ context.Context, _ *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error) {
+func (f *fakeSubscriptionActionClient) Reactivate(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reactivateCalls++
-	if f.reactivateErr != nil {
-		return nil, f.reactivateErr
-	}
-	return &larkeventv1.ReactivateSubscriptionResp{}, nil
+	// The action discards the returned subscription (only the error matters), so
+	// success returns a nil subscription here.
+	return nil, f.reactivateErr
 }
 
-func (f *fakeSubscriptionActionClient) Renew(_ context.Context, _ *larkeventv1.RenewSubscriptionReq) (*larkeventv1.RenewSubscriptionResp, error) {
+func (f *fakeSubscriptionActionClient) Renew(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.renewCalls++
-	if f.renewErr != nil {
-		return nil, f.renewErr
-	}
-	return &larkeventv1.RenewSubscriptionResp{}, nil
+	return nil, f.renewErr
 }
 
 func (f *fakeSubscriptionActionClient) getCount() int {
@@ -95,24 +92,25 @@ func (f *fakeSubscriptionActionClient) renewCount() int {
 	return f.renewCalls
 }
 
-// buildGetResp constructs a minimal GetSubscriptionResp reporting state
-// (and, when non-empty, a verbatim suspension code) -- exactly the shape
-// reconcileWithGet reads.
-func buildGetResp(state, suspensionCode string) *larkeventv1.GetSubscriptionResp {
+// buildGetSub constructs a minimal RemoteSubscription reporting state (and, when
+// non-empty, a verbatim suspension code) -- exactly the shape reconcileWithGet
+// reads -- projected through the gateway's projection as production would.
+func buildGetSub(state, suspensionCode string) *larkgw.RemoteSubscription {
 	b := larkeventv1.NewSubscriptionDetailBuilder().State(state)
 	if suspensionCode != "" {
 		b = b.Suspension(larkeventv1.NewSuspensionBuilder().Code(suspensionCode).Build())
 	}
-	return &larkeventv1.GetSubscriptionResp{Data: &larkeventv1.GetSubscriptionRespData{Subscription: b.Build()}}
+	sub := larkgw.ProjectSubscription(b.Build())
+	return &sub
 }
 
-// buildGetRespActive constructs a state="active" GetSubscriptionResp that
-// ALSO carries target_resource/authority/payload_options.include_resource_data
-// -- the 3 dimensions issue #23's reconcileWithGet compatibility check
-// projects and compares against the lead conn's own stored intent.
-// authorityUserOpenID=="" builds an "app" authority; non-empty builds
-// "user:<id>" (mirrors lifecycle.AuthorityMatchesOwner's own vocabulary).
-func buildGetRespActive(targetResource, authorityUserOpenID string, includeResourceData bool) *larkeventv1.GetSubscriptionResp {
+// buildGetSubActive constructs a state="active" RemoteSubscription that ALSO
+// carries target_resource/authority/payload_options.include_resource_data -- the
+// 3 dimensions reconcileWithGet's compatibility check projects and compares
+// against the lead conn's own stored intent. authorityUserOpenID=="" builds an
+// "app" authority; non-empty builds "user:<id>" (mirrors
+// lifecycle.AuthorityMatchesOwner's own vocabulary).
+func buildGetSubActive(targetResource, authorityUserOpenID string, includeResourceData bool) *larkgw.RemoteSubscription {
 	authorityBuilder := larkeventv1.NewAuthorityBuilder().Type("app")
 	if authorityUserOpenID != "" {
 		authorityBuilder = larkeventv1.NewAuthorityBuilder().Type("user").OpenId(authorityUserOpenID)
@@ -123,16 +121,27 @@ func buildGetRespActive(targetResource, authorityUserOpenID string, includeResou
 		Authority(authorityBuilder.Build()).
 		PayloadOptions(larkeventv1.NewPayloadOptionsBuilder().IncludeResourceData(includeResourceData).Build()).
 		Build()
-	return &larkeventv1.GetSubscriptionResp{Data: &larkeventv1.GetSubscriptionRespData{Subscription: d}}
+	sub := larkgw.ProjectSubscription(d)
+	return &sub
 }
 
-// buildGetRespActiveWithFilter is buildGetRespActive plus a server-side filter
-// on the returned snapshot, for exercising the filter dimension of
+// buildGetSubActiveWithFilter is buildGetSubActive plus a server-side filter on
+// the returned snapshot, for exercising the filter dimension of
 // reconcileWithGet's "active" projection.
-func buildGetRespActiveWithFilter(targetResource, authorityUserOpenID string, includeResourceData bool, f *event.Filter) *larkeventv1.GetSubscriptionResp {
-	resp := buildGetRespActive(targetResource, authorityUserOpenID, includeResourceData)
-	resp.Data.Subscription.Filter = event.FilterToSDK(f)
-	return resp
+func buildGetSubActiveWithFilter(targetResource, authorityUserOpenID string, includeResourceData bool, f *event.Filter) *larkgw.RemoteSubscription {
+	authorityBuilder := larkeventv1.NewAuthorityBuilder().Type("app")
+	if authorityUserOpenID != "" {
+		authorityBuilder = larkeventv1.NewAuthorityBuilder().Type("user").OpenId(authorityUserOpenID)
+	}
+	d := larkeventv1.NewSubscriptionDetailBuilder().
+		State("active").
+		TargetResource(targetResource).
+		Authority(authorityBuilder.Build()).
+		PayloadOptions(larkeventv1.NewPayloadOptionsBuilder().IncludeResourceData(includeResourceData).Build()).
+		Filter(event.FilterToSDK(f)).
+		Build()
+	sub := larkgw.ProjectSubscription(d)
+	return &sub
 }
 
 // newLifecycleDispatchTestConn builds a *Conn registered on hub with BOTH a
@@ -328,7 +337,7 @@ func TestSubscriptionLifecycleAction_Suspended_UnknownCode_DefaultBranch_GetOnce
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
-	deps.client.getResp = buildGetResp("suspended", "some_future_unrecognized_code")
+	deps.client.getSub = buildGetSub("suspended", "some_future_unrecognized_code")
 
 	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "some_future_unrecognized_code"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
@@ -734,7 +743,7 @@ func TestSubscriptionLifecycleAction_Updated_MissingPayloadOptions_SingleGetReco
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
-	deps.client.getResp = buildGetResp("active", "")
+	deps.client.getSub = buildGetSub("active", "")
 
 	le := lifecycle.LifecycleEvent{
 		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
@@ -775,7 +784,7 @@ func TestSubscriptionLifecycleAction_Updated_UnclearAuthority_SingleGetReconcile
 	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	hub.RegisterAndIsFirst(c)
-	deps.client.getResp = buildGetResp("active", "")
+	deps.client.getSub = buildGetSub("active", "")
 
 	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
@@ -915,7 +924,7 @@ func TestSubscriptionLifecycleAction_Updated_MissingFilter_SingleGetReconcile(t 
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
-	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_1", "ou_alice", true)
+	deps.client.getSub = buildGetSubActive("im.message?chat_id=oc_1", "ou_alice", true)
 
 	le := lifecycle.LifecycleEvent{
 		EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active",
@@ -951,7 +960,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveCompatible_ClearsDeg
 	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	c.SetDegraded(lifecycle.ReasonRemoteSubscriptionConflict) // simulate an earlier degraded evaluation
 	hub.RegisterAndIsFirst(c)
-	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_1", "ou_alice", true)
+	deps.client.getSub = buildGetSubActive("im.message?chat_id=oc_1", "ou_alice", true)
 
 	// Authority=="" on the event forces classifyUpdateCompatibility to
 	// "unclear", triggering the single Get reconcile this test exercises.
@@ -977,7 +986,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleTargetRe
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
-	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_DIFFERENT", "ou_alice", true)
+	deps.client.getSub = buildGetSubActive("im.message?chat_id=oc_DIFFERENT", "ou_alice", true)
 
 	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
@@ -999,7 +1008,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleIncludeR
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	c.SetListenIntent("im.message?chat_id=oc_1", true, nil) // this consumer's own ENCRYPTED intent
 	hub.RegisterAndIsFirst(c)
-	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_1", "ou_alice", false) // Get reports plaintext
+	deps.client.getSub = buildGetSubActive("im.message?chat_id=oc_1", "ou_alice", false) // Get reports plaintext
 
 	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
@@ -1018,7 +1027,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleAuthorit
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
-	deps.client.getResp = buildGetRespActive("im.message?chat_id=oc_1", "ou_SOMEONE_ELSE", true)
+	deps.client.getSub = buildGetSubActive("im.message?chat_id=oc_1", "ou_SOMEONE_ELSE", true)
 
 	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
@@ -1040,7 +1049,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_ActiveIncompatibleFilter_S
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	c.SetListenIntent("im.message?chat_id=oc_1", true, newListenIntentTestFilter("oc_1"))
 	hub.RegisterAndIsFirst(c)
-	deps.client.getResp = buildGetRespActiveWithFilter("im.message?chat_id=oc_1", "ou_alice", true, newListenIntentTestFilter("oc_DIFFERENT"))
+	deps.client.getSub = buildGetSubActiveWithFilter("im.message?chat_id=oc_1", "ou_alice", true, newListenIntentTestFilter("oc_DIFFERENT"))
 
 	// Authority=="" forces classifyUpdateCompatibility to "unclear", triggering
 	// the single Get reconcile this test exercises.
@@ -1069,7 +1078,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_Suspended_Unchanged(t *tes
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
-	deps.client.getResp = buildGetResp("suspended", "some_future_unrecognized_code")
+	deps.client.getSub = buildGetSub("suspended", "some_future_unrecognized_code")
 
 	le := lifecycle.LifecycleEvent{EventType: "event.subscription.suspended_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "suspended", SuspensionCode: "some_future_unrecognized_code"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {
@@ -1091,7 +1100,7 @@ func TestSubscriptionLifecycleAction_ReconcileWithGet_Expired_Unchanged(t *testi
 	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
 	c.SetListenIntent("im.message?chat_id=oc_1", true, nil)
 	hub.RegisterAndIsFirst(c)
-	deps.client.getResp = buildGetResp("expired", "")
+	deps.client.getSub = buildGetSub("expired", "")
 
 	le := lifecycle.LifecycleEvent{EventType: "event.subscription.updated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active", Authority: ""}
 	if err := deps.action.Handle(context.Background(), le); err != nil {

@@ -23,6 +23,7 @@ import (
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 	"github.com/larksuite/cli/internal/event/busdiscover"
+	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
 	"github.com/larksuite/cli/internal/event/source"
 	"github.com/larksuite/cli/internal/event/transport"
@@ -155,7 +156,7 @@ func (b *Bus) SetIdentityProviders(resolveUAT func(ctx context.Context, appID, u
 // `event subscription` command builds via f.LarkClient() (cmd/event/bus.go
 // wires this). The per-call identity (bot, or a specific user's FRESH uat —
 // never a historical one) is decided fresh for EVERY action by the
-// lifecycle action itself via eventlib.NewSubscriptionClient(sdk, as, uat)
+// lifecycle action itself via larkgw.NewSubscriptionGateway(sdk, as, uat)
 // — never by constructing a second
 // *lark.Client.
 func (b *Bus) SetSubscriptionClient(sdk *lark.Client) {
@@ -163,7 +164,7 @@ func (b *Bus) SetSubscriptionClient(sdk *lark.Client) {
 		return
 	}
 	b.lifecycleAction.SetNewSubscriptionClient(func(as core.Identity, uat string) (lifecycle.SubscriptionClient, error) {
-		return event.NewSubscriptionClient(sdk, as, uat)
+		return larkgw.NewSubscriptionGateway(sdk, as, uat)
 	})
 	// The encrypt-key provider fetches keys via GetEncryptKey on
 	// the SAME per-app *lark.Client, deciding the per-call identity (bot, or a

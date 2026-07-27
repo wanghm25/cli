@@ -6,10 +6,7 @@ package lifecycle
 import (
 	"context"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
-	"github.com/larksuite/cli/internal/event"
-	"github.com/larksuite/cli/internal/event/source"
+	lark "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
 // --- activated --------------------------------------------------------------
@@ -123,8 +120,7 @@ func (a *SubscriptionAction) reactivateAndMaybeBind(ctx context.Context, le Life
 		return err
 	}
 
-	req := larkeventv1.NewReactivateSubscriptionReqBuilder().SubscriptionId(le.RemoteSubscriptionID).Build()
-	_, callErr := client.Reactivate(ctx, req)
+	_, callErr := client.Reactivate(ctx, le.RemoteSubscriptionID)
 	markActionResult(res.conns, "reactivate", callErr)
 	if callErr != nil {
 		for _, c := range res.conns {
@@ -174,8 +170,7 @@ func (a *SubscriptionAction) handleExpirationReminder(ctx context.Context, le Li
 		return err
 	}
 
-	req := larkeventv1.NewRenewSubscriptionReqBuilder().SubscriptionId(le.RemoteSubscriptionID).Build()
-	_, callErr := client.Renew(ctx, req)
+	_, callErr := client.Renew(ctx, le.RemoteSubscriptionID)
 	markActionResult(res.conns, "renew", callErr)
 	if callErr != nil {
 		for _, c := range res.conns {
@@ -263,8 +258,7 @@ func (a *SubscriptionAction) reconcileWithGet(ctx context.Context, le LifecycleE
 		return err
 	}
 
-	req := larkeventv1.NewGetSubscriptionReqBuilder().SubscriptionId(le.RemoteSubscriptionID).Build()
-	resp, callErr := client.Get(ctx, req)
+	sub, callErr := client.Get(ctx, le.RemoteSubscriptionID)
 	markActionResult(res.conns, "get", callErr)
 	if callErr != nil {
 		for _, c := range res.conns {
@@ -275,21 +269,15 @@ func (a *SubscriptionAction) reconcileWithGet(ctx context.Context, le LifecycleE
 	}
 
 	var state, suspensionCode string
-	var subscription *larkeventv1.SubscriptionDetail
-	if resp != nil && resp.Data != nil && resp.Data.Subscription != nil {
-		subscription = resp.Data.Subscription
-		if subscription.State != nil {
-			state = *subscription.State
-		}
-		if subscription.Suspension != nil && subscription.Suspension.Code != nil {
-			suspensionCode = *subscription.Suspension.Code
-		}
+	if sub != nil {
+		state = sub.State
+		suspensionCode = sub.SuspensionReason
 	}
 	// Only consulted by the "active" branch below — computed once against
 	// lead (mirrors handleUpdated's own "classify once, apply to every eligible
 	// conn" pattern, since every conn sharing one remote_subscription_id is
 	// expected to share the same local listening intent).
-	compatible := classifyUpdateCompatibility(projectSubscriptionCompatibility(subscription), lead) == updateCompatible
+	compatible := classifyUpdateCompatibility(projectSubscriptionCompatibility(sub), lead) == updateCompatible
 
 	for _, c := range res.conns {
 		c.SetLifecycleSummary(le.EventType, le.EventID, state)
@@ -317,34 +305,35 @@ func (a *SubscriptionAction) reconcileWithGet(ctx context.Context, le LifecycleE
 	return nil
 }
 
-// projectSubscriptionCompatibility turns a Get response's Subscription
-// snapshot into the same {Authority,TargetResource,IncludeResourceData,
-// PayloadOptionsPresent,Filter,FilterPresent} shape
-// classifyUpdateCompatibility already compares an updated_v1 event's After
-// snapshot through — using the SAME authority normalization
-// (source.FormatLifecycleAuthority) an actual lifecycle event would carry — so
-// reconcileWithGet's "active" branch can reuse that identical 4-dimension
-// compare rather than re-deriving it or trusting
-// state=="active" alone. d==nil (a malformed/empty Get response) projects to
-// the zero value: every dimension reads as "absent", which
-// classifyUpdateCompatibility already treats as "unclear" rather than a
-// confirmed match — never silently "compatible".
-func projectSubscriptionCompatibility(d *larkeventv1.SubscriptionDetail) LifecycleEvent {
-	if d == nil {
+// projectSubscriptionCompatibility turns a Get's RemoteSubscription snapshot
+// into the same {Authority,TargetResource,IncludeResourceData,
+// PayloadOptionsPresent,Filter,FilterPresent} shape classifyUpdateCompatibility
+// already compares an updated_v1 event's After snapshot through — using the SAME
+// authority vocabulary (RemoteAuthority.String(), which the gateway projected
+// from the SDK authority) an actual lifecycle event would carry — so
+// reconcileWithGet's "active" branch can reuse that identical 4-dimension compare
+// rather than re-deriving it or trusting state=="active" alone. sub==nil (a
+// malformed/empty Get response the gateway would have rejected, or the defensive
+// no-snapshot case) projects to the zero value: every dimension reads as
+// "absent", which classifyUpdateCompatibility already treats as "unclear" rather
+// than a confirmed match — never silently "compatible".
+func projectSubscriptionCompatibility(sub *lark.RemoteSubscription) LifecycleEvent {
+	if sub == nil {
 		return LifecycleEvent{}
 	}
-	le := LifecycleEvent{Authority: source.FormatLifecycleAuthority(d.Authority)}
-	if d.TargetResource != nil {
-		le.TargetResource = *d.TargetResource
+	le := LifecycleEvent{
+		Authority:      sub.Authority.String(),
+		TargetResource: sub.TargetResource,
 	}
-	if d.PayloadOptions != nil && d.PayloadOptions.IncludeResourceData != nil {
+	if sub.IncludeResourceData != nil {
 		le.PayloadOptionsPresent = true
-		le.IncludeResourceData = *d.PayloadOptions.IncludeResourceData
+		le.IncludeResourceData = *sub.IncludeResourceData
 	}
 	// A Get carries the authoritative filter, so this dimension is always known
-	// here: d.Filter==nil projects to an empty (no-filter) model — distinct from
-	// the updated_v1 path, where an absent filter means "unknown".
+	// here: the gateway projects an absent SDK filter to an empty (no-filter)
+	// model — distinct from the updated_v1 path, where an absent filter means
+	// "unknown".
 	le.FilterPresent = true
-	le.Filter = event.FilterFromSDK(d.Filter)
+	le.Filter = sub.Filter
 	return le
 }

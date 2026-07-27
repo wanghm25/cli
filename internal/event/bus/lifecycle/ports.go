@@ -15,9 +15,8 @@ package lifecycle
 import (
 	"context"
 
-	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
-
 	"github.com/larksuite/cli/internal/event"
+	lark "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
 // Conn is one consumer connection, as the lifecycle actions need to observe
@@ -82,15 +81,17 @@ type IdentityGate interface {
 	BindConsumer(ctx context.Context, c Conn) error
 }
 
-// SubscriptionClient is the narrow subset of the OAPI subscription client the
-// real action needs: a single Get (state-source-of-truth reconcile) and a
-// single Reactivate/Renew (at most one such remote call per event, never a
-// retry). Declared here — narrower than the full Create/Get/List/Patch/Renew/
-// Reactivate/Delete surface — purely as a test seam: the production client
-// satisfies it structurally, so production code passes it straight through
-// while tests substitute a fake with no *lark.Client or network call involved.
+// SubscriptionClient is the narrow subset of the platform/lark
+// SubscriptionGateway the real action needs: a single Get (state-source-of-truth
+// reconcile) and a single Reactivate/Renew (at most one such remote call per
+// event, never a retry). Declared here — narrower than the full gateway surface,
+// and domain-typed (no larkeventv1.* crosses it) — purely as a test seam: the
+// production *lark.Gateway satisfies it structurally, so production code passes
+// it straight through while tests substitute a fake with no *lark.Client or
+// network call involved. Reactivate/Renew return the refreshed RemoteSubscription
+// to match the gateway's shape; the action discards it (only the error matters).
 type SubscriptionClient interface {
-	Get(ctx context.Context, req *larkeventv1.GetSubscriptionReq) (*larkeventv1.GetSubscriptionResp, error)
-	Reactivate(ctx context.Context, req *larkeventv1.ReactivateSubscriptionReq) (*larkeventv1.ReactivateSubscriptionResp, error)
-	Renew(ctx context.Context, req *larkeventv1.RenewSubscriptionReq) (*larkeventv1.RenewSubscriptionResp, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*lark.RemoteSubscription, error)
+	Reactivate(ctx context.Context, remoteSubscriptionID string) (*lark.RemoteSubscription, error)
+	Renew(ctx context.Context, remoteSubscriptionID string) (*lark.RemoteSubscription, error)
 }
