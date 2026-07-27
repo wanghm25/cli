@@ -77,7 +77,7 @@ EventKey>' to actually start receiving events — creating/updating a
 Subscription here never starts, stops, or changes a local consumer.`,
 		Example: `  lark-cli event subscription list --as bot --json
   lark-cli event subscription get sub_xxx --as bot --json
-  lark-cli event subscription create im.message.created_v1/chat-id/oc_xxx --dry-run --as bot --json
+  lark-cli event subscription create im.message.example_v1/chat-id/oc_xxx --dry-run --as bot --json
   lark-cli event subscription update sub_xxx --clear-filter --dry-run --as bot --json
   lark-cli event subscription delete sub_xxx --dry-run --as bot --json`,
 		SilenceUsage: true,
@@ -267,7 +267,7 @@ type subscriptionRow struct {
 // EventKey to EventType verbatim (a legacy/plain EventKey IS its OAPI
 // event_type) and additionally surfaces
 // TargetResource as its own field, rather than fabricating a materialized
-// refined-key string (e.g. "im.message.created_v1/chat-id/oc_xxx"): doing
+// refined-key string (e.g. "im.message.example_v1/chat-id/oc_xxx"): doing
 // that faithfully requires a reverse KeyTemplate lookup (registry base +
 // PathSegment reconstruction from the resource query string) that does not
 // exist yet, and a wrong guess would emit a key-shaped string that `event

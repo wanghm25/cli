@@ -74,7 +74,7 @@ for one entry's full detail.
 SAFETY: read-only; never writes, never requires --yes.`,
 		Example: `  lark-cli event subscription list --as bot --json
   lark-cli event subscription list --state suspended --as bot --json
-  lark-cli event subscription list --event-key im.message.created_v1 --page-size 20 --as bot --json`,
+  lark-cli event subscription list --event-key im.message.example_v1 --page-size 20 --as bot --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runList(cmd, f, o)
 		},

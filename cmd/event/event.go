@@ -41,8 +41,8 @@ create, update, reactivate, or delete them can affect later consumers. Prefer
 NEXT STEP: 'lark-cli event list --json' to see what's available, then
 'lark-cli event schema <EventKey> --json' for details.`,
 		Example: `  lark-cli event list --json
-  lark-cli event schema im.message.created_v1 --json
-  lark-cli event consume im.message.created_v1/chat-id/oc_xxx --dry-run --as bot
+  lark-cli event schema im.message.example_v1 --json
+  lark-cli event consume im.message.example_v1/chat-id/oc_xxx --dry-run --as bot
   lark-cli event subscription list --as bot --json`,
 		// Without SilenceUsage, RunE errors print the full flag help banner.
 		SilenceUsage: true,

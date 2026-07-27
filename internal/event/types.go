@@ -218,8 +218,8 @@ type KeyDefinition struct {
 // KeyTemplate describes one resource-selector materialization path for a
 // refined-subscription base KeyDefinition (see KeyDefinition.RefinedSubscription).
 type KeyTemplate struct {
-	Template    string `json:"template"` // e.g. im.message.created_v1/chat-id/{chat_id}
-	Example     string `json:"example"`  // e.g. im.message.created_v1/chat-id/oc_9f3b1c2d8a
+	Template    string `json:"template"` // e.g. im.message.example_v1/chat-id/{chat_id}
+	Example     string `json:"example"`  // e.g. im.message.example_v1/chat-id/oc_9f3b1c2d8a
 	Description string `json:"description"`
 
 	// SelectorKey is the OAPI selector key this template resolves to (e.g. "chat_id").

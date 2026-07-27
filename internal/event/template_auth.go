@@ -18,7 +18,7 @@ import (
 // cmd/event/consume.go's resolveIdentity / cmd/event/subscription/create.go's
 // tier-1 check), the SPECIFIC matched template may accept a narrower set
 // (e.g. "owner/me" is user-only even though its base key
-// im.message.created_v1 allows user+bot). Empty Template.AuthTypes means "no
+// im.message.example_v1 allows user+bot). Empty Template.AuthTypes means "no
 // additional restriction" (mirrors KeyDefinition.AuthTypes' own "empty = no
 // identity required" convention). Violated -> typed failed_precondition
 // (never a silent identity switch — AGENTS.md "no silent downgrade"),

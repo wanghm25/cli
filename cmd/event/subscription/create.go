@@ -59,7 +59,7 @@ func NewCmdCreate(f *cmdutil.Factory) *cobra.Command {
 		Use:   "create <refined EventKey>",
 		Short: "Create (or idempotently reuse) a remote event Subscription",
 		Long: `Create a remote Subscription for a materialized refined EventKey (e.g.
-'im.message.created_v1/chat-id/oc_xxx'), or idempotently reuse an existing
+'im.message.example_v1/chat-id/oc_xxx'), or idempotently reuse an existing
 compatible one.
 
 A bare refined base key (no template segment) is rejected — pass a
@@ -97,10 +97,10 @@ recreate) — never silently resolved. Use --dry-run to preview the plan
 (parse/identity/scope preflight + a remote read + impact analysis) without
 creating, reusing, or changing anything; create never requires --yes
 (additive and pre-checked for conflicts).`,
-		Example: `  lark-cli event schema im.message.created_v1 --json                                          # find key_templates[].example first
-  lark-cli event subscription create im.message.created_v1/chat-id/oc_xxx --dry-run --as bot --json
-  lark-cli event subscription create im.message.created_v1/chat-id/oc_xxx --as bot --json
-  lark-cli event subscription create im.message.created_v1/owner/me --as user --json               # fixed-value template, user only`,
+		Example: `  lark-cli event schema im.message.example_v1 --json                                          # find key_templates[].example first
+  lark-cli event subscription create im.message.example_v1/chat-id/oc_xxx --dry-run --as bot --json
+  lark-cli event subscription create im.message.example_v1/chat-id/oc_xxx --as bot --json
+  lark-cli event subscription create im.message.example_v1/owner/me --as user --json               # fixed-value template, user only`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCreate(cmd, f, args[0], o)
