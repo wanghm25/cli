@@ -65,10 +65,24 @@ func Default() (busdiscover.Scanner, Querier) {
 	return busdiscover.Default(), transportQuerier{tr: transport.New()}
 }
 
-// Query is the production entry point: discover + fan-out over the Default
-// wiring. Best-effort; see QueryConsumers. This is the single seam the
-// management commands point their local-consumer lookup at.
+// Query is the production entry point for READ commands (list/get): discover +
+// fan-out over the Default wiring, returning only the consumers it could
+// enumerate. Best-effort; see QueryConsumers. A write-gate caller (update/
+// delete) must use QueryWithUnreachable instead so it can fail closed on a
+// discovered-but-unqueryable bus rather than mistake it for "no consumer".
 func Query() []Consumer {
+	sc, q := Default()
+	consumers, _ := QueryConsumers(sc, q)
+	return consumers
+}
+
+// QueryWithUnreachable is Query for the WRITE-GATE paths (update/delete): it
+// additionally returns the appIDs of any DISCOVERED bus whose status query
+// FAILED. Such a bus may still be running a consumer bound to the subscription
+// being mutated, so a caller that gates on local impact must treat a non-empty
+// unreachable set as uncertainty (require --yes, and signal it after the write)
+// instead of proceeding as if no consumer exists.
+func QueryWithUnreachable() (consumers []Consumer, unreachable []string) {
 	sc, q := Default()
 	return QueryConsumers(sc, q)
 }
@@ -86,22 +100,28 @@ func SignalSubscriptionUpdated(appID, remoteSubscriptionID string) error {
 
 // QueryConsumers discovers every running local consumer across all live bus
 // daemons: it scans for live buses (sc) and, for each, queries its status (q),
-// flattening the returned consumers into []Consumer.
+// flattening the returned consumers into []Consumer. It also returns the appIDs
+// of any DISCOVERED bus whose status query FAILED — the caller decides what that
+// uncertainty means (a read command ignores it; a write gate fails closed on
+// it).
 //
 // BEST-EFFORT end to end — it never returns an error:
-//   - a nil scanner/querier, or a scan error, yields no consumers;
+//   - a nil scanner/querier, or a scan error / no bus, yields no consumers AND
+//     no unreachable set (there is nothing we know we failed to reach);
 //   - a per-bus query failure (an orphan bus with no socket, a wedged peer, a
-//     decode error) simply skips that bus, never aborting the rest.
+//     decode error) skips that bus for the consumer list but records its appID
+//     in unreachable, since it was discovered and MAY still run a bound
+//     consumer we simply could not enumerate.
 //
 // Queries fan out in parallel so one wedged bus cannot compound busctl's
 // per-query read deadline across many apps (as status's deriveStatuses does).
-func QueryConsumers(sc busdiscover.Scanner, q Querier) []Consumer {
+func QueryConsumers(sc busdiscover.Scanner, q Querier) (consumers []Consumer, unreachable []string) {
 	if sc == nil || q == nil {
-		return nil
+		return nil, nil
 	}
 	procs, err := sc.ScanBusProcesses()
 	if err != nil || len(procs) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Query each discovered bus in parallel; a failed query leaves its slot nil.
@@ -118,14 +138,17 @@ func QueryConsumers(sc busdiscover.Scanner, q Querier) []Consumer {
 	}
 	wg.Wait()
 
-	var out []Consumer
 	for i, p := range procs {
 		resp := responses[i]
 		if resp == nil {
+			// Discovered but unqueryable — we cannot enumerate its consumers, so
+			// we cannot rule out one bound to the subscription being mutated.
+			// Report the appID as uncertainty rather than silently dropping it.
+			unreachable = append(unreachable, p.AppID)
 			continue
 		}
 		for _, c := range resp.Consumers {
-			out = append(out, Consumer{
+			consumers = append(consumers, Consumer{
 				AppID:                p.AppID,
 				PID:                  c.PID,
 				EventKey:             c.EventKey,
@@ -133,5 +156,5 @@ func QueryConsumers(sc busdiscover.Scanner, q Querier) []Consumer {
 			})
 		}
 	}
-	return out
+	return consumers, unreachable
 }

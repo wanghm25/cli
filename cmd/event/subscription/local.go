@@ -39,6 +39,14 @@ type localConsumerView struct {
 // commands' local-surfacing is exercised with no real bus.
 var queryLocalConsumers = buslocal.Query
 
+// queryLocalImpact is the WRITE-GATE seam (update/delete): like
+// queryLocalConsumers but it ALSO reports the appIDs of discovered-but-
+// unqueryable buses, so the write path can fail closed on that uncertainty
+// instead of mistaking an unreachable bus for "no local consumer". Production
+// points it at buslocal.QueryWithUnreachable; tests replace it with a canned
+// (consumers, unreachable) pair.
+var queryLocalImpact = buslocal.QueryWithUnreachable
+
 // signalSubscriptionUpdated is the process-wide seam for telling a running bus
 // that a subscription was just updated, so it proactively degrades the matching
 // local consumers rather than waiting for the platform's own updated_v1 push.
@@ -48,22 +56,31 @@ var queryLocalConsumers = buslocal.Query
 var signalSubscriptionUpdated = buslocal.SignalSubscriptionUpdated
 
 // notifyAffectedBuses fires the best-effort SubscriptionUpdated signal to the
-// bus of each DISTINCT app that has a running consumer bound to
-// remoteSubscriptionID — so those consumers are proactively degraded after a
-// real update Patch. One signal per app (a bus degrades all its matching
-// consumers from a single id); a consumer with no known app_id is skipped (it
-// cannot be addressed), and every send error is ignored (best-effort — the
-// platform's own updated_v1 remains the backstop, so no bus reachable still
-// leaves update succeeding). Call ONLY after a Patch actually applied — never on
-// a no-op or --dry-run.
-func notifyAffectedBuses(remoteSubscriptionID string, affected []localConsumerInfo) {
-	seen := make(map[string]bool, len(affected))
-	for _, c := range affected {
-		if c.AppID == "" || seen[c.AppID] {
-			continue
+// bus of each DISTINCT app that either has a running consumer bound to
+// remoteSubscriptionID OR was discovered but could not be queried (unreachable)
+// — so those consumers are proactively degraded after a real update Patch. The
+// unreachable buses are included precisely because we could not rule out a bound
+// consumer on them: skipping them would leave exactly the uncertain consumers
+// waiting for the platform's slower updated_v1 push. One signal per app (a bus
+// degrades all its matching consumers from a single id); an empty app_id is
+// skipped (it cannot be addressed), and every send error is ignored (best-effort
+// — the platform's own updated_v1 remains the backstop, so no bus reachable
+// still leaves update succeeding). Call ONLY after a Patch actually applied —
+// never on a no-op or --dry-run.
+func notifyAffectedBuses(remoteSubscriptionID string, affected []localConsumerInfo, unreachable []string) {
+	seen := make(map[string]bool, len(affected)+len(unreachable))
+	signal := func(appID string) {
+		if appID == "" || seen[appID] {
+			return
 		}
-		seen[c.AppID] = true
-		_ = signalSubscriptionUpdated(c.AppID, remoteSubscriptionID)
+		seen[appID] = true
+		_ = signalSubscriptionUpdated(appID, remoteSubscriptionID)
+	}
+	for _, c := range affected {
+		signal(c.AppID)
+	}
+	for _, appID := range unreachable {
+		signal(appID)
 	}
 }
 

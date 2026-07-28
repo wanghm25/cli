@@ -54,7 +54,10 @@ func TestQueryConsumers_FlattensRunningConsumers(t *testing.T) {
 		}),
 	}}
 
-	got := QueryConsumers(sc, q)
+	got, unreachable := QueryConsumers(sc, q)
+	if len(unreachable) != 0 {
+		t.Errorf("unreachable = %v, want none when every discovered bus answered", unreachable)
+	}
 	if len(got) != 2 {
 		t.Fatalf("len = %d, want 2: %+v", len(got), got)
 	}
@@ -70,10 +73,13 @@ func TestQueryConsumers_FlattensRunningConsumers(t *testing.T) {
 	}
 }
 
-// TestQueryConsumers_PerBusQueryFailure_SkipsThatBus locks best-effort
-// fan-out: one unreachable bus is skipped while the reachable bus's consumers
-// still surface — a wedged/orphan peer never suppresses the rest.
-func TestQueryConsumers_PerBusQueryFailure_SkipsThatBus(t *testing.T) {
+// TestQueryConsumers_PerBusQueryFailure_ReportsUnreachable locks the
+// fail-closed contract: a DISCOVERED bus whose query fails is reported in
+// `unreachable` (never silently dropped as "no consumer"), while the reachable
+// bus's consumers still surface. A write-gate caller relies on this to fail
+// closed on the unqueryable bus instead of Patching a shared filter as if no
+// consumer existed there.
+func TestQueryConsumers_PerBusQueryFailure_ReportsUnreachable(t *testing.T) {
 	sc := fakeScanner{procs: []busdiscover.Process{{AppID: "cli_up"}, {AppID: "cli_down"}}}
 	q := fakeQuerier{
 		respByAppID: map[string]*protocol.StatusResponse{
@@ -84,9 +90,12 @@ func TestQueryConsumers_PerBusQueryFailure_SkipsThatBus(t *testing.T) {
 		errByAppID: map[string]error{"cli_down": errors.New("no socket")},
 	}
 
-	got := QueryConsumers(sc, q)
+	got, unreachable := QueryConsumers(sc, q)
 	if len(got) != 1 || got[0].RemoteSubscriptionID != "sub_up" {
 		t.Fatalf("got = %+v, want only the reachable bus's consumer (sub_up)", got)
+	}
+	if len(unreachable) != 1 || unreachable[0] != "cli_down" {
+		t.Fatalf("unreachable = %v, want [cli_down] (discovered but unqueryable)", unreachable)
 	}
 }
 
@@ -94,22 +103,24 @@ func TestQueryConsumers_PerBusQueryFailure_SkipsThatBus(t *testing.T) {
 // to "no local consumers known" — never an error the caller must handle.
 func TestQueryConsumers_ScanError_ReturnsNil(t *testing.T) {
 	sc := fakeScanner{err: errors.New("ps failed")}
-	if got := QueryConsumers(sc, fakeQuerier{}); got != nil {
-		t.Errorf("got = %+v, want nil on scan error", got)
+	// A scan error means we could not enumerate any bus at all — no consumers AND
+	// no unreachable set (there is no discovered bus we know we failed to reach).
+	if got, unreachable := QueryConsumers(sc, fakeQuerier{}); got != nil || unreachable != nil {
+		t.Errorf("got = %+v, unreachable = %v, want both nil on scan error", got, unreachable)
 	}
 }
 
 // TestQueryConsumers_NoBuses_ReturnsNil: no discovered bus means no consumers,
 // and no query is attempted at all.
 func TestQueryConsumers_NoBuses_ReturnsNil(t *testing.T) {
-	if got := QueryConsumers(fakeScanner{procs: nil}, fakeQuerier{}); got != nil {
-		t.Errorf("got = %+v, want nil when no bus is discovered", got)
+	if got, unreachable := QueryConsumers(fakeScanner{procs: nil}, fakeQuerier{}); got != nil || unreachable != nil {
+		t.Errorf("got = %+v, unreachable = %v, want both nil when no bus is discovered", got, unreachable)
 	}
 }
 
 // TestQueryConsumers_NilInputs_ReturnsNil guards the degenerate wiring.
 func TestQueryConsumers_NilInputs_ReturnsNil(t *testing.T) {
-	if got := QueryConsumers(nil, nil); got != nil {
-		t.Errorf("got = %+v, want nil for nil scanner/querier", got)
+	if got, unreachable := QueryConsumers(nil, nil); got != nil || unreachable != nil {
+		t.Errorf("got = %+v, unreachable = %v, want both nil for nil scanner/querier", got, unreachable)
 	}
 }
