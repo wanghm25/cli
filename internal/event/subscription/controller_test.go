@@ -34,6 +34,16 @@ type fakeGateway struct {
 	reactivateID    string
 	reactivateCalls int
 
+	getResp  *model.RemoteSubscription
+	getErr   error
+	getID    string
+	getCalls int
+
+	renewResp  *model.RemoteSubscription
+	renewErr   error
+	renewID    string
+	renewCalls int
+
 	encryptKey string
 	encryptErr error
 }
@@ -73,6 +83,24 @@ func (g *fakeGateway) Reactivate(_ context.Context, id string) (*model.RemoteSub
 		return nil, g.reactivateErr
 	}
 	return g.reactivateResp, nil
+}
+
+func (g *fakeGateway) Get(_ context.Context, id string) (*model.RemoteSubscription, error) {
+	g.getCalls++
+	g.getID = id
+	if g.getErr != nil {
+		return nil, g.getErr
+	}
+	return g.getResp, nil
+}
+
+func (g *fakeGateway) Renew(_ context.Context, id string) (*model.RemoteSubscription, error) {
+	g.renewCalls++
+	g.renewID = id
+	if g.renewErr != nil {
+		return nil, g.renewErr
+	}
+	return g.renewResp, nil
 }
 
 func (g *fakeGateway) GetEncryptKey(_ context.Context, _ string) (string, error) {
@@ -291,6 +319,83 @@ func TestApply_CreateFails_ConsumeBootstrap_NoReconcile_PropagatesError(t *testi
 	}
 	if g.walkCalls != 0 {
 		t.Errorf("walkCalls = %d, want 0 (consume bootstrap never re-lists after a failed create)", g.walkCalls)
+	}
+}
+
+// ---- Lifecycle-recovery entry points: writes/read funnel through the gateway ----
+
+// The lifecycle reducer DECIDES reactivate/renew and reaches these Controller
+// methods directly (the bus wires its SubscriptionClient to a Controller), so the
+// remote WRITE goes through the Controller — the single write path — rather than
+// straight at platform/lark. These assert the delegation + id threading.
+
+func TestControllerReactivate_Delegates_To_GatewayReactivate(t *testing.T) {
+	g := &fakeGateway{reactivateResp: subPtr(activeSub("sub_resumed", false, "user"))}
+	c := NewController(g)
+	got, err := c.Reactivate(context.Background(), "sub_susp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if g.reactivateCalls != 1 || g.reactivateID != "sub_susp" {
+		t.Errorf("reactivateCalls=%d id=%q, want 1 sub_susp", g.reactivateCalls, g.reactivateID)
+	}
+	if got == nil || got.ID.String() != "sub_resumed" {
+		t.Errorf("Reactivate result = %+v, want the gateway's refreshed subscription", got)
+	}
+	if g.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (reactivate never creates)", g.createCalls)
+	}
+}
+
+func TestControllerReactivate_PropagatesGatewayError(t *testing.T) {
+	sentinel := errors.New("boom: reactivate failed")
+	g := &fakeGateway{reactivateErr: sentinel}
+	if _, err := NewController(g).Reactivate(context.Background(), "sub_susp"); !errors.Is(err, sentinel) {
+		t.Errorf("err = %v, want the gateway error (%v)", err, sentinel)
+	}
+}
+
+func TestControllerRenew_Delegates_To_GatewayRenew(t *testing.T) {
+	g := &fakeGateway{renewResp: subPtr(activeSub("sub_renewed", false, "user"))}
+	c := NewController(g)
+	got, err := c.Renew(context.Background(), "sub_expiring")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if g.renewCalls != 1 || g.renewID != "sub_expiring" {
+		t.Errorf("renewCalls=%d id=%q, want 1 sub_expiring", g.renewCalls, g.renewID)
+	}
+	if got == nil || got.ID.String() != "sub_renewed" {
+		t.Errorf("Renew result = %+v, want the gateway's refreshed subscription", got)
+	}
+	if g.createCalls != 0 || g.reactivateCalls != 0 {
+		t.Errorf("renew must never create/reactivate (create=%d reactivate=%d)", g.createCalls, g.reactivateCalls)
+	}
+}
+
+func TestControllerRenew_PropagatesGatewayError(t *testing.T) {
+	sentinel := errors.New("boom: renew failed")
+	g := &fakeGateway{renewErr: sentinel}
+	if _, err := NewController(g).Renew(context.Background(), "sub_expiring"); !errors.Is(err, sentinel) {
+		t.Errorf("err = %v, want the gateway error (%v)", err, sentinel)
+	}
+}
+
+func TestControllerGet_Delegates_To_GatewayGet_IsAReadNotAWrite(t *testing.T) {
+	g := &fakeGateway{getResp: subPtr(activeSub("sub_read", false, "user"))}
+	c := NewController(g)
+	got, err := c.Get(context.Background(), "sub_read")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if g.getCalls != 1 || g.getID != "sub_read" {
+		t.Errorf("getCalls=%d id=%q, want 1 sub_read", g.getCalls, g.getID)
+	}
+	if got == nil || got.ID.String() != "sub_read" {
+		t.Errorf("Get result = %+v, want the gateway's subscription", got)
+	}
+	if g.createCalls != 0 || g.reactivateCalls != 0 || g.renewCalls != 0 {
+		t.Errorf("Get is a read: it must never write (create=%d reactivate=%d renew=%d)", g.createCalls, g.reactivateCalls, g.renewCalls)
 	}
 }
 

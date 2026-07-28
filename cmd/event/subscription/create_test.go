@@ -232,6 +232,16 @@ func (g *fakeCreateGateway) Reactivate(_ context.Context, id string) (*model.Rem
 	return g.reactivateResp, nil
 }
 
+// Get and Renew satisfy the widened subscription.Gateway surface. The create
+// command's Plan/Apply flow never invokes them, so these are inert stubs.
+func (g *fakeCreateGateway) Get(_ context.Context, _ string) (*model.RemoteSubscription, error) {
+	return nil, nil
+}
+
+func (g *fakeCreateGateway) Renew(_ context.Context, _ string) (*model.RemoteSubscription, error) {
+	return nil, nil
+}
+
 func (g *fakeCreateGateway) GetEncryptKey(_ context.Context, _ string) (string, error) {
 	g.getEncryptKeyCalls++
 	return g.encryptKey, g.encryptErr

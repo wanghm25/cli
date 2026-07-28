@@ -27,6 +27,7 @@ import (
 	"github.com/larksuite/cli/internal/event/protocol"
 	"github.com/larksuite/cli/internal/event/session"
 	"github.com/larksuite/cli/internal/event/source"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/transport"
 	"github.com/larksuite/cli/internal/lockfile"
 )
@@ -160,12 +161,22 @@ func (b *Bus) SetIdentityProviders(resolveUAT func(ctx context.Context, appID, u
 // lifecycle action itself via larkgw.NewSubscriptionGateway(sdk, as, uat)
 // — never by constructing a second
 // *lark.Client.
+//
+// The identity-bound gateway is wrapped once in a subscription.Controller so the
+// lifecycle action's remote Reactivate/Renew writes (and its reconcile Get read)
+// flow through the SAME single remote-write path the management-create and
+// consume-bootstrap flows already use — the reducer still DECIDES the effect, the
+// Controller EXECUTES the write, and platform/lark is never written directly.
 func (b *Bus) SetSubscriptionClient(sdk *lark.Client) {
 	if sdk == nil {
 		return
 	}
 	b.lifecycleAction.SetNewSubscriptionClient(func(as core.Identity, uat string) (lifecycle.SubscriptionClient, error) {
-		return larkgw.NewSubscriptionGateway(sdk, as, uat)
+		gw, err := larkgw.NewSubscriptionGateway(sdk, as, uat)
+		if err != nil {
+			return nil, err
+		}
+		return subown.NewController(gw), nil
 	})
 	// The encrypt-key provider fetches keys via GetEncryptKey on
 	// the SAME per-app *lark.Client, deciding the per-call identity (bot, or a

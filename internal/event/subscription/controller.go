@@ -13,12 +13,19 @@ import (
 )
 
 // Gateway is the remote-Subscription surface the Controller (and its embedded
-// Observer/Planner) drives: the bounded List scan, the two writes it performs
-// (Create/Reactivate), and the encrypt-key probe. *lark.Gateway satisfies it.
+// Observer/Planner) drives: the bounded List scan and the point Get read, the
+// three writes it performs (Create/Reactivate/Renew), and the encrypt-key probe.
+// *lark.Gateway satisfies it. Get and Renew back the Controller's
+// lifecycle-recovery entry points (Get/Reactivate/Renew below): the subscription
+// lifecycle control plane drives its state-source-of-truth Get and its
+// Reactivate/Renew writes through the Controller, so every remote write funnels
+// through this one owner instead of reaching platform/lark directly.
 type Gateway interface {
 	WalkSubscriptions(ctx context.Context, params lark.ListParams, visit func(model.RemoteSubscription) bool) (bool, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 	Create(ctx context.Context, spec lark.CreateSpec) (*model.RemoteSubscription, error)
 	Reactivate(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
+	Renew(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 	GetEncryptKey(ctx context.Context, remoteSubscriptionID string) (string, error)
 }
 
@@ -128,6 +135,36 @@ func (c *Controller) Apply(ctx context.Context, plan SubscriptionPlan, policy Po
 		return ApplyReceipt{}, errs.NewInternalError(errs.SubtypeUnknown,
 			"subscription controller: Apply called with non-writable action %q", plan.Action)
 	}
+}
+
+// Get reads one remote Subscription by id. It is a READ, not a write — exposed on
+// the Controller so the subscription lifecycle control plane drives its
+// state-source-of-truth reconcile Get through the same owner of the remote
+// surface it drives its recovery writes through, rather than reaching for the raw
+// gateway. The DECISION to Get (an unclear updated_v1, an unrecognized suspension
+// code) stays the lifecycle reducer's; the Controller only performs the read.
+func (c *Controller) Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error) {
+	return c.gateway.Get(ctx, remoteSubscriptionID)
+}
+
+// Reactivate executes a lifecycle-decided reactivation of a suspended remote
+// Subscription and returns its refreshed state. It is the recovery-write
+// counterpart to Apply(ActionReactivate): the management/bootstrap flows reach a
+// Reactivate through Plan->Apply (the Planner made the decision), while the
+// lifecycle reducer reaches this method directly (it already decided — reactivate
+// on authority_revoked — from the event). Either way the write itself happens
+// HERE, over the Controller's gateway, so the Controller stays the single
+// remote-write path and platform/lark is never written from the lifecycle package.
+func (c *Controller) Reactivate(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error) {
+	return c.gateway.Reactivate(ctx, remoteSubscriptionID)
+}
+
+// Renew executes a lifecycle-decided renewal of a remote Subscription's TTL and
+// returns its refreshed state. Same split as Reactivate: the lifecycle reducer
+// DECIDES renew (on an expiration_reminder) from the event; the Controller
+// EXECUTES the write over its gateway, keeping every remote write on the one path.
+func (c *Controller) Renew(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error) {
+	return c.gateway.Renew(ctx, remoteSubscriptionID)
 }
 
 // reconcileAfterCreateFailure is the one bounded post-Create-failure pass. It

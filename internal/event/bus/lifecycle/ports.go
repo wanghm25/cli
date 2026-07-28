@@ -83,15 +83,18 @@ type IdentityGate interface {
 	BindConsumer(ctx context.Context, c Conn) error
 }
 
-// SubscriptionClient is the narrow subset of the platform/lark
-// SubscriptionGateway the real action needs: a single Get (state-source-of-truth
-// reconcile) and a single Reactivate/Renew (at most one such remote call per
-// event, never a retry). Declared here — narrower than the full gateway surface,
-// and domain-typed (no larkeventv1.* crosses it) — purely as a test seam: the
-// production *lark.Gateway satisfies it structurally, so production code passes
-// it straight through while tests substitute a fake with no *lark.Client or
-// network call involved. Reactivate/Renew return the refreshed RemoteSubscription
-// to match the gateway's shape; the action discards it (only the error matters).
+// SubscriptionClient is the narrow surface the real action needs: a single Get
+// (state-source-of-truth reconcile) and a single Reactivate/Renew (at most one
+// such remote call per event, never a retry). Declared here — narrower than the
+// full gateway surface, and domain-typed (no larkeventv1.* crosses it) — as a
+// test seam AND a boundary that keeps this package from importing subscription:
+// in production the bus passes a *subscription.Controller (which wraps the
+// identity-bound *lark.Gateway), so the Reactivate/Renew WRITES this action
+// issues flow through the Controller — the single remote-write path — rather than
+// straight at the gateway; the reducer still DECIDES the effect, the Controller
+// EXECUTES the write. Tests substitute a fake with no *lark.Client or network
+// call involved. Reactivate/Renew return the refreshed RemoteSubscription to match
+// the underlying shape; the action discards it (only the error matters).
 type SubscriptionClient interface {
 	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 	Reactivate(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
