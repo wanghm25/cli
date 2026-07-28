@@ -137,7 +137,7 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 func applyRenew(ctx context.Context, svc renewSubscriptionAPI, out io.Writer, remoteSubscriptionID string, cmdCtx eventlib.CommandContext, o renewOpts, before *subscriptionRow, scopesVerified bool) error {
 	if o.dryRun {
 		// Plan from the OBSERVED remote state, not a static assumption.
-		plannedAction, nextAction := mutationDryRunPlan("renew", remoteSubscriptionID, before.Remote.State)
+		plannedAction, nextAction := mutationDryRunPlan("renew", remoteSubscriptionID, before.Remote.State, cmdCtx)
 		result := buildMutationDryRunResult("renew", remoteSubscriptionID, cmdCtx.Identity, scopesVerified, before,
 			plannedAction, false, renewLocalImpactNote, nextAction)
 		if o.asJSON {

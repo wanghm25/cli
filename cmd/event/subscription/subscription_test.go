@@ -561,7 +561,7 @@ func TestMutationDryRunPlan_StateAppropriate(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			action, next := mutationDryRunPlan(c.operation, "sub_1", c.state)
+			action, next := mutationDryRunPlan(c.operation, "sub_1", c.state, eventlib.CommandContext{})
 			if action != c.wantAction {
 				t.Errorf("plannedAction = %q, want %q", action, c.wantAction)
 			}

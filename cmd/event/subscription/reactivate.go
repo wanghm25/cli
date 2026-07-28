@@ -139,7 +139,7 @@ func applyReactivate(ctx context.Context, svc reactivateSubscriptionAPI, out io.
 	if o.dryRun {
 		// Plan from the OBSERVED remote state: an already-active subscription is a
 		// no-op, not a fresh reactivation.
-		plannedAction, nextAction := mutationDryRunPlan("reactivate", remoteSubscriptionID, before.Remote.State)
+		plannedAction, nextAction := mutationDryRunPlan("reactivate", remoteSubscriptionID, before.Remote.State, cmdCtx)
 		result := buildMutationDryRunResult("reactivate", remoteSubscriptionID, cmdCtx.Identity, scopesVerified, before,
 			plannedAction, false, reactivateLocalImpactNote, nextAction)
 		if o.asJSON {

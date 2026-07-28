@@ -476,7 +476,7 @@ func classifyMutation(operation, state string) mutationDecision {
 // runs before the dry-run branch), sharing classifyMutation with the real run so
 // the preview always matches what the real run would do — including a "blocked"
 // plan for a state the real run fails closed on.
-func mutationDryRunPlan(operation, remoteSubscriptionID, state string) (plannedAction, nextAction string) {
+func mutationDryRunPlan(operation, remoteSubscriptionID, state string, cmdCtx eventlib.CommandContext) (plannedAction, nextAction string) {
 	switch classifyMutation(operation, state) {
 	case mutationNoop:
 		return "noop", fmt.Sprintf("remote_subscription_id=%s is already active; no reactivation is needed", remoteSubscriptionID)
@@ -485,7 +485,9 @@ func mutationDryRunPlan(operation, remoteSubscriptionID, state string) (plannedA
 	}
 	// proceed
 	if operation == "renew" && state == "suspended" {
-		return "renew", fmt.Sprintf("run without --dry-run to renew remote_subscription_id=%s; it stays suspended — run `lark-cli event subscription reactivate %s` to resume delivery", remoteSubscriptionID, remoteSubscriptionID)
+		// The reactivate cross-reference is a real runnable command, so it carries
+		// the same owning --profile/--as as the renew (same owner) via cmdCtx.
+		return "renew", fmt.Sprintf("run without --dry-run to renew remote_subscription_id=%s; it stays suspended — run `%s event subscription reactivate %s%s` to resume delivery", remoteSubscriptionID, cmdCtx.CLIHead(), remoteSubscriptionID, cmdCtx.AsFlag())
 	}
 	return operation, fmt.Sprintf("run without --dry-run to %s remote_subscription_id=%s", operation, remoteSubscriptionID)
 }
