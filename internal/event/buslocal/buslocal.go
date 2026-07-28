@@ -73,6 +73,17 @@ func Query() []Consumer {
 	return QueryConsumers(sc, q)
 }
 
+// SignalSubscriptionUpdated tells appID's bus that remoteSubscriptionID was just
+// updated (an operator Patch), so the bus can proactively degrade its matching
+// local consumers instead of waiting for the platform's own updated_v1 push.
+// Best-effort over a fresh IPC transport (same wiring Query uses); a down or
+// unreachable bus simply returns an error the management caller ignores. This is
+// the single seam the management plane points its post-Patch signal at, mirroring
+// Query's role for discovery.
+func SignalSubscriptionUpdated(appID, remoteSubscriptionID string) error {
+	return busctl.SendSubscriptionUpdated(transport.New(), appID, remoteSubscriptionID)
+}
+
 // QueryConsumers discovers every running local consumer across all live bus
 // daemons: it scans for live buses (sc) and, for each, queries its status (q),
 // flattening the returned consumers into []Consumer.

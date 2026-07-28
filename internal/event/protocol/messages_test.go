@@ -44,6 +44,9 @@ func TestConstructors_PinTypeField(t *testing.T) {
 	if got := NewShutdown(); got.Type != MsgTypeShutdown {
 		t.Errorf("NewShutdown.Type = %q", got.Type)
 	}
+	if got := NewSubscriptionUpdated("sub_x"); got.Type != MsgTypeSubscriptionUpdated || got.RemoteSubscriptionID != "sub_x" {
+		t.Errorf("NewSubscriptionUpdated mismatch: %+v", got)
+	}
 	if got := NewSourceStatus("feishu-ws", SourceStateConnected, "ok"); got.Type != MsgTypeSourceStatus || got.Detail != "ok" {
 		t.Errorf("NewSourceStatus mismatch: %+v", got)
 	}
@@ -72,7 +75,55 @@ func TestEncode_DecodeRoundtripAllTypes(t *testing.T) {
 	roundtrip(t, NewStatusResponse(7, 120, 1, []ConsumerInfo{{PID: 99, EventKey: "k"}}), &StatusResponse{})
 	roundtrip(t, NewShutdown(), &Shutdown{})
 	roundtrip(t, NewSourceStatus("feishu", SourceStateReconnecting, "attempt 2"), &SourceStatus{})
+	roundtrip(t, NewSubscriptionUpdated("sub_x"), &SubscriptionUpdated{})
 	roundtrip(t, &Bye{Type: MsgTypeBye}, &Bye{})
+}
+
+// A SubscriptionUpdated frame round-trips carrying its remote_subscription_id.
+func TestSubscriptionUpdated_RoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	if err := Encode(&buf, NewSubscriptionUpdated("sub_upd_123")); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	msg, err := Decode(bytes.TrimRight(buf.Bytes(), "\n"))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got, ok := msg.(*SubscriptionUpdated)
+	if !ok {
+		t.Fatalf("decoded type = %T, want *SubscriptionUpdated", msg)
+	}
+	if got.RemoteSubscriptionID != "sub_upd_123" {
+		t.Errorf("RemoteSubscriptionID = %q, want %q", got.RemoteSubscriptionID, "sub_upd_123")
+	}
+}
+
+// A success HelloAck carrying Capabilities round-trips them; an ack with none
+// omits the key (an old bus / a rejected ack stays byte-identical to before).
+func TestHelloAck_Capabilities_RoundTrip(t *testing.T) {
+	ack := NewHelloAck("v1", true)
+	ack.Capabilities = []string{CapabilityRefinedRouting, CapabilityHelloV2}
+	var buf bytes.Buffer
+	if err := Encode(&buf, ack); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	msg, err := Decode(bytes.TrimRight(buf.Bytes(), "\n"))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := msg.(*HelloAck)
+	if !reflect.DeepEqual(got.Capabilities, ack.Capabilities) {
+		t.Errorf("Capabilities = %v, want %v", got.Capabilities, ack.Capabilities)
+	}
+
+	// omitempty: a capability-free ack must not write the key.
+	data, err := json.Marshal(NewHelloAck("v1", true))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(data, []byte(`"capabilities"`)) {
+		t.Errorf("empty Capabilities leaked onto wire: %s", data)
+	}
 }
 
 // EncodeWithDeadline must apply a write deadline so a wedged peer can't stall the writer forever.

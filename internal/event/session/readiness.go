@@ -109,13 +109,23 @@ func (c *Consumer) set(fn func()) {
 }
 
 // Ready reports the real terminal readiness for this consumer's identity type:
-// it must be admitted, a user consumer must additionally be Bound, and an
-// encrypted consumer must additionally be KeyReady. This — not Accepted — is
-// what gates the stderr ready marker.
+// it must be admitted, the WS source must be up, a user consumer must
+// additionally be Bound, and an encrypted consumer must additionally be
+// KeyReady. This — not Accepted — is what gates the stderr ready marker.
+//
+// SourceReady is a conjunct for EVERY identity, not just user: a bot, like a
+// user, must not ack "ready" before the WS source is up, or it would silently
+// receive nothing until the source connects. Whether there is a real source to
+// wait on is the bus's concern (it marks source-ready immediately on a bus with
+// no WS wiring, or after the bounded WS-ready wait on a real one); this type
+// only states that source-readiness is required.
 func (c *Consumer) Ready() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.accepted {
+		return false
+	}
+	if !c.sourceReady {
 		return false
 	}
 	if c.requiresBind && !c.bound {
@@ -134,7 +144,7 @@ func (c *Consumer) State() Readiness {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	switch {
-	case c.accepted && (!c.requiresBind || c.bound) && (!c.requiresKey || c.keyReady):
+	case c.accepted && c.sourceReady && (!c.requiresBind || c.bound) && (!c.requiresKey || c.keyReady):
 		return StateRouteReady
 	case c.keyReady:
 		return StateKeyReady

@@ -20,6 +20,15 @@ const (
 	MsgTypeStatusResponse   = "status_response"
 	MsgTypeShutdown         = "shutdown"
 	MsgTypeSourceStatus     = "source_status"
+	// MsgTypeSubscriptionUpdated is a fire-and-forget control message a
+	// management command (event subscription update) sends to a running bus
+	// AFTER a successful Patch that changed a remote Subscription with running
+	// local consumers, so the bus can proactively mark those consumers degraded
+	// (remote_subscription_conflict / next_action=get) rather than waiting for
+	// the platform's own updated_v1 lifecycle push. Best-effort: the sender
+	// never waits for a response, and the platform updated_v1 remains the
+	// backstop when no bus is reachable.
+	MsgTypeSubscriptionUpdated = "subscription_updated"
 )
 
 const (
@@ -75,6 +84,28 @@ const RejectReasonDecryptKeyUnavailable = "decrypt_key_unavailable"
 // single fixed token — never the specific failure cause (no oracle), and never
 // a UAT, open_id, or key.
 const RejectReasonBindFailed = "identity_bind_failed"
+
+// RejectReasonMalformedUserIdentity is the HelloAck.RejectReason the bus sends
+// when a Hello declares Identity == "user" but carries no UserOpenID. Such a
+// consumer cannot be owner/current-gated, bound, or delivery-gated — every one
+// of those keys off owner_user_open_id — so silently treating it as a bot (the
+// pre-fix behavior) would bypass BindUser, the owner==current gate, and the
+// delivery gate entirely. The bus fails closed at admission, BEFORE any
+// registration, rather than downgrade it. A legitimate user Hello always
+// carries its resolved UserOpenID; a bot Hello declares Identity == "bot"; so
+// neither is affected. A single fixed token — never an identity value.
+const RejectReasonMalformedUserIdentity = "malformed_user_identity"
+
+// RejectReasonSourceNotReady is the HelloAck.RejectReason the bus sends when the
+// WS source did not become ready within the bounded pre-ack wait. The success
+// ack (which triggers the consumer's ready marker) must never fire before the
+// source is up, for EVERY identity (a bot, like a user, would otherwise ack
+// "ready" while the source is still down and silently receive nothing). A
+// source that never comes up within the deadline fails closed here — distinct
+// from identity_bind_failed, which is specifically a user-consumer BindUser
+// failure, so a bot rejected for a dead source is not mislabeled as a bind
+// failure. A single fixed token.
+const RejectReasonSourceNotReady = "source_not_ready"
 
 // RejectReasonIncompleteRefinedHello is the HelloAck.RejectReason the bus sends
 // when a refined consumer's Hello (a non-empty RemoteSubscriptionID) omits its
@@ -181,6 +212,19 @@ type HelloAck struct {
 	FirstForKey  bool   `json:"first_for_key"`
 	Rejected     bool   `json:"rejected,omitempty"`
 	RejectReason string `json:"reject_reason,omitempty"`
+
+	// Capabilities echoes, on the REAL consume connection, the bus feature
+	// markers this bus advertises (e.g. "refined_routing", "hello_v2") — set by
+	// the bus from its own wiring on every SUCCESS ack. This is the authoritative
+	// capability gate: a refined consume re-validates it on the connection it will
+	// actually receive events on, closing the TOCTOU a SEPARATE status-connection
+	// probe leaves open (that probe reads a different connection than the one the
+	// consumer ends up bound to). Mirrors StatusResponse.Capabilities's shape (a
+	// slice, not a bool) and uses the identical capability names. Absent/empty on
+	// an old bus reads as neither capability present — a refined consume then
+	// fails closed. omitempty so a rejected ack (which never reaches the gate)
+	// and an old bus both marshal to the pre-existing wire shape.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // Event: Seq is per-conn monotonic; gaps signal bus drop-oldest backpressure loss.
@@ -487,6 +531,18 @@ type Shutdown struct {
 	Type string `json:"type"`
 }
 
+// SubscriptionUpdated is the fire-and-forget control message carrying the
+// remote_subscription_id an operator's Patch just changed. The bus reacts by
+// marking every matching local consumer degraded exactly as an incompatible
+// updated_v1 would (remote_subscription_conflict / next_action=get). It carries
+// ONLY the id — deliberately minimal, no filter/after-snapshot — since the
+// operator's intentional change is treated as a conflict the consumer must
+// re-inspect, not diff-compared here.
+type SubscriptionUpdated struct {
+	Type                 string `json:"type"`
+	RemoteSubscriptionID string `json:"remote_subscription_id"`
+}
+
 func NewHello(pid int, eventKey string, eventTypes []string, version string, subscriptionID string) *Hello {
 	return &Hello{
 		Type:           MsgTypeHello,
@@ -551,6 +607,10 @@ func NewStatusResponse(pid int, uptimeSec int, activeConns int, consumers []Cons
 }
 
 func NewShutdown() *Shutdown { return &Shutdown{Type: MsgTypeShutdown} }
+
+func NewSubscriptionUpdated(remoteSubscriptionID string) *SubscriptionUpdated {
+	return &SubscriptionUpdated{Type: MsgTypeSubscriptionUpdated, RemoteSubscriptionID: remoteSubscriptionID}
+}
 
 func NewSourceStatus(source, state, detail string) *SourceStatus {
 	return &SourceStatus{

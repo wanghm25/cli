@@ -396,6 +396,8 @@ func (b *Bus) handleConn(conn net.Conn) {
 		b.handleStatusQuery(conn)
 	case *protocol.Shutdown:
 		b.handleShutdown(conn)
+	case *protocol.SubscriptionUpdated:
+		b.handleSubscriptionUpdated(conn, m)
 	default:
 		conn.Close()
 	}
@@ -429,6 +431,27 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 	// RemoteSubscriptionID is non-empty.
 	bc.SetListenIntent(hello.TargetResource, hello.IncludeResourceData, hello.Filter)
 	bc.SetLogger(b.logger)
+
+	// Fail closed on a MALFORMED user identity BEFORE any registration: a Hello
+	// that declares Identity == "user" but carries no UserOpenID cannot be
+	// owner/current-gated, bound, or delivery-gated — all three key off
+	// owner_user_open_id. Silently treating it as a bot (the pre-fix behavior:
+	// requiresBind below is false for an empty UserOpenID) would bypass BindUser,
+	// the owner==current gate, and the delivery gate entirely. Reject it with a
+	// fixed token rather than downgrade it. A legitimate user Hello always carries
+	// its resolved UserOpenID (consume's buildHelloV2); a bot declares
+	// Identity == "bot"; a legacy Hello declares no Identity at all — none is
+	// affected.
+	if hello.Identity == string(core.AsUser) && hello.UserOpenID == "" {
+		b.logger.Printf("WARN: rejecting malformed user consumer pid=%d key=%q: identity=user with empty user_open_id",
+			hello.PID, hello.EventKey)
+		if werr := bc.writeFrame(protocol.NewHelloAckRejected("v1", protocol.RejectReasonMalformedUserIdentity)); werr != nil {
+			b.logger.Printf("WARN: reject hello_ack (malformed_user_identity) write to pid=%d key=%q failed: %v",
+				hello.PID, hello.EventKey, werr)
+		}
+		bc.Close()
+		return
+	}
 
 	// Reject an INCOMPLETE refined registration before acking: a refined
 	// consumer (a non-empty RemoteSubscriptionID) always builds its
@@ -539,32 +562,43 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 	}
 	b.mu.Unlock()
 
-	// A user consumer must be BOUND before it can ack truly-ready: a user
-	// consumer that acked "ready" while still unbound would silently receive no
-	// events (the readiness bug this closes). So the bus ensures the bind HERE,
-	// before acking, for EVERY user consumer:
-	//   - if the WS source is not up yet (a fresh bus), wait (bounded) for it
-	//     rather than acking early and binding later; a source that never comes
-	//     up within the deadline fails closed as a bind failure.
-	//   - bind under the shared owner==current gate; on any failure REJECT the
-	//     Hello (identity_bind_failed) so the consumer never readies while it
-	//     would receive nothing. A mid-bind WS reconnect (errStaleEpoch) is
-	//     retried on the now-current generation.
-	// This runs after the hub + b.conns registration above, so a failed bind's
-	// bc.Close() unwinds both via onClose. onConnReady still (re)binds this
-	// consumer on later reconnects. Bots/legacy consumers (empty owner
-	// user_open_id) are never identity-gated and skip straight to the ack.
-	if sc.RequiresBind() { // implies b.identityGate != nil (see requiresBind above)
+	// Source-readiness gate — EVERY identity. The success ack (which triggers the
+	// consumer's ready marker) must not fire before the WS source is up: a bot,
+	// like a user, would otherwise ack "ready" while the source is still down and
+	// silently receive nothing until it connected. Wait (bounded) for the first
+	// WS-ready for every consumer — the SAME wait the user-bind path used, now
+	// hoisted to gate every identity, not just user. A bus with no identity gate
+	// wired (the legacy/test default) has no WS-ready signal to wait on, so
+	// source-readiness is immediate there (nothing to wait on — readiness reduces
+	// to Accepted exactly as before). A source that never comes up within the
+	// deadline fails closed (source_not_ready) rather than parking the handshake
+	// forever. This runs after the hub + b.conns registration above, so the
+	// reject's bc.Close() unwinds both via onClose.
+	if b.identityGate != nil {
 		if !b.identityGate.ready() && !b.identityGate.awaitWSReady(context.Background(), b.identityGate.wsReadyWait) {
-			b.logger.Printf("WARN: rejecting user consumer pid=%d key=%q: WS source not ready before bind deadline",
+			b.logger.Printf("WARN: rejecting consumer pid=%d key=%q: WS source not ready before ack deadline",
 				hello.PID, hello.EventKey)
-			if werr := bc.writeFrame(protocol.NewHelloAckRejected("v1", protocol.RejectReasonBindFailed)); werr != nil {
-				b.logger.Printf("WARN: reject hello_ack (identity_bind_failed) write to pid=%d key=%q failed: %v",
+			if werr := bc.writeFrame(protocol.NewHelloAckRejected("v1", protocol.RejectReasonSourceNotReady)); werr != nil {
+				b.logger.Printf("WARN: reject hello_ack (source_not_ready) write to pid=%d key=%q failed: %v",
 					hello.PID, hello.EventKey, werr)
 			}
 			bc.Close()
 			return
 		}
+	}
+	sc.MarkSourceReady()
+
+	// Bind gate — USER consumers only. A user consumer must be BOUND before it can
+	// ack truly-ready: one that acked "ready" while still unbound would silently
+	// receive no events (the readiness bug this closes). The WS source is already
+	// up (the source gate above passed), so bind directly under the shared
+	// owner==current gate; on any failure REJECT the Hello (identity_bind_failed)
+	// so the consumer never readies while it would receive nothing. A mid-bind WS
+	// reconnect (errStaleEpoch) is retried on the now-current generation.
+	// onConnReady still (re)binds this consumer on later reconnects.
+	// Bots/legacy consumers (empty owner user_open_id) are never identity-gated
+	// and skip straight to the ack.
+	if sc.RequiresBind() { // implies b.identityGate != nil (see requiresBind above)
 		var bindErr error
 		for attempt := 0; attempt < bindAdmitRetryLimit; attempt++ {
 			bindErr = b.identityGate.bindConsumer(context.Background(), bc)
@@ -585,7 +619,6 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 			bc.Close()
 			return
 		}
-		sc.MarkSourceReady()
 		sc.MarkBound()
 	}
 
@@ -604,6 +637,13 @@ func (b *Bus) handleHello(conn net.Conn, reader *bufio.Reader, hello *protocol.H
 	}
 
 	ack := protocol.NewHelloAck("v1", firstForKey)
+	// Echo this bus's capabilities on the REAL consume connection (#19): the
+	// authoritative capability gate. A refined consumer re-validates these on the
+	// connection it will actually receive events on, closing the TOCTOU the
+	// separate status-connection probe leaves open. Set from the bus's own wiring
+	// — the SAME markers handleStatusQuery advertises — so a status_response and a
+	// hello_ack carry identical capability names for the same concept.
+	ack.Capabilities = busCapabilities()
 	// writeFrame shares writeMu with every other write; bc.Close on failure unwinds hub+bus registration via onClose.
 	if err := bc.writeFrame(ack); err != nil {
 		b.logger.Printf("WARN: hello_ack write to pid=%d key=%q failed: %v (rejecting connection)",
@@ -639,9 +679,38 @@ func (b *Bus) handleStatusQuery(conn net.Conn) {
 		b.hub.Consumers(),
 	)
 	resp.ProtocolVersion = protocol.ProtocolVersionV2
-	resp.Capabilities = []string{protocol.CapabilityRefinedRouting, protocol.CapabilityHelloV2}
+	resp.Capabilities = busCapabilities()
 	resp.RegisteredEventTypes = b.hub.RegisteredEventTypes()
 	_ = protocol.EncodeWithDeadline(conn, resp, protocol.WriteTimeout)
+}
+
+// busCapabilities is the ONE list of feature markers this bus build advertises,
+// referenced by BOTH the status_response (handleStatusQuery, read by the
+// pre-probe) AND the hello_ack (handleHello, the authoritative gate a refined
+// consume re-validates on the real connection) — defined once here so the two
+// surfaces can never advertise a different set. A fresh copy per call so a
+// caller assigning it to a message never aliases a shared slice.
+func busCapabilities() []string {
+	return []string{protocol.CapabilityRefinedRouting, protocol.CapabilityHelloV2}
+}
+
+// handleSubscriptionUpdated reacts to an operator's post-Patch signal (#13): it
+// proactively marks every local consumer bound to the changed
+// remote_subscription_id degraded (remote_subscription_conflict /
+// next_action=get) — the SAME outcome an incompatible updated_v1 produces —
+// rather than waiting for the platform's own updated_v1 push. Fire-and-forget:
+// it never writes a response, just processes and closes. A summary-only bus
+// (lifecycle action never nil) still degrades bot/legacy consumers; user
+// consumers are degraded only when owner==current (mirroring the updated_v1
+// eligibility gate). An empty id is a no-op.
+func (b *Bus) handleSubscriptionUpdated(conn net.Conn, m *protocol.SubscriptionUpdated) {
+	defer conn.Close()
+	if m.RemoteSubscriptionID == "" {
+		return
+	}
+	n := b.lifecycleAction.MarkLocalUpdate(m.RemoteSubscriptionID)
+	b.logger.Printf("Subscription update signal: remote_subscription_id=%s degraded_consumers=%d",
+		m.RemoteSubscriptionID, n)
 }
 
 // onDecryptFailure records a fail-closed SDK decryption failure for

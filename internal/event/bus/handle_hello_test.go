@@ -337,6 +337,83 @@ func TestHandleHello_RefinedHelloWithTargetResource_Accepted(t *testing.T) {
 	}
 }
 
+// --- #10(a): a Hello declaring Identity=="user" with an EMPTY UserOpenID is a
+// malformed registration. It must FAIL CLOSED (reject, never register), NOT be
+// silently downgraded to a bot — a bot downgrade would bypass BindUser, the
+// owner==current gate, and the delivery gate, all of which key off
+// owner_user_open_id. ---
+
+func TestHandleHello_MalformedUserIdentity_EmptyOpenID_RejectedNotDowngraded(t *testing.T) {
+	var buf bytes.Buffer
+	b := newPlainHelloBus(t, log.New(&buf, "", 0))
+	hello := &protocol.Hello{
+		PID:        6200,
+		EventKey:   "im.message.receive_v1",
+		EventTypes: []string{"im.message.receive_v1"},
+		Identity:   "user", // declares user...
+		UserOpenID: "",      // ...but carries no open_id -> malformed
+	}
+	ack := readAckFromClient(t, b, hello)
+	if !ack.Rejected {
+		t.Fatal("a user Hello with an empty user_open_id must be rejected, not silently treated as a bot")
+	}
+	if ack.RejectReason != protocol.RejectReasonMalformedUserIdentity {
+		t.Errorf("reject reason = %q, want %q", ack.RejectReason, protocol.RejectReasonMalformedUserIdentity)
+	}
+	if got := b.hub.ConnCount(); got != 0 {
+		t.Errorf("hub.ConnCount = %d, want 0 (a malformed user consumer must NEVER register)", got)
+	}
+}
+
+// A bot Hello (Identity=="bot", empty UserOpenID) is NOT malformed — it is the
+// normal bot shape and must still be accepted (the malformed gate keys on
+// Identity=="user" specifically).
+func TestHandleHello_BotEmptyOpenID_NotMalformed_Accepted(t *testing.T) {
+	b := newPlainHelloBus(t, log.New(io.Discard, "", 0))
+	hello := &protocol.Hello{
+		PID:        6201,
+		EventKey:   "im.message.receive_v1",
+		EventTypes: []string{"im.message.receive_v1"},
+		Identity:   "bot",
+	}
+	ack := readAckFromClient(t, b, hello)
+	if ack.Rejected {
+		t.Fatalf("a bot Hello with an empty user_open_id must be accepted, got rejected: %q", ack.RejectReason)
+	}
+	if got := b.hub.ConnCount(); got != 1 {
+		t.Errorf("hub.ConnCount = %d, want 1", got)
+	}
+}
+
+// --- #19: the SUCCESS hello_ack echoes the bus's refined capabilities on the
+// real connection, so a refined consume can re-validate them there. ---
+
+func TestHandleHello_SuccessAck_EchoesRefinedCapabilities(t *testing.T) {
+	b := newPlainHelloBus(t, log.New(io.Discard, "", 0))
+	hello := &protocol.Hello{
+		PID:        6300,
+		EventKey:   "im.message.receive_v1",
+		EventTypes: []string{"im.message.receive_v1"},
+		Identity:   "bot",
+	}
+	ack := readAckFromClient(t, b, hello)
+	if ack.Rejected {
+		t.Fatalf("unexpected reject: %q", ack.RejectReason)
+	}
+	has := func(want string) bool {
+		for _, c := range ack.Capabilities {
+			if c == want {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(protocol.CapabilityRefinedRouting) || !has(protocol.CapabilityHelloV2) {
+		t.Errorf("success ack Capabilities = %v, want it to echo both %q and %q",
+			ack.Capabilities, protocol.CapabilityRefinedRouting, protocol.CapabilityHelloV2)
+	}
+}
+
 // A plaintext consumer (IncludeResourceData=false) never triggers a key fetch —
 // the fetch client would error if called, yet the consumer registers fine.
 func TestHandleHello_PlaintextConsumer_NoKeyFetch(t *testing.T) {
@@ -1125,7 +1202,10 @@ func TestHandleHello_UserConsumer_FreshBus_BindFailure_Rejected(t *testing.T) {
 }
 
 // Fresh bus whose WS never comes up: a user consumer fails CLOSED after the
-// bounded wait — rejected, never acked-ready.
+// bounded wait — rejected, never acked-ready. The WS-readiness wait is now the
+// shared SOURCE gate that fronts every identity, so the reason is
+// source_not_ready (a dead source), not identity_bind_failed (a user BindUser
+// failure) — the reject fires before the bind gate is even reached.
 func TestHandleHello_UserConsumer_FreshBus_WSNeverReady_Rejected(t *testing.T) {
 	h := NewHub()
 	uat := &fakeUATResolver{uat: "uat-for-alice"}
@@ -1136,12 +1216,84 @@ func TestHandleHello_UserConsumer_FreshBus_WSNeverReady_Rejected(t *testing.T) {
 		PID: 5108, EventKey: "im.message.receive_v1", EventTypes: []string{"im.message.receive_v1"},
 		Identity: "user", UserOpenID: "ou_alice",
 	})
-	if !ack.Rejected || ack.RejectReason != protocol.RejectReasonBindFailed {
+	if !ack.Rejected || ack.RejectReason != protocol.RejectReasonSourceNotReady {
 		t.Fatalf("a user consumer whose WS never comes up must fail closed (reject %q), got rejected=%v reason=%q",
-			protocol.RejectReasonBindFailed, ack.Rejected, ack.RejectReason)
+			protocol.RejectReasonSourceNotReady, ack.Rejected, ack.RejectReason)
 	}
 	if got := h.ConnCount(); got != 0 {
 		t.Errorf("hub.ConnCount = %d, want 0 (fail-closed reject unwinds)", got)
+	}
+}
+
+// Fresh bus whose WS never comes up: a BOT consumer ALSO fails closed after the
+// bounded source-readiness wait — the source gate fronts every identity, not
+// just user, so a bot no longer acks "ready" before the WS is up. (Before this
+// fix a bot reached Ready the moment it was Accepted.)
+func TestHandleHello_BotConsumer_FreshBus_WSNeverReady_Rejected(t *testing.T) {
+	h := NewHub()
+	uat := &fakeUATResolver{uat: "uat-unused"}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
+	b := newBindTestBus(t, gate) // wsReadyWait shrunk to 100ms; onConnReady never called
+
+	ack := runHelloToCompletion(t, b, &protocol.Hello{
+		PID: 5109, EventKey: "im.message.receive_v1", EventTypes: []string{"im.message.receive_v1"},
+		Identity: "bot", // bot: never bound, but still source-gated
+	})
+	if !ack.Rejected || ack.RejectReason != protocol.RejectReasonSourceNotReady {
+		t.Fatalf("a bot consumer whose WS never comes up must fail closed (reject %q), got rejected=%v reason=%q",
+			protocol.RejectReasonSourceNotReady, ack.Rejected, ack.RejectReason)
+	}
+	if got := h.ConnCount(); got != 0 {
+		t.Errorf("hub.ConnCount = %d, want 0 (fail-closed reject unwinds)", got)
+	}
+}
+
+// A bot consumer on a FRESH bus whose WS then comes up is acked (not rejected):
+// the source gate parks it until onConnReady fires, then it readies — proving
+// source-readiness gates the bot's ack rather than blocking it forever.
+func TestHandleHello_BotConsumer_FreshBus_WSComesUp_Acked(t *testing.T) {
+	h := NewHub()
+	uat := &fakeUATResolver{uat: "uat-unused"}
+	fb := &fakeBindUser{}
+	gate := newIdentityGate(h, staticCurrent("app1", "ou_alice"), uat.resolve, discardTestLogger())
+	b := newBindTestBus(t, gate)
+
+	server, client := net.Pipe()
+	t.Cleanup(func() { server.Close(); client.Close() })
+	done := make(chan struct{})
+	go func() {
+		b.handleHello(server, bufio.NewReader(server), &protocol.Hello{
+			PID: 5110, EventKey: "im.message.receive_v1", EventTypes: []string{"im.message.receive_v1"},
+			Identity: "bot",
+		})
+		close(done)
+	}()
+
+	// handleHello is parked in the source gate; the WS becomes ready.
+	gate.onConnReady(context.Background(), "conn-1", fb.bind)
+
+	line, err := protocol.ReadFrame(bufio.NewReader(client))
+	if err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	msg, err := protocol.Decode(bytes.TrimRight(line, "\n"))
+	if err != nil {
+		t.Fatalf("decode ack: %v", err)
+	}
+	ack := msg.(*protocol.HelloAck)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleHello did not return within 3s")
+	}
+	if ack.Rejected {
+		t.Fatalf("a bot whose WS came up must be acked, got rejected: %q", ack.RejectReason)
+	}
+	if fb.callCount() != 0 {
+		t.Errorf("bindUser call count = %d, want 0 (a bot is source-gated but never bound)", fb.callCount())
+	}
+	if got := h.ConnCount(); got != 1 {
+		t.Errorf("hub.ConnCount = %d, want 1 (bot registered and acked once source-ready)", got)
 	}
 }
 

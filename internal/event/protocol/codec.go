@@ -95,6 +95,8 @@ func Decode(line []byte) (interface{}, error) {
 		msg = &Shutdown{}
 	case MsgTypeSourceStatus:
 		msg = &SourceStatus{}
+	case MsgTypeSubscriptionUpdated:
+		msg = &SubscriptionUpdated{}
 	default:
 		return nil, fmt.Errorf("protocol: unknown message type %q", env.Type)
 	}

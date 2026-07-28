@@ -66,3 +66,17 @@ func SendShutdown(tr transport.IPC, appID string) error {
 	defer conn.Close()
 	return protocol.EncodeWithDeadline(conn, protocol.NewShutdown(), protocol.WriteTimeout)
 }
+
+// SendSubscriptionUpdated tells appID's bus that remoteSubscriptionID was just
+// updated by an operator, so it can proactively degrade the matching local
+// consumers. Fire-and-forget, exactly like SendShutdown: it writes the frame
+// and returns without reading a response — the caller treats any error as
+// best-effort (the platform's own updated_v1 remains the backstop).
+func SendSubscriptionUpdated(tr transport.IPC, appID, remoteSubscriptionID string) error {
+	conn, err := tr.Dial(tr.Address(appID))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return protocol.EncodeWithDeadline(conn, protocol.NewSubscriptionUpdated(remoteSubscriptionID), protocol.WriteTimeout)
+}

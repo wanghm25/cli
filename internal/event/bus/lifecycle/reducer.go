@@ -75,6 +75,17 @@ type subDecision struct {
 	next   string // for subSet (next_action)
 }
 
+// subConflictGetDecision is the ONE "the remote subscription no longer matches
+// this consumer's local intent — go re-inspect it" health decision:
+// remote_subscription_conflict + next_action=get. Defined once so the updated_v1
+// INCOMPATIBLE branch here and the proactive operator-update signal
+// (SubscriptionAction.MarkLocalUpdate) apply the byte-identical decision and can
+// never drift — the whole point of "the local-update signal mirrors updated_v1
+// exactly".
+func subConflictGetDecision() subDecision {
+	return subDecision{op: subSet, reason: ReasonRemoteSubscriptionConflict, next: NextActionGet}
+}
+
 // reduceScope is which conns a reduction's subscription decision applies to:
 // only the ELIGIBLE (owner==current) conns, or ALL matched conns (expired/
 // deleted are pure local bookkeeping, applied even to an ineligible conn).
@@ -133,7 +144,7 @@ func reduce(cur Phase, le LifecycleEvent, intent Intent) Reduction {
 		case updateCompatible:
 			return Reduction{Phase: PhaseActive, sub: subDecision{op: subClearIfConflict}, scope: scopeEligible}
 		case updateIncompatible:
-			return Reduction{Phase: PhaseActive, sub: subDecision{op: subSet, reason: ReasonRemoteSubscriptionConflict, next: NextActionGet}, scope: scopeEligible}
+			return Reduction{Phase: PhaseActive, sub: subConflictGetDecision(), scope: scopeEligible}
 		default: // unclear: reconcile with a single Get
 			return Reduction{Phase: PhaseActive, scope: scopeEligible, effect: EffectReconcileGet}
 		}

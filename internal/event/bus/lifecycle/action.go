@@ -281,6 +281,29 @@ func (a *SubscriptionAction) Handle(ctx context.Context, le LifecycleEvent) erro
 	return a.runEffect(ctx, le, red.effect, res, intentOf(res.conns))
 }
 
+// MarkLocalUpdate proactively degrades the consumers bound to
+// remoteSubscriptionID EXACTLY as an incompatible updated_v1 would —
+// remote_subscription_conflict + next_action=get on the eligible (owner==current)
+// consumers — WITHOUT any remote Get. It is the proactive local counterpart to
+// waiting for the platform's own updated_v1 push: an operator's `subscription
+// update` Patch changed the remote Subscription underneath the running
+// consumers, so their assumption that it still matches their own local listening
+// intent is a conflict they must re-inspect. It reuses the SAME eligibility gate
+// (eligibleConns) and subscription-health decision (applySubDecision with the
+// shared subConflictGetDecision the updated_v1 INCOMPATIBLE branch uses), so the
+// degrade outcome is byte-identical to that path; like the executor's own
+// degradeExecutorFull it writes the health fields directly (Conn.health is
+// concurrency-safe) rather than routing a synthetic event through the reducer —
+// no remote call, no lifecycle summary. Returns how many consumers were degraded
+// (0 when none are bound, or all are ineligible) for the caller's log. Safe to
+// call from the bus's IPC handler goroutine.
+func (a *SubscriptionAction) MarkLocalUpdate(remoteSubscriptionID string) int {
+	conns := a.registry.ConnsByRemoteSubscriptionID(remoteSubscriptionID)
+	res := a.eligibleConns(conns)
+	applySubDecision(res.conns, subConflictGetDecision())
+	return len(res.conns)
+}
+
 // applySubDecision applies a reduction's subscription-dimension health decision
 // to conns — the ONLY place (besides an effect runner) the Subscription health
 // fact is mutated for a reduction.
