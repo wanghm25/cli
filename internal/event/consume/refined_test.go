@@ -871,6 +871,53 @@ func TestRunRefinedChain_PlanConflict_NonDryRun_ReturnsTypedErrorBeforeApply(t *
 	}
 }
 
+// TestRunRefinedChain_UnknownState_FailsClosedNoApply (fail-fast #5a): a match in
+// a state this CLI cannot classify blocks with the "state" dimension; a real run
+// fails closed with a typed error naming the state and never reaches
+// apply/startBus/hello -- never silently creating a possible duplicate.
+func TestRunRefinedChain_UnknownState_FailsClosedNoApply(t *testing.T) {
+	var applyCalled, startBusCalled, helloCalled bool
+	existing := &larkgw.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_weird"), State: "pending"}
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{
+				Action:         subown.ActionBlock,
+				Before:         existing,
+				ConflictFields: []errs.InvalidParam{{Name: subown.StateConflictField, Reason: `unrecognized state "pending"`}},
+			}, nil
+		},
+		apply: func(context.Context, subown.SubscriptionPlan) (string, bool, error) {
+			applyCalled = true
+			return "", false, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) { startBusCalled = true; return nil, nil },
+		hello: func(context.Context, net.Conn, string) (*protocol.HelloAck, *bufio.Reader, error) {
+			helloCalled = true
+			return nil, nil, nil
+		},
+	}
+	opts := RefinedOptions{ErrOut: io.Discard, Out: io.Discard, Identity: core.AsUser}
+
+	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
+	if err == nil {
+		t.Fatal("expected a typed fail-closed error for an unrecognized remote state")
+	}
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if !strings.Contains(ve.Error(), "pending") || !strings.Contains(ve.Error(), "sub_weird") {
+		t.Errorf("Error() = %q, want it to name the unrecognized state and id", ve.Error())
+	}
+	if applyCalled || startBusCalled || helloCalled {
+		t.Error("an unrecognized-state block must short-circuit before apply/startBus/hello")
+	}
+}
+
 // TestRunRefinedChain_RealRun_Indeterminate_FailsClosedNoApply locks the
 // must-fix: an inconclusive remote scan (Indeterminate) on a real run fails
 // closed with a typed error and never reaches apply/startBus/hello — it must

@@ -17,8 +17,9 @@ import (
 // about to write. Before is the existing remote match the plan is about (nil for
 // a fresh Create). ConflictFields carries the fail-closed conflict dimensions
 // for an ActionBlock caused by a configuration conflict (include_resource_data
-// or filter); it is empty for an ActionBlock caused by a suspended match the
-// Policy refuses to overwrite, which is how a caller tells a config conflict
+// or filter), or the "state" dimension when a match is in an unrecognized
+// remote state; it is empty for an ActionBlock caused by a suspended match the
+// Policy refuses to overwrite, which is how a caller tells a config/state block
 // from a suspended block. Reason is a short, secret-free machine token for
 // logging (never any filter contents).
 type SubscriptionPlan struct {
@@ -38,6 +39,12 @@ const FilterConflictField = "filter"
 // includeResourceDataField is the ConflictFields Name for an include_resource_data
 // (encryption) mismatch.
 const includeResourceDataField = "include_resource_data"
+
+// StateConflictField is the ConflictFields Name used when a matched subscription
+// is in a remote state this CLI does not recognize. Callers use ConflictOnState
+// to detect this dimension and render an "unrecognized state" block (inspect the
+// subscription and decide) rather than a configuration-conflict message.
+const StateConflictField = "state"
 
 // encryptKeyProber is the read-only seam the Planner needs to resolve the
 // encryption conflict matrix for an active, include_resource_data=true match:
@@ -71,7 +78,9 @@ func NewPlanner(prober encryptKeyProber) Planner { return Planner{prober: prober
 //   - suspended match: the same include/filter conflict checks first (a
 //     mismatch Blocks, never a silent reactivate-reuse); else the Policy's
 //     suspendedAction (Block or Reactivate).
-//   - expired/deleted/unknown state => ActionCreate (inert; treated as absent).
+//   - expired/deleted state => ActionCreate (terminal/inert; treated as absent).
+//   - any other/unrecognized state => ActionBlock (fail-closed: an unknown state
+//     cannot be safely classified, so it is never silently Created or reused).
 func (p Planner) Plan(ctx context.Context, obs Observation, policy Policy, req Request) (SubscriptionPlan, error) {
 	if obs.Completeness == Indeterminate {
 		return SubscriptionPlan{Policy: policy, Action: ActionIndeterminate, Reason: "list_incomplete"}, nil
@@ -121,10 +130,19 @@ func (p Planner) Plan(ctx context.Context, obs Observation, policy Policy, req R
 		}
 		return SubscriptionPlan{Policy: policy, Action: policy.suspendedAction, Before: match, Reason: "suspended"}, nil
 
-	default:
-		// "expired", "deleted", "", or any other/unknown state: inert -- treat
-		// like not-found.
+	case "expired", "deleted":
+		// A terminal remote state is inert -- the subscription no longer
+		// delivers and can be neither reused nor reactivated, so it is treated
+		// like not-found: create a fresh one.
 		return SubscriptionPlan{Policy: policy, Action: ActionCreate}, nil
+
+	default:
+		// Any other state -- the empty string, or any token this CLI does not
+		// recognize -- cannot be safely classified. Fail closed: never silently
+		// Create (which could duplicate a still-live subscription) and never
+		// reuse/reactivate a state whose meaning is unknown. Block so a human
+		// inspects the matched subscription and decides.
+		return blockPlan(policy, match, "unrecognized_remote_state", stateConflictFields(match.State)), nil
 	}
 }
 
@@ -197,6 +215,29 @@ func filterConflictFields() []errs.InvalidParam {
 func ConflictOnFilter(fields []errs.InvalidParam) bool {
 	for _, f := range fields {
 		if f.Name == FilterConflictField {
+			return true
+		}
+	}
+	return false
+}
+
+// stateConflictFields builds the ConflictFields for a match in an unrecognized
+// remote state. The reason names the observed state token (a short status word,
+// never a filter or secret) so a human can see what was found and decide.
+func stateConflictFields(state string) []errs.InvalidParam {
+	return []errs.InvalidParam{{
+		Name:   StateConflictField,
+		Reason: fmt.Sprintf("the existing subscription is in an unrecognized remote state %q; it cannot be safely reused, reactivated, or treated as absent, so it is not silently overwritten or duplicated", state),
+	}}
+}
+
+// ConflictOnState reports whether a block's fields include the unrecognized-state
+// dimension. Such a block is neither a configuration conflict nor a suspended
+// match: the remote subscription's state could not be classified, so a human
+// inspects it and decides.
+func ConflictOnState(fields []errs.InvalidParam) bool {
+	for _, f := range fields {
+		if f.Name == StateConflictField {
 			return true
 		}
 	}

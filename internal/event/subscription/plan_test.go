@@ -172,17 +172,51 @@ func TestPlan_SuspendedConsumeBootstrap_ReturnsReactivate(t *testing.T) {
 	}
 }
 
-func TestPlan_ExpiredDeletedUnknown_TreatedAsCreate(t *testing.T) {
-	for _, state := range []string{"expired", "deleted", "", "some_future_state"} {
+// TestPlan_ExpiredDeleted_TreatedAsCreate: a terminal remote state is inert --
+// the subscription can be neither reused nor reactivated, so it is treated like
+// not-found and a fresh one is created.
+func TestPlan_ExpiredDeleted_TreatedAsCreate(t *testing.T) {
+	for _, state := range []string{"expired", "deleted"} {
 		t.Run(state, func(t *testing.T) {
 			plan, err := noProber().Plan(context.Background(), completeObs(stateSub("sub_old", state)), ManagementCreate, req(false, nil))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if plan.Action != ActionCreate {
-				t.Errorf("Action = %q, want %q (state %q is inert)", plan.Action, ActionCreate, state)
+				t.Errorf("Action = %q, want %q (state %q is terminal/inert)", plan.Action, ActionCreate, state)
 			}
 		})
+	}
+}
+
+// TestPlan_UnrecognizedState_ReturnsBlock_NeverCreate (fail-fast #5a): a matched
+// subscription in a state this CLI does not recognize (the empty string or any
+// unknown token) cannot be safely classified. It must fail closed -- Block,
+// never Create (which could duplicate a still-live subscription) and never
+// silently reuse/reactivate -- carrying the "state" conflict dimension and the
+// matched subscription as Before, under every policy.
+func TestPlan_UnrecognizedState_ReturnsBlock_NeverCreate(t *testing.T) {
+	for _, state := range []string{"", "some_future_state", "pending", "paused"} {
+		for _, policy := range []Policy{ManagementCreate, ConsumeBootstrap} {
+			t.Run("state="+state+"/"+policy.Name(), func(t *testing.T) {
+				plan, err := noProber().Plan(context.Background(), completeObs(stateSub("sub_weird", state)), policy, req(false, nil))
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if plan.Action != ActionBlock {
+					t.Fatalf("Action = %q, want %q (an unrecognized state must never Create)", plan.Action, ActionBlock)
+				}
+				if !ConflictOnState(plan.ConflictFields) {
+					t.Errorf("ConflictFields = %+v, want the state dimension", plan.ConflictFields)
+				}
+				if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Reason == "" {
+					t.Errorf("ConflictFields = %+v, want one entry with a non-empty reason", plan.ConflictFields)
+				}
+				if plan.Before == nil || plan.Before.ID.String() != "sub_weird" {
+					t.Errorf("Before = %+v, want the matched sub_weird", plan.Before)
+				}
+			})
+		}
 	}
 }
 

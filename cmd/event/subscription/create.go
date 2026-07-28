@@ -325,15 +325,37 @@ func createRequiredScopes(includeResourceData bool) []string {
 // ---- typed errors for non-writable plans ----
 
 // blockError maps an ActionBlock plan to create's typed failed_precondition. A
-// block carrying conflict fields is a configuration conflict (the active/suspended
-// match disagrees on include_resource_data or filter); a block with no conflict
-// fields is a suspended match create refuses to overwrite. The two render
-// different guidance (get/delete vs reactivate).
+// block carrying the "state" dimension is a match in an unrecognized remote
+// state (fail-closed); a block carrying include_resource_data/filter fields is a
+// configuration conflict (the active/suspended match disagrees); a block with no
+// conflict fields is a suspended match create refuses to overwrite. Each renders
+// its own guidance (inspect vs get/delete vs reactivate).
 func blockError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan, includeResourceData bool) error {
+	if subown.ConflictOnState(plan.ConflictFields) {
+		return unknownStateError(resolved, identity, plan)
+	}
 	if len(plan.ConflictFields) > 0 {
 		return conflictError(resolved, identity, plan, includeResourceData)
 	}
 	return suspendedError(resolved, identity, plan)
+}
+
+// unknownStateError implements the "unrecognized remote state" block: a match
+// exists but its state is not one this CLI can classify (not active/suspended/
+// expired/deleted), so create fails closed rather than risk duplicating a
+// still-live subscription. It guides the human to inspect and decide.
+func unknownStateError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) error {
+	id := planBeforeID(plan)
+	state := ""
+	if plan.Before != nil {
+		state = plan.Before.State
+	}
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"a subscription already exists for %s in an unrecognized remote state %q (remote_subscription_id=%s); create fails closed rather than risk duplicating it",
+		resolved.MaterializedKey, state, id).
+		WithParam("event_key").
+		WithParams(plan.ConflictFields...).
+		WithHint("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s and its state, then reactivate, delete, or wait as appropriate before re-running create", id, identity, id)
 }
 
 // conflictError implements the "active but conflicting" case and

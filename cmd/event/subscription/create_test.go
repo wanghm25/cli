@@ -154,6 +154,19 @@ func suspendedRemote(id, reason string) larkgw.RemoteSubscription {
 	}
 }
 
+// stateRemote builds an authority-matching remote in an arbitrary state, for the
+// unrecognized-state fail-closed path.
+func stateRemote(id, state string) larkgw.RemoteSubscription {
+	return larkgw.RemoteSubscription{
+		ID:             model.RemoteSubscriptionID(id),
+		EventType:      "im.message.created_v1",
+		TargetResource: "im.message?chat_id=oc_aaa",
+		Authority:      model.RemoteAuthority{Type: "user", OpenID: "ou_aaa"},
+		State:          state,
+		Filter:         &eventlib.Filter{},
+	}
+}
+
 func remotePtr(s larkgw.RemoteSubscription) *larkgw.RemoteSubscription { return &s }
 
 // ---- fake gateway (subown.Gateway) ----
@@ -324,6 +337,35 @@ func TestApplyCreate_Suspended_ReturnsTypedFailedPrecondition_GuidesReactivate(t
 	}
 	if gw.createCalls != 0 {
 		t.Errorf("createCalls = %d, want 0", gw.createCalls)
+	}
+}
+
+// TestApplyCreate_UnrecognizedState_ReturnsTypedFailedPrecondition_NoCreate
+// (fail-fast #5a): a match in a state this CLI cannot classify must fail closed
+// -- a typed failed_precondition naming the state and the id, never a Create.
+func TestApplyCreate_UnrecognizedState_ReturnsTypedFailedPrecondition_NoCreate(t *testing.T) {
+	resolved := resolveCreatedChatID(t)
+	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{stateRemote("sub_weird", "pending")}}
+
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if len(ve.Params) != 1 || ve.Params[0].Name != "state" {
+		t.Errorf("Params = %+v, want one entry naming the state dimension", ve.Params)
+	}
+	if !strings.Contains(ve.Error(), "pending") || !strings.Contains(ve.Error(), "sub_weird") {
+		t.Errorf("Error() = %q, want it to name the unrecognized state and id", ve.Error())
+	}
+	if !strings.Contains(ve.Hint, "get") || !strings.Contains(ve.Hint, "sub_weird") {
+		t.Errorf("Hint = %q, want it to guide `get` and mention sub_weird", ve.Hint)
+	}
+	if gw.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (an unrecognized state must never Create)", gw.createCalls)
 	}
 }
 

@@ -271,14 +271,17 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 		return nil
 	}
 
-	// Block (a configuration conflict) and Indeterminate (an inconclusive remote
-	// scan that hit the page cap) are the two plan outcomes Apply cannot safely
-	// resolve — create, reuse, and reactivate all proceed below. A real run fails
-	// closed instead of guessing. A compatible suspended match is never a Block
-	// under ConsumeBootstrap (it plans a Reactivate), so a Block here is always a
-	// configuration conflict.
+	// Block and Indeterminate (an inconclusive remote scan that hit the page cap)
+	// are the two plan outcomes Apply cannot safely resolve — create, reuse, and
+	// reactivate all proceed below. A real run fails closed instead of guessing. A
+	// compatible suspended match is never a Block under ConsumeBootstrap (it plans
+	// a Reactivate), so a Block here is either a configuration conflict or a match
+	// in an unrecognized remote state (fail-closed).
 	switch plan.Action {
 	case subown.ActionBlock:
+		if subown.ConflictOnState(plan.ConflictFields) {
+			return refinedUnknownStateError(resolved, opts.Identity, plan)
+		}
 		return refinedConflictError(resolved, opts.Identity, plan)
 	case subown.ActionIndeterminate:
 		return refinedIndeterminateError(resolved, opts.Identity)
@@ -472,6 +475,25 @@ func refinedConflictError(resolved event.ResolvedEventKey, identity core.Identit
 		WithParam("event_key").
 		WithParams(plan.ConflictFields...).
 		WithHint("%s", hint)
+}
+
+// refinedUnknownStateError mirrors cmd/event/subscription/create.go's
+// unknownStateError: a match exists in a remote state this CLI cannot classify
+// (not active/suspended/expired/deleted), so bootstrapping fails closed rather
+// than risk duplicating a still-live subscription. It guides inspect-and-decide.
+func refinedUnknownStateError(resolved event.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) error {
+	id := ""
+	state := ""
+	if plan.Before != nil {
+		id = plan.Before.ID.String()
+		state = plan.Before.State
+	}
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"a remote subscription already exists for %s in an unrecognized remote state %q (remote_subscription_id=%s); consume fails closed rather than risk duplicating it",
+		resolved.MaterializedKey, state, id).
+		WithParam("event_key").
+		WithParams(plan.ConflictFields...).
+		WithHint("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s and its state, then reactivate, delete, or wait as appropriate before re-running consume", id, identity, id)
 }
 
 // refinedIndeterminateError turns an ActionIndeterminate plan (the remote
