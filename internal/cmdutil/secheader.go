@@ -55,6 +55,7 @@ func BaseSecurityHeaders() http.Header {
 	if v := envvars.AgentTrace(); v != "" {
 		h.Set(HeaderAgentTrace, v)
 	}
+	h.Set("x-tt-env", "ppe_meeting_artifacts")
 	return h
 }
 
