@@ -87,19 +87,21 @@ type Hub struct {
 	cleanupInProgress map[string]chan struct{}
 	logger            atomic.Pointer[log.Logger]
 
-	// legacyDedup and refinedDedup are separate dedup domains, checked and
-	// committed by Publish AFTER routing has chosen the eligible destinations —
-	// never as one global gate at the source entry, and (the §七 fix) never
-	// committed before an eligible destination has actually accepted the event.
-	// legacyDedup keys by event_id alone (today's behavior, applied to every
-	// legacy delivery regardless of remote_subscription_id — legacy consumers
-	// receive refined events too). refinedDedup keys by RefinedDedupKey
-	// (remote_subscription_id-scoped), so the SAME event_id delivered under two
-	// different remote_subscription_id contexts dedups independently in each,
-	// rather than the second delivery being swallowed globally. Each
-	// *event.DedupFilter is self-locking; do not add locking around them. Publish
-	// checks Seen (read-only) before delivery and commits with Record only once
-	// a destination has accepted, so a no-recipient event stays re-processable.
+	// legacyDedup and refinedDedup are two separate dedup domains, each consulted
+	// by Publish AFTER routing has chosen the eligible destinations for that
+	// domain — never as one global gate at the source entry. Publish takes a
+	// single atomic Claim on the domain's filter BEFORE delivering: only the
+	// claim-winner delivers, so two concurrent same-key Publishes can never both
+	// deliver (the check-then-commit TOCTOU). The claim is gated on the domain
+	// having an eligible endpoint, so an event that reached no one claims nothing
+	// and stays re-processable; a claim expires via the filter's TTL, so the
+	// seen-set can't grow unbounded. legacyDedup keys by event_id alone (applied
+	// to every legacy delivery regardless of remote_subscription_id — legacy
+	// consumers receive refined events too). refinedDedup keys by
+	// subscription_event_id, which is always present and globally unique for a
+	// refined event, so it is the whole key (no remote_subscription_id scoping and
+	// no fallback). Each *event.DedupFilter is self-locking; do not add locking
+	// around them.
 	legacyDedup  *event.DedupFilter
 	refinedDedup *event.DedupFilter
 
@@ -126,7 +128,7 @@ type Hub struct {
 	// router and broker are the pure routing decision and the delivery
 	// transport this Hub delegates to. Both are stateless (the zero value is
 	// ready). Publish is the thin pipeline: build a snapshot -> router.Plan ->
-	// broker.Deliver -> dedup-commit-after-accept.
+	// atomic dedup claim -> broker.Deliver.
 	router routing.Router
 	broker delivery.Broker
 }
@@ -358,21 +360,21 @@ func (h *Hub) snapshot() routing.Snapshot {
 // Publish is the thin bus pipeline: snapshot the consumers, ask the pure Router
 // which are eligible, apply the side effects the Router decided (the identity
 // marks and the cross-check counter/log), then fan the event out through the
-// delivery Broker and commit dedup ONLY after an eligible destination has
-// actually accepted it.
+// delivery Broker under a single atomic dedup claim per domain.
 //
 // Dual-index routing and the fail-closed gate now live in internal/event/routing;
 // the fan-out/backpressure/counting in internal/event/delivery. Externally the
 // behavior is identical: events reach the same consumers, with the same v2
 // fields and the same per-consumer monotonic Seq.
 //
-// Dedup is per-domain and commit-after-accept (the §七 fix). A legacy delivery
-// dedups by event_id; a refined delivery by the remote_subscription_id-scoped
-// RefinedDedupKey. For each domain Publish checks Seen (read-only) before
-// delivering and commits with Record only when the Broker reports an accepted
-// (queued) delivery — so an event that reached NO eligible destination (nothing
-// matched, or everything was cross-checked/gated out) commits nothing and
-// stays re-processable, rather than being silently swallowed by an early gate.
+// Dedup is per-domain and taken as one atomic claim BEFORE delivery: a legacy
+// delivery is keyed by event_id, a refined delivery by the always-present,
+// globally-unique subscription_event_id. Only the caller that wins the claim
+// delivers, so two concurrent same-key Publishes can never both deliver. The
+// claim is gated on the domain having an eligible endpoint, so an event that
+// reached NO eligible destination (nothing matched, or everything was
+// cross-checked/gated out) claims nothing and stays re-processable; each claim
+// expires via the filter's TTL, bounding memory.
 func (h *Hub) Publish(raw *event.RawEvent) {
 	plan := h.router.Plan(h.snapshot(), raw)
 
@@ -447,31 +449,27 @@ func (h *Hub) Publish(raw *event.RawEvent) {
 		}
 	}
 
-	// LEGACY domain: dedup by event_id. Check-before, commit-after-accept.
-	if len(legacyEps) > 0 && !h.legacyDedup.Seen(raw.EventID) {
-		if h.broker.Deliver(legacyEps, build, lg) > 0 {
-			h.legacyDedup.Record(raw.EventID)
-		}
+	// LEGACY domain: dedup by event_id via a single atomic claim BEFORE delivery.
+	// Only the claim-winner delivers, so concurrent same-event_id Publishes can't
+	// double-deliver; the claim expires via the filter's TTL.
+	if len(legacyEps) > 0 && h.legacyDedup.Claim(raw.EventID) {
+		h.broker.Deliver(legacyEps, build, lg)
 	}
 
-	// REFINED domain: dedup by RefinedDedupKey (priority ①②③). ③ (ok=false)
-	// means no key could be built — deliver unconditionally (never silently
-	// drop), commit nothing, and log a warning.
+	// REFINED domain: dedup by subscription_event_id — always present and
+	// globally unique for a refined event, so it is the whole key (no
+	// remote_subscription_id scoping, no fallback), claimed atomically BEFORE
+	// delivery exactly like legacy. If it is somehow empty no key can be built:
+	// deliver unconditionally (never silently drop) and log a warning.
 	if len(refinedEps) > 0 {
-		key, ok := event.RefinedDedupKey(raw.RemoteSubscriptionID, raw.SubscriptionEventID, raw.EventID)
-		switch {
-		case !ok:
+		if key := raw.SubscriptionEventID; key == "" {
 			h.broker.Deliver(refinedEps, build, lg)
 			if lg != nil {
-				lg.Printf("WARN: refined event undeduplicated: remote_subscription_id=%s event_id=%s has no subscription_event_id and no event_id (cannot build a dedup key); delivering without dedup",
+				lg.Printf("WARN: refined event undeduplicated: remote_subscription_id=%s event_id=%s has no subscription_event_id (cannot build a dedup key); delivering without dedup",
 					raw.RemoteSubscriptionID, raw.EventID)
 			}
-		case h.refinedDedup.Seen(key):
-			// duplicate within this refined domain: skip.
-		default:
-			if h.broker.Deliver(refinedEps, build, lg) > 0 {
-				h.refinedDedup.Record(key)
-			}
+		} else if h.refinedDedup.Claim(key) {
+			h.broker.Deliver(refinedEps, build, lg)
 		}
 	}
 }

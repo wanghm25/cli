@@ -46,7 +46,7 @@ const (
 	RouteLegacy RouteKind = iota
 	// RouteRefined: selected by remote_subscription_id equality (which REQUIRES
 	// a non-empty id on both the consumer and the event). Its dedup domain is
-	// the remote_subscription_id-scoped RefinedDedupKey.
+	// keyed by subscription_event_id (globally unique for a refined event).
 	RouteRefined
 )
 

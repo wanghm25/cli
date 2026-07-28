@@ -520,9 +520,9 @@ func TestHub_Publish_SplitDedupAcrossRemoteSubscriptions(t *testing.T) {
 	mustNotReceive(t, legacy.sendCh, "legacy (must be deduped by event_id on the second, same-event_id delivery)")
 }
 
-// Redelivering the identical remote_subscription_id + subscription_event_id
-// must be deduped for that refined consumer (priority ①), exercised through
-// Hub.Publish itself (not just the standalone RefinedDedupKey unit tests).
+// Redelivering the identical subscription_event_id must be deduped for that
+// refined consumer, exercised through Hub.Publish itself: the refined domain is
+// keyed on subscription_event_id alone (globally unique for a refined event).
 func TestHub_Publish_RefinedDedupSameKeyTwice(t *testing.T) {
 	h := NewHub()
 	refinedR1 := newRefinedTestConn("im.msg/chat-id/oc_1", []string{"im.message.receive_v1"}, "R1")
@@ -544,9 +544,9 @@ func TestHub_Publish_RefinedDedupSameKeyTwice(t *testing.T) {
 	mustNotReceive(t, refinedR1.sendCh, "redelivery with identical dedup key must be dropped")
 }
 
-// Priority ③ (spec §4.3): when both subscription_event_id and event_id are
-// empty, the refined domain cannot build a dedup key — Publish must deliver
-// EVERY time (no dedup, never silently drop) and log a warning.
+// When subscription_event_id is empty the refined domain cannot build a dedup
+// key — Publish must deliver EVERY time (no dedup, never silently drop) and log
+// a warning, rather than collapsing distinct keyless events into one.
 func TestHub_Publish_RefinedNoDedupKeyDeliversEveryTimeAndWarns(t *testing.T) {
 	var logBuf bytes.Buffer
 	h := NewHub()
@@ -573,13 +573,15 @@ func TestHub_Publish_RefinedNoDedupKeyDeliversEveryTimeAndWarns(t *testing.T) {
 	}
 }
 
-// --- §七 fix: dedup commits ONLY after an eligible destination has accepted the
-// event. A no-recipient (or matched-but-not-accepted) event must stay
-// re-processable, never swallowed by an early dedup commit. ---
+// --- No-recipient events stay re-processable. The atomic dedup claim is gated
+// on the domain having an eligible endpoint, so an event that matched no one
+// claims nothing and a later genuine consumer still receives it. (An event whose
+// delivery WAS attempted but not accepted is a different case: the claim is
+// already taken — see TestHub_Publish_UnacceptedDeliveryStillClaims.) ---
 
-// A legacy event delivered while NO consumer matches must not commit its
-// event_id: a consumer that registers afterward and receives the SAME event_id
-// must still get it.
+// A legacy event published while NO consumer matches has no eligible endpoint,
+// so nothing is claimed for its event_id: a consumer that registers afterward
+// and receives the SAME event_id must still get it.
 func TestHub_Publish_NoRecipientLegacyEventStaysReprocessable(t *testing.T) {
 	h := NewHub()
 	const eventID = "evt-no-recipient"
@@ -592,11 +594,12 @@ func TestHub_Publish_NoRecipientLegacyEventStaysReprocessable(t *testing.T) {
 	h.RegisterAndIsFirst(c)
 	h.Publish(&event.RawEvent{EventID: eventID, EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
 
-	mustReceiveEvent(t, c.sendCh, "consumer must receive a redelivered event whose first delivery had NO recipient (no early dedup commit)")
+	mustReceiveEvent(t, c.sendCh, "consumer must receive a redelivered event whose first publish had NO eligible endpoint, so nothing was claimed")
 }
 
-// The refined half of the same rule: a refined event delivered while no consumer
-// is bound to its remote_subscription_id must not commit its refined dedup key.
+// The refined half of the same rule: a refined event published while no consumer
+// is bound to its remote_subscription_id has no eligible refined endpoint, so
+// its subscription_event_id is never claimed.
 func TestHub_Publish_NoRecipientRefinedEventStaysReprocessable(t *testing.T) {
 	h := NewHub()
 	other := newRefinedTestConn("im.msg/chat-id/oc_2", []string{"im.message.receive_v1"}, "R2")
@@ -612,7 +615,7 @@ func TestHub_Publish_NoRecipientRefinedEventStaysReprocessable(t *testing.T) {
 		Payload:              json.RawMessage(`{}`),
 	}
 	// No R1 consumer yet: nothing eligible in the refined domain, so the refined
-	// dedup key must NOT be committed.
+	// dedup key is never claimed.
 	h.Publish(raw)
 
 	// R1 consumer registers and the SAME refined event (same dedup key) arrives.
@@ -624,14 +627,20 @@ func TestHub_Publish_NoRecipientRefinedEventStaysReprocessable(t *testing.T) {
 	mustNotReceive(t, other.sendCh, "R2 must never receive an R1-scoped event")
 }
 
-// "Accepted" means queued, not merely matched: an eligible destination that
-// exists but cannot enqueue (PushDropOldest fails) must also commit no dedup, so
-// a later working consumer still receives the same event_id.
-func TestHub_Publish_UnacceptedDeliveryDoesNotCommitDedup(t *testing.T) {
+// Atomic claim-before-deliver: the dedup key is claimed at the first delivery
+// ATTEMPT, before and independent of whether any destination accepts it. So a
+// same-event_id republish within the TTL is deduped even if the first attempt
+// enqueued nowhere (its only consumer's queue was full). This deliberately
+// supersedes the earlier "unaccepted delivery stays re-processable" behavior:
+// claiming before delivery is precisely what stops two concurrent same-key
+// Publishes from both delivering, and here a matched consumer DID exist — it was
+// merely overwhelmed, so there is nothing a retention rule needs to protect. The
+// claim is bounded by the TTL, so the id becomes re-claimable once it expires.
+func TestHub_Publish_UnacceptedDeliveryStillClaims(t *testing.T) {
 	h := NewHub()
 	const eventID = "evt-unaccepted"
 
-	// The first consumer can never enqueue.
+	// The only consumer can never enqueue, so the first delivery accepts nowhere.
 	failing := &alwaysFailSubscriber{
 		eventKey:   "im.msg",
 		eventTypes: []string{"im.message.receive_v1"},
@@ -643,13 +652,14 @@ func TestHub_Publish_UnacceptedDeliveryDoesNotCommitDedup(t *testing.T) {
 		t.Fatalf("precondition: always-fail subscriber should have Received 0, got %d", failing.Received())
 	}
 
-	// A working consumer registers; the SAME event_id must still reach it,
-	// because the earlier unaccepted delivery committed no dedup key.
+	// A working consumer registers and the SAME event_id is republished within
+	// the TTL. The first attempt already claimed the key, so the republish is
+	// deduped and never reaches the new consumer.
 	working := newTestConn("im.msg2", []string{"im.message.receive_v1"})
 	h.RegisterAndIsFirst(working)
 	h.Publish(&event.RawEvent{EventID: eventID, EventType: "im.message.receive_v1", Payload: json.RawMessage(`{}`)})
 
-	mustReceiveEvent(t, working.sendCh, "a working consumer must receive the event_id an earlier unaccepted delivery failed to commit")
+	mustNotReceive(t, working.sendCh, "same event_id within the TTL is deduped: the first (unaccepted) attempt already claimed it — atomic claim-before-deliver")
 }
 
 // fan-out: multiple LOCAL consumers may share one remote_subscription_id
