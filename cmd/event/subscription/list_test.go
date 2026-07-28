@@ -106,8 +106,12 @@ func TestListSubscriptions_TwoItems_JSONShape(t *testing.T) {
 	if first.EventType != "im.message.created_v1" {
 		t.Errorf("Subscriptions[0].EventType = %q, want im.message.created_v1", first.EventType)
 	}
-	if first.Identity != "user:ou_aaa" {
-		t.Errorf("Subscriptions[0].Identity = %q, want user:ou_aaa", first.Identity)
+	// identity is the `--as`-composable token; the open_id is preserved separately.
+	if first.Identity != "user" {
+		t.Errorf("Subscriptions[0].Identity = %q, want user", first.Identity)
+	}
+	if first.UserOpenID != "ou_aaa" {
+		t.Errorf("Subscriptions[0].UserOpenID = %q, want ou_aaa", first.UserOpenID)
 	}
 	if first.Remote.State != "active" {
 		t.Errorf("Subscriptions[0].Remote.State = %q, want active", first.Remote.State)

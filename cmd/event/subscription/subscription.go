@@ -253,8 +253,14 @@ type subscriptionRow struct {
 	EventKey             string              `json:"event_key"`
 	EventType            string              `json:"event_type"`
 	TargetResource       string              `json:"target_resource,omitempty"`
-	Identity             string              `json:"identity,omitempty"`
-	PayloadOptions       *payloadOptionsView `json:"payload_options,omitempty"`
+	// Identity is the subscription owner's authority as the exact `--as` token
+	// ("bot" / "user"), so it can be copied straight into `--as <value>` on a
+	// follow-up command. The owning user's open_id (lost from this composable
+	// token) is preserved separately in UserOpenID.
+	Identity   string `json:"identity,omitempty"`
+	UserOpenID string `json:"user_open_id,omitempty"`
+
+	PayloadOptions *payloadOptionsView `json:"payload_options,omitempty"`
 	// Filter is the remote server-side event filter as canonical JSON, present
 	// only when the remote subscription actually carries one (omitted for an
 	// unfiltered subscription). Faithfully surfaced from the remote record; the
@@ -283,7 +289,11 @@ func mapRemoteSubscription(sub model.RemoteSubscription) subscriptionRow {
 		RemoteSubscriptionID: sub.ID.String(),
 		EventType:            sub.EventType,
 		TargetResource:       sub.TargetResource,
-		Identity:             sub.Authority.String(),
+		// Emit the `--as`-composable token ("bot"/"user"), not the compact
+		// "app"/"user:<open_id>" matching spelling, and keep the open_id in its own
+		// field so nothing is lost.
+		Identity:   sub.Authority.AsToken(),
+		UserOpenID: sub.Authority.OpenID,
 	}
 	// Only a real subscription (one carrying an event_type) gets an event_key: a
 	// zero/absent record has no key at all and stays "" rather than being

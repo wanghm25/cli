@@ -157,6 +157,9 @@ func writeGetText(out io.Writer, row *subscriptionRow) {
 	if row.Identity != "" {
 		fmt.Fprintf(out, "Identity:                %s\n", row.Identity)
 	}
+	if row.UserOpenID != "" {
+		fmt.Fprintf(out, "User Open ID:            %s\n", row.UserOpenID)
+	}
 	state := row.Remote.State
 	if state == "" {
 		state = "-"

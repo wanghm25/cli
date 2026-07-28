@@ -338,8 +338,12 @@ func TestMapRemoteSubscription_FullDetail_MapsEveryRemoteField(t *testing.T) {
 	if row.TargetResource != "im.message?chat_id=oc_xxx" {
 		t.Errorf("TargetResource = %q, want im.message?chat_id=oc_xxx", row.TargetResource)
 	}
-	if row.Identity != "user:ou_xxx" {
-		t.Errorf("Identity = %q, want user:ou_xxx", row.Identity)
+	// identity is the `--as`-composable token; the open_id is preserved separately.
+	if row.Identity != "user" {
+		t.Errorf("Identity = %q, want user", row.Identity)
+	}
+	if row.UserOpenID != "ou_xxx" {
+		t.Errorf("UserOpenID = %q, want ou_xxx", row.UserOpenID)
 	}
 	if row.PayloadOptions == nil || !row.PayloadOptions.IncludeResourceData {
 		t.Errorf("PayloadOptions = %+v, want IncludeResourceData=true", row.PayloadOptions)
@@ -361,6 +365,26 @@ func TestMapRemoteSubscription_FullDetail_MapsEveryRemoteField(t *testing.T) {
 	}
 	if row.Local != nil {
 		t.Errorf("Local = %v, want nil/omitted — local-consumer association is a future concern", row.Local)
+	}
+}
+
+// TestMapRemoteSubscription_AppAuthority_IdentityIsBotNoOpenID locks the other
+// authority tier: a remote "app" authority surfaces as the `--as bot` token with
+// no user_open_id, so the row's identity round-trips through `--as` for a bot too.
+func TestMapRemoteSubscription_AppAuthority_IdentityIsBotNoOpenID(t *testing.T) {
+	registerCreateFixtures(t)
+	row := mapRemoteSubscription(larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{
+		SubscriptionId: strPtr("sub_bot"),
+		Authority:      &larkeventv1.Authority{Type: strPtr("app"), AppId: strPtr("cli_xxx")},
+		TargetResource: strPtr("im.message?chat_id=oc_xxx"),
+		EventType:      strPtr("im.message.created_v1"),
+		State:          strPtr("active"),
+	}))
+	if row.Identity != "bot" {
+		t.Errorf("Identity = %q, want bot", row.Identity)
+	}
+	if row.UserOpenID != "" {
+		t.Errorf("UserOpenID = %q, want empty for an app authority", row.UserOpenID)
 	}
 }
 

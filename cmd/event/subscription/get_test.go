@@ -61,8 +61,12 @@ func TestGetSubscription_SingleDetail_JSONShape(t *testing.T) {
 	if row.EventKey != "im.message.created_v1/chat-id/oc_xxx" {
 		t.Errorf("EventKey = %q, want im.message.created_v1/chat-id/oc_xxx", row.EventKey)
 	}
-	if row.Identity != "user:ou_xxx" {
-		t.Errorf("Identity = %q, want user:ou_xxx", row.Identity)
+	// identity is the `--as`-composable token; the open_id is preserved separately.
+	if row.Identity != "user" {
+		t.Errorf("Identity = %q, want user", row.Identity)
+	}
+	if row.UserOpenID != "ou_xxx" {
+		t.Errorf("UserOpenID = %q, want ou_xxx", row.UserOpenID)
 	}
 	if row.Remote.State != "active" {
 		t.Errorf("Remote.State = %q, want active", row.Remote.State)

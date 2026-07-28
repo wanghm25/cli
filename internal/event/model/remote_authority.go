@@ -39,6 +39,27 @@ func (a RemoteAuthority) String() string {
 	}
 }
 
+// AsToken renders the authority as the exact `--as` flag token so an agent can
+// copy it straight back into `--as <token>`: "bot" for an app authority, "user"
+// for a user authority, "" for an unset one, and any other (open-vocabulary)
+// Type passed through verbatim. Unlike String — the compact "user:<open_id>" /
+// "app" spelling used for MATCHING (AuthorityMatchesOwner) — AsToken is the
+// AI-composable OUTPUT form: it never embeds the open_id (surfaced in its own
+// field alongside it), and maps the remote "app" tier to the CLI's "bot" identity
+// vocabulary so the value round-trips through `--as`.
+func (a RemoteAuthority) AsToken() string {
+	switch a.Type {
+	case "":
+		return ""
+	case "user":
+		return "user"
+	case "app":
+		return "bot"
+	default:
+		return a.Type
+	}
+}
+
 // IsZero reports whether the authority is unset (no type known).
 func (a RemoteAuthority) IsZero() bool {
 	return a == RemoteAuthority{}
