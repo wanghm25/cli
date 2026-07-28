@@ -141,13 +141,19 @@ no-op there.`,
 	// can't vary by the EventKey argument (unknown until RunE resolves it),
 	// and a refined key's consume startup chain has REAL write side effects
 	// (create/reuse/reactivate a remote Subscription) — so the static tag
-	// (what --help shows and what anything inspecting risk before args are
-	// resolved sees) must reflect this command's worst case, never silently
-	// under-report it as pure "read". The precise per-invocation value ("read"
-	// for an ordinary key) is app.InvocationDescriptor.Risk once the EventKey is
-	// resolved; RunE never mutates this annotation — a command must not rewrite
-	// its own Cobra risk mid-run.
+	// must reflect this command's worst case, never silently under-report it as
+	// pure "read". The precise per-invocation value ("read" for an ordinary key)
+	// is app.InvocationDescriptor.Risk; RunE never mutates this annotation — a
+	// command must not rewrite its own Cobra risk mid-run.
 	cmdutil.SetRisk(cmd, "write")
+
+	// The framework reads that annotation BEFORE RunE parses the argument — for
+	// pre-startup command pruning (a max_risk policy) and the --help "Risk:" line
+	// — so refine it from the command line when THIS invocation's EventKey is
+	// already visible there: a resolvable legacy key downgrades the display/gate
+	// to "read" via the same app.InvocationDescriptor.Risk policy, a refined key
+	// (or an unresolvable/absent one) leaves the conservative "write" untouched.
+	applyArgAwareConsumeRisk(cmd, os.Args[1:])
 
 	return cmd
 }
