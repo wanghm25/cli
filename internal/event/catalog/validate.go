@@ -24,6 +24,9 @@ import (
 //   - placeholder/empty schemas: a chosen schema spec that carries no Go type
 //     and whose raw body is empty / "{}" / "null" (RegisterKey only checks the
 //     raw body is non-empty bytes, so "{}" passes it);
+//   - lifecycle collisions: a business event_type equal to a reserved
+//     subscription lifecycle meta-event type, which would make the source layer
+//     skip that lifecycle handler (RegisterKey does not know the reserved set);
 //   - invalid Filter Meta: an operand operator outside its event_type's global
 //     operator set, a logic op that is not and/or, or an operand list cap above
 //     the hard cap.
@@ -39,6 +42,7 @@ func Validate() error {
 
 		problems = append(problems, validateTemplates(def)...)
 		problems = append(problems, validateSchemaShape(def)...)
+		problems = append(problems, validateLifecycleCollision(def)...)
 	}
 
 	problems = append(problems, validateFilterMetas()...)
@@ -62,6 +66,18 @@ func validateTemplates(def *KeyDefinition) []string {
 		seen[tmpl.PathSegment] = true
 	}
 	return problems
+}
+
+// validateLifecycleCollision flags a business EventKey whose event_type collides
+// with a reserved subscription lifecycle meta-event type. The source layer skips
+// registering a lifecycle handler whose event_type a business key already owns
+// (the SDK dispatcher panics on duplicate registration), so such a key would
+// silently drop that lifecycle signal.
+func validateLifecycleCollision(def *KeyDefinition) []string {
+	if IsReservedLifecycleEventType(def.EventType) {
+		return []string{fmt.Sprintf("EventKey %q: event_type %q collides with a reserved subscription lifecycle event type; the lifecycle handler for it would be skipped", def.Key, def.EventType)}
+	}
+	return nil
 }
 
 // validateSchemaShape flags a missing or placeholder/empty schema.

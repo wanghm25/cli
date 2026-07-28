@@ -81,6 +81,28 @@ func TestValidate_CatchesPlaceholderSchema(t *testing.T) {
 	}
 }
 
+// TestValidate_CatchesLifecycleEventTypeCollision (fail-fast #5c) seeds a
+// business EventKey whose event_type equals a reserved subscription lifecycle
+// event type — allowed by RegisterKey (it does not know the reserved set),
+// rejected by Validate because the source layer would skip that lifecycle
+// handler.
+func TestValidate_CatchesLifecycleEventTypeCollision(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+
+	RegisterKey(KeyDefinition{
+		Key: "im.collide_v1", EventType: "event.subscription.activated_v1", Schema: nativeSchema(),
+	})
+
+	err := Validate()
+	if err == nil {
+		t.Fatal("expected a validation error for an event_type colliding with a lifecycle event type")
+	}
+	if !strings.Contains(err.Error(), "lifecycle event type") {
+		t.Errorf("error = %v, want it to flag the lifecycle collision", err)
+	}
+}
+
 // TestValidate_CatchesInvalidFilterMeta seeds a filter meta whose operand
 // references an operator outside the event_type's global operator set.
 func TestValidate_CatchesInvalidFilterMeta(t *testing.T) {
