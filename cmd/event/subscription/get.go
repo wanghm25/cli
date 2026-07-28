@@ -14,6 +14,7 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/event/buslocal"
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
@@ -97,7 +98,9 @@ func runGet(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID string,
 		return err
 	}
 
-	row, err := getSubscription(ctx, client, remoteSubscriptionID)
+	// Best-effort local-consumer facts: a down/unreachable bus yields none and
+	// never fails this read-only command.
+	row, err := getSubscriptionRow(ctx, client, remoteSubscriptionID, queryLocalConsumers())
 	if err != nil {
 		return err
 	}
@@ -108,6 +111,21 @@ func runGet(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID string,
 	}
 	writeGetText(f.IOStreams.Out, row)
 	return nil
+}
+
+// getSubscriptionRow is runGet's testable core: it fetches the row via the
+// bare getSubscription mapper (shared with delete) and additively annotates it
+// with the running local consumer(s) bound to this remote_subscription_id
+// (nil/none leaves `local` omitted). localConsumers is the already-queried,
+// best-effort set — so this is exercised against a fake gateway + canned
+// consumers with no real bus.
+func getSubscriptionRow(ctx context.Context, svc getSubscriptionAPI, remoteSubscriptionID string, localConsumers []buslocal.Consumer) (*subscriptionRow, error) {
+	row, err := getSubscription(ctx, svc, remoteSubscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	row.Local = localViewFor(localConsumers, row.RemoteSubscriptionID)
+	return row, nil
 }
 
 // getSubscription calls svc.Get and maps the domain RemoteSubscription into
@@ -155,5 +173,10 @@ func writeGetText(out io.Writer, row *subscriptionRow) {
 	}
 	if len(row.Filter) > 0 {
 		fmt.Fprintf(out, "Filter:                  %s\n", row.Filter)
+	}
+	// Additive: the running local consumer(s) bound to this subscription, when
+	// the bus reported any. Absent line = none known (best-effort).
+	if row.Local != nil && row.Local.Running {
+		fmt.Fprintf(out, "Local Consumer:          running (%s)\n", formatLocalConsumers(row.Local.Consumers))
 	}
 }

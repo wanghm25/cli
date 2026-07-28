@@ -16,6 +16,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	"github.com/larksuite/cli/internal/event/buslocal"
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
@@ -82,6 +83,54 @@ func TestGetSubscription_SingleDetail_JSONShape(t *testing.T) {
 	}
 	if _, present := generic["local"]; present {
 		t.Errorf(`get --json "local" present (%v), want omitted`, generic["local"])
+	}
+}
+
+// TestGetSubscriptionRow_SurfacesRunningLocalConsumer locks the get-side
+// surfacing: a running consumer bound to this remote_subscription_id is added
+// as the row's additive `local` object (running + the consumer).
+func TestGetSubscriptionRow_SurfacesRunningLocalConsumer(t *testing.T) {
+	registerCreateFixtures(t)
+	fake := &fakeGetAPI{sub: subPtr(activeSub("sub_xxx", false, "user"))}
+	consumers := []buslocal.Consumer{{AppID: "cli_x", PID: 99, EventKey: "im.message.created_v1/chat-id/oc_aaa", RemoteSubscriptionID: "sub_xxx"}}
+
+	row, err := getSubscriptionRow(context.Background(), fake, "sub_xxx", consumers)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if row.Local == nil || !row.Local.Running {
+		t.Fatalf("Local = %+v, want a running local consumer", row.Local)
+	}
+	if len(row.Local.Consumers) != 1 || row.Local.Consumers[0].PID != 99 {
+		t.Errorf("Local.Consumers = %+v, want the pid=99 consumer", row.Local.Consumers)
+	}
+
+	raw, err := json.Marshal(row)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var generic map[string]interface{}
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if _, present := generic["local"]; !present {
+		t.Errorf(`get --json "local" absent, want present when a consumer is bound; got %s`, raw)
+	}
+}
+
+// TestGetSubscriptionRow_NoBus_OmitsLocal locks best-effort: with no local
+// consumer known (bus down / none bound), get still succeeds and `local` is
+// omitted — exactly the pre-change shape.
+func TestGetSubscriptionRow_NoBus_OmitsLocal(t *testing.T) {
+	registerCreateFixtures(t)
+	fake := &fakeGetAPI{sub: subPtr(activeSub("sub_xxx", false, "user"))}
+
+	row, err := getSubscriptionRow(context.Background(), fake, "sub_xxx", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if row.Local != nil {
+		t.Errorf("Local = %+v, want nil/omitted when no consumer is known", row.Local)
 	}
 }
 

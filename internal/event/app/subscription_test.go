@@ -257,7 +257,7 @@ func emptyFilterSub() *model.RemoteSubscription {
 func TestUpdate_GetError_Propagates(t *testing.T) {
 	sentinel := errors.New("get failed")
 	svc := &fakeUpdatePort{getErr: sentinel}
-	_, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
+	_, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false, nil)
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want the Get error", err)
 	}
@@ -270,7 +270,7 @@ func TestUpdate_GetError_Propagates(t *testing.T) {
 // that omits event_type is an InvalidResponse, never a guess, and never patches.
 func TestUpdate_MissingEventType_TypedError(t *testing.T) {
 	svc := &fakeUpdatePort{getSub: &model.RemoteSubscription{EventType: "", Filter: &event.Filter{}}}
-	_, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
+	_, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false, nil)
 	var ie *errs.InternalError
 	if !errors.As(err, &ie) || ie.Subtype != errs.SubtypeInvalidResponse {
 		t.Fatalf("err = %v, want InternalError/invalid_response", err)
@@ -284,7 +284,7 @@ func TestUpdate_MissingEventType_TypedError(t *testing.T) {
 // (including NoChange) without ever patching.
 func TestUpdate_DryRun_Preview_NoPatch(t *testing.T) {
 	svc := &fakeUpdatePort{getSub: emptyFilterSub()}
-	out, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, true)
+	out, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, true, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestUpdate_DryRun_Preview_NoPatch(t *testing.T) {
 // an already-empty filter issues no Patch.
 func TestUpdate_ClearFilter_Noop_WhenAlreadyEmpty(t *testing.T) {
 	svc := &fakeUpdatePort{getSub: emptyFilterSub()}
-	out, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
+	out, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestUpdate_ClearFilter_Patches(t *testing.T) {
 		getSub:    &model.RemoteSubscription{EventType: updateTestEventType, Filter: nonEmptyFilter(t)},
 		patchResp: after,
 	}
-	out, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
+	out, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestUpdate_PatchError_Propagates(t *testing.T) {
 		getSub:   &model.RemoteSubscription{EventType: updateTestEventType, Filter: nonEmptyFilter(t)},
 		patchErr: sentinel,
 	}
-	_, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
+	_, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false, nil)
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want the Patch error unchanged", err)
 	}

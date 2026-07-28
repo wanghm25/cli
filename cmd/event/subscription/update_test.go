@@ -21,6 +21,7 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
 	eventlib "github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/buslocal"
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
@@ -104,7 +105,7 @@ func TestApplyUpdate_SetFilter_PatchesWhenChanged(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
-		updateOpts{filter: sampleUpdateFilterJSON})
+		updateOpts{filter: sampleUpdateFilterJSON}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -117,7 +118,7 @@ func TestApplyUpdate_MalformedFilterJSON_RejectedNoPatch(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
-		updateOpts{filter: `{"composite_condition":`})
+		updateOpts{filter: `{"composite_condition":`}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -145,7 +146,7 @@ func TestApplyUpdate_InvalidFilterRule_RejectedNoPatch_NeverLeaksValue(t *testin
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
-		updateOpts{filter: raw})
+		updateOpts{filter: raw}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -166,7 +167,7 @@ func TestApplyUpdate_ClearFilter_PatchesWhenFilterPresent(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", present))}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
-		updateOpts{clearFilter: true})
+		updateOpts{clearFilter: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -186,7 +187,7 @@ func TestApplyUpdate_ClearFilter_NoOpWhenAlreadyEmpty(t *testing.T) {
 	var buf bytes.Buffer
 
 	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
-		updateOpts{clearFilter: true, asJSON: true})
+		updateOpts{clearFilter: true, asJSON: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -212,7 +213,7 @@ func TestApplyUpdate_SetFilter_NoOpWhenEqualsCurrent(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", current))}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
-		updateOpts{filter: sampleUpdateFilterJSON})
+		updateOpts{filter: sampleUpdateFilterJSON}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -225,8 +226,11 @@ func TestApplyUpdate_DryRun_ReadsButDoesNotPatch(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 	var buf bytes.Buffer
 
+	// A running local consumer is bound to sub_1, so a real filter change would
+	// affect its stream; the dry-run must disclose that (and list it).
+	consumers := []buslocal.Consumer{{PID: 4242, EventKey: "im.message.created_v1/chat-id/oc_aaa", RemoteSubscriptionID: "sub_1"}}
 	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
-		updateOpts{filter: sampleUpdateFilterJSON, dryRun: true, asJSON: true})
+		updateOpts{filter: sampleUpdateFilterJSON, dryRun: true, asJSON: true}, consumers)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -253,11 +257,40 @@ func TestApplyUpdate_DryRun_ReadsButDoesNotPatch(t *testing.T) {
 	if pc["action"] != "update" {
 		t.Errorf(`planned_change.action = %v, want "update"`, pc["action"])
 	}
-	// A real filter change affects any running local consumer's stream, so the
-	// dry-run must disclose that rather than assert none.
+	// A real filter change affects the running local consumer's stream, so the
+	// dry-run must disclose it AND list the affected consumer.
 	li, _ := generic["local_impact"].(map[string]interface{})
 	if li["local_consumer_affected"] != true {
-		t.Errorf("local_impact.local_consumer_affected = %v, want true for a real filter change", li["local_consumer_affected"])
+		t.Errorf("local_impact.local_consumer_affected = %v, want true when a consumer is bound", li["local_consumer_affected"])
+	}
+	affected, ok := li["consumers"].([]interface{})
+	if !ok || len(affected) != 1 {
+		t.Fatalf("local_impact.consumers = %v, want the affected consumer listed", li["consumers"])
+	}
+}
+
+// TestApplyUpdate_DryRun_NoLocalConsumer_NotAffected locks best-effort: with no
+// local consumer bound (bus down / none running), a real filter change previews
+// local_consumer_affected=false and lists none — the command still succeeds.
+func TestApplyUpdate_DryRun_NoLocalConsumer_NotAffected(t *testing.T) {
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
+	var buf bytes.Buffer
+
+	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON, dryRun: true, asJSON: true}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var generic map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &generic); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	li, _ := generic["local_impact"].(map[string]interface{})
+	if li["local_consumer_affected"] != false {
+		t.Errorf("local_impact.local_consumer_affected = %v, want false when no consumer is bound", li["local_consumer_affected"])
+	}
+	if _, present := li["consumers"]; present {
+		t.Errorf("local_impact.consumers present (%v), want omitted when none affected", li["consumers"])
 	}
 }
 
@@ -269,8 +302,11 @@ func TestApplyUpdate_DryRun_NoOp_ReportsNoopAction(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", current))}
 	var buf bytes.Buffer
 
+	// Even with a running local consumer bound, a no-op changes nothing and so
+	// must NOT claim impact (and must never require --yes).
+	consumers := []buslocal.Consumer{{PID: 4242, RemoteSubscriptionID: "sub_1"}}
 	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
-		updateOpts{filter: sampleUpdateFilterJSON, dryRun: true, asJSON: true})
+		updateOpts{filter: sampleUpdateFilterJSON, dryRun: true, asJSON: true}, consumers)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -285,10 +321,14 @@ func TestApplyUpdate_DryRun_NoOp_ReportsNoopAction(t *testing.T) {
 	if pc["action"] != "noop" {
 		t.Errorf(`planned_change.action = %v, want "noop" for an already-matching filter`, pc["action"])
 	}
-	// A no-op changes nothing, so it must not claim local-consumer impact.
+	// A no-op changes nothing, so it must not claim local-consumer impact even
+	// when a consumer is running.
 	li, _ := generic["local_impact"].(map[string]interface{})
 	if li["local_consumer_affected"] != false {
 		t.Errorf("local_impact.local_consumer_affected = %v, want false for a no-op", li["local_consumer_affected"])
+	}
+	if _, present := li["consumers"]; present {
+		t.Errorf("local_impact.consumers present (%v), want omitted for a no-op", li["consumers"])
 	}
 }
 
@@ -303,7 +343,7 @@ func TestApplyUpdate_EventTypeComesFromGet(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: &sub}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
-		updateOpts{filter: sampleUpdateFilterJSON})
+		updateOpts{filter: sampleUpdateFilterJSON}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -325,7 +365,7 @@ func TestApplyUpdate_MissingEventType_TypedError(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: &sub}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
-		updateOpts{clearFilter: true})
+		updateOpts{clearFilter: true}, nil)
 	if _, ok := errs.ProblemOf(err); !ok {
 		t.Fatalf("expected a typed errs.* error, got %T: %v", err, err)
 	}
@@ -339,7 +379,7 @@ func TestApplyUpdate_GetError_Propagates(t *testing.T) {
 	fake := &fakeUpdateAPI{getErr: sentinel}
 
 	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
-		updateOpts{clearFilter: true})
+		updateOpts{clearFilter: true}, nil)
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want the Get error passed through unchanged (%v)", err, sentinel)
 	}
@@ -495,13 +535,15 @@ func TestRunUpdate_MissingWriteScope_ReturnsPermissionError(t *testing.T) {
 }
 
 // TestNewCmdUpdate_HasExpectedFlags locks update's flag surface: the two
-// filter flags, --dry-run/--json/--as, no --include-resource-data (update
-// changes only the filter; resource-data delivery is fixed at create time), no
-// --yes (update is not confirmation-gated), and risk=write.
+// filter flags, --dry-run/--yes/--json/--as, no --include-resource-data (update
+// changes only the filter; resource-data delivery is fixed at create time), and
+// risk=write. --yes is now present because update conditionally confirmation-
+// gates a real filter change that affects a running local consumer; risk stays
+// "write" because the gate is conditional/command-driven, not framework-forced.
 func TestNewCmdUpdate_HasExpectedFlags(t *testing.T) {
 	f := &cmdutil.Factory{}
 	cmd := NewCmdUpdate(f)
-	for _, name := range []string{"filter", "clear-filter", "dry-run", "json", "as"} {
+	for _, name := range []string{"filter", "clear-filter", "dry-run", "yes", "json", "as"} {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Errorf("NewCmdUpdate missing --%s flag", name)
 		}
@@ -509,11 +551,90 @@ func TestNewCmdUpdate_HasExpectedFlags(t *testing.T) {
 	if cmd.Flags().Lookup("include-resource-data") != nil {
 		t.Error("NewCmdUpdate must not expose --include-resource-data (update changes only the filter)")
 	}
-	if cmd.Flags().Lookup("yes") != nil {
-		t.Error("NewCmdUpdate must not expose --yes (a filter change is reversible, not confirmation-gated)")
-	}
 	if level, ok := cmdutil.GetRisk(cmd); !ok || level != cmdutil.RiskWrite {
 		t.Errorf("risk = (%q, %v), want (%q, true)", level, ok, cmdutil.RiskWrite)
+	}
+}
+
+// ---- update --yes gate (conditional confirmation when a consumer is affected) ----
+
+// TestApplyUpdate_RealChange_AffectedConsumer_RequiresYes locks the gate: a real
+// filter change on a subscription with a running local consumer, without --yes,
+// returns a ConfirmationRequiredError naming the consumer — and never patches.
+func TestApplyUpdate_RealChange_AffectedConsumer_RequiresYes(t *testing.T) {
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
+	consumers := []buslocal.Consumer{{PID: 4242, EventKey: "im.message.created_v1/chat-id/oc_aaa", RemoteSubscriptionID: "sub_1"}}
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON}, consumers)
+
+	var ce *errs.ConfirmationRequiredError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected *errs.ConfirmationRequiredError, got %T: %v", err, err)
+	}
+	if ce.Risk != errs.RiskHighRiskWrite {
+		t.Errorf("Risk = %q, want %q", ce.Risk, errs.RiskHighRiskWrite)
+	}
+	if ce.Action != "event subscription update" {
+		t.Errorf("Action = %q, want %q", ce.Action, "event subscription update")
+	}
+	if !strings.Contains(ce.Hint, "pid=4242") {
+		t.Errorf("Hint = %q, want it to name the affected consumer pid=4242", ce.Hint)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0: confirmation-required must never patch", fake.patchCalls)
+	}
+}
+
+// TestApplyUpdate_RealChange_AffectedConsumer_WithYes_Patches locks that --yes
+// acknowledges the impact and lets the real change through.
+func TestApplyUpdate_RealChange_AffectedConsumer_WithYes_Patches(t *testing.T) {
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
+	consumers := []buslocal.Consumer{{PID: 4242, RemoteSubscriptionID: "sub_1"}}
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON, yes: true}, consumers)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 1 {
+		t.Errorf("patchCalls = %d, want 1 (--yes acknowledges the impact and proceeds)", fake.patchCalls)
+	}
+}
+
+// TestApplyUpdate_RealChange_NoConsumer_PatchesWithoutYes locks that with no
+// local consumer affected, update needs no confirmation — the flow is unchanged
+// (a real change patches without --yes).
+func TestApplyUpdate_RealChange_NoConsumer_PatchesWithoutYes(t *testing.T) {
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
+
+	// A consumer bound to a DIFFERENT subscription must not gate this one.
+	consumers := []buslocal.Consumer{{PID: 4242, RemoteSubscriptionID: "sub_other"}}
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON}, consumers)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 1 {
+		t.Errorf("patchCalls = %d, want 1 (no affected consumer ⇒ no confirmation, unchanged flow)", fake.patchCalls)
+	}
+}
+
+// TestApplyUpdate_NoOp_AffectedConsumer_NeverConfirms locks that a no-op never
+// triggers the gate even when a consumer is bound — nothing changes, so nothing
+// is confirmed and nothing is patched.
+func TestApplyUpdate_NoOp_AffectedConsumer_NeverConfirms(t *testing.T) {
+	current := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", current))}
+	consumers := []buslocal.Consumer{{PID: 4242, RemoteSubscriptionID: "sub_1"}}
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON}, consumers) // equals current => no-op
+	if err != nil {
+		t.Fatalf("a no-op must not require confirmation, got: %v", err)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0 for a no-op", fake.patchCalls)
 	}
 }
 

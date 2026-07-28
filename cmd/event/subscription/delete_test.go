@@ -50,7 +50,7 @@ func TestApplyDelete_NotYes_ReturnsConfirmationRequired_NoDeleteCall(t *testing.
 	fake := &fakeDeleteAPI{}
 	before := rowFromDetail(t, activeDetail("sub_1", false, "user"))
 
-	err := applyDelete(context.Background(), fake, "sub_1", core.AsUser, before, false)
+	err := applyDelete(context.Background(), fake, "sub_1", core.AsUser, before, nil, false)
 
 	var ce *errs.ConfirmationRequiredError
 	if !errors.As(err, &ce) {
@@ -88,12 +88,98 @@ func TestApplyDelete_Yes_CallsDelete(t *testing.T) {
 	fake := &fakeDeleteAPI{}
 	before := rowFromDetail(t, activeDetail("sub_1", false, "user"))
 
-	err := applyDelete(context.Background(), fake, "sub_1", core.AsUser, before, true)
+	err := applyDelete(context.Background(), fake, "sub_1", core.AsUser, before, nil, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if fake.deleteCalls != 1 {
 		t.Errorf("deleteCalls = %d, want 1", fake.deleteCalls)
+	}
+}
+
+// TestApplyDelete_NotYes_NamesAffectedLocalConsumerInHint locks that when a
+// running local consumer is bound to the subscription, the confirmation Hint
+// names it (pid) so the operator sees exactly what the delete disrupts — while
+// still carrying the "not a substitute for stopping local consumers" caveat.
+func TestApplyDelete_NotYes_NamesAffectedLocalConsumerInHint(t *testing.T) {
+	fake := &fakeDeleteAPI{}
+	before := rowFromDetail(t, activeDetail("sub_1", false, "user"))
+	matched := []localConsumerInfo{{PID: 4242, EventKey: "im.message.created_v1/chat-id/oc_aaa"}}
+
+	err := applyDelete(context.Background(), fake, "sub_1", core.AsUser, before, matched, false)
+
+	var ce *errs.ConfirmationRequiredError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected *errs.ConfirmationRequiredError, got %T: %v", err, err)
+	}
+	if !strings.Contains(ce.Hint, "pid=4242") {
+		t.Errorf("Hint = %q, want it to name the affected consumer pid=4242", ce.Hint)
+	}
+	if !strings.Contains(ce.Hint, "not a substitute for stopping local consumers") {
+		t.Errorf("Hint = %q, want it to keep the local-consumers caveat", ce.Hint)
+	}
+	if fake.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0", fake.deleteCalls)
+	}
+}
+
+// ---- buildDeleteDryRun: truthful local impact ----
+
+// TestBuildDeleteDryRun_AffectedConsumer_ListsItAndFlagsImpact locks that a
+// delete --dry-run over a subscription with a running local consumer reports
+// local_consumer_affected=true, lists the consumer, and the note names it —
+// replacing the old hardcoded "no local impact".
+func TestBuildDeleteDryRun_AffectedConsumer_ListsItAndFlagsImpact(t *testing.T) {
+	before := rowFromDetail(t, activeDetail("sub_1", false, "user"))
+	matched := []localConsumerInfo{{PID: 4242, EventKey: "im.message.created_v1/chat-id/oc_aaa"}}
+
+	result := buildDeleteDryRun("sub_1", core.AsUser, before, matched)
+
+	if !result.LocalImpact.LocalConsumerAffected {
+		t.Error("local_consumer_affected = false, want true when a local consumer is bound")
+	}
+	if len(result.LocalImpact.Consumers) != 1 || result.LocalImpact.Consumers[0].PID != 4242 {
+		t.Errorf("LocalImpact.Consumers = %+v, want the pid=4242 consumer listed", result.LocalImpact.Consumers)
+	}
+	if !strings.Contains(result.LocalImpact.Note, "pid=4242") {
+		t.Errorf("note = %q, want it to name the affected consumer", result.LocalImpact.Note)
+	}
+
+	// Round-trip the JSON so the wire keys (consumers[]) are pinned too.
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var generic map[string]interface{}
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	li, _ := generic["local_impact"].(map[string]interface{})
+	if li["local_consumer_affected"] != true {
+		t.Errorf("local_impact.local_consumer_affected = %v, want true", li["local_consumer_affected"])
+	}
+	consumers, ok := li["consumers"].([]interface{})
+	if !ok || len(consumers) != 1 {
+		t.Fatalf("local_impact.consumers = %v, want an array of 1", li["consumers"])
+	}
+}
+
+// TestBuildDeleteDryRun_NoBus_NoLocalImpact locks best-effort: with no local
+// consumer known (bus down / none bound), the dry-run reports no local impact,
+// omits consumers, and keeps the invariant note — the command still succeeds.
+func TestBuildDeleteDryRun_NoBus_NoLocalImpact(t *testing.T) {
+	before := rowFromDetail(t, activeDetail("sub_1", false, "user"))
+
+	result := buildDeleteDryRun("sub_1", core.AsUser, before, nil)
+
+	if result.LocalImpact.LocalConsumerAffected {
+		t.Error("local_consumer_affected = true, want false when no consumer is known")
+	}
+	if len(result.LocalImpact.Consumers) != 0 {
+		t.Errorf("LocalImpact.Consumers = %+v, want none", result.LocalImpact.Consumers)
+	}
+	if !strings.Contains(result.LocalImpact.Note, "not a substitute for stopping local consumers") {
+		t.Errorf("note = %q, want the invariant caveat", result.LocalImpact.Note)
 	}
 }
 

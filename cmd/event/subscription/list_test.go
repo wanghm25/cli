@@ -17,6 +17,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	"github.com/larksuite/cli/internal/event/buslocal"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
@@ -84,7 +85,7 @@ func TestListSubscriptions_TwoItems_JSONShape(t *testing.T) {
 		},
 	}, true, "tok_next")}
 
-	result, err := listSubscriptions(context.Background(), fake, listOpts{})
+	result, err := listSubscriptions(context.Background(), fake, listOpts{}, nil)
 	if err != nil {
 		t.Fatalf("listSubscriptions: unexpected error: %v", err)
 	}
@@ -164,7 +165,7 @@ func TestListSubscriptions_TwoItems_JSONShape(t *testing.T) {
 func TestListSubscriptions_EmptyResult_NoNextAction(t *testing.T) {
 	fake := &fakeListAPI{page: listPage(nil, false, "")}
 
-	result, err := listSubscriptions(context.Background(), fake, listOpts{})
+	result, err := listSubscriptions(context.Background(), fake, listOpts{}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -192,10 +193,62 @@ func TestListSubscriptions_EmptyResult_NoNextAction(t *testing.T) {
 	}
 }
 
+// TestListSubscriptions_SurfacesRunningLocalConsumer locks the list-side
+// local-consumer surfacing: a row whose remote_subscription_id matches a queried
+// running consumer gets an additive `local` object (running + the consumer);
+// a row with no matching consumer leaves `local` omitted — additive, best-effort.
+func TestListSubscriptions_SurfacesRunningLocalConsumer(t *testing.T) {
+	registerCreateFixtures(t)
+	fake := &fakeListAPI{page: listPage([]*larkeventv1.SubscriptionDetail{
+		activeDetail("sub_1", false, "user"),
+		activeDetail("sub_2", false, "user"),
+	}, false, "")}
+	// One running consumer, bound to sub_1 only.
+	consumers := []buslocal.Consumer{{AppID: "cli_x", PID: 4242, EventKey: "im.message.created_v1/chat-id/oc_aaa", RemoteSubscriptionID: "sub_1"}}
+
+	result, err := listSubscriptions(context.Background(), fake, listOpts{}, consumers)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Subscriptions) != 2 {
+		t.Fatalf("len(Subscriptions) = %d, want 2", len(result.Subscriptions))
+	}
+
+	sub1 := result.Subscriptions[0]
+	if sub1.Local == nil || !sub1.Local.Running {
+		t.Fatalf("sub_1 Local = %+v, want a running local consumer", sub1.Local)
+	}
+	if len(sub1.Local.Consumers) != 1 || sub1.Local.Consumers[0].PID != 4242 {
+		t.Errorf("sub_1 Local.Consumers = %+v, want the pid=4242 consumer", sub1.Local.Consumers)
+	}
+	if result.Subscriptions[1].Local != nil {
+		t.Errorf("sub_2 Local = %+v, want nil/omitted (no consumer bound)", result.Subscriptions[1].Local)
+	}
+
+	// Pin the wire shape: subscriptions[0].local present, subscriptions[1].local omitted.
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var generic map[string]interface{}
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	rows, _ := generic["subscriptions"].([]interface{})
+	row0, _ := rows[0].(map[string]interface{})
+	if _, present := row0["local"]; !present {
+		t.Errorf("subscriptions[0].local absent, want present when a consumer is bound; got %v", row0)
+	}
+	row1, _ := rows[1].(map[string]interface{})
+	if _, present := row1["local"]; present {
+		t.Errorf("subscriptions[1].local present (%v), want omitted", row1["local"])
+	}
+}
+
 func TestListSubscriptions_TransportError_PropagatesTyped(t *testing.T) {
 	fake := &fakeListAPI{err: errors.New("boom: connection reset")}
 
-	_, err := listSubscriptions(context.Background(), fake, listOpts{})
+	_, err := listSubscriptions(context.Background(), fake, listOpts{}, nil)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}

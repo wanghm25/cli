@@ -464,11 +464,15 @@ type plannedChange struct {
 	ConflictFields       []errs.InvalidParam `json:"conflict_fields,omitempty"`
 }
 
-// localImpact documents that `subscription create` never touches a local
-// `event consume` process — only the remote management plane.
+// localImpact documents a mutation's effect on local `event consume`
+// process(es). LocalConsumerAffected/Consumers are computed per command from a
+// best-effort local-bus query (buslocal): update/delete populate Consumers with
+// the REAL running consumers bound to this subscription; create/renew/
+// reactivate never affect one, so they leave Consumers empty (omitted).
 type localImpact struct {
-	LocalConsumerAffected bool   `json:"local_consumer_affected"`
-	Note                  string `json:"note"`
+	LocalConsumerAffected bool                `json:"local_consumer_affected"`
+	Consumers             []localConsumerInfo `json:"consumers,omitempty"`
+	Note                  string              `json:"note"`
 }
 
 // legacyPlanAction maps a subscription plan action to the stable

@@ -133,10 +133,12 @@ func runDelete(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 		return err
 	}
 
+	// Best-effort local-consumer facts: a down/unreachable bus yields none, so
+	// the impact truthfully reports "no known local consumer" without failing.
+	affectedConsumers := matchLocalConsumers(queryLocalConsumers(), remoteSubscriptionID)
+
 	if o.dryRun {
-		result := buildMutationDryRunResult("delete", remoteSubscriptionID, identity, before,
-			"delete", false, deleteLocalImpactNote,
-			fmt.Sprintf("run with --yes (after a human confirms) to permanently delete remote_subscription_id=%s; this does not stop any local `event consume` process", remoteSubscriptionID))
+		result := buildDeleteDryRun(remoteSubscriptionID, identity, before, affectedConsumers)
 		if o.asJSON {
 			output.PrintJson(f.IOStreams.Out, result)
 			return nil
@@ -145,7 +147,7 @@ func runDelete(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 		return nil
 	}
 
-	if err := applyDelete(ctx, client, remoteSubscriptionID, identity, before, o.yes); err != nil {
+	if err := applyDelete(ctx, client, remoteSubscriptionID, identity, before, affectedConsumers, o.yes); err != nil {
 		return err
 	}
 	result := buildDeleteResult(remoteSubscriptionID, before)
@@ -163,12 +165,31 @@ func runDelete(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 // client) so this decision sequence is directly testable against a fake
 // deleteSubscriptionAPI, mirroring update.go's applyUpdate. before is the
 // remote state runDelete already fetched via Get for --dry-run/
-// remote_before/Hint purposes; this does not re-fetch it.
-func applyDelete(ctx context.Context, svc deleteSubscriptionAPI, remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, yes bool) error {
+// remote_before/Hint purposes; this does not re-fetch it. matched is the REAL
+// running local consumer(s) bound to this subscription (best-effort; empty when
+// the bus is down), named in the confirmation Hint so the operator sees exactly
+// what a delete disrupts.
+func applyDelete(ctx context.Context, svc deleteSubscriptionAPI, remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, matched []localConsumerInfo, yes bool) error {
 	if !yes {
-		return errDeleteConfirmationRequired(remoteSubscriptionID, identity, before)
+		return errDeleteConfirmationRequired(remoteSubscriptionID, identity, before, matched)
 	}
 	return doDeleteSubscription(ctx, svc, remoteSubscriptionID)
+}
+
+// buildDeleteDryRun is delete's testable --dry-run builder: the shared mutation
+// preview plus the REAL local impact — local_consumer_affected and the named
+// consumer(s) come from matched (the running consumers bound to this
+// subscription), so the preview truthfully reflects what a delete disrupts
+// instead of the old hardcoded "no local impact". Empty matched (no bus / none
+// bound) reports no local impact.
+func buildDeleteDryRun(remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, matched []localConsumerInfo) *mutationDryRunResult {
+	result := buildMutationDryRunResult("delete", remoteSubscriptionID, identity, before,
+		"delete", len(matched) > 0, deleteImpactNote(matched),
+		fmt.Sprintf("run with --yes (after a human confirms) to permanently delete remote_subscription_id=%s; this does not stop any local `event consume` process", remoteSubscriptionID))
+	if len(matched) > 0 {
+		result.LocalImpact.Consumers = matched
+	}
+	return result
 }
 
 // doDeleteSubscription issues the actual Delete call via the gateway. Unlike
@@ -183,13 +204,30 @@ func doDeleteSubscription(ctx context.Context, svc deleteSubscriptionAPI, remote
 // errDeleteConfirmationRequired implements the high-risk-write
 // confirmation gate for delete: category confirmation (exit code 10),
 // risk high-risk-write, and a Hint naming the affected
-// remote_subscription_id/event_key/identity/current state (pids omitted —
-// no bus/local-consumer registry exists yet to know them) plus
-// the required "not a substitute for stopping local consumers" caveat.
-func errDeleteConfirmationRequired(remoteSubscriptionID string, identity core.Identity, before *subscriptionRow) error {
+// remote_subscription_id/event_key/identity/current state plus the REAL
+// running local consumer(s) bound to it (from the best-effort bus query; the
+// pids clause is omitted when none is running) and the required "not a
+// substitute for stopping local consumers" caveat.
+func errDeleteConfirmationRequired(remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, matched []localConsumerInfo) error {
+	consumerClause := ""
+	if len(matched) > 0 {
+		consumerClause = fmt.Sprintf(" %d local consumer(s) are currently bound to it and will stop receiving events: %s;", len(matched), formatLocalConsumers(matched))
+	}
 	return errs.NewConfirmationRequiredError(errs.RiskHighRiskWrite, "event subscription delete",
 		"deleting remote Subscription %s requires confirmation", remoteSubscriptionID).
-		WithHint("this permanently deletes shared remote Subscription %s (event_key=%s, identity=%s, current state=%s); it is not a substitute for stopping local consumers — stop any local `event consume` process using it separately with `lark-cli event stop`; re-run the same command with --yes after a human has confirmed", remoteSubscriptionID, before.EventKey, identity, before.Remote.State)
+		WithHint("this permanently deletes shared remote Subscription %s (event_key=%s, identity=%s, current state=%s);%s it is not a substitute for stopping local consumers — stop any local `event consume` process using it separately with `lark-cli event stop`; re-run the same command with --yes after a human has confirmed", remoteSubscriptionID, before.EventKey, identity, before.Remote.State, consumerClause)
+}
+
+// deleteImpactNote is delete's --dry-run local_impact note, grounded in the
+// REAL bus query: it names the running consumer(s) a delete disrupts when any
+// is bound, and otherwise states the delete has no local impact. Either way it
+// keeps the invariant caveat that delete is not a substitute for stopping local
+// consumers.
+func deleteImpactNote(matched []localConsumerInfo) string {
+	if len(matched) > 0 {
+		return fmt.Sprintf("a running local consumer is bound to this subscription (%s); deleting it stops that consumer from receiving events. `event subscription delete` only removes the remote Subscription — it is not a substitute for stopping local consumers; stop the `event consume` process separately with `lark-cli event stop`.", formatLocalConsumers(matched))
+	}
+	return deleteLocalImpactNote
 }
 
 const deleteLocalImpactNote = "`event subscription delete` only removes the remote Subscription; it never stops a local `event consume` process — it is not a substitute for stopping local consumers, which must be stopped separately."

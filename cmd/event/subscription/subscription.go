@@ -243,13 +243,11 @@ type remoteState struct {
 // record — shared by `list`'s subscriptions[] entries and `get`'s single
 // result.
 //
-// Local is always omitted in this change: local-consumer association
-// (which local `event consume` process, if any, is currently bound to this
-// remote subscription) is a future concern — the bus runtime that would
-// supply that data does not exist yet. Rather than fake
-// or guess at it, this field is left nil/omitted; a later change populates
-// it once the bus runtime exists, additively, without changing this
-// field's name or position.
+// Local surfaces the running local `event consume` process(es), if any,
+// currently bound to this remote subscription — discovered best-effort from the
+// local bus (buslocal, the same mechanism `event status` uses) and matched by
+// remote_subscription_id. It stays nil/omitted when no local consumer is known
+// (no bus reachable, or none bound), so the field is purely additive.
 type subscriptionRow struct {
 	RemoteSubscriptionID string              `json:"remote_subscription_id"`
 	EventKey             string              `json:"event_key"`
@@ -261,9 +259,9 @@ type subscriptionRow struct {
 	// only when the remote subscription actually carries one (omitted for an
 	// unfiltered subscription). Faithfully surfaced from the remote record; the
 	// CLI does not interpret it here.
-	Filter json.RawMessage `json:"filter,omitempty"`
-	Remote remoteState     `json:"remote"`
-	Local  json.RawMessage `json:"local,omitempty"` // placeholder; see doc comment above.
+	Filter json.RawMessage    `json:"filter,omitempty"`
+	Remote remoteState        `json:"remote"`
+	Local  *localConsumerView `json:"local,omitempty"` // running local consumer(s); see doc comment above.
 }
 
 // mapRemoteSubscription converts one domain RemoteSubscription (projected from
@@ -428,6 +426,12 @@ func writeMutationDryRunText(out io.Writer, result *mutationDryRunResult) {
 	fmt.Fprintf(out, "Remote Subscription ID: %s\n", result.RemoteSubscriptionID)
 	if result.RemoteBefore != nil {
 		fmt.Fprintf(out, "Current remote state:    %s\n", result.RemoteBefore.Remote.State)
+	}
+	// Surface the REAL affected local consumer(s) discovered from the bus, so the
+	// text preview agrees with local_impact in the JSON. Shown only when this
+	// operation actually affects a running local consumer.
+	if len(result.LocalImpact.Consumers) > 0 {
+		fmt.Fprintf(out, "Local consumers affected: %s\n", formatLocalConsumers(result.LocalImpact.Consumers))
 	}
 	fmt.Fprintf(out, "Next: %s\n", result.NextAction)
 }

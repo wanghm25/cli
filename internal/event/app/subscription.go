@@ -179,11 +179,21 @@ type UpdateOutcome struct {
 //     returned unchanged, and never echoes the filter contents).
 //   - dryRun: stop (UpdatePreview) — no Patch.
 //   - already matches: stop (UpdateNoop) — no Patch.
-//   - otherwise: Patch (svc.Patch) and return UpdateApplied.
+//   - otherwise: run confirm (if any), then Patch (svc.Patch) and return
+//     UpdateApplied.
+//
+// confirm is an OPTIONAL caller-supplied gate invoked exactly once, at the
+// write boundary: after the dry-run and no-op branches, so it fires ONLY when a
+// real Patch is imminent. The command layer uses it to require --yes when a
+// running local consumer is affected (returning a ConfirmationRequiredError);
+// any error it returns aborts before the Patch, so nothing is written. nil
+// means "no gate" — the previous unconditional-write behavior. Keeping the
+// policy in the caller (which alone knows --yes and the local bus) while the
+// use case owns WHEN it fires keeps this layer free of both concerns.
 //
 // include_resource_data is never touched here (Patch is filter-only). This is
 // the one place the update decision lives, so the command only renders.
-func (SubscriptionUseCase) Update(ctx context.Context, svc UpdatePort, remoteSubscriptionID, filterInput string, clearFilter, dryRun bool) (UpdateOutcome, error) {
+func (SubscriptionUseCase) Update(ctx context.Context, svc UpdatePort, remoteSubscriptionID, filterInput string, clearFilter, dryRun bool, confirm func() error) (UpdateOutcome, error) {
 	before, err := svc.Get(ctx, remoteSubscriptionID)
 	if err != nil {
 		return UpdateOutcome{}, err
@@ -215,6 +225,14 @@ func (SubscriptionUseCase) Update(ctx context.Context, svc UpdatePort, remoteSub
 	}
 	if noChange {
 		return UpdateOutcome{Kind: UpdateNoop, Before: *before}, nil
+	}
+
+	// A real filter change is imminent — give the caller its one chance to gate
+	// the write (e.g. require --yes when a running local consumer is affected).
+	if confirm != nil {
+		if err := confirm(); err != nil {
+			return UpdateOutcome{}, err
+		}
 	}
 
 	after, err := svc.Patch(ctx, remoteSubscriptionID, lark.PatchSpec{Filter: desired})

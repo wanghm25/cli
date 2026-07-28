@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/event/buslocal"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
@@ -114,7 +115,9 @@ func runList(cmd *cobra.Command, f *cmdutil.Factory, o listOpts) error {
 		return err
 	}
 
-	result, err := listSubscriptions(ctx, client, o)
+	// Best-effort local-consumer facts: a down/unreachable bus yields none and
+	// never fails this read-only command.
+	result, err := listSubscriptions(ctx, client, o, queryLocalConsumers())
 	if err != nil {
 		return err
 	}
@@ -140,8 +143,10 @@ type listResult struct {
 // maps the page into this package's stable JSON shape. svc is the
 // listSubscriptionsAPI test seam so this mapping is unit-tested against a fake,
 // without a real *lark.Client. --event-key filters on the OAPI event_type
-// server-side.
-func listSubscriptions(ctx context.Context, svc listSubscriptionsAPI, o listOpts) (*listResult, error) {
+// server-side. localConsumers is the already-queried (best-effort) set of
+// running local consumers; each row is additively annotated with the one(s)
+// bound to its remote_subscription_id (nil/none leaves `local` omitted).
+func listSubscriptions(ctx context.Context, svc listSubscriptionsAPI, o listOpts, localConsumers []buslocal.Consumer) (*listResult, error) {
 	page, err := svc.List(ctx, larkgw.ListParams{
 		State:     o.state,
 		EventType: o.eventKey,
@@ -157,7 +162,9 @@ func listSubscriptions(ctx context.Context, svc listSubscriptionsAPI, o listOpts
 		return result, nil
 	}
 	for _, item := range page.Items {
-		result.Subscriptions = append(result.Subscriptions, mapRemoteSubscription(item))
+		row := mapRemoteSubscription(item)
+		row.Local = localViewFor(localConsumers, row.RemoteSubscriptionID)
+		result.Subscriptions = append(result.Subscriptions, row)
 	}
 	result.HasMore = page.HasMore
 	result.NextPageToken = page.NextPageToken
@@ -173,7 +180,7 @@ func writeListText(out io.Writer, result *listResult) {
 		return
 	}
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "REMOTE_SUBSCRIPTION_ID\tEVENT_KEY\tIDENTITY\tSTATE\tEXPIRE_TIME")
+	fmt.Fprintln(w, "REMOTE_SUBSCRIPTION_ID\tEVENT_KEY\tIDENTITY\tSTATE\tEXPIRE_TIME\tLOCAL")
 	for _, s := range result.Subscriptions {
 		expire := "-"
 		if s.Remote.ExpireTime != nil {
@@ -187,7 +194,7 @@ func writeListText(out io.Writer, result *listResult) {
 		if state == "" {
 			state = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", s.RemoteSubscriptionID, s.EventKey, identity, state, expire)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", s.RemoteSubscriptionID, s.EventKey, identity, state, expire, formatLocalConsumersColumn(s.Local))
 	}
 	w.Flush()
 	if result.HasMore {
