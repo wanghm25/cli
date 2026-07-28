@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 )
@@ -121,27 +122,40 @@ func TestReducer_RenewSuccess_ClearsSubscriptionButNotDecryptFailed(t *testing.T
 	}
 }
 
-// KeepPending is the terminal-aware merge policy the bounded executor consults:
-// a pending terminal (deleted/expired) is never superseded by a later
-// activated/updated, but is superseded by / can supersede as normal otherwise.
-func TestSubscriptionAction_KeepPending_TerminalMergePolicy(t *testing.T) {
-	a := lifecycle.NewSubscriptionAction(NewHub().lifecycleRegistry(), discardTestLogger())
-	deleted := lifecycle.LifecycleEvent{EventType: evTypeDeleted}
-	expired := lifecycle.LifecycleEvent{EventType: evTypeExpired}
-	activated := lifecycle.LifecycleEvent{EventType: evTypeActivated}
-	updated := lifecycle.LifecycleEvent{EventType: evTypeUpdated}
+// Terminal-state priority under the FIFO executor (#11): a burst of events for
+// one id — a terminal followed by a resurrection — arriving while a run is
+// in-flight is processed in ARRIVAL order, and the reducer's phase store drops
+// the resurrection that follows the terminal. This replaces the old executor
+// merge-window supersede policy: there is no latest-wins merge to veto, so the
+// tombstone invariant is enforced in ONE place (the reducer) even when events
+// queue behind an in-flight run.
+func TestSubscriptionAction_FIFO_TerminalThenResurrection_ResurrectionDropped(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-fifo", "user", "app1", "ou_alice")
+	hub.RegisterAndIsFirst(c)
 
-	if !a.KeepPending(deleted, activated) {
-		t.Error("a pending deleted must be KEPT over a later activated (not superseded)")
+	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), deps.action, discardTestLogger())
+	defer exec.Cancel()
+
+	// A deleted (terminal) then a late activated (resurrection) for the same id.
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: evTypeDeleted, EventID: "evt-del", RemoteSubscriptionID: "sub-fifo"})
+	exec.Submit(context.Background(), lifecycle.LifecycleEvent{EventType: evTypeActivated, EventID: "evt-act", RemoteSubscriptionID: "sub-fifo", State: "active"})
+
+	// Wait for the terminal to settle, then confirm the resurrection was dropped.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.SubscriptionDegradedReason() == lifecycle.ReasonRemoteSubscriptionDeleted {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if !a.KeepPending(expired, updated) {
-		t.Error("a pending expired must be KEPT over a later updated (not superseded)")
+	time.Sleep(50 * time.Millisecond) // settle window for the (dropped) activated
+	if got := c.SubscriptionDegradedReason(); got != lifecycle.ReasonRemoteSubscriptionDeleted {
+		t.Errorf("SubscriptionDegradedReason() = %q, want %q (a resurrection after a terminal, in FIFO order, must be dropped)", got, lifecycle.ReasonRemoteSubscriptionDeleted)
 	}
-	if a.KeepPending(activated, deleted) {
-		t.Error("a pending activated must be superseded by a later deleted (terminal wins)")
-	}
-	if a.KeepPending(activated, updated) {
-		t.Error("two non-terminal events must merge latest-wins (no keep)")
+	if got := deps.bind.callCount(); got != 0 {
+		t.Errorf("bindUser call count = %d, want 0 (a tombstoned activated must never revive/bind)", got)
 	}
 }
 

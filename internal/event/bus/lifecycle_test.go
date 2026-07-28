@@ -189,12 +189,12 @@ func TestLifecycleExecutor_Dedup_DifferentRemoteSubID_BothRun(t *testing.T) {
 	}
 }
 
-// TestLifecycleExecutor_InFlightMerge_SameRemoteSubscriptionID locks spec
-// §5.2's in-flight/pending merge: several DISTINCT events for the SAME
-// remote_subscription_id arriving while a run for that id is already
-// in-flight must collapse into exactly one extra run (the LATEST), never one
-// run per submission.
-func TestLifecycleExecutor_InFlightMerge_SameRemoteSubscriptionID(t *testing.T) {
+// TestLifecycleExecutor_FIFO_SameRemoteSubscriptionID_ProcessedInArrivalOrder
+// locks the ordered reducer (#11): a burst of DISTINCT events for the SAME
+// remote_subscription_id arriving while a run for that id is in-flight must EACH
+// be processed, in ARRIVAL order — true FIFO, not the old latest-wins that ran
+// only the newest and overwrote the middle events.
+func TestLifecycleExecutor_FIFO_SameRemoteSubscriptionID_ProcessedInArrivalOrder(t *testing.T) {
 	hub := NewHub()
 	action := newRecordingAction()
 	g := newTestGate()
@@ -202,28 +202,30 @@ func TestLifecycleExecutor_InFlightMerge_SameRemoteSubscriptionID(t *testing.T) 
 	exec := lifecycle.NewExecutor(hub.lifecycleRegistry(), action, discardTestLogger())
 	defer func() { g.release(); exec.Cancel() }()
 
-	first := lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-1", RemoteSubscriptionID: "sub-merge", State: "active"}
+	first := lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-1", RemoteSubscriptionID: "sub-fifo", State: "active"}
 	exec.Submit(context.Background(), first)
 	waitForCalls(t, action, 1) // first Handle call is now blocked on the gate
 
+	// Four more DISTINCT events queue behind the in-flight run, in order.
+	want := []string{"evt-1", "evt-2", "evt-3", "evt-4", "evt-5"}
 	for i := 2; i <= 5; i++ {
 		exec.Submit(context.Background(), lifecycle.LifecycleEvent{
-			EventType: "t", EventID: fmt.Sprintf("evt-%d", i), RemoteSubscriptionID: "sub-merge", State: "active",
+			EventType: "t", EventID: fmt.Sprintf("evt-%d", i), RemoteSubscriptionID: "sub-fifo", State: "active",
 		})
 	}
-	last := lifecycle.LifecycleEvent{EventType: "t", EventID: "evt-last", RemoteSubscriptionID: "sub-merge", State: "suspended"}
-	exec.Submit(context.Background(), last)
 
-	g.release() // let the first (blocked) run finish
-	waitForCalls(t, action, 1)
+	g.release() // let the in-flight run finish; the queued backlog drains in order
+	waitForCalls(t, action, 4)
 
-	time.Sleep(50 * time.Millisecond) // settle window
-	if got := action.callCount(); got != 2 {
-		t.Fatalf("Handle called %d times, want 2 (1 in-flight + 1 merged latest); calls=%+v", got, action.allCalls())
+	time.Sleep(50 * time.Millisecond) // settle window: no extra/dropped events
+	calls := action.allCalls()
+	if len(calls) != len(want) {
+		t.Fatalf("Handle called %d times, want %d (every queued event runs, not just the last); calls=%+v", len(calls), len(want), calls)
 	}
-	gotLast, ok := action.lastCall()
-	if !ok || gotLast.EventID != "evt-last" {
-		t.Errorf("merged run's event = %+v, want EventID=%q (the LATEST submission while busy, spec §5.2 \"保最新摘要\")", gotLast, "evt-last")
+	for i, w := range want {
+		if calls[i].EventID != w {
+			t.Errorf("call[%d].EventID = %q, want %q (FIFO arrival order, not latest-wins)", i, calls[i].EventID, w)
+		}
 	}
 }
 

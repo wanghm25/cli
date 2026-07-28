@@ -185,26 +185,10 @@ func phaseFromState(state string) (Phase, bool) {
 
 func strPtr(s string) *string { return &s }
 
-// SupersedePolicy is an OPTIONAL Action capability the bounded executor consults
-// when merging a newer event into an already-pending one for the same
-// remote_subscription_id. It lets the Action veto the executor's default
-// latest-wins merge for a specific (pending, incoming) pair, so the executor
-// stays otherwise action-agnostic. SubscriptionAction implements it to enforce
-// terminal-state priority even in the merge window: a pending deleted/expired
-// must not be overwritten by a later activated/updated before it is processed.
-type SupersedePolicy interface {
-	// KeepPending reports whether the already-pending event must be kept
-	// (incoming dropped from the merge) rather than replaced by incoming.
-	KeepPending(pending, incoming LifecycleEvent) bool
-}
-
-// KeepPending makes SubscriptionAction a SupersedePolicy: a pending terminal
-// (deleted/expired) event is never overwritten by a resurrection.
-func (a *SubscriptionAction) KeepPending(pending, incoming LifecycleEvent) bool {
-	return isTerminalEvent(pending.EventType) && isResurrection(incoming.EventType)
-}
-
-// isTerminalEvent reports whether an event type is itself terminal.
-func isTerminalEvent(eventType string) bool {
-	return eventType == lifecycleEventTypeExpired || eventType == LifecycleEventTypeDeleted
-}
+// Terminal-state priority no longer needs an executor-level supersede/merge
+// veto: the per-id FIFO executor processes events for one remote_subscription_id
+// in ARRIVAL order, and the pure reducer's phase store (reduce's terminal check
+// against the recorded Phase) drops a resurrection that follows a terminal in
+// that order. So a pending terminal can never be "overwritten" — there is no
+// latest-wins merge to veto — and the tombstone invariant is owned in ONE place,
+// the reducer, rather than being duplicated as a merge-window policy here.
