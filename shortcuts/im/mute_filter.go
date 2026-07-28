@@ -231,7 +231,8 @@ func MuteFilterMetaToMap(meta MuteFilterMeta) map[string]interface{} {
 
 // FetchMuteStatus calls batch_get_mute_status for the given chat_ids and
 // parses the result. Caller MUST ensure len(chatIDs) <= MaxMuteStatusBatchSize
-// (the shortcuts already cap --page-size at 100, so a single page is safe).
+// for this one upstream call. MaybeApplyMuteFilter performs dynamic batching
+// before calling this helper.
 //
 // Empty input is a no-op (avoids triggering the upstream "chat_ids is empty"
 // InvalidParam).
@@ -250,6 +251,38 @@ func FetchMuteStatus(runtime *common.RuntimeContext, chatIDs []string) (map[stri
 		return nil, nil, wrapIMNetworkErr(err, "fetch mute status")
 	}
 	muted, unknown := ParseBatchGetMuteStatusResponse(chatIDs, resp)
+	return muted, unknown, nil
+}
+
+type muteStatusBatchFetcher func([]string) (map[string]bool, []string, error)
+
+func fetchMuteStatusBatches(chatIDs []string, fetch muteStatusBatchFetcher) (map[string]bool, []string, error) {
+	unique := make([]string, 0, len(chatIDs))
+	seen := make(map[string]struct{}, len(chatIDs))
+	for _, id := range chatIDs {
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+
+	muted := make(map[string]bool, len(unique))
+	unknown := make([]string, 0)
+	for start := 0; start < len(unique); start += MaxMuteStatusBatchSize {
+		end := min(start+MaxMuteStatusBatchSize, len(unique))
+		batchMuted, batchUnknown, err := fetch(unique[start:end])
+		if err != nil {
+			return nil, nil, err
+		}
+		for id, isMuted := range batchMuted {
+			muted[id] = isMuted
+		}
+		unknown = append(unknown, batchUnknown...)
+	}
 	return muted, unknown, nil
 }
 
@@ -303,7 +336,9 @@ func MaybeApplyMuteFilter(runtime *common.RuntimeContext, in MuteFilterInput) (M
 		// counts already zero; Skipped stays false
 	default:
 		ids := ExtractChatIDs(in.Chats, in.ChatIDKey)
-		muted, unknown, err := FetchMuteStatus(runtime, ids)
+		muted, unknown, err := fetchMuteStatusBatches(ids, func(batch []string) (map[string]bool, []string, error) {
+			return FetchMuteStatus(runtime, batch)
+		})
 		if err != nil {
 			return MuteFilterOutput{}, err
 		}

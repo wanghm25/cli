@@ -32,7 +32,7 @@ func newMessagesSearchRuntime(t *testing.T, stringFlags map[string]string, boolF
 	}
 	cmd.Flags().Int("page-size", 20, "")
 	cmd.Flags().Int("page-limit", 20, "")
-	boolFlagNames := []string{"page-all"}
+	boolFlagNames := []string{"page-all", "no-reactions"}
 	for _, name := range boolFlagNames {
 		cmd.Flags().Bool(name, false, "")
 	}

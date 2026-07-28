@@ -12,6 +12,7 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/client"
+	"github.com/larksuite/cli/internal/imcontract"
 	"github.com/larksuite/cli/internal/output"
 	"github.com/larksuite/cli/shortcuts/common"
 	convertlib "github.com/larksuite/cli/shortcuts/im/convert_lib"
@@ -99,7 +100,10 @@ var ImMessagesSearch = common.Shortcut{
 			return err
 		}
 
+		materialization := newMaterializationLedger(rawItems)
+		messageIds := materialization.requestedIDs()
 		if len(rawItems) == 0 {
+			runtime.RecordMaterialization(materialization.status())
 			outData := map[string]interface{}{
 				"messages":   []interface{}{},
 				"total":      0,
@@ -115,39 +119,9 @@ var ImMessagesSearch = common.Shortcut{
 			return nil
 		}
 
-		messageIds := make([]string, 0, len(rawItems))
-		for _, item := range rawItems {
-			if itemMap, ok := item.(map[string]interface{}); ok {
-				if metaData, ok := itemMap["meta_data"].(map[string]interface{}); ok {
-					if id, ok := metaData["message_id"].(string); ok && id != "" {
-						messageIds = append(messageIds, id)
-					}
-				}
-			}
-		}
-
 		// ── Step 2: Batch fetch message details (mget) ──
-		msgItems, err := batchMGetMessages(runtime, messageIds)
-		if err != nil {
-			// Fallback when mget fails: return ID list only
-			outData := map[string]interface{}{
-				"message_ids": messageIds,
-				"total":       len(messageIds),
-				"has_more":    hasMore,
-				"page_token":  nextPageToken,
-				"note":        "failed to fetch message details, returning ID list only",
-			}
-			if notice != "" {
-				outData["notice"] = notice
-			}
-			runtime.OutFormat(outData, nil, func(w io.Writer) {
-				fmt.Fprintf(w, "Found %d messages (failed to fetch details):\n", len(messageIds))
-				for _, id := range messageIds {
-					fmt.Fprintln(w, " ", id)
-				}
-			})
-			return nil
-		}
+		msgItems, materializationStatus := batchMGetMessages(runtime, materialization)
+		runtime.RecordMaterialization(materializationStatus)
 
 		// ── Step 3: Batch fetch chat info ──
 		chatIds := make([]string, 0, len(msgItems))
@@ -210,10 +184,11 @@ var ImMessagesSearch = common.Shortcut{
 		}
 
 		outData := map[string]interface{}{
-			"messages":   enriched,
-			"total":      len(enriched),
-			"has_more":   hasMore,
-			"page_token": nextPageToken,
+			"message_ids": messageIds,
+			"messages":    enriched,
+			"total":       len(enriched),
+			"has_more":    hasMore,
+			"page_token":  nextPageToken,
 		}
 		if notice != "" {
 			outData["notice"] = notice
@@ -391,9 +366,13 @@ func buildMessagesSearchRequest(runtime *common.RuntimeContext) (*messagesSearch
 
 // messagesSearchPaginationConfig derives auto-pagination mode and page limit.
 func messagesSearchPaginationConfig(runtime *common.RuntimeContext) (autoPaginate bool, pageLimit int) {
-	autoPaginate = runtime.Bool("page-all") ||
-		(runtime.Cmd != nil && runtime.Cmd.Flags().Changed("page-limit"))
+	pageAll := runtime.Bool("page-all")
+	limitChanged := runtime.Cmd != nil && runtime.Cmd.Flags().Changed("page-limit")
+	autoPaginate = pageAll || limitChanged
 	pageLimit = runtime.Int("page-limit")
+	if pageAll && !limitChanged {
+		pageLimit = messagesSearchMaxPageLimit
+	}
 	return autoPaginate, pageLimit
 }
 
@@ -427,17 +406,21 @@ func searchMessages(runtime *common.RuntimeContext, req *messagesSearchRequest) 
 }
 
 // batchMGetMessages fetches message details in API-sized batches.
-func batchMGetMessages(runtime *common.RuntimeContext, messageIds []string) ([]interface{}, error) {
+func batchMGetMessages(
+	runtime *common.RuntimeContext,
+	ledger *materializationLedger,
+) ([]interface{}, imcontract.MaterializationStatus) {
 	var items []interface{}
-	for _, batch := range chunkStrings(messageIds, messagesSearchMGetBatchSize) {
+	for _, batch := range chunkStrings(ledger.requestedIDs(), messagesSearchMGetBatchSize) {
 		mgetData, err := runtime.DoAPIJSONTyped(http.MethodGet, buildMGetURL(batch), nil, nil)
 		if err != nil {
-			return nil, err
+			ledger.recordCause(err)
+			break
 		}
 		batchItems, _ := mgetData["items"].([]interface{})
-		items = append(items, batchItems...)
+		items = append(items, reconcileMessageMaterialization(ledger, batch, batchItems)...)
 	}
-	return items, nil
+	return items, ledger.status()
 }
 
 // batchQueryChatContexts fetches chat metadata best-effort for message rows.
