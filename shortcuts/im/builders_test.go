@@ -265,11 +265,12 @@ func TestShortcutValidateBranches(t *testing.T) {
 
 	t.Run("ImChatCreate valid", func(t *testing.T) {
 		runtime := newTestRuntimeContext(t, map[string]string{
-			"type":  "public",
-			"name":  "Team Room",
-			"users": "ou_1,ou_2",
-			"bots":  "cli_1",
-			"owner": "ou_owner",
+			"type":            "public",
+			"name":            "Team Room",
+			"users":           "ou_1,ou_2",
+			"bots":            "cli_1",
+			"owner":           "ou_owner",
+			"idempotency-key": "builders-stable-key",
 		}, nil)
 		if err := ImChatCreate.Validate(context.Background(), runtime); err != nil {
 			t.Fatalf("ImChatCreate.Validate() unexpected error = %v", err)
@@ -278,7 +279,8 @@ func TestShortcutValidateBranches(t *testing.T) {
 
 	t.Run("ImChatCreate name too long", func(t *testing.T) {
 		runtime := newTestRuntimeContext(t, map[string]string{
-			"name": strings.Repeat("长", 61),
+			"name":            strings.Repeat("长", 61),
+			"idempotency-key": "builders-stable-key",
 		}, nil)
 		err := ImChatCreate.Validate(context.Background(), runtime)
 		if err == nil || !strings.Contains(err.Error(), "--name exceeds the maximum of 60 characters") {
@@ -288,7 +290,8 @@ func TestShortcutValidateBranches(t *testing.T) {
 
 	t.Run("ImChatCreate description too long", func(t *testing.T) {
 		runtime := newTestRuntimeContext(t, map[string]string{
-			"description": strings.Repeat("d", 101),
+			"description":     strings.Repeat("d", 101),
+			"idempotency-key": "builders-stable-key",
 		}, nil)
 		err := ImChatCreate.Validate(context.Background(), runtime)
 		if err == nil || !strings.Contains(err.Error(), "--description exceeds the maximum of 100 characters") {
@@ -298,7 +301,8 @@ func TestShortcutValidateBranches(t *testing.T) {
 
 	t.Run("ImChatCreate invalid user id", func(t *testing.T) {
 		runtime := newTestRuntimeContext(t, map[string]string{
-			"users": "ou_1,user_2",
+			"users":           "ou_1,user_2",
+			"idempotency-key": "builders-stable-key",
 		}, nil)
 		err := ImChatCreate.Validate(context.Background(), runtime)
 		if err == nil || !strings.Contains(err.Error(), "invalid user ID format") {
@@ -308,7 +312,8 @@ func TestShortcutValidateBranches(t *testing.T) {
 
 	t.Run("ImChatCreate too many bots", func(t *testing.T) {
 		runtime := newTestRuntimeContext(t, map[string]string{
-			"bots": "cli_1,cli_2,cli_3,cli_4,cli_5,cli_6",
+			"bots":            "cli_1,cli_2,cli_3,cli_4,cli_5,cli_6",
+			"idempotency-key": "builders-stable-key",
 		}, nil)
 		err := ImChatCreate.Validate(context.Background(), runtime)
 		if err == nil || !strings.Contains(err.Error(), "--bots exceeds the maximum of 5") {
@@ -318,7 +323,8 @@ func TestShortcutValidateBranches(t *testing.T) {
 
 	t.Run("ImChatCreate invalid owner id", func(t *testing.T) {
 		runtime := newTestRuntimeContext(t, map[string]string{
-			"owner": "user_1",
+			"owner":           "user_1",
+			"idempotency-key": "builders-stable-key",
 		}, nil)
 		err := ImChatCreate.Validate(context.Background(), runtime)
 		if err == nil || !strings.Contains(err.Error(), "invalid user ID format") {
@@ -797,7 +803,7 @@ func TestMessagesSearchPaginationConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("page all keeps the safe default limit", func(t *testing.T) {
+	t.Run("page all without an explicit limit restores the historical max", func(t *testing.T) {
 		runtime := newMessagesSearchTestRuntimeContext(t, nil, map[string]bool{
 			"page-all": true,
 		})
@@ -805,8 +811,8 @@ func TestMessagesSearchPaginationConfig(t *testing.T) {
 		if !autoPaginate {
 			t.Fatal("messagesSearchPaginationConfig() autoPaginate = false, want true")
 		}
-		if pageLimit != messagesSearchDefaultPageLimit {
-			t.Fatalf("messagesSearchPaginationConfig() pageLimit = %d, want %d", pageLimit, messagesSearchDefaultPageLimit)
+		if pageLimit != messagesSearchMaxPageLimit {
+			t.Fatalf("messagesSearchPaginationConfig() pageLimit = %d, want %d", pageLimit, messagesSearchMaxPageLimit)
 		}
 	})
 

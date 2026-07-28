@@ -29,6 +29,8 @@ var ImMessagesReply = common.Shortcut{
 		{Name: "content", Desc: "(one of --content/--text/--markdown/--image/--file/--video/--audio required) message content JSON"},
 		{Name: "text", Desc: "plain text message (auto-wrapped as JSON)"},
 		{Name: "markdown", Desc: "markdown text (auto-wrapped as post format with style optimization; image URLs auto-resolved)"},
+		{Name: "mention", Type: "string_slice", Desc: "user_id or open_id to mention (repeatable or comma-separated; values are sent unchanged)"},
+		{Name: "mention-all", Type: "bool", Desc: "mention all members using a structured at node"},
 		{Name: "image", Desc: "image key (img_xxx), URL, or cwd-relative local path (absolute paths and .. are rejected)"},
 		{Name: "file", Desc: "file key (file_xxx), URL, or cwd-relative local path (absolute paths and .. are rejected)"},
 		{Name: "video", Desc: "video file key (file_xxx), URL, or cwd-relative local path (absolute paths and .. are rejected); must be used together with --video-cover"},
@@ -39,8 +41,10 @@ var ImMessagesReply = common.Shortcut{
 	},
 	Tips: []string{
 		`Example: lark-cli im +messages-reply --message-id <message_id> --text "reply" --as bot`,
+		`Example: lark-cli im +messages-reply --message-id <message_id> --text "please review" --mention <user_id_or_open_id> --idempotency-key <generated_uuid> --as bot`,
 		`Example: lark-cli im +messages-reply --message-id <message_id> --text "reply" --reply-in-thread --as bot`,
 	},
+	PostMount: installMentionFlagParser,
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
 		messageId := runtime.Str("message-id")
 		msgType := runtime.Str("msg-type")
@@ -62,17 +66,16 @@ var ImMessagesReply = common.Shortcut{
 		} else if mt, c, d := buildMediaContentFromKey(text, imageKey, fileKey, videoKey, videoCoverKey, audioKey); mt != "" {
 			msgType, content, desc = mt, c, d
 		}
-		if msgType == "text" || msgType == "post" {
-			content = normalizeAtMentions(content)
-		}
-
-		body := map[string]interface{}{"msg_type": msgType, "content": content}
+		extra := map[string]interface{}{}
 		if replyInThread {
-			body["reply_in_thread"] = true
+			extra["reply_in_thread"] = true
 		}
 		if idempotencyKey != "" {
-			body["uuid"] = idempotencyKey
+			extra["uuid"] = idempotencyKey
 		}
+		// Validate runs before DryRun in the shortcut pipeline, so request
+		// construction cannot fail here.
+		body, _ := buildMessageRequestBody(runtime, msgType, content, extra)
 
 		d := common.NewDryRunAPI()
 		if desc != "" {
@@ -129,6 +132,17 @@ var ImMessagesReply = common.Shortcut{
 			return errs.NewValidationError(errs.SubtypeInvalidArgument, "%s", msg).WithParam("--msg-type")
 		}
 
+		previewType, previewContent := msgType, content
+		if markdown != "" {
+			previewType = "post"
+			previewContent, _ = wrapMarkdownAsPostForDryRun(markdown)
+		} else if mt, c, _ := buildMediaContentFromKey(text, imageKey, fileKey, videoKey, videoCoverKey, audioKey); mt != "" {
+			previewType, previewContent = mt, c
+		}
+		if _, err := buildMessageRequestBody(runtime, previewType, previewContent, nil); err != nil {
+			return err
+		}
+
 		return nil
 	},
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
@@ -166,20 +180,16 @@ var ImMessagesReply = common.Shortcut{
 			msgType, content = mt, c
 		}
 
-		normalizedContent := content
-		if msgType == "text" || msgType == "post" {
-			normalizedContent = normalizeAtMentions(content)
-		}
-
-		data := map[string]interface{}{
-			"msg_type": msgType,
-			"content":  normalizedContent,
-		}
+		extra := map[string]interface{}{}
 		if replyInThread {
-			data["reply_in_thread"] = true
+			extra["reply_in_thread"] = true
 		}
 		if idempotencyKey != "" {
-			data["uuid"] = idempotencyKey
+			extra["uuid"] = idempotencyKey
+		}
+		data, err := buildMessageRequestBody(runtime, msgType, content, extra)
+		if err != nil {
+			return err
 		}
 
 		resData, err := runtime.DoWriteAPIJSONTyped(http.MethodPost,
@@ -189,11 +199,15 @@ var ImMessagesReply = common.Shortcut{
 			return err
 		}
 
-		runtime.Out(map[string]interface{}{
+		result := map[string]interface{}{
 			"message_id":  resData["message_id"],
 			"chat_id":     resData["chat_id"],
 			"create_time": common.FormatTimeWithSeconds(resData["create_time"]),
-		}, nil)
+		}
+		if err := addMessageMentionResult(runtime, resData, result); err != nil {
+			return err
+		}
+		runtime.Out(result, nil)
 		return nil
 	},
 }
