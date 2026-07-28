@@ -205,8 +205,8 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 	// ungated. But a bus that WAS discovered and could not be queried comes back
 	// in `unreachable` — update must fail closed on it rather than mistake it for
 	// "no consumer" and silently Patch a shared filter.
-	localConsumers, unreachable := queryLocalImpact()
-	return applyUpdate(ctx, client, f.IOStreams.Out, remoteSubscriptionID, identity, o, localConsumers, unreachable)
+	localConsumers, unreachable, scanFailed := queryLocalImpact()
+	return applyUpdate(ctx, client, f.IOStreams.Out, remoteSubscriptionID, identity, o, localConsumers, unreachable, scanFailed)
 }
 
 // applyUpdate is update's testable core: it hands the request to the
@@ -223,15 +223,16 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 // filter change is imminent (never on a dry-run or no-op), returning a
 // ConfirmationRequiredError when a consumer is affected and --yes was not given.
 // Exercised against a fake updateSubscriptionAPI + canned consumers in tests.
-func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, remoteSubscriptionID string, identity core.Identity, o updateOpts, localConsumers []buslocal.Consumer, unreachable []string) error {
+func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, remoteSubscriptionID string, identity core.Identity, o updateOpts, localConsumers []buslocal.Consumer, unreachable []string, scanFailed bool) error {
 	affectedConsumers := matchLocalConsumers(localConsumers, remoteSubscriptionID)
 
 	// confirm gates the real write path only: the use case calls it after the
 	// no-op guard, so reaching it already means a genuine filter change. Require
 	// an explicit --yes when EITHER a running local consumer is bound (its event
-	// stream changes) OR a discovered bus could not be queried (a bound consumer
-	// cannot be ruled out — fail CLOSED on that uncertainty rather than Patch a
-	// shared filter as if none exists). With neither, proceed ungated.
+	// stream changes) OR local impact could not be fully determined — a discovered
+	// bus could not be queried, or the bus scan itself failed. In the uncertain
+	// cases a bound consumer cannot be ruled out, so fail CLOSED rather than Patch
+	// a shared filter as if none exists. With neither, proceed ungated.
 	confirm := func() error {
 		if o.yes {
 			return nil
@@ -239,8 +240,8 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		if len(affectedConsumers) > 0 {
 			return errUpdateConfirmationRequired(remoteSubscriptionID, identity, affectedConsumers)
 		}
-		if len(unreachable) > 0 {
-			return errUpdateUncertainLocalImpact(remoteSubscriptionID, identity, unreachable)
+		if len(unreachable) > 0 || scanFailed {
+			return errUpdateUncertainLocalImpact(remoteSubscriptionID, identity, unreachable, scanFailed)
 		}
 		return nil
 	}
@@ -257,7 +258,7 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		// actually running for this subscription.
 		affected := !outcome.NoChange && len(affectedConsumers) > 0
 		result := buildMutationDryRunResult("update", remoteSubscriptionID, identity, o.scopesVerified, &beforeRow,
-			updatePlannedAction(outcome.NoChange), affected, updateImpactNote(outcome.NoChange, affectedConsumers, unreachable),
+			updatePlannedAction(outcome.NoChange), affected, updateImpactNote(outcome.NoChange, affectedConsumers, unreachable, scanFailed),
 			updateDryRunNextAction(remoteSubscriptionID, o.clearFilter, outcome.NoChange))
 		if affected {
 			result.LocalImpact.Consumers = affectedConsumers
@@ -346,12 +347,14 @@ func updateSuccessNextAction(remoteSubscriptionID string, identity core.Identity
 //   - real change with a running consumer: it WILL receive the new stream and a
 //     real run requires --yes to proceed;
 //   - real change with none running: the change is safe now (nothing to disrupt).
-func updateImpactNote(noChange bool, matched []localConsumerInfo, unreachable []string) string {
+func updateImpactNote(noChange bool, matched []localConsumerInfo, unreachable []string, scanFailed bool) string {
 	switch {
 	case noChange:
 		return updateNoopLocalImpactNote
 	case len(matched) > 0:
 		return updateAffectedLocalImpactNote
+	case scanFailed:
+		return "the local bus scan failed, so running consumers could not be enumerated and a consumer bound to this subscription cannot be ruled out; running without --dry-run requires --yes to proceed despite the unverifiable impact"
 	case len(unreachable) > 0:
 		return fmt.Sprintf("%d local bus(es) were discovered but could not be queried, so a running consumer bound to this subscription cannot be ruled out; running without --dry-run requires --yes to proceed despite the unverifiable impact, and those bus(es) are signalled to degrade after the change", len(unreachable))
 	default:
@@ -385,8 +388,12 @@ func errUpdateConfirmationRequired(remoteSubscriptionID string, identity core.Id
 // category/exit code as errUpdateConfirmationRequired; distinct message so the
 // operator/Agent knows the gate is uncertainty, not a confirmed affected
 // consumer.
-func errUpdateUncertainLocalImpact(remoteSubscriptionID string, identity core.Identity, unreachable []string) error {
+func errUpdateUncertainLocalImpact(remoteSubscriptionID string, identity core.Identity, unreachable []string, scanFailed bool) error {
+	reason := fmt.Sprintf("%d discovered local bus(es) could not be queried (%s)", len(unreachable), strings.Join(unreachable, ", "))
+	if scanFailed {
+		reason = "the local bus scan failed, so running local consumers could not be enumerated"
+	}
 	return errs.NewConfirmationRequiredError(errs.RiskHighRiskWrite, "event subscription update",
 		"updating remote Subscription %s cannot confirm local-consumer impact and requires confirmation", remoteSubscriptionID).
-		WithHint("a filter change on %s (identity=%s) may affect running local consumers on %d discovered local bus(es) that could not be queried (%s); re-run with --yes after confirming it is safe, then check `lark-cli event status`", remoteSubscriptionID, identity, len(unreachable), strings.Join(unreachable, ", "))
+		WithHint("a filter change on %s (identity=%s) may affect running local consumers: %s; re-run with --yes after confirming it is safe, then check `lark-cli event status`", remoteSubscriptionID, identity, reason)
 }

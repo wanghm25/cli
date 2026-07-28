@@ -54,7 +54,10 @@ func TestQueryConsumers_FlattensRunningConsumers(t *testing.T) {
 		}),
 	}}
 
-	got, unreachable := QueryConsumers(sc, q)
+	got, unreachable, scanFailed := QueryConsumers(sc, q)
+	if scanFailed {
+		t.Error("scanFailed = true, want false when the scan succeeded")
+	}
 	if len(unreachable) != 0 {
 		t.Errorf("unreachable = %v, want none when every discovered bus answered", unreachable)
 	}
@@ -90,7 +93,7 @@ func TestQueryConsumers_PerBusQueryFailure_ReportsUnreachable(t *testing.T) {
 		errByAppID: map[string]error{"cli_down": errors.New("no socket")},
 	}
 
-	got, unreachable := QueryConsumers(sc, q)
+	got, unreachable, _ := QueryConsumers(sc, q)
 	if len(got) != 1 || got[0].RemoteSubscriptionID != "sub_up" {
 		t.Fatalf("got = %+v, want only the reachable bus's consumer (sub_up)", got)
 	}
@@ -99,28 +102,34 @@ func TestQueryConsumers_PerBusQueryFailure_ReportsUnreachable(t *testing.T) {
 	}
 }
 
-// TestQueryConsumers_ScanError_ReturnsNil locks that a scanner failure degrades
-// to "no local consumers known" — never an error the caller must handle.
-func TestQueryConsumers_ScanError_ReturnsNil(t *testing.T) {
+// TestQueryConsumers_ScanError_ReportsScanFailed locks the fail-closed signal: a
+// scanner failure means NO bus could be enumerated, so local impact is UNKNOWN
+// — scanFailed is true (distinct from "no bus", which is certain). A write-gate
+// caller fails closed on it; a read caller ignores it.
+func TestQueryConsumers_ScanError_ReportsScanFailed(t *testing.T) {
 	sc := fakeScanner{err: errors.New("ps failed")}
-	// A scan error means we could not enumerate any bus at all — no consumers AND
-	// no unreachable set (there is no discovered bus we know we failed to reach).
-	if got, unreachable := QueryConsumers(sc, fakeQuerier{}); got != nil || unreachable != nil {
+	got, unreachable, scanFailed := QueryConsumers(sc, fakeQuerier{})
+	if got != nil || unreachable != nil {
 		t.Errorf("got = %+v, unreachable = %v, want both nil on scan error", got, unreachable)
+	}
+	if !scanFailed {
+		t.Error("scanFailed = false, want true on a scan error (impact is unknown, must fail closed)")
 	}
 }
 
 // TestQueryConsumers_NoBuses_ReturnsNil: no discovered bus means no consumers,
-// and no query is attempted at all.
+// no uncertainty (we are CERTAIN there is nothing), and no query attempted.
 func TestQueryConsumers_NoBuses_ReturnsNil(t *testing.T) {
-	if got, unreachable := QueryConsumers(fakeScanner{procs: nil}, fakeQuerier{}); got != nil || unreachable != nil {
-		t.Errorf("got = %+v, unreachable = %v, want both nil when no bus is discovered", got, unreachable)
+	got, unreachable, scanFailed := QueryConsumers(fakeScanner{procs: nil}, fakeQuerier{})
+	if got != nil || unreachable != nil || scanFailed {
+		t.Errorf("got = %+v, unreachable = %v, scanFailed = %v; want empty + scanFailed=false when no bus is discovered", got, unreachable, scanFailed)
 	}
 }
 
 // TestQueryConsumers_NilInputs_ReturnsNil guards the degenerate wiring.
 func TestQueryConsumers_NilInputs_ReturnsNil(t *testing.T) {
-	if got, unreachable := QueryConsumers(nil, nil); got != nil || unreachable != nil {
-		t.Errorf("got = %+v, unreachable = %v, want both nil for nil scanner/querier", got, unreachable)
+	got, unreachable, scanFailed := QueryConsumers(nil, nil)
+	if got != nil || unreachable != nil || scanFailed {
+		t.Errorf("got = %+v, unreachable = %v, scanFailed = %v; want all zero for nil scanner/querier", got, unreachable, scanFailed)
 	}
 }
