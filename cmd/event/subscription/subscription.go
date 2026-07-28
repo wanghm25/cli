@@ -425,42 +425,100 @@ type mutationDryRunResult struct {
 	NextAction           string            `json:"next_action"`
 }
 
-// mutationDryRunPlan derives the state-appropriate planned action and next_action
-// for a renew/reactivate --dry-run from the OBSERVED remote state (getSubscription
-// runs before the dry-run branch, so the preview plans from what a real run would
-// actually find rather than a static assumption):
-//
-//   - reactivate targets a SUSPENDED subscription. On an already-active one it is
-//     a no-op (planned_action "noop"); on any other state it reactivates.
-//   - renew extends the expiry from any live state, but leaves a SUSPENDED
-//     subscription suspended — so a renew of a suspended subscription is still a
-//     renew, with next_action noting delivery stays paused until reactivate.
-//
-// delete/update supply their own planned action + next_action (their plans do not
-// vary by lifecycle state this way) and do not use this. The "active"/"suspended"
-// spellings match the remote-state vocabulary the subscription Planner uses.
-// reactivateIsNoop reports whether reactivating a subscription in the given
-// remote state is a no-op (it is already active). BOTH the --dry-run preview
-// (mutationDryRunPlan) and the real reactivate path consult this single
-// predicate, so the preview and the execution can never disagree about whether
-// a Reactivate call actually happens.
-func reactivateIsNoop(state string) bool { return state == "active" }
+// mutationDecision is the shared verdict for a renew/reactivate against the
+// OBSERVED remote state, so the --dry-run preview and the real run consult ONE
+// policy and can never diverge.
+type mutationDecision int
 
-func mutationDryRunPlan(operation, remoteSubscriptionID, state string) (plannedAction, nextAction string) {
+const (
+	mutationProceed mutationDecision = iota // execute the write
+	mutationNoop                            // already in the target state; skip the write
+	mutationBlocked                         // state is not valid for this operation; fail closed
+)
+
+// classifyMutation decides what renew/reactivate does for the given remote
+// state. A state OUTSIDE each operation's well-defined set (expired, empty, any
+// future/unknown value) is BLOCKED — the command fails closed rather than issue
+// a write against an indeterminate state and let the platform reject it with an
+// unclassified error:
+//
+//   - reactivate: suspended -> proceed; active -> noop; anything else -> blocked.
+//   - renew:      active or suspended -> proceed; anything else -> blocked.
+//
+// The "active"/"suspended" spellings match the remote-state vocabulary the
+// subscription Planner uses. delete/update do not vary by lifecycle state this
+// way and do not use this.
+func classifyMutation(operation, state string) mutationDecision {
 	switch operation {
 	case "reactivate":
-		if reactivateIsNoop(state) {
-			return "noop", fmt.Sprintf("remote_subscription_id=%s is already active; no reactivation is needed", remoteSubscriptionID)
+		switch state {
+		case "suspended":
+			return mutationProceed
+		case "active":
+			return mutationNoop
+		default:
+			return mutationBlocked
 		}
-		return "reactivate", fmt.Sprintf("run without --dry-run to reactivate remote_subscription_id=%s", remoteSubscriptionID)
 	case "renew":
-		if state == "suspended" {
-			return "renew", fmt.Sprintf("run without --dry-run to renew remote_subscription_id=%s; it stays suspended — run `lark-cli event subscription reactivate %s` to resume delivery", remoteSubscriptionID, remoteSubscriptionID)
+		switch state {
+		case "active", "suspended":
+			return mutationProceed
+		default:
+			return mutationBlocked
 		}
-		return "renew", fmt.Sprintf("run without --dry-run to renew remote_subscription_id=%s", remoteSubscriptionID)
 	default:
-		return operation, fmt.Sprintf("run without --dry-run to %s remote_subscription_id=%s", operation, remoteSubscriptionID)
+		return mutationProceed
 	}
+}
+
+// mutationDryRunPlan derives the state-appropriate planned action + next_action
+// for a renew/reactivate --dry-run from the OBSERVED remote state (getSubscription
+// runs before the dry-run branch), sharing classifyMutation with the real run so
+// the preview always matches what the real run would do — including a "blocked"
+// plan for a state the real run fails closed on.
+func mutationDryRunPlan(operation, remoteSubscriptionID, state string) (plannedAction, nextAction string) {
+	switch classifyMutation(operation, state) {
+	case mutationNoop:
+		return "noop", fmt.Sprintf("remote_subscription_id=%s is already active; no reactivation is needed", remoteSubscriptionID)
+	case mutationBlocked:
+		return "blocked", blockedMutationHint(operation, remoteSubscriptionID, state)
+	}
+	// proceed
+	if operation == "renew" && state == "suspended" {
+		return "renew", fmt.Sprintf("run without --dry-run to renew remote_subscription_id=%s; it stays suspended — run `lark-cli event subscription reactivate %s` to resume delivery", remoteSubscriptionID, remoteSubscriptionID)
+	}
+	return operation, fmt.Sprintf("run without --dry-run to %s remote_subscription_id=%s", operation, remoteSubscriptionID)
+}
+
+// blockedMutationHint explains why a renew/reactivate is blocked for a state
+// outside its valid set, and what to do instead. Shared by the --dry-run
+// preview and the fail-closed real-run error so they read identically.
+func blockedMutationHint(operation, remoteSubscriptionID, state string) string {
+	switch operation {
+	case "reactivate":
+		return fmt.Sprintf("cannot reactivate remote_subscription_id=%s in state %q — only a suspended subscription can be reactivated; if it has expired, recreate it with `lark-cli event subscription create`", remoteSubscriptionID, stateOrUnknown(state))
+	case "renew":
+		return fmt.Sprintf("cannot renew remote_subscription_id=%s in state %q — only an active or suspended subscription can be renewed; if it has expired, recreate it with `lark-cli event subscription create`", remoteSubscriptionID, stateOrUnknown(state))
+	default:
+		return fmt.Sprintf("cannot %s remote_subscription_id=%s in state %q", operation, remoteSubscriptionID, stateOrUnknown(state))
+	}
+}
+
+// errMutationBlockedState is the fail-closed error a REAL renew/reactivate
+// returns when the observed remote state is not valid for the operation — a
+// failed_precondition (the caller must change/recreate the resource, not retry),
+// mirroring the --dry-run's "blocked" plan.
+func errMutationBlockedState(operation, remoteSubscriptionID, state string) error {
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"cannot %s remote_subscription_id=%s in remote state %q", operation, remoteSubscriptionID, stateOrUnknown(state)).
+		WithHint("%s", blockedMutationHint(operation, remoteSubscriptionID, state))
+}
+
+func stateOrUnknown(state string) string {
+	if state == "" {
+		return "(unknown)"
+	}
+	return state
 }
 
 // buildMutationDryRunResult builds the shared --dry-run result. scopesVerified

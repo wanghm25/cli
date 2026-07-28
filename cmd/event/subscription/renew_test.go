@@ -110,6 +110,44 @@ func TestRenewDryRun_EndToEndViaFakeService_JSONShapeAndNoRenewCall(t *testing.T
 	}
 }
 
+// ---- applyRenew: valid-state proceed, invalid-state fail-closed ----
+
+// TestApplyRenew_Active_CallsRenew locks that renew proceeds for a valid state.
+func TestApplyRenew_Active_CallsRenew(t *testing.T) {
+	fake := &fakeRenewAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
+	before, err := getSubscription(context.Background(), fake, "sub_1")
+	if err != nil {
+		t.Fatalf("getSubscription: %v", err)
+	}
+
+	if err := applyRenew(context.Background(), fake, io.Discard, "sub_1", core.AsUser, renewOpts{}, before, true); err != nil {
+		t.Fatalf("applyRenew: unexpected error: %v", err)
+	}
+	if fake.renewCalls != 1 {
+		t.Errorf("renewCalls = %d, want 1 for an active subscription", fake.renewCalls)
+	}
+}
+
+// TestApplyRenew_ExpiredState_FailsClosed_NoRenewCall locks the P2 fail-closed
+// policy for renew: a state outside {active, suspended} (here expired) returns a
+// failed_precondition and never calls Renew.
+func TestApplyRenew_ExpiredState_FailsClosed_NoRenewCall(t *testing.T) {
+	fake := &fakeRenewAPI{getSub: remotePtr(stateRemote("sub_1", "expired"))}
+	before, err := getSubscription(context.Background(), fake, "sub_1")
+	if err != nil {
+		t.Fatalf("getSubscription: %v", err)
+	}
+
+	err = applyRenew(context.Background(), fake, io.Discard, "sub_1", core.AsUser, renewOpts{}, before, true)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) || ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Fatalf("err = %v (%T), want a failed_precondition ValidationError", err, err)
+	}
+	if fake.renewCalls != 0 {
+		t.Errorf("renewCalls = %d, want 0: a non-{active,suspended} state must fail closed", fake.renewCalls)
+	}
+}
+
 // ---- runRenew wiring (cobra-level; every case below must short-circuit
 // before any network-capable client is built) ----
 

@@ -149,11 +149,17 @@ func applyReactivate(ctx context.Context, svc reactivateSubscriptionAPI, out io.
 		return nil
 	}
 
-	if reactivateIsNoop(before.Remote.State) {
-		// Already active — mirror the --dry-run's "noop" plan EXACTLY (same
-		// reactivateIsNoop predicate): a real run must not issue a redundant
-		// Reactivate the preview promised was unnecessary. Echo the record we
-		// just read (before is already the mapped row) instead of calling the API.
+	switch classifyMutation("reactivate", before.Remote.State) {
+	case mutationBlocked:
+		// A state outside {suspended, active} (expired, empty, or any unknown
+		// value) — fail closed rather than issue a Reactivate the platform would
+		// reject with an unclassified error. The --dry-run showed this same
+		// "blocked" plan (shared classifyMutation predicate).
+		return errMutationBlockedState("reactivate", remoteSubscriptionID, before.Remote.State)
+	case mutationNoop:
+		// Already active — mirror the --dry-run's "noop": a real run must not issue
+		// a redundant Reactivate the preview promised was unnecessary. Echo the
+		// record we just read (before is already the mapped row).
 		result := &mutationResult{
 			Operation:            "reactivate",
 			RemoteSubscriptionID: before.RemoteSubscriptionID,

@@ -537,9 +537,11 @@ func TestBuildMutationDryRunResult_ScopesOK(t *testing.T) {
 
 // TestMutationDryRunPlan_StateAppropriate locks that the renew/reactivate
 // dry-run plan is derived from the OBSERVED remote state, not a static
-// assumption: reactivating an already-active subscription is a no-op, while a
-// suspended one reactivates; renewing extends the expiry but leaves a suspended
-// subscription suspended.
+// assumption: an already-active reactivate is a no-op, a suspended one
+// reactivates, and a renew extends but leaves a suspended subscription
+// suspended — while any state OUTSIDE each operation's valid set (expired,
+// empty, unknown) is "blocked" (the real run fails closed), so the preview and
+// the real run agree.
 func TestMutationDryRunPlan_StateAppropriate(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -550,9 +552,12 @@ func TestMutationDryRunPlan_StateAppropriate(t *testing.T) {
 	}{
 		{"reactivate active -> noop", "reactivate", "active", "noop", "already active"},
 		{"reactivate suspended -> reactivate", "reactivate", "suspended", "reactivate", "run without --dry-run to reactivate"},
-		{"reactivate unknown -> reactivate", "reactivate", "", "reactivate", "run without --dry-run to reactivate"},
+		{"reactivate expired -> blocked", "reactivate", "expired", "blocked", "only a suspended subscription can be reactivated"},
+		{"reactivate empty -> blocked", "reactivate", "", "blocked", "cannot reactivate"},
 		{"renew active -> renew", "renew", "active", "renew", "run without --dry-run to renew"},
 		{"renew suspended -> renew, stays suspended", "renew", "suspended", "renew", "stays suspended"},
+		{"renew expired -> blocked", "renew", "expired", "blocked", "only an active or suspended subscription can be renewed"},
+		{"renew empty -> blocked", "renew", "", "blocked", "cannot renew"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

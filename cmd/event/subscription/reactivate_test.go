@@ -158,6 +158,27 @@ func TestApplyReactivate_Suspended_RealRun_CallsReactivate(t *testing.T) {
 	}
 }
 
+// TestApplyReactivate_ExpiredState_FailsClosed_NoReactivateCall locks the P2
+// fail-closed policy: reactivating a subscription in a state OUTSIDE {suspended,
+// active} (here expired) returns a failed_precondition and never calls
+// Reactivate — it does not blindly issue a write against an indeterminate state.
+func TestApplyReactivate_ExpiredState_FailsClosed_NoReactivateCall(t *testing.T) {
+	fake := &fakeReactivateAPI{getSub: remotePtr(stateRemote("sub_1", "expired"))}
+	before, err := getSubscription(context.Background(), fake, "sub_1")
+	if err != nil {
+		t.Fatalf("getSubscription: %v", err)
+	}
+
+	err = applyReactivate(context.Background(), fake, io.Discard, "sub_1", core.AsUser, reactivateOpts{}, before, true)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) || ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Fatalf("err = %v (%T), want a failed_precondition ValidationError", err, err)
+	}
+	if fake.reactivateCalls != 0 {
+		t.Errorf("reactivateCalls = %d, want 0: a non-{suspended,active} state must fail closed", fake.reactivateCalls)
+	}
+}
+
 // ---- runReactivate wiring (cobra-level; every case below must
 // short-circuit before any network-capable client is built) ----
 

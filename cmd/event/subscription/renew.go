@@ -6,11 +6,13 @@ package subscription
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
@@ -121,31 +123,45 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 	if err != nil {
 		return err
 	}
+	return applyRenew(ctx, client, f.IOStreams.Out, remoteSubscriptionID, identity, o, before, scopesVerified)
+}
 
+// applyRenew is renew's testable core: given the already-read remote state
+// (before), it renders the --dry-run preview or executes the Renew. A remote
+// state outside {active, suspended} (expired, empty, or any unknown value) fails
+// closed — mirroring the --dry-run's "blocked" plan via the shared
+// classifyMutation predicate — so renew never issues a write against an
+// indeterminate state. It never reads remote state itself; runRenew's
+// getSubscription supplies before. Exercised against a fake renewSubscriptionAPI.
+func applyRenew(ctx context.Context, svc renewSubscriptionAPI, out io.Writer, remoteSubscriptionID string, identity core.Identity, o renewOpts, before *subscriptionRow, scopesVerified bool) error {
 	if o.dryRun {
 		// Plan from the OBSERVED remote state, not a static assumption.
 		plannedAction, nextAction := mutationDryRunPlan("renew", remoteSubscriptionID, before.Remote.State)
 		result := buildMutationDryRunResult("renew", remoteSubscriptionID, identity, scopesVerified, before,
 			plannedAction, false, renewLocalImpactNote, nextAction)
 		if o.asJSON {
-			output.PrintJson(f.IOStreams.Out, result)
+			output.PrintJson(out, result)
 			return nil
 		}
-		writeMutationDryRunText(f.IOStreams.Out, result)
+		writeMutationDryRunText(out, result)
 		return nil
 	}
 
-	sub, err := doRenewSubscription(ctx, client, remoteSubscriptionID)
+	if classifyMutation("renew", before.Remote.State) == mutationBlocked {
+		return errMutationBlockedState("renew", remoteSubscriptionID, before.Remote.State)
+	}
+
+	sub, err := doRenewSubscription(ctx, svc, remoteSubscriptionID)
 	if err != nil {
 		return err
 	}
 	result := buildMutationResult("renew", *sub,
 		fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to confirm the new expire_time", remoteSubscriptionID, identity))
 	if o.asJSON {
-		output.PrintJson(f.IOStreams.Out, result)
+		output.PrintJson(out, result)
 		return nil
 	}
-	writeMutationResultText(f.IOStreams.Out, "Renewed", result)
+	writeMutationResultText(out, "Renewed", result)
 	return nil
 }
 
