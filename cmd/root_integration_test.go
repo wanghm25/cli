@@ -339,7 +339,9 @@ func TestIntegration_StrictModeUser_ProfileOverride_ChatCreateDryRunSucceeds(t *
 	rootCmd := buildStrictModeIntegrationRootCmd(t, f)
 
 	code := executeRootIntegration(t, f, rootCmd, []string{
-		"im", "+chat-create", "--name", "probe", "--dry-run",
+		"im", "+chat-create", "--name", "probe",
+		"--idempotency-key", "df1ed037-6175-4f6b-a3fc-2ce6e836b292",
+		"--dry-run",
 	})
 
 	if code != 0 {
@@ -356,7 +358,9 @@ func TestIntegration_StrictModeUser_ProfileOverride_ShortcutExplicitBotReturnsEn
 	rootCmd := buildStrictModeIntegrationRootCmd(t, f)
 
 	code := executeRootIntegration(t, f, rootCmd, []string{
-		"im", "+chat-create", "--name", "probe", "--as", "bot", "--dry-run",
+		"im", "+chat-create", "--name", "probe",
+		"--idempotency-key", "3324d8ae-57ec-47de-b1b9-853b634c8fdb",
+		"--as", "bot", "--dry-run",
 	})
 
 	if code != output.ExitValidation {
