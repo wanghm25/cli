@@ -638,6 +638,130 @@ func TestApplyUpdate_NoOp_AffectedConsumer_NeverConfirms(t *testing.T) {
 	}
 }
 
+// ---- #13-residual: proactive SubscriptionUpdated signal after a real Patch ----
+
+// captureSignals installs a capturing signalSubscriptionUpdated seam (restored
+// on cleanup) and returns a pointer to the recorded (appID, id) calls, so the
+// post-Patch signalling is exercised with no real bus/socket. err is what the
+// seam returns (nil by default; set non-nil to simulate a down bus).
+func captureSignals(t *testing.T, err error) *[]struct{ AppID, ID string } {
+	t.Helper()
+	orig := signalSubscriptionUpdated
+	t.Cleanup(func() { signalSubscriptionUpdated = orig })
+	var calls []struct{ AppID, ID string }
+	signalSubscriptionUpdated = func(appID, id string) error {
+		calls = append(calls, struct{ AppID, ID string }{appID, id})
+		return err
+	}
+	return &calls
+}
+
+// A real filter change (with --yes) on a subscription with a running local
+// consumer must PATCH and then proactively signal that consumer's bus so it
+// degrades the consumer now — one signal per distinct app, carrying the
+// remote_subscription_id.
+func TestApplyUpdate_RealChange_AffectedConsumer_WithYes_SignalsBus(t *testing.T) {
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
+	consumers := []buslocal.Consumer{{PID: 4242, AppID: "app_x", RemoteSubscriptionID: "sub_1"}}
+	calls := captureSignals(t, nil)
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON, yes: true}, consumers)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 1 {
+		t.Fatalf("patchCalls = %d, want 1", fake.patchCalls)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("signal calls = %d, want 1 (one per affected app after a real Patch)", len(*calls))
+	}
+	if (*calls)[0].AppID != "app_x" || (*calls)[0].ID != "sub_1" {
+		t.Errorf("signal call = %+v, want {app_x sub_1}", (*calls)[0])
+	}
+}
+
+// Multiple consumers under the SAME app collapse to one signal (the bus degrades
+// all its matching consumers from a single id); an affected consumer with no
+// known app_id is skipped (unaddressable).
+func TestApplyUpdate_RealChange_DedupsPerApp_SkipsUnaddressable(t *testing.T) {
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
+	consumers := []buslocal.Consumer{
+		{PID: 1, AppID: "app_x", RemoteSubscriptionID: "sub_1"},
+		{PID: 2, AppID: "app_x", RemoteSubscriptionID: "sub_1"}, // same app -> one signal
+		{PID: 3, AppID: "", RemoteSubscriptionID: "sub_1"},      // no app_id -> skipped
+	}
+	calls := captureSignals(t, nil)
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON, yes: true}, consumers)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(*calls) != 1 || (*calls)[0].AppID != "app_x" {
+		t.Errorf("signal calls = %+v, want exactly one for app_x", *calls)
+	}
+}
+
+// No affected local consumer ⇒ a real Patch signals nothing.
+func TestApplyUpdate_RealChange_NoConsumer_NoSignal(t *testing.T) {
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
+	calls := captureSignals(t, nil)
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 1 {
+		t.Errorf("patchCalls = %d, want 1", fake.patchCalls)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("signal calls = %d, want 0 (nothing to degrade)", len(*calls))
+	}
+}
+
+// A no-op (requested filter already matches) never patches and so never signals,
+// even when a consumer is bound.
+func TestApplyUpdate_NoOp_AffectedConsumer_NoSignal(t *testing.T) {
+	current := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", current))}
+	consumers := []buslocal.Consumer{{PID: 4242, AppID: "app_x", RemoteSubscriptionID: "sub_1"}}
+	calls := captureSignals(t, nil)
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON, yes: true}, consumers) // equals current => no-op
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0 for a no-op", fake.patchCalls)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("signal calls = %d, want 0 (a no-op changes nothing)", len(*calls))
+	}
+}
+
+// Best-effort: a signal error (bus went down between discovery and the signal)
+// is swallowed — the Patch already succeeded, so update still succeeds.
+func TestApplyUpdate_SignalBestEffort_BusDown_StillSucceeds(t *testing.T) {
+	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
+	consumers := []buslocal.Consumer{{PID: 4242, AppID: "app_x", RemoteSubscriptionID: "sub_1"}}
+	calls := captureSignals(t, errors.New("dial: no such bus"))
+
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+		updateOpts{filter: sampleUpdateFilterJSON, yes: true}, consumers)
+	if err != nil {
+		t.Fatalf("a failed best-effort signal must not fail update, got: %v", err)
+	}
+	if fake.patchCalls != 1 {
+		t.Errorf("patchCalls = %d, want 1 (the Patch still applied)", fake.patchCalls)
+	}
+	if len(*calls) != 1 {
+		t.Errorf("signal calls = %d, want 1 (attempted, error swallowed)", len(*calls))
+	}
+}
+
 // TestNewCmdSubscription_RegistersUpdateAsWrite mirrors create_test.go's
 // TestNewCmdSubscription_RegistersCreateAsWrite: it locks that update is
 // registered in the subscription group (without disturbing list/get/create)

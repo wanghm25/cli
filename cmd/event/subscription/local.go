@@ -39,6 +39,34 @@ type localConsumerView struct {
 // commands' local-surfacing is exercised with no real bus.
 var queryLocalConsumers = buslocal.Query
 
+// signalSubscriptionUpdated is the process-wide seam for telling a running bus
+// that a subscription was just updated, so it proactively degrades the matching
+// local consumers rather than waiting for the platform's own updated_v1 push.
+// Production points it at buslocal.SignalSubscriptionUpdated (busctl over the
+// real IPC transport, best-effort); tests replace it with a capture so update's
+// post-Patch signalling is exercised with no real bus.
+var signalSubscriptionUpdated = buslocal.SignalSubscriptionUpdated
+
+// notifyAffectedBuses fires the best-effort SubscriptionUpdated signal to the
+// bus of each DISTINCT app that has a running consumer bound to
+// remoteSubscriptionID — so those consumers are proactively degraded after a
+// real update Patch. One signal per app (a bus degrades all its matching
+// consumers from a single id); a consumer with no known app_id is skipped (it
+// cannot be addressed), and every send error is ignored (best-effort — the
+// platform's own updated_v1 remains the backstop, so no bus reachable still
+// leaves update succeeding). Call ONLY after a Patch actually applied — never on
+// a no-op or --dry-run.
+func notifyAffectedBuses(remoteSubscriptionID string, affected []localConsumerInfo) {
+	seen := make(map[string]bool, len(affected))
+	for _, c := range affected {
+		if c.AppID == "" || seen[c.AppID] {
+			continue
+		}
+		seen[c.AppID] = true
+		_ = signalSubscriptionUpdated(c.AppID, remoteSubscriptionID)
+	}
+}
+
 // matchLocalConsumers returns the running local consumers bound to
 // remoteSubscriptionID (the OpenAPI Subscription primary key). Matching is by
 // remote_subscription_id alone — that id is globally unique, so a consumer

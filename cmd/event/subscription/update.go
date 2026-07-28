@@ -265,6 +265,14 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		return nil
 
 	default: // app.UpdateApplied
+		// A real filter change just landed. If running local consumers are bound
+		// to this subscription, proactively tell their bus(es) so it degrades them
+		// (remote_subscription_conflict / next_action=get) NOW, rather than leaving
+		// them to wait for the platform's own updated_v1 push. Best-effort and
+		// fire-and-forget: a down/unreachable bus is skipped silently (the platform
+		// updated_v1 is the backstop), so update still succeeds. Fires only here —
+		// never on a no-op (UpdateNoop) or a --dry-run (UpdatePreview).
+		notifyAffectedBuses(remoteSubscriptionID, affectedConsumers)
 		result := buildMutationResult("update", outcome.After,
 			updateSuccessNextAction(remoteSubscriptionID, identity, o.clearFilter))
 		if o.asJSON {
