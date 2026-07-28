@@ -254,14 +254,16 @@ func TestNewCmdDelete_HasExpectedFlags(t *testing.T) {
 		}
 	}
 	if cmd.Flags().Lookup("include-resource-data") != nil {
-		t.Error("NewCmdDelete must not expose --include-resource-data (update-only)")
+		t.Error("NewCmdDelete must not expose --include-resource-data (create-only)")
 	}
-	if level, ok := cmdutil.GetRisk(cmd); !ok || level != cmdutil.RiskWrite {
-		t.Errorf("risk = (%q, %v), want (%q, true)", level, ok, cmdutil.RiskWrite)
+	// delete is confirmation-gated, so its static risk must be high-risk-write
+	// (matching the ConfirmationRequiredError it returns without --yes).
+	if level, ok := cmdutil.GetRisk(cmd); !ok || level != cmdutil.RiskHighRiskWrite {
+		t.Errorf("risk = (%q, %v), want (%q, true)", level, ok, cmdutil.RiskHighRiskWrite)
 	}
 }
 
-func TestNewCmdSubscription_RegistersDeleteAsWrite(t *testing.T) {
+func TestNewCmdSubscription_RegistersDeleteAsHighRiskWrite(t *testing.T) {
 	f := &cmdutil.Factory{}
 	cmd := NewCmdSubscription(f)
 
@@ -275,7 +277,7 @@ func TestNewCmdSubscription_RegistersDeleteAsWrite(t *testing.T) {
 		t.Fatal(`subscription command group missing "delete" subcommand`)
 	}
 	level, ok := cmdutil.GetRisk(del)
-	if !ok || level != cmdutil.RiskWrite {
-		t.Errorf(`"delete" risk = (%q, %v), want (%q, true)`, level, ok, cmdutil.RiskWrite)
+	if !ok || level != cmdutil.RiskHighRiskWrite {
+		t.Errorf(`"delete" risk = (%q, %v), want (%q, true)`, level, ok, cmdutil.RiskHighRiskWrite)
 	}
 }

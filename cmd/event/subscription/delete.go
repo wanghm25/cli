@@ -88,7 +88,12 @@ confirmed. Use --dry-run to preview the plan without deleting anything.`,
 	cmd.Flags().BoolVar(&o.yes, "yes", false, "Confirm this high-risk write (required unless --dry-run); only pass this after a human has confirmed")
 	cmd.Flags().BoolVar(&o.asJSON, "json", false, "Emit the result as JSON (for AI / scripts)")
 	addAsFlag(cmd)
-	cmdutil.SetRisk(cmd, "write")
+	// delete is confirmation-gated: without --yes it returns a
+	// ConfirmationRequiredError (RiskHighRiskWrite, exit code 10). The static
+	// annotation must match that gate so --help/schema tell an Agent the truth —
+	// framework-level confirmation gating acts only on high-risk-write. (renew/
+	// reactivate stay "write": a filter/TTL change is reversible and ungated.)
+	cmdutil.SetRisk(cmd, "high-risk-write")
 
 	return cmd
 }
