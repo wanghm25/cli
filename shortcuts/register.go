@@ -147,10 +147,6 @@ func RegisterShortcutsWithContext(ctx context.Context, program *cobra.Command, f
 		// before shortcuts run). Without this, only pure-shortcut
 		// services like `docs` would get tagged.
 		cmdmeta.SetDomain(svc, service)
-		if service == "docs" {
-			doc.ConfigureServiceHelp(svc)
-		}
-
 		for _, shortcut := range shortcuts {
 			shortcut.MountWithContext(ctx, svc, f)
 		}
