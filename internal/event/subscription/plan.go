@@ -149,14 +149,17 @@ func (p Planner) Plan(ctx context.Context, obs Observation, policy Policy, req R
 // probeEncryptedActiveMatch implements the conflict-matrix rows for an active,
 // include_resource_data=true match once the request also wants it encrypted.
 // GetEncryptKey is the only available signal: a usable (non-empty) key means the
-// match is genuinely encrypted and this identity can retrieve it -> reuse; no
-// key, an empty key, or ANY error (the gateway maps an empty key to
-// InvalidResponse, and every business/transport failure surfaces as an error)
-// -> Block, because "plaintext resource_data" and "encrypted but key
-// unavailable to this identity" are indistinguishable from here and both unsafe
-// to auto-reuse. It deliberately does not distinguish a transport failure from a
-// confirmed empty key: retrying re-probes from scratch, and a human needs the
-// same guidance either way.
+// match is genuinely encrypted and this identity can retrieve it -> reuse.
+//
+// A FAILED probe no longer collapses into a blanket "delete-and-recreate" Block:
+// that told a user with a transient transport blip to destroy their
+// subscription and lost GetEncryptKey's own typed classification + cause. The
+// gateway already classifies the failure (transport / auth / permission /
+// invalid-response); the Planner PROPAGATES that typed error (Plan returns it as
+// an error, which the caller surfaces) with a recovery that FITS the class —
+// retry for transport, fix-scope for permission, re-auth for auth, and only the
+// definitive empty-key (invalid_response) is genuinely "unconfirmed, verify or
+// recreate after human confirmation". See encryptKeyProbeError.
 func (p Planner) probeEncryptedActiveMatch(ctx context.Context, policy Policy, match *model.RemoteSubscription) (SubscriptionPlan, error) {
 	if p.prober == nil {
 		// Fail-closed: a probing Policy must be constructed with a prober.
@@ -165,13 +168,70 @@ func (p Planner) probeEncryptedActiveMatch(ctx context.Context, policy Policy, m
 			"subscription planner: policy %q classifies an active include_resource_data=true match by probing its encrypt_key, but no prober is configured", policy.name)
 	}
 	key, err := p.prober.GetEncryptKey(ctx, match.ID.String())
-	if err == nil && key != "" {
-		return reusePlan(policy, match), nil
+	if err != nil {
+		return SubscriptionPlan{}, encryptKeyProbeError(err, match)
 	}
-	return blockPlan(policy, match, "encrypt_key_unconfirmed", []errs.InvalidParam{{
-		Name:   includeResourceDataField,
-		Reason: "existing subscription has include_resource_data=true but its encrypt_key could not be confirmed retrievable with this identity (remote may be plaintext resource_data, or the key is unavailable — indistinguishable from here, and both unsafe to auto-reuse); delete and recreate after human confirmation, or verify the subscription and the `event:encrypt_key:read` scope",
-	}}), nil
+	if key == "" {
+		// The production gateway maps an empty key to InvalidResponse (so this is
+		// unreachable there), but a direct prober could still return (\"\", nil);
+		// treat it as the same definitive "no usable key" case rather than
+		// silently reusing a possibly-plaintext subscription.
+		return SubscriptionPlan{}, encryptKeyProbeError(
+			errs.NewInternalError(errs.SubtypeInvalidResponse,
+				"subscription get_encrypt_key for %s returned no encrypt_key", match.ID.String()),
+			match)
+	}
+	return reusePlan(policy, match), nil
+}
+
+// encryptKeyProbeError maps a failed encrypt-key probe to a typed error that
+// PRESERVES GetEncryptKey's own classification (transport / auth / permission /
+// invalid-response) and its cause (errors.Is/Unwrap reaches the original), and
+// carries a recovery that fits the class. A transient transport failure must
+// tell the caller to RETRY, never to delete the subscription; a permission
+// failure points at the missing scope; an auth failure points at re-auth; only a
+// definitive empty key (invalid_response) is genuinely unconfirmed, and even
+// then recreate is guarded behind human confirmation, never automatic. The
+// Planner returns this as an error (not a Block), so the caller surfaces the
+// real failure instead of a fabricated conflict.
+func encryptKeyProbeError(err error, match *model.RemoteSubscription) error {
+	id := match.ID.String()
+	switch {
+	case errs.IsNetwork(err):
+		return errs.NewNetworkError(probeSubtype(err, errs.SubtypeNetworkTransport),
+			"could not confirm the encrypt_key for remote subscription %s: the get_encrypt_key probe could not reach the server", id).
+			WithRetryable().
+			WithHint("this is a transient transport failure — retry `event subscription create`; do not delete or recreate the subscription").
+			WithCause(err)
+	case errs.IsPermission(err):
+		return errs.NewPermissionError(probeSubtype(err, errs.SubtypeMissingScope),
+			"could not confirm the encrypt_key for remote subscription %s: this identity is not permitted to read it", id).
+			WithHint("grant this identity the `event:encrypt_key:read` scope — the existing subscription is fine, do not delete it — then retry `event subscription create`").
+			WithCause(err)
+	case errs.IsAuthentication(err):
+		return errs.NewAuthenticationError(probeSubtype(err, errs.SubtypeTokenInvalid),
+			"could not confirm the encrypt_key for remote subscription %s: authentication failed", id).
+			WithHint("re-authenticate with `lark-cli auth login`, then retry `event subscription create`; do not delete the subscription").
+			WithCause(err)
+	default:
+		// A definitive empty key (invalid_response) or any other classification:
+		// the key is genuinely unconfirmed — the ONE case where verify-or-recreate
+		// is honest guidance. Still NEVER an automatic delete: the remote could
+		// simply be plaintext resource_data, which only a human can confirm.
+		return errs.NewInternalError(probeSubtype(err, errs.SubtypeInvalidResponse),
+			"could not confirm the encrypt_key for the active include_resource_data=true subscription %s with this identity", id).
+			WithHint("verify remote_subscription_id=%s with `event subscription get %s` and this identity's `event:encrypt_key:read` scope; the remote may be plaintext resource_data or the key may be unavailable — both unsafe to auto-reuse — so delete and recreate only after human confirmation", id, id).
+			WithCause(err)
+	}
+}
+
+// probeSubtype returns err's own Subtype (preserving the gateway's
+// classification) when it carries one, else fallback.
+func probeSubtype(err error, fallback errs.Subtype) errs.Subtype {
+	if p, ok := errs.ProblemOf(err); ok && p.Subtype != "" {
+		return p.Subtype
+	}
+	return fallback
 }
 
 // reusePlan builds an ActionReuse plan for a compatible active match.

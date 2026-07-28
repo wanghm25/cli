@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
 )
@@ -252,24 +253,60 @@ func TestPlan_EncryptedProbe_UsableKey_ReturnsReuse(t *testing.T) {
 	}
 }
 
-func TestPlan_EncryptedProbe_EmptyKeyOrError_ReturnsBlock(t *testing.T) {
-	// The gateway maps an empty key to InvalidResponse, and any business/transport
-	// failure surfaces as an error; both classify as a conflict here.
-	cases := map[string]*fakeProber{
-		"invalid_response_empty_key": {key: "", err: errors.New("subscription get_encrypt_key reported success but returned no encrypt_key")},
-		"transport_error":            {key: "", err: errors.New("boom: permission denied")},
+// A failed encrypt-key probe must PROPAGATE GetEncryptKey's typed classification
+// (transport / auth / permission / invalid-response) with an appropriate,
+// class-specific recovery and the original cause preserved — never the old
+// blanket delete-and-recreate Block. A transient transport failure in particular
+// must be retryable and must not steer the user toward deleting their
+// subscription.
+func TestPlan_EncryptedProbe_TypedError_PropagatesWithRecovery_CausePreserved(t *testing.T) {
+	transportCause := errs.NewNetworkError(errs.SubtypeNetworkTimeout, "dial tcp: i/o timeout")
+	permissionCause := errs.NewPermissionError(errs.SubtypeMissingScope, "missing event:encrypt_key:read")
+	authCause := errs.NewAuthenticationError(errs.SubtypeTokenExpired, "user access token expired")
+	invalidCause := errs.NewInternalError(errs.SubtypeInvalidResponse, "get_encrypt_key returned no encrypt_key")
+
+	cases := []struct {
+		name        string
+		cause       error
+		wantIs      func(error) bool
+		wantSubtype errs.Subtype
+		wantHint    string // the class-specific recovery hint must contain this
+		retryable   bool
+	}{
+		{"transport", transportCause, errs.IsNetwork, errs.SubtypeNetworkTimeout, "retry", true},
+		{"permission", permissionCause, errs.IsPermission, errs.SubtypeMissingScope, "event:encrypt_key:read", false},
+		{"auth", authCause, errs.IsAuthentication, errs.SubtypeTokenExpired, "auth login", false},
+		{"invalid_response", invalidCause, errs.IsInternal, errs.SubtypeInvalidResponse, "verify", false},
 	}
-	for name, prober := range cases {
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prober := &fakeProber{err: tc.cause}
 			plan, err := NewPlanner(prober).Plan(context.Background(), completeObs(activeSub("sub_enc", true, "user")), ManagementCreate, req(true, nil))
-			if err != nil {
-				t.Fatalf("unexpected error (a probe failure must classify as Block, not propagate): %v", err)
+			if err == nil {
+				t.Fatalf("want a propagated typed error, got plan=%+v", plan)
 			}
-			if plan.Action != ActionBlock {
-				t.Errorf("Action = %q, want %q", plan.Action, ActionBlock)
+			if plan.Action == ActionBlock {
+				t.Errorf("a probe failure must NOT collapse into a delete-and-recreate Block, got Action=%q", plan.Action)
 			}
-			if len(plan.ConflictFields) != 1 || plan.ConflictFields[0].Name != "include_resource_data" {
-				t.Errorf("ConflictFields = %+v, want one entry naming include_resource_data", plan.ConflictFields)
+			if !tc.wantIs(err) {
+				t.Errorf("returned error is not the expected typed class: %v", err)
+			}
+			// Cause preserved: errors.Is reaches the original gateway error.
+			if !errors.Is(err, tc.cause) {
+				t.Errorf("cause not preserved: errors.Is(err, cause)=false; err=%v", err)
+			}
+			p, ok := errs.ProblemOf(err)
+			if !ok {
+				t.Fatalf("returned error carries no Problem: %v", err)
+			}
+			if p.Subtype != tc.wantSubtype {
+				t.Errorf("Subtype = %q, want %q (the gateway's classification must be preserved)", p.Subtype, tc.wantSubtype)
+			}
+			if !strings.Contains(p.Hint, tc.wantHint) {
+				t.Errorf("recovery hint %q does not mention %q", p.Hint, tc.wantHint)
+			}
+			if p.Retryable != tc.retryable {
+				t.Errorf("Retryable = %v, want %v (a transient transport failure must be retryable, not a destructive block)", p.Retryable, tc.retryable)
 			}
 			if prober.calls != 1 {
 				t.Errorf("prober.calls = %d, want 1", prober.calls)

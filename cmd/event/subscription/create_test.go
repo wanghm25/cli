@@ -548,28 +548,31 @@ func TestApplyCreate_Encrypted_RemoteTrueUsableKey_ReusesNoNewCreateNoNewKey(t *
 	}
 }
 
-func TestApplyCreate_Encrypted_RemoteTrueKeyUnavailable_ReturnsConflictHumanHint(t *testing.T) {
+// A failed encrypt-key probe during create must PROPAGATE GetEncryptKey's typed
+// classification (here: a permission failure -> fix-scope) with the cause
+// preserved, instead of collapsing into a blanket delete-and-recreate conflict.
+// The subscription is never deleted and Create is never issued.
+func TestApplyCreate_Encrypted_RemoteTrueKeyProbeFails_PropagatesTypedError_NoDeleteRecreate(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
+	cause := errs.NewPermissionError(errs.SubtypeMissingScope, "missing event:encrypt_key:read scope")
 	gw := &fakeCreateGateway{
 		walkItems:  []model.RemoteSubscription{activeRemote("sub_key_unavailable", true, "app")},
-		encryptErr: errors.New("boom: synthetic permission failure"),
+		encryptErr: cause,
 	}
 
 	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true}, nil)
-	var ve *errs.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	var pe *errs.PermissionError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected *errs.PermissionError (typed classification preserved, not a delete-and-recreate conflict), got %T: %v", err, err)
 	}
-	if ve.Subtype != errs.SubtypeFailedPrecondition {
-		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	if !errors.Is(err, cause) {
+		t.Errorf("cause not preserved: errors.Is(err, cause)=false; err=%v", err)
 	}
-	for _, want := range []string{"sub_key_unavailable", "event:encrypt_key:read", "delete"} {
-		if !strings.Contains(ve.Hint, want) {
-			t.Errorf("Hint = %q, want it to mention %q", ve.Hint, want)
-		}
+	if !strings.Contains(pe.Hint, "event:encrypt_key:read") {
+		t.Errorf("Hint = %q, want it to point at the event:encrypt_key:read scope", pe.Hint)
 	}
 	if gw.createCalls != 0 {
-		t.Errorf("createCalls = %d, want 0 (a conflict must never call Create)", gw.createCalls)
+		t.Errorf("createCalls = %d, want 0 (a probe failure must never call Create)", gw.createCalls)
 	}
 }
 
