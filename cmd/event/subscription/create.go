@@ -211,7 +211,8 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 		return err
 	}
 
-	return applyCreate(ctx, subown.NewController(gateway), f.IOStreams.Out, resolved, identity, o, reqFilter)
+	cmdCtx := eventlib.CommandContext{Profile: cfg.ProfileName, Identity: identity}
+	return applyCreate(ctx, subown.NewController(gateway), f.IOStreams.Out, resolved, cmdCtx, o, reqFilter)
 }
 
 // createController is the subset of the subscription Controller create's flow
@@ -230,11 +231,11 @@ type createController = app.SubscriptionController
 // reconcile-after-failure matrix, builds a request body, or calls the SDK — the
 // use case, the Controller, and the platform/lark gateway own all of that; this
 // function only builds the request and renders.
-func applyCreate(ctx context.Context, controller createController, out io.Writer, resolved eventlib.ResolvedEventKey, identity core.Identity, o createOpts, reqFilter *eventlib.Filter) error {
+func applyCreate(ctx context.Context, controller createController, out io.Writer, resolved eventlib.ResolvedEventKey, cmdCtx eventlib.CommandContext, o createOpts, reqFilter *eventlib.Filter) error {
 	req := subown.Request{
 		EventType:           resolved.Definition.EventType,
 		TargetResource:      resolved.TargetResource,
-		Identity:            identity,
+		Identity:            cmdCtx.Identity,
 		IncludeResourceData: o.includeResourceData,
 		Filter:              reqFilter,
 	}
@@ -246,7 +247,7 @@ func applyCreate(ctx context.Context, controller createController, out io.Writer
 
 	switch outcome.Kind {
 	case app.ProvisionPreview:
-		result := buildDryRunResult(resolved, identity, outcome.Plan, o.includeResourceData, o.scopesVerified)
+		result := buildDryRunResult(resolved, cmdCtx, outcome.Plan, o.includeResourceData, o.scopesVerified)
 		if o.asJSON {
 			output.PrintJson(out, result)
 			return nil
@@ -257,11 +258,11 @@ func applyCreate(ctx context.Context, controller createController, out io.Writer
 		// A block carrying conflict fields is a configuration conflict; a block
 		// with none is a suspended match create refuses to overwrite. blockError
 		// renders the right typed failed_precondition from the plan.
-		return blockError(resolved, identity, outcome.Plan, o.includeResourceData)
+		return blockError(resolved, cmdCtx, outcome.Plan, o.includeResourceData)
 	case app.ProvisionIndeterminate:
-		return indeterminateError(resolved, identity)
+		return indeterminateError(resolved, cmdCtx)
 	case app.ProvisionApplied:
-		result := buildCreateResult(resolved, identity, outcome.Receipt)
+		result := buildCreateResult(resolved, cmdCtx, outcome.Receipt)
 		if o.asJSON {
 			output.PrintJson(out, result)
 			return nil
@@ -338,21 +339,21 @@ func createRequiredScopes(includeResourceData bool) []string {
 // configuration conflict (the active/suspended match disagrees); a block with no
 // conflict fields is a suspended match create refuses to overwrite. Each renders
 // its own guidance (inspect vs get/delete vs reactivate).
-func blockError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan, includeResourceData bool) error {
+func blockError(resolved eventlib.ResolvedEventKey, cmdCtx eventlib.CommandContext, plan subown.SubscriptionPlan, includeResourceData bool) error {
 	if subown.ConflictOnState(plan.ConflictFields) {
-		return unknownStateError(resolved, identity, plan)
+		return unknownStateError(resolved, cmdCtx, plan)
 	}
 	if len(plan.ConflictFields) > 0 {
-		return conflictError(resolved, identity, plan, includeResourceData)
+		return conflictError(resolved, cmdCtx, plan, includeResourceData)
 	}
-	return suspendedError(resolved, identity, plan)
+	return suspendedError(resolved, cmdCtx, plan)
 }
 
 // unknownStateError implements the "unrecognized remote state" block: a match
 // exists but its state is not one this CLI can classify (not active/suspended/
 // expired/deleted), so create fails closed rather than risk duplicating a
 // still-live subscription. It guides the human to inspect and decide.
-func unknownStateError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) error {
+func unknownStateError(resolved eventlib.ResolvedEventKey, cmdCtx eventlib.CommandContext, plan subown.SubscriptionPlan) error {
 	id := planBeforeID(plan)
 	state := ""
 	if plan.Before != nil {
@@ -363,7 +364,7 @@ func unknownStateError(resolved eventlib.ResolvedEventKey, identity core.Identit
 		resolved.MaterializedKey, state, id).
 		WithParam("event_key").
 		WithParams(plan.ConflictFields...).
-		WithHint("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s and its state, then reactivate, delete, or wait as appropriate before re-running create", id, identity, id)
+		WithHint("run `%s event subscription get %s --as %s --json` to inspect remote_subscription_id=%s and its state, then reactivate, delete, or wait as appropriate before re-running create", cmdCtx.CLIHead(), id, cmdCtx.Identity, id)
 }
 
 // conflictError implements the "active but conflicting" case and
@@ -376,19 +377,20 @@ func unknownStateError(resolved eventlib.ResolvedEventKey, identity core.Identit
 // an encrypted request's conflict is only ever resolved by a human — verify
 // the existing subscription (and this identity's event:encrypt_key:read
 // scope), or delete and recreate.
-func conflictError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan, includeResourceData bool) error {
+func conflictError(resolved eventlib.ResolvedEventKey, cmdCtx eventlib.CommandContext, plan subown.SubscriptionPlan, includeResourceData bool) error {
 	id := planBeforeID(plan)
+	head := cmdCtx.CLIHead()
 	var hint string
 	switch {
 	case subown.ConflictOnFilter(plan.ConflictFields):
 		// A filter difference is resolvable in place — change it with `update`
 		// rather than deleting a possibly-shared subscription. Guide inspect ->
 		// preview -> apply -> re-run; the filter values are never named here.
-		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, preview the change with `lark-cli event subscription update %s --filter <json> --dry-run --as %s`, apply it with `lark-cli event subscription update %s --filter <json> --as %s`, then re-run create to reuse the now-matching subscription — a filter change is reversible, so there is no need to delete a possibly-shared subscription", id, identity, id, id, identity, id, identity)
+		hint = fmt.Sprintf("run `%s event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, preview the change with `%s event subscription update %s --filter <json> --dry-run --as %s`, apply it with `%s event subscription update %s --filter <json> --as %s`, then re-run create to reuse the now-matching subscription — a filter change is reversible, so there is no need to delete a possibly-shared subscription", head, id, cmdCtx.Identity, id, head, id, cmdCtx.Identity, head, id, cmdCtx.Identity)
 	case includeResourceData:
-		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s; include_resource_data cannot be changed in place, so after human confirmation either keep the existing subscription, ensure this identity has scope `event:encrypt_key:read`, or delete it and create a new one with the desired resource-data setting", id, identity, id)
+		hint = fmt.Sprintf("run `%s event subscription get %s --as %s --json` to inspect remote_subscription_id=%s; include_resource_data cannot be changed in place, so after human confirmation either keep the existing subscription, ensure this identity has scope `event:encrypt_key:read`, or delete it and create a new one with the desired resource-data setting", head, id, cmdCtx.Identity, id)
 	default:
-		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before creating a differently-configured one", id, identity, id)
+		hint = fmt.Sprintf("run `%s event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before creating a differently-configured one", head, id, cmdCtx.Identity, id)
 	}
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"an active subscription already exists for %s with a conflicting configuration (remote_subscription_id=%s)",
@@ -400,7 +402,7 @@ func conflictError(resolved eventlib.ResolvedEventKey, identity core.Identity, p
 
 // suspendedError implements the "suspended" case: do not overwrite;
 // guide the caller to `reactivate` instead of creating a duplicate.
-func suspendedError(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) error {
+func suspendedError(resolved eventlib.ResolvedEventKey, cmdCtx eventlib.CommandContext, plan subown.SubscriptionPlan) error {
 	id := planBeforeID(plan)
 	reason := ""
 	if plan.Before != nil {
@@ -410,19 +412,19 @@ func suspendedError(resolved eventlib.ResolvedEventKey, identity core.Identity, 
 		"a suspended subscription already exists for %s (remote_subscription_id=%s, suspension_reason=%s); it is not automatically overwritten",
 		resolved.MaterializedKey, id, reason).
 		WithParam("event_key").
-		WithHint("run `lark-cli event subscription reactivate %s --as %s` to resume delivery instead of creating a duplicate", id, identity)
+		WithHint("run `%s event subscription reactivate %s --as %s` to resume delivery instead of creating a duplicate", cmdCtx.CLIHead(), id, cmdCtx.Identity)
 }
 
 // indeterminateError implements the "the remote scan was inconclusive" case (the
 // paginated List hit the page cap without a definitive answer). Rather than
 // silently creating — which risks a duplicate against a match beyond the pages
 // read — create fails closed with actionable guidance.
-func indeterminateError(resolved eventlib.ResolvedEventKey, identity core.Identity) error {
+func indeterminateError(resolved eventlib.ResolvedEventKey, cmdCtx eventlib.CommandContext) error {
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"could not determine whether a matching subscription already exists for %s: the remote subscription list scan reached its %d-page cap before finding a match or exhausting all results, so creating now could duplicate an existing subscription",
 		resolved.MaterializedKey, eventlib.MaxSubscriptionListPages).
 		WithParam("event_key").
-		WithHint("re-run `lark-cli event subscription list --as %s --json` to inspect existing subscriptions (the scan was NOT confirmed absence, only \"no match within the pages read\"); if none matches, retry create", identity)
+		WithHint("re-run `%s event subscription list --as %s --json` to inspect existing subscriptions (the scan was NOT confirmed absence, only \"no match within the pages read\"); if none matches, retry create", cmdCtx.CLIHead(), cmdCtx.Identity)
 }
 
 // planBeforeID renders the existing match's remote_subscription_id, or "" when a
@@ -508,7 +510,7 @@ func legacyPlanAction(plan subown.SubscriptionPlan) string {
 	}
 }
 
-func buildDryRunResult(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan, includeResourceData, scopesVerified bool) *createDryRunResult {
+func buildDryRunResult(resolved eventlib.ResolvedEventKey, cmdCtx eventlib.CommandContext, plan subown.SubscriptionPlan, includeResourceData, scopesVerified bool) *createDryRunResult {
 	var remoteBefore *subscriptionRow
 	if plan.Before != nil {
 		row := mapRemoteSubscription(*plan.Before)
@@ -526,7 +528,7 @@ func buildDryRunResult(resolved eventlib.ResolvedEventKey, identity core.Identit
 		TargetResource: resolved.TargetResource,
 		RequiredScopes: createRequiredScopes(includeResourceData),
 		Preflight: createPreflight{
-			Identity:        string(identity),
+			Identity:        string(cmdCtx.Identity),
 			MatchedTemplate: resolved.Template.Template,
 			// scopes_ok true ONLY when the pre-check actually confirmed the scopes;
 			// false when scope data was unavailable — never a false green light.
@@ -540,24 +542,25 @@ func buildDryRunResult(resolved eventlib.ResolvedEventKey, identity core.Identit
 			LocalConsumerAffected: false,
 			Note:                  "`event subscription create` never starts or changes a local `event consume` process; run `event consume` separately after create succeeds.",
 		},
-		NextAction: dryRunNextAction(plan, resolved, identity),
+		NextAction: dryRunNextAction(plan, resolved, cmdCtx),
 	}
 }
 
-func dryRunNextAction(plan subown.SubscriptionPlan, resolved eventlib.ResolvedEventKey, identity core.Identity) string {
+func dryRunNextAction(plan subown.SubscriptionPlan, resolved eventlib.ResolvedEventKey, cmdCtx eventlib.CommandContext) string {
+	head := cmdCtx.CLIHead()
 	switch plan.Action {
 	case subown.ActionReuse:
-		return fmt.Sprintf("run without --dry-run to idempotently reuse remote_subscription_id=%s, then `lark-cli event consume %s --as %s`", planBeforeID(plan), resolved.MaterializedKey, identity)
+		return fmt.Sprintf("run without --dry-run to idempotently reuse remote_subscription_id=%s, then `%s event consume %s --as %s`", planBeforeID(plan), head, resolved.MaterializedKey, cmdCtx.Identity)
 	case subown.ActionBlock:
 		id := planBeforeID(plan)
 		if len(plan.ConflictFields) == 0 {
-			return fmt.Sprintf("run `lark-cli event subscription reactivate %s --as %s` instead of creating a duplicate", id, identity)
+			return fmt.Sprintf("run `%s event subscription reactivate %s --as %s` instead of creating a duplicate", head, id, cmdCtx.Identity)
 		}
-		return fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect the conflicting remote_subscription_id=%s before deciding how to proceed", id, identity, id)
+		return fmt.Sprintf("run `%s event subscription get %s --as %s --json` to inspect the conflicting remote_subscription_id=%s before deciding how to proceed", head, id, cmdCtx.Identity, id)
 	case subown.ActionIndeterminate:
-		return fmt.Sprintf("run `lark-cli event subscription list --as %s --json` to inspect existing subscriptions before running create — the scan reached its page cap without a definitive answer", identity)
+		return fmt.Sprintf("run `%s event subscription list --as %s --json` to inspect existing subscriptions before running create — the scan reached its page cap without a definitive answer", head, cmdCtx.Identity)
 	default: // ActionCreate
-		return fmt.Sprintf("run without --dry-run to create the subscription, then `lark-cli event consume %s --as %s`", resolved.MaterializedKey, identity)
+		return fmt.Sprintf("run without --dry-run to create the subscription, then `%s event consume %s --as %s`", head, resolved.MaterializedKey, cmdCtx.Identity)
 	}
 }
 
@@ -573,7 +576,7 @@ type createResult struct {
 	NextAction           string          `json:"next_action"`
 }
 
-func buildCreateResult(resolved eventlib.ResolvedEventKey, identity core.Identity, receipt subown.ApplyReceipt) *createResult {
+func buildCreateResult(resolved eventlib.ResolvedEventKey, cmdCtx eventlib.CommandContext, receipt subown.ApplyReceipt) *createResult {
 	action := "created"
 	if receipt.Action == subown.ActionReuse {
 		action = "reused"
@@ -587,14 +590,14 @@ func buildCreateResult(resolved eventlib.ResolvedEventKey, identity core.Identit
 		Action:               action,
 		RemoteSubscriptionID: receipt.RemoteID.String(),
 		Subscription:         row,
-		NextAction:           createNextAction(resolved, identity),
+		NextAction:           createNextAction(resolved, cmdCtx),
 	}
 }
 
 // createNextAction implements the "creation succeeding does not
 // mean listening started" guidance.
-func createNextAction(resolved eventlib.ResolvedEventKey, identity core.Identity) string {
-	return fmt.Sprintf("run `lark-cli event consume %s --as %s` to start receiving these events", resolved.MaterializedKey, identity)
+func createNextAction(resolved eventlib.ResolvedEventKey, cmdCtx eventlib.CommandContext) string {
+	return fmt.Sprintf("run `%s event consume %s --as %s` to start receiving these events", cmdCtx.CLIHead(), resolved.MaterializedKey, cmdCtx.Identity)
 }
 
 func writeCreateDryRunText(out io.Writer, result *createDryRunResult) {

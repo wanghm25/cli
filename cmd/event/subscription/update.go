@@ -14,6 +14,7 @@ import (
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
+	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/app"
 	"github.com/larksuite/cli/internal/event/buslocal"
 	"github.com/larksuite/cli/internal/event/model"
@@ -206,7 +207,8 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 	// in `unreachable` — update must fail closed on it rather than mistake it for
 	// "no consumer" and silently Patch a shared filter.
 	localConsumers, unreachable, scanFailed := queryLocalImpact()
-	return applyUpdate(ctx, client, f.IOStreams.Out, remoteSubscriptionID, identity, o, localConsumers, unreachable, scanFailed)
+	cmdCtx := eventlib.CommandContext{Profile: cfg.ProfileName, Identity: identity}
+	return applyUpdate(ctx, client, f.IOStreams.Out, remoteSubscriptionID, cmdCtx, o, localConsumers, unreachable, scanFailed)
 }
 
 // applyUpdate is update's testable core: it hands the request to the
@@ -223,7 +225,7 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 // filter change is imminent (never on a dry-run or no-op), returning a
 // ConfirmationRequiredError when a consumer is affected and --yes was not given.
 // Exercised against a fake updateSubscriptionAPI + canned consumers in tests.
-func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, remoteSubscriptionID string, identity core.Identity, o updateOpts, localConsumers []buslocal.Consumer, unreachable []string, scanFailed bool) error {
+func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, remoteSubscriptionID string, cmdCtx eventlib.CommandContext, o updateOpts, localConsumers []buslocal.Consumer, unreachable []string, scanFailed bool) error {
 	affectedConsumers := matchLocalConsumers(localConsumers, remoteSubscriptionID)
 
 	// confirm gates the real write path only: the use case calls it after the
@@ -238,10 +240,10 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 			return nil
 		}
 		if len(affectedConsumers) > 0 {
-			return errUpdateConfirmationRequired(remoteSubscriptionID, identity, affectedConsumers)
+			return errUpdateConfirmationRequired(remoteSubscriptionID, cmdCtx.Identity, affectedConsumers)
 		}
 		if len(unreachable) > 0 || scanFailed {
-			return errUpdateUncertainLocalImpact(remoteSubscriptionID, identity, unreachable, scanFailed)
+			return errUpdateUncertainLocalImpact(remoteSubscriptionID, cmdCtx.Identity, unreachable, scanFailed)
 		}
 		return nil
 	}
@@ -257,7 +259,7 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		// A real change (not a no-op) affects local consumers only when one is
 		// actually running for this subscription.
 		affected := !outcome.NoChange && len(affectedConsumers) > 0
-		result := buildMutationDryRunResult("update", remoteSubscriptionID, identity, o.scopesVerified, &beforeRow,
+		result := buildMutationDryRunResult("update", remoteSubscriptionID, cmdCtx.Identity, o.scopesVerified, &beforeRow,
 			updatePlannedAction(outcome.NoChange), affected, updateImpactNote(outcome.NoChange, affectedConsumers, unreachable, scanFailed),
 			updateDryRunNextAction(remoteSubscriptionID, o.clearFilter, outcome.NoChange))
 		if affected {
@@ -281,7 +283,7 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 			already = "already has no filter"
 		}
 		result := buildMutationResult("update", outcome.Before,
-			fmt.Sprintf("no change: remote_subscription_id=%s %s; run `lark-cli event subscription get %s --as %s --json` to confirm", remoteSubscriptionID, already, remoteSubscriptionID, identity))
+			fmt.Sprintf("no change: remote_subscription_id=%s %s; run `%s event subscription get %s --as %s --json` to confirm", remoteSubscriptionID, already, cmdCtx.CLIHead(), remoteSubscriptionID, cmdCtx.Identity))
 		if o.asJSON {
 			output.PrintJson(out, result)
 			return nil
@@ -299,7 +301,7 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		// never on a no-op (UpdateNoop) or a --dry-run (UpdatePreview).
 		notifyAffectedBuses(remoteSubscriptionID, affectedConsumers, unreachable)
 		result := buildMutationResult("update", outcome.After,
-			updateSuccessNextAction(remoteSubscriptionID, identity, o.clearFilter))
+			updateSuccessNextAction(remoteSubscriptionID, cmdCtx, o.clearFilter))
 		if o.asJSON {
 			output.PrintJson(out, result)
 			return nil
@@ -332,12 +334,12 @@ func updateDryRunNextAction(remoteSubscriptionID string, clearFilter, noChange b
 	}
 }
 
-func updateSuccessNextAction(remoteSubscriptionID string, identity core.Identity, clearFilter bool) string {
+func updateSuccessNextAction(remoteSubscriptionID string, cmdCtx eventlib.CommandContext, clearFilter bool) string {
 	what := "the new filter"
 	if clearFilter {
 		what = "that the filter was removed"
 	}
-	return fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to confirm %s; a running local `event consume` process picks up the change only after it re-syncs — check `lark-cli event status`", remoteSubscriptionID, identity, what)
+	return fmt.Sprintf("run `%s event subscription get %s --as %s --json` to confirm %s; a running local `event consume` process picks up the change only after it re-syncs — check `%s event status`", cmdCtx.CLIHead(), remoteSubscriptionID, cmdCtx.Identity, what, cmdCtx.CLIHead())
 }
 
 // updateImpactNote returns the honest local-consumer impact note for update's

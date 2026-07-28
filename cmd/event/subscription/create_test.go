@@ -258,7 +258,7 @@ func TestApplyCreate_NotFound_Creates(t *testing.T) {
 	gw := &fakeCreateGateway{createResp: remotePtr(activeRemote("sub_new", false, "user"))}
 	var buf bytes.Buffer
 
-	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{asJSON: true}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{asJSON: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestApplyCreate_ActiveCompatible_ReusesWithoutCreate(t *testing.T) {
 	gw := &fakeCreateGateway{walkItems: []model.RemoteSubscription{activeRemote("sub_existing", false, "user")}}
 	var buf bytes.Buffer
 
-	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{asJSON: true}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{asJSON: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestApplyCreate_ActiveConflict_ReturnsTypedFailedPrecondition(t *testing.T)
 	gw := &fakeCreateGateway{walkItems: []model.RemoteSubscription{activeRemote("sub_conflict", true, "user")}}
 
 	// requested include_resource_data=false mismatches the existing true.
-	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -330,7 +330,7 @@ func TestApplyCreate_Suspended_ReturnsTypedFailedPrecondition_GuidesReactivate(t
 	// A distinct reason so the assertion proves suspendedError read this fixture.
 	gw := &fakeCreateGateway{walkItems: []model.RemoteSubscription{suspendedRemote("sub_susp", "identity_revoked")}}
 
-	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -356,7 +356,7 @@ func TestApplyCreate_UnrecognizedState_ReturnsTypedFailedPrecondition_NoCreate(t
 	resolved := resolveCreatedChatID(t)
 	gw := &fakeCreateGateway{walkItems: []model.RemoteSubscription{stateRemote("sub_weird", "pending")}}
 
-	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -387,7 +387,7 @@ func TestApplyCreate_Indeterminate_ReturnsTypedFailedPrecondition_NoCreate(t *te
 		walkCapped: true,
 	}
 
-	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -414,7 +414,7 @@ func TestApplyCreate_CreateFails_ReconcileFindsCompatible_ReturnsReused(t *testi
 	}
 	var buf bytes.Buffer
 
-	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{asJSON: true}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{asJSON: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -442,7 +442,7 @@ func TestApplyCreate_CreateFails_ReconcileFindsConflict_ReturnsTypedFail(t *test
 		},
 	}
 
-	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -460,7 +460,7 @@ func TestApplyCreate_CreateFails_ReconcileFindsNothing_ReturnsOriginalError(t *t
 	sentinel := errors.New("boom: transport timeout")
 	gw := &fakeCreateGateway{createErr: sentinel} // both reconciles find nothing
 
-	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{}, nil)
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want the original Create error passed through unchanged (%v)", err, sentinel)
 	}
@@ -477,7 +477,7 @@ func TestApplyCreate_Encrypted_NotFound_CreatesAtomicallyWithKey(t *testing.T) {
 	keyGen := 0
 	ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(countingKeyGen(&keyGen, "THE-GENERATED-KEY")))
 
-	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true}, nil)
+	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, eventlib.CommandContext{Identity: core.AsBot}, createOpts{includeResourceData: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -499,7 +499,7 @@ func TestApplyCreate_Encrypted_RemoteFalse_ReturnsConflict_NeverProbes(t *testin
 		encryptKey: "usable-key",
 	}
 
-	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, eventlib.CommandContext{Identity: core.AsBot}, createOpts{includeResourceData: true}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
@@ -525,7 +525,7 @@ func TestApplyCreate_Encrypted_RemoteTrueUsableKey_ReusesNoNewCreateNoNewKey(t *
 	ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(countingKeyGen(&keyGen, "unused")))
 	var buf bytes.Buffer
 
-	err := applyCreate(context.Background(), ctrl, &buf, resolved, core.AsBot, createOpts{includeResourceData: true, asJSON: true}, nil)
+	err := applyCreate(context.Background(), ctrl, &buf, resolved, eventlib.CommandContext{Identity: core.AsBot}, createOpts{includeResourceData: true, asJSON: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -559,7 +559,7 @@ func TestApplyCreate_Encrypted_RemoteTrueKeyProbeFails_PropagatesTypedError_NoDe
 		encryptErr: cause,
 	}
 
-	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, eventlib.CommandContext{Identity: core.AsBot}, createOpts{includeResourceData: true}, nil)
 	var pe *errs.PermissionError
 	if !errors.As(err, &pe) {
 		t.Fatalf("expected *errs.PermissionError (typed classification preserved, not a delete-and-recreate conflict), got %T: %v", err, err)
@@ -589,7 +589,7 @@ func TestApplyCreate_Encrypted_CreateFails_SecondReconcileStillRequiresEncryptio
 		},
 	}
 
-	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{includeResourceData: true}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{includeResourceData: true}, nil)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *errs.ValidationError (conflict, not a silent plaintext fallback), got %T: %v", err, err)
@@ -613,7 +613,7 @@ func TestEncryptedCreate_Redaction_KeyNeverAppearsInAnyOutput(t *testing.T) {
 		ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(func() (string, error) { return secret, nil }))
 		var buf bytes.Buffer
 
-		err := applyCreate(context.Background(), ctrl, &buf, resolved, core.AsBot, createOpts{includeResourceData: true, asJSON: asJSON}, nil)
+		err := applyCreate(context.Background(), ctrl, &buf, resolved, eventlib.CommandContext{Identity: core.AsBot}, createOpts{includeResourceData: true, asJSON: asJSON}, nil)
 		if err != nil {
 			t.Fatalf("asJSON=%v: unexpected error: %v", asJSON, err)
 		}
@@ -633,7 +633,7 @@ func TestEncryptedCreate_Redaction_KeyNeverAppearsInErrorOnCreateFailure(t *test
 	gw := &fakeCreateGateway{createErr: errors.New("boom: synthetic create failure")} // both reconciles find nothing
 	ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(func() (string, error) { return secret, nil }))
 
-	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true}, nil)
+	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, eventlib.CommandContext{Identity: core.AsBot}, createOpts{includeResourceData: true}, nil)
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -693,7 +693,7 @@ func TestDryRun_IncludeResourceDataTrue_NotFound_GeneratesNoKeyAndNoCreateCall(t
 	keyGen := 0
 	ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(countingKeyGen(&keyGen, "x")))
 
-	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true, dryRun: true}, nil)
+	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, eventlib.CommandContext{Identity: core.AsBot}, createOpts{includeResourceData: true, dryRun: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -718,7 +718,7 @@ func TestDryRun_IncludeResourceDataTrue_ActiveMatch_ProbesButGeneratesNoKey(t *t
 	keyGen := 0
 	ctrl := subown.NewController(gw, subown.WithEncryptKeyGenerator(countingKeyGen(&keyGen, "x")))
 
-	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, core.AsBot, createOpts{includeResourceData: true, dryRun: true}, nil)
+	err := applyCreate(context.Background(), ctrl, io.Discard, resolved, eventlib.CommandContext{Identity: core.AsBot}, createOpts{includeResourceData: true, dryRun: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -739,7 +739,7 @@ func TestBuildDryRunResult_NotFound_ShapeAndNoRemoteBefore(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
 	plan := subown.SubscriptionPlan{Action: subown.ActionCreate}
 
-	result := buildDryRunResult(resolved, core.AsUser, plan, false, false /* scopesVerified: unknown */)
+	result := buildDryRunResult(resolved, eventlib.CommandContext{Identity: core.AsUser}, plan, false, false /* scopesVerified: unknown */)
 
 	if result.Operation != "create" {
 		t.Errorf("Operation = %q, want create", result.Operation)
@@ -781,7 +781,7 @@ func TestBuildDryRunResult_ActiveCompatible_RemoteBeforePopulated(t *testing.T) 
 	resolved := resolveCreatedChatID(t)
 	plan := subown.SubscriptionPlan{Action: subown.ActionReuse, Before: remotePtr(activeRemote("sub_existing", false, "user"))}
 
-	result := buildDryRunResult(resolved, core.AsUser, plan, false, true /* scopesVerified */)
+	result := buildDryRunResult(resolved, eventlib.CommandContext{Identity: core.AsUser}, plan, false, true /* scopesVerified */)
 
 	if result.PlannedChange.Action != "reuse" {
 		t.Errorf("PlannedChange.Action = %q, want reuse", result.PlannedChange.Action)
@@ -812,7 +812,7 @@ func TestBuildDryRunResult_IncludeResourceDataTrue_RequiredScopesIncludesEncrypt
 	resolved := resolveCreatedChatID(t)
 	plan := subown.SubscriptionPlan{Action: subown.ActionCreate}
 
-	result := buildDryRunResult(resolved, core.AsUser, plan, true, false)
+	result := buildDryRunResult(resolved, eventlib.CommandContext{Identity: core.AsUser}, plan, true, false)
 
 	want := map[string]bool{"event:subscription:read": true, "event:subscription:write": true, "event:encrypt_key:read": true}
 	if len(result.RequiredScopes) != len(want) {
@@ -833,7 +833,7 @@ func TestDryRun_NotFound_EndToEnd_JSONShapeAndNoCreateCall(t *testing.T) {
 	gw := &fakeCreateGateway{}
 	var buf bytes.Buffer
 
-	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsBot, createOpts{dryRun: true, asJSON: true}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, eventlib.CommandContext{Identity: core.AsBot}, createOpts{dryRun: true, asJSON: true}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -868,7 +868,7 @@ func TestDryRun_ActiveConflicting_EndToEnd_ReportsInformationallyNoCreateCall(t 
 	var buf bytes.Buffer
 
 	// requested include_resource_data=false mismatches the existing true -> conflict.
-	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{dryRun: true, asJSON: true}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{dryRun: true, asJSON: true}, nil)
 	if err != nil {
 		t.Fatalf("dry-run must report informationally, not error: %v", err)
 	}
@@ -898,7 +898,7 @@ func TestDryRun_Suspended_EndToEnd_ReportsInformationallyNoCreateCall(t *testing
 	gw := &fakeCreateGateway{walkItems: []model.RemoteSubscription{suspendedRemote("sub_susp", "authority_revoked")}}
 	var buf bytes.Buffer
 
-	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{dryRun: true, asJSON: true}, nil)
+	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, eventlib.CommandContext{Identity: core.AsUser}, createOpts{dryRun: true, asJSON: true}, nil)
 	if err != nil {
 		t.Fatalf("dry-run must report informationally, not error: %v", err)
 	}

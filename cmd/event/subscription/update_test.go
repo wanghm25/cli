@@ -105,7 +105,7 @@ func (f *fakeUpdateAPI) Patch(_ context.Context, _ string, spec subown.PatchSpec
 func TestApplyUpdate_SetFilter_PatchesWhenChanged(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON}, nil, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -118,7 +118,7 @@ func TestApplyUpdate_SetFilter_PatchesWhenChanged(t *testing.T) {
 func TestApplyUpdate_MalformedFilterJSON_RejectedNoPatch(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: `{"composite_condition":`}, nil, nil, false)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
@@ -146,7 +146,7 @@ func TestApplyUpdate_InvalidFilterRule_RejectedNoPatch_NeverLeaksValue(t *testin
 	raw := `{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"sender","op":"eq","value":"` + secret + `"}}]}}`
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: raw}, nil, nil, false)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
@@ -167,7 +167,7 @@ func TestApplyUpdate_ClearFilter_PatchesWhenFilterPresent(t *testing.T) {
 	present := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", present))}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{clearFilter: true}, nil, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -187,7 +187,7 @@ func TestApplyUpdate_ClearFilter_NoOpWhenAlreadyEmpty(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))} // no filter
 	var buf bytes.Buffer
 
-	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, &buf, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{clearFilter: true, asJSON: true}, nil, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -213,7 +213,7 @@ func TestApplyUpdate_SetFilter_NoOpWhenEqualsCurrent(t *testing.T) {
 	current := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", current))}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON}, nil, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -230,7 +230,7 @@ func TestApplyUpdate_DryRun_ReadsButDoesNotPatch(t *testing.T) {
 	// A running local consumer is bound to sub_1, so a real filter change would
 	// affect its stream; the dry-run must disclose that (and list it).
 	consumers := []buslocal.Consumer{{PID: 4242, EventKey: "im.message.created_v1/chat-id/oc_aaa", RemoteSubscriptionID: "sub_1"}}
-	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, &buf, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON, dryRun: true, asJSON: true}, consumers, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -277,7 +277,7 @@ func TestApplyUpdate_DryRun_NoLocalConsumer_NotAffected(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 	var buf bytes.Buffer
 
-	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, &buf, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON, dryRun: true, asJSON: true}, nil, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -306,7 +306,7 @@ func TestApplyUpdate_DryRun_NoOp_ReportsNoopAction(t *testing.T) {
 	// Even with a running local consumer bound, a no-op changes nothing and so
 	// must NOT claim impact (and must never require --yes).
 	consumers := []buslocal.Consumer{{PID: 4242, RemoteSubscriptionID: "sub_1"}}
-	err := applyUpdate(context.Background(), fake, &buf, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, &buf, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON, dryRun: true, asJSON: true}, consumers, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -343,7 +343,7 @@ func TestApplyUpdate_EventTypeComesFromGet(t *testing.T) {
 	sub.EventType = "im.message.receive_v1" // no filter capability
 	fake := &fakeUpdateAPI{getSub: &sub}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON}, nil, nil, false)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) {
@@ -365,7 +365,7 @@ func TestApplyUpdate_MissingEventType_TypedError(t *testing.T) {
 	sub.EventType = ""
 	fake := &fakeUpdateAPI{getSub: &sub}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{clearFilter: true}, nil, nil, false)
 	if _, ok := errs.ProblemOf(err); !ok {
 		t.Fatalf("expected a typed errs.* error, got %T: %v", err, err)
@@ -379,7 +379,7 @@ func TestApplyUpdate_GetError_Propagates(t *testing.T) {
 	sentinel := errors.New("boom: subscription not found")
 	fake := &fakeUpdateAPI{getErr: sentinel}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{clearFilter: true}, nil, nil, false)
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want the Get error passed through unchanged (%v)", err, sentinel)
@@ -566,7 +566,7 @@ func TestApplyUpdate_RealChange_AffectedConsumer_RequiresYes(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 	consumers := []buslocal.Consumer{{PID: 4242, EventKey: "im.message.created_v1/chat-id/oc_aaa", RemoteSubscriptionID: "sub_1"}}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON}, consumers, nil, false)
 
 	var ce *errs.ConfirmationRequiredError
@@ -593,7 +593,7 @@ func TestApplyUpdate_RealChange_AffectedConsumer_WithYes_Patches(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 	consumers := []buslocal.Consumer{{PID: 4242, RemoteSubscriptionID: "sub_1"}}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON, yes: true}, consumers, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -611,7 +611,7 @@ func TestApplyUpdate_RealChange_NoConsumer_PatchesWithoutYes(t *testing.T) {
 
 	// A consumer bound to a DIFFERENT subscription must not gate this one.
 	consumers := []buslocal.Consumer{{PID: 4242, RemoteSubscriptionID: "sub_other"}}
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON}, consumers, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -629,7 +629,7 @@ func TestApplyUpdate_NoOp_AffectedConsumer_NeverConfirms(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", current))}
 	consumers := []buslocal.Consumer{{PID: 4242, RemoteSubscriptionID: "sub_1"}}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON}, consumers, nil, false) // equals current => no-op
 	if err != nil {
 		t.Fatalf("a no-op must not require confirmation, got: %v", err)
@@ -650,7 +650,7 @@ func TestApplyUpdate_UnreachableBus_RequiresYes(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
 	// No consumers enumerated, but a discovered bus (app_down) could not be queried.
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON}, nil, []string{"app_down"}, false)
 
 	var ce *errs.ConfirmationRequiredError
@@ -673,7 +673,7 @@ func TestApplyUpdate_UnreachableBus_WithYes_PatchesAndSignals(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 	calls := captureSignals(t, nil)
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON, yes: true}, nil, []string{"app_down"}, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -693,7 +693,7 @@ func TestApplyUpdate_NoOp_UnreachableBus_NeverConfirms(t *testing.T) {
 	current := mustParseCreatedFilter(t, sampleUpdateFilterJSON)
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSubWithFilter("sub_1", current))}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON}, nil, []string{"app_down"}, false) // equals current => no-op
 	if err != nil {
 		t.Fatalf("a no-op must not require confirmation even with an unreachable bus, got: %v", err)
@@ -710,7 +710,7 @@ func TestApplyUpdate_NoOp_UnreachableBus_NeverConfirms(t *testing.T) {
 func TestApplyUpdate_ScanFailed_RequiresYes(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON}, nil, nil, true) // scanFailed
 	var ce *errs.ConfirmationRequiredError
 	if !errors.As(err, &ce) {
@@ -751,7 +751,7 @@ func TestApplyUpdate_RealChange_AffectedConsumer_WithYes_SignalsBus(t *testing.T
 	consumers := []buslocal.Consumer{{PID: 4242, AppID: "app_x", RemoteSubscriptionID: "sub_1"}}
 	calls := captureSignals(t, nil)
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON, yes: true}, consumers, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -779,7 +779,7 @@ func TestApplyUpdate_RealChange_DedupsPerApp_SkipsUnaddressable(t *testing.T) {
 	}
 	calls := captureSignals(t, nil)
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON, yes: true}, consumers, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -794,7 +794,7 @@ func TestApplyUpdate_RealChange_NoConsumer_NoSignal(t *testing.T) {
 	fake := &fakeUpdateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
 	calls := captureSignals(t, nil)
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON}, nil, nil, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -815,7 +815,7 @@ func TestApplyUpdate_NoOp_AffectedConsumer_NoSignal(t *testing.T) {
 	consumers := []buslocal.Consumer{{PID: 4242, AppID: "app_x", RemoteSubscriptionID: "sub_1"}}
 	calls := captureSignals(t, nil)
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON, yes: true}, consumers, nil, false) // equals current => no-op
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -835,7 +835,7 @@ func TestApplyUpdate_SignalBestEffort_BusDown_StillSucceeds(t *testing.T) {
 	consumers := []buslocal.Consumer{{PID: 4242, AppID: "app_x", RemoteSubscriptionID: "sub_1"}}
 	calls := captureSignals(t, errors.New("dial: no such bus"))
 
-	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", core.AsUser,
+	err := applyUpdate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser},
 		updateOpts{filter: sampleUpdateFilterJSON, yes: true}, consumers, nil, false)
 	if err != nil {
 		t.Fatalf("a failed best-effort signal must not fail update, got: %v", err)
