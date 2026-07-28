@@ -242,6 +242,11 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 // so this function itself must never reach into tr/appID/etc. — every
 // stage's real work lives behind the deps closures built in prodRefinedDeps.
 func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts RefinedOptions, deps refinedDeps) error {
+	// cmdCtx renders every recovery / next-step hint against THIS consumer's
+	// OWNING profile + identity — the command-resolved OwnerRef.Profile + the
+	// resolved --as — never a re-read of the raw --profile flag, so a suggested
+	// command targets the same app + identity this consumer bootstrapped as.
+	cmdCtx := event.CommandContext{Profile: opts.OwnerRef.Profile, Identity: opts.Identity}
 	errOut := opts.ErrOut
 	if errOut == nil {
 		errOut = os.Stderr //nolint:forbidigo // library-caller fallback
@@ -299,7 +304,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 
 	// ---- 3. --dry-run exits HERE: no Apply, no bus, no remote write ----
 	if opts.DryRun {
-		writeRefinedDryRunPreview(previewOut, resolved, opts.Identity, plan)
+		writeRefinedDryRunPreview(previewOut, resolved, cmdCtx, plan)
 		return nil
 	}
 
@@ -311,7 +316,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 	// in an unrecognized remote state (fail-closed). The --dry-run preview above
 	// consults the SAME refinedBlockOutcome so it can report a would-Block plan
 	// truthfully rather than inviting the caller to remove --dry-run.
-	if blockErr := refinedBlockOutcome(resolved, opts.Identity, plan); blockErr != nil {
+	if blockErr := refinedBlockOutcome(resolved, cmdCtx, plan); blockErr != nil {
 		return blockErr
 	}
 
@@ -344,7 +349,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 		// just because the LOCAL bus failed to start. Preserve
 		// remote_subscription_id/created_by_this_attempt so the caller can
 		// retry (Plan will reuse it, not create a duplicate).
-		return errApplyOkStartBusFailed(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, err)
+		return errApplyOkStartBusFailed(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt, err)
 	}
 	defer conn.Close()
 
@@ -354,7 +359,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 		// Same rationale as the startBus-fail branch above: Apply already
 		// succeeded, so this must carry the same recovery Hint, not a
 		// generic unactionable message.
-		return errApplyOkHelloFailed(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, err)
+		return errApplyOkHelloFailed(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt, err)
 	}
 	// The bus rejects a refined Hello with a fixed reason token for several
 	// distinct fail-closed conditions (it never reveals WHY beyond the token —
@@ -367,19 +372,19 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 	if ack != nil && ack.Rejected {
 		switch ack.RejectReason {
 		case protocol.RejectReasonDecryptKeyUnavailable:
-			return refinedDecryptKeyUnavailableError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
+			return refinedDecryptKeyUnavailableError(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt)
 		case protocol.RejectReasonBindFailed:
-			return refinedBindFailedError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
+			return refinedBindFailedError(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt)
 		case protocol.RejectReasonSourceNotReady:
-			return refinedSourceNotReadyError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
+			return refinedSourceNotReadyError(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt)
 		case protocol.RejectReasonMalformedUserIdentity:
-			return refinedMalformedUserIdentityError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
+			return refinedMalformedUserIdentityError(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt)
 		case protocol.RejectReasonIncompleteRefinedHello:
-			return refinedIncompleteHelloError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
+			return refinedIncompleteHelloError(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt)
 		}
 	}
 	if rejErr := rejectionError(ack, resolved.MaterializedKey); rejErr != nil {
-		return applyOkRejectedError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, rejErr)
+		return applyOkRejectedError(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt, rejErr)
 	}
 
 	// #19: the REAL connection is authoritative for capability. Even though the
@@ -392,7 +397,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 	// connection this consumer will receive events on is capable, closing the
 	// probe's time-of-check-to-time-of-use window.
 	if !ackAdvertisesRefinedCapabilities(ack) {
-		return refinedBusCapabilityMissingError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
+		return refinedBusCapabilityMissingError(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt)
 	}
 
 	consumeOpts := Options{
@@ -473,13 +478,13 @@ func refinedRequest(opts RefinedOptions, eventType, targetResource string) subow
 // (or delete+recreate). The bus never returns WHY it failed (no oracle) — only
 // the fixed reason token — so this message is fully local, carrying no key
 // material or raw fetch error.
-func refinedDecryptKeyUnavailableError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool) error {
+func refinedDecryptKeyUnavailableError(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, remoteSubscriptionID string, createdByThisAttempt bool) error {
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"cannot start consuming %s: the event bus could not obtain its subscription encrypt_key (decrypt_key_unavailable), so it could not decrypt this subscription's events",
 		resolved.MaterializedKey).
 		WithParam("--include-resource-data").
 		WithHint("the consumer was NOT started. Ensure identity %s holds scope `event:encrypt_key:read` and is the owner of the subscription (switch --as/--profile if this identity is not the owner); or delete and recreate the subscription after human confirmation. %s",
-			identity, applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+			cmdCtx.Identity, applyOkRecoveryHint(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt))
 }
 
 // refinedBindFailedError turns the bus's identity_bind_failed Hello rejection
@@ -490,13 +495,13 @@ func refinedDecryptKeyUnavailableError(resolved event.ResolvedEventKey, identity
 // rejects and closes the connection (unwinding any registration) so the
 // consumer never readies. The bus returns only the fixed reason token (no
 // oracle for which check failed), so this guidance is fully local.
-func refinedBindFailedError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool) error {
+func refinedBindFailedError(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, remoteSubscriptionID string, createdByThisAttempt bool) error {
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"cannot start consuming %s: the event bus could not bind this subscription to identity %s (identity_bind_failed)",
-		resolved.MaterializedKey, identity).
+		resolved.MaterializedKey, cmdCtx.Identity).
 		WithParam("--as").
 		WithHint("the consumer was NOT started. Confirm the active profile/user is the owner of the subscription (switch --as/--profile if it is not) and that its user access token is still valid (re-run `lark-cli auth login` to re-authorize if needed). %s",
-			applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+			applyOkRecoveryHint(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt))
 }
 
 // refinedIncompleteHelloError turns the bus's incomplete_refined_hello Hello
@@ -505,12 +510,12 @@ func refinedBindFailedError(resolved event.ResolvedEventKey, identity core.Ident
 // target_resource. A refined consumer always resolves a target_resource from
 // its key, so this signals an internal inconsistency rather than an
 // operator-fixable condition.
-func refinedIncompleteHelloError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool) error {
+func refinedIncompleteHelloError(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, remoteSubscriptionID string, createdByThisAttempt bool) error {
 	return errs.NewInternalError(errs.SubtypeUnknown,
 		"cannot start consuming %s: the event bus rejected the registration as incomplete (incomplete_refined_hello) — the refined Hello carried no target_resource",
 		resolved.MaterializedKey).
 		WithHint("the consumer was NOT started. This is an internal inconsistency (a refined consumer should always resolve a target_resource); please report it if it persists. %s",
-			applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+			applyOkRecoveryHint(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt))
 }
 
 // refinedSourceNotReadyError turns the bus's source_not_ready Hello rejection
@@ -519,12 +524,12 @@ func refinedIncompleteHelloError(resolved event.ResolvedEventKey, identity core.
 // not ready before the source is up). Usually transient (a bus still connecting
 // its WebSocket), so the guidance is to retry; the consumer never registered or
 // readied, so there is nothing to roll back.
-func refinedSourceNotReadyError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool) error {
+func refinedSourceNotReadyError(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, remoteSubscriptionID string, createdByThisAttempt bool) error {
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"cannot start consuming %s: the event bus's WebSocket source did not become ready in time (source_not_ready)",
 		resolved.MaterializedKey).
 		WithHint("the consumer was NOT started. This is usually transient (the bus was still connecting its WebSocket) — retry shortly; if it persists, run `lark-cli event stop` to retire the bus and retry, and check connectivity to the Lark/Feishu open platform. %s",
-			applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+			applyOkRecoveryHint(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt))
 }
 
 // refinedMalformedUserIdentityError turns the bus's malformed_user_identity
@@ -533,12 +538,12 @@ func refinedSourceNotReadyError(resolved event.ResolvedEventKey, identity core.I
 // bound, or delivery-gated). A refined consumer resolves its owner user_open_id
 // from --as/--profile, so an empty one is an internal inconsistency (a user
 // identity with no resolved open_id) rather than an operator-fixable condition.
-func refinedMalformedUserIdentityError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool) error {
+func refinedMalformedUserIdentityError(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, remoteSubscriptionID string, createdByThisAttempt bool) error {
 	return errs.NewInternalError(errs.SubtypeUnknown,
 		"cannot start consuming %s: the event bus rejected the registration as a malformed user identity (malformed_user_identity) — identity=user with no resolved user_open_id",
 		resolved.MaterializedKey).
 		WithHint("the consumer was NOT started. Ensure a user is logged in for this profile (`lark-cli auth login`) so a user identity resolves an open_id, or use --as bot. If it persists with a logged-in user, please report it. %s",
-			applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+			applyOkRecoveryHint(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt))
 }
 
 // refinedBusCapabilityMissingError is the #19 fail-closed error for when the
@@ -548,29 +553,30 @@ func refinedMalformedUserIdentityError(resolved event.ResolvedEventKey, identity
 // it would silently misroute or drop its dual-indexed events. The connection is
 // closed (the caller's deferred conn.Close) and the consumer never readies. The
 // fix is operator-actionable: retire the old bus and retry against a fresh one.
-func refinedBusCapabilityMissingError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool) error {
+func refinedBusCapabilityMissingError(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, remoteSubscriptionID string, createdByThisAttempt bool) error {
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"cannot start consuming %s: the running local event bus did not advertise refined-subscription support on the consume connection (missing refined_routing/hello_v2 in its hello_ack)",
 		resolved.MaterializedKey).
 		WithHint("the consumer was NOT started (the connection was closed). The running bus predates refined-subscription support — run `lark-cli event stop` to retire it, then retry; a freshly started bus carries the required capabilities. %s",
-			applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+			applyOkRecoveryHint(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt))
 }
 
 // refinedConflictError mirrors cmd/event/subscription/create.go's own
 // conflictError for an ActionBlock plan — the configuration-conflict outcome
 // runRefinedChain always turns into a typed error on a real run (create,
 // reuse, and reactivate all proceed to Apply instead).
-func refinedConflictError(resolved event.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) error {
+func refinedConflictError(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, plan subown.SubscriptionPlan) error {
 	id := ""
 	if plan.Before != nil {
 		id = plan.Before.ID.String()
 	}
-	hint := fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before consuming", id, identity, id)
+	head := cmdCtx.CLIHead()
+	hint := fmt.Sprintf("run `%s event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, then either accept its existing configuration or delete it before consuming", head, id, cmdCtx.Identity, id)
 	if subown.ConflictOnFilter(plan.ConflictFields) {
 		// A filter difference is resolvable in place — change it with `update`
 		// rather than deleting a possibly-shared subscription. Guide inspect ->
 		// preview -> apply -> re-run consume; the filter values are never named.
-		hint = fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, preview the change with `lark-cli event subscription update %s --filter <json> --dry-run --as %s`, apply it with `lark-cli event subscription update %s --filter <json> --as %s`, then re-run consume — a filter change is reversible, so there is no need to delete a possibly-shared subscription", id, identity, id, id, identity, id, identity)
+		hint = fmt.Sprintf("run `%s event subscription get %s --as %s --json` to inspect remote_subscription_id=%s, preview the change with `%s event subscription update %s --filter <json> --dry-run --as %s`, apply it with `%s event subscription update %s --filter <json> --as %s`, then re-run consume — a filter change is reversible, so there is no need to delete a possibly-shared subscription", head, id, cmdCtx.Identity, id, head, id, cmdCtx.Identity, head, id, cmdCtx.Identity)
 	}
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"an active remote subscription already exists for %s with a conflicting configuration (remote_subscription_id=%s)",
@@ -584,7 +590,7 @@ func refinedConflictError(resolved event.ResolvedEventKey, identity core.Identit
 // unknownStateError: a match exists in a remote state this CLI cannot classify
 // (not active/suspended/expired/deleted), so bootstrapping fails closed rather
 // than risk duplicating a still-live subscription. It guides inspect-and-decide.
-func refinedUnknownStateError(resolved event.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) error {
+func refinedUnknownStateError(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, plan subown.SubscriptionPlan) error {
 	id := ""
 	state := ""
 	if plan.Before != nil {
@@ -596,19 +602,19 @@ func refinedUnknownStateError(resolved event.ResolvedEventKey, identity core.Ide
 		resolved.MaterializedKey, state, id).
 		WithParam("event_key").
 		WithParams(plan.ConflictFields...).
-		WithHint("run `lark-cli event subscription get %s --as %s --json` to inspect remote_subscription_id=%s and its state, then reactivate, delete, or wait as appropriate before re-running consume", id, identity, id)
+		WithHint("run `%s event subscription get %s --as %s --json` to inspect remote_subscription_id=%s and its state, then reactivate, delete, or wait as appropriate before re-running consume", cmdCtx.CLIHead(), id, cmdCtx.Identity, id)
 }
 
 // refinedIndeterminateError turns an ActionIndeterminate plan (the remote
 // subscription list scan hit its page cap without a definitive answer) into a
 // fail-closed typed error on a real run: bootstrapping a subscription now could
 // duplicate an existing one beyond the pages read, so the consumer is NOT started.
-func refinedIndeterminateError(resolved event.ResolvedEventKey, identity core.Identity) error {
+func refinedIndeterminateError(resolved event.ResolvedEventKey, cmdCtx event.CommandContext) error {
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
 		"cannot start consuming %s: could not determine whether a matching remote subscription already exists — the subscription list scan reached its %d-page cap before finding a match or exhausting all results",
 		resolved.MaterializedKey, event.MaxSubscriptionListPages).
 		WithParam("event_key").
-		WithHint("the consumer was NOT started. Run `lark-cli event subscription list --as %s --json` to inspect existing subscriptions (this is NOT confirmed absence, only \"no match within the pages read\"), then retry once you have confirmed none matches", identity)
+		WithHint("the consumer was NOT started. Run `%s event subscription list --as %s --json` to inspect existing subscriptions (this is NOT confirmed absence, only \"no match within the pages read\"), then retry once you have confirmed none matches", cmdCtx.CLIHead(), cmdCtx.Identity)
 }
 
 // refinedOwnerGate is the consume bootstrap's owner==current fail-closed gate,
@@ -678,9 +684,9 @@ func refinedUnresolvedIdentityError(resolved event.ResolvedEventKey) error {
 // call sites (errApplyOkStartBusFailed, errApplyOkHelloFailed,
 // applyOkRejectedError) construct byte-identical wording instead of each
 // maintaining its own copy.
-func applyOkRecoveryHint(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool) string {
-	return fmt.Sprintf("remote_subscription_id=%s created_by_this_attempt=%t next_action=retry `lark-cli event consume %s --as %s` (the remote subscription was left as-is; retrying will reconcile/reuse it, not create a duplicate)",
-		remoteSubscriptionID, createdByThisAttempt, resolved.MaterializedKey, identity)
+func applyOkRecoveryHint(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, remoteSubscriptionID string, createdByThisAttempt bool) string {
+	return fmt.Sprintf("remote_subscription_id=%s created_by_this_attempt=%t next_action=retry `%s event consume %s --as %s` (the remote subscription was left as-is; retrying will reconcile/reuse it, not create a duplicate)",
+		remoteSubscriptionID, createdByThisAttempt, cmdCtx.CLIHead(), resolved.MaterializedKey, cmdCtx.Identity)
 }
 
 // errApplyOkStartBusFailed implements the explicit
@@ -691,22 +697,22 @@ func applyOkRecoveryHint(resolved event.ResolvedEventKey, identity core.Identity
 // successful remote write. The safe recovery is to retry consume, which
 // will Plan-reuse the same remote subscription rather than create a
 // duplicate.
-func errApplyOkStartBusFailed(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool, cause error) error {
+func errApplyOkStartBusFailed(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, remoteSubscriptionID string, createdByThisAttempt bool, cause error) error {
 	return errs.NewInternalError(errs.SubtypeUnknown,
 		"remote subscription is ready but the local event bus failed to start: %s", cause).
 		WithCause(cause).
-		WithHint(applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+		WithHint(applyOkRecoveryHint(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt))
 }
 
 // errApplyOkHelloFailed is errApplyOkStartBusFailed's HelloV2 counterpart. A
 // transport/decode error during the HelloV2 handshake happens after Apply
 // already succeeded and the bus already started, so it must be as actionable
 // as a startBus failure and carry the same recovery hint.
-func errApplyOkHelloFailed(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool, cause error) error {
+func errApplyOkHelloFailed(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, remoteSubscriptionID string, createdByThisAttempt bool, cause error) error {
 	return errs.NewInternalError(errs.SubtypeUnknown,
 		"remote subscription is ready but the event bus handshake failed: %s", cause).
 		WithCause(cause).
-		WithHint(applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+		WithHint(applyOkRecoveryHint(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt))
 }
 
 // applyOkRejectedError is errApplyOkStartBusFailed's bus-rejection
@@ -716,12 +722,12 @@ func errApplyOkHelloFailed(resolved event.ResolvedEventKey, identity core.Identi
 // created_by_this_attempt/next_action recovery hint used by other post-Apply
 // failures. The original hint is preserved so the local rejection reason and
 // the remote recovery context are both visible.
-func applyOkRejectedError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool, rejErr error) error {
+func applyOkRejectedError(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, remoteSubscriptionID string, createdByThisAttempt bool, rejErr error) error {
 	var ve *errs.ValidationError
 	if !errors.As(rejErr, &ve) {
 		return rejErr
 	}
-	return ve.WithHint("%s; %s", ve.Hint, applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+	return ve.WithHint("%s; %s", ve.Hint, applyOkRecoveryHint(resolved, cmdCtx, remoteSubscriptionID, createdByThisAttempt))
 }
 
 // refinedBlockOutcome returns the fail-closed error a REAL refined consume run
@@ -732,15 +738,15 @@ func applyOkRejectedError(resolved event.ResolvedEventKey, identity core.Identit
 // runRefinedChain's real run and the --dry-run preview, so the preview mirrors the
 // real outcome exactly and can never invite removing --dry-run for a path that
 // cannot succeed.
-func refinedBlockOutcome(resolved event.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) error {
+func refinedBlockOutcome(resolved event.ResolvedEventKey, cmdCtx event.CommandContext, plan subown.SubscriptionPlan) error {
 	switch plan.Action {
 	case subown.ActionBlock:
 		if subown.ConflictOnState(plan.ConflictFields) {
-			return refinedUnknownStateError(resolved, identity, plan)
+			return refinedUnknownStateError(resolved, cmdCtx, plan)
 		}
-		return refinedConflictError(resolved, identity, plan)
+		return refinedConflictError(resolved, cmdCtx, plan)
 	case subown.ActionIndeterminate:
-		return refinedIndeterminateError(resolved, identity)
+		return refinedIndeterminateError(resolved, cmdCtx)
 	default:
 		return nil
 	}
@@ -758,7 +764,7 @@ func refinedBlockOutcome(resolved event.ResolvedEventKey, identity core.Identity
 // fail closed on (would-Block / inconclusive) it says the run would Block and
 // carries the SAME message + recovery guidance the real error would — never
 // "run without --dry-run" for a path that cannot succeed.
-func writeRefinedDryRunPreview(errOut io.Writer, resolved event.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) {
+func writeRefinedDryRunPreview(errOut io.Writer, resolved event.ResolvedEventKey, cmdCtx event.CommandContext, plan subown.SubscriptionPlan) {
 	fmt.Fprintf(errOut, "[event] dry-run: event_key=%s target_resource=%s planned_action=%s",
 		resolved.MaterializedKey, resolved.TargetResource, plan.Action)
 	if plan.Before != nil {
@@ -766,7 +772,7 @@ func writeRefinedDryRunPreview(errOut io.Writer, resolved event.ResolvedEventKey
 	}
 	fmt.Fprintln(errOut)
 
-	if blockErr := refinedBlockOutcome(resolved, identity, plan); blockErr != nil {
+	if blockErr := refinedBlockOutcome(resolved, cmdCtx, plan); blockErr != nil {
 		reason := "the plan cannot be applied"
 		hint := ""
 		if p, ok := errs.ProblemOf(blockErr); ok {

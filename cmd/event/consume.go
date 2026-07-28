@@ -535,7 +535,7 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 	// dry-run branch) so a preview surfaces the same rejection a real run
 	// would hit, rather than only discovering it on a later real run.
 	if o.includeResourceData {
-		if err := preflightEncryptKeyScope(cmd.Context(), f, cfg.AppID, identity, resolved.MaterializedKey); err != nil {
+		if err := preflightEncryptKeyScope(cmd.Context(), f, cfg.AppID, eventlib.CommandContext{Profile: cfg.ProfileName, Identity: identity}, resolved.MaterializedKey); err != nil {
 			return err
 		}
 	}
@@ -615,13 +615,13 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 	}
 
 	return consume.RunRefined(ctx, transport.New(), cfg.AppID, cfg.ProfileName, domain, resolved, consume.RefinedOptions{
-		Params:              paramMap,
-		JQExpr:              o.jqExpr,
-		Quiet:               o.quiet,
-		OutputDir:           outputDir,
-		Runtime:             runtime,
-		Out:                 f.IOStreams.Out,
-		ErrOut:              errOut,
+		Params:    paramMap,
+		JQExpr:    o.jqExpr,
+		Quiet:     o.quiet,
+		OutputDir: outputDir,
+		Runtime:   runtime,
+		Out:       f.IOStreams.Out,
+		ErrOut:    errOut,
 		// The dry-run plan preview is the payload of --dry-run and stays even
 		// under --quiet (which only discards the chatty errOut above).
 		PreviewOut:          f.IOStreams.ErrOut,
@@ -668,8 +668,8 @@ var refinedEncryptKeyReadScopes = []string{"event:encrypt_key:read"}
 // returns Scopes==""), so in practice this only ever fires for a user
 // identity — for a bot, the bus's Hello-time GetEncryptKey fetch remains the
 // sole enforcement.
-func preflightEncryptKeyScope(ctx context.Context, f *cmdutil.Factory, appID string, identity core.Identity, materializedKey string) error {
-	result, err := f.Credential.ResolveToken(ctx, credential.NewTokenSpec(identity, appID))
+func preflightEncryptKeyScope(ctx context.Context, f *cmdutil.Factory, appID string, cmdCtx eventlib.CommandContext, materializedKey string) error {
+	result, err := f.Credential.ResolveToken(ctx, credential.NewTokenSpec(cmdCtx.Identity, appID))
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
@@ -684,10 +684,10 @@ func preflightEncryptKeyScope(ctx context.Context, f *cmdutil.Factory, appID str
 		return nil
 	}
 	return errs.NewPermissionError(errs.SubtypeMissingScope,
-		"missing required scope for --include-resource-data=true (as %s): %s", identity, strings.Join(missing, ", ")).
-		WithIdentity(string(identity)).
+		"missing required scope for --include-resource-data=true (as %s): %s", cmdCtx.Identity, strings.Join(missing, ", ")).
+		WithIdentity(string(cmdCtx.Identity)).
 		WithMissingScopes(missing...).
-		WithHint("grant/re-authorize scope `event:encrypt_key:read` for identity %s, then retry `lark-cli event consume %s --include-resource-data=true --as %s`; this scope is required for resource data delivery", identity, materializedKey, identity)
+		WithHint("grant/re-authorize scope `event:encrypt_key:read` for identity %s, then retry `%s event consume %s --include-resource-data=true --as %s`; this scope is required for resource data delivery", cmdCtx.Identity, cmdCtx.CLIHead(), materializedKey, cmdCtx.Identity)
 }
 
 // resolveIdentityUAT resolves the user access token the subscription gateway
