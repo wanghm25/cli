@@ -1,23 +1,26 @@
 // Copyright (c) 2026 Lark Technologies Pte. Ltd.
 // SPDX-License-Identifier: MIT
 
-package event
+package model
 
 import (
 	"bytes"
 	"encoding/json"
 )
 
-// DSL vocabulary. Operators are the supported comparison ops; logic ops combine
-// conditions. "not" is deliberately absent — it is rejected even though some SDK
-// comments still list it.
+// Filter DSL vocabulary. Operators are the supported comparison ops; logic ops
+// combine conditions. "not" is deliberately absent — it is rejected even though
+// some SDK comments still list it. These are the canonical spellings owned by
+// the model (the filter value type lives here); the validator, the SDK
+// projection, and the schema example all reference them so no layer re-invents
+// the wire strings.
 const (
-	opEq       = "eq"
-	opIn       = "in"
-	opContains = "contains"
+	OpEq       = "eq"
+	OpIn       = "in"
+	OpContains = "contains"
 
-	logicAnd = "and"
-	logicOr  = "or"
+	LogicAnd = "and"
+	LogicOr  = "or"
 )
 
 // Filter is the CLI-owned model of a server-side event filter. It is aligned to
@@ -52,13 +55,13 @@ func (f *Filter) IsEmpty() bool {
 
 // Canonicalize returns the deterministic wire JSON used for equality comparison
 // and the byte-size limit. It marshals the CLI model DIRECTLY to the canonical
-// wire shape (no SDK dependency), so the model — and this method — can live in
-// the SDK-free value layer. The bytes are byte-identical to what the SDK
-// projection (FilterToSDK) would marshal, because the canonical wire structs
-// below mirror the SDK filter type's exact JSON field names, declaration order,
-// and omitempty semantics, and the projection reproduces the SDK projector's
-// exact nil/non-nil field decisions. The filter_canonical byte-identity test
-// pins that equivalence against the real SDK path.
+// wire shape (no SDK dependency), which is why the model — and this method —
+// live in the SDK-free value layer. The bytes are byte-identical to what the
+// SDK projection (platform/lark.FilterToSDK) would marshal, because the
+// canonical wire structs below mirror the SDK filter type's exact JSON field
+// names, declaration order, and omitempty semantics, and toCanonical reproduces
+// the SDK projector's exact nil/non-nil field decisions. The platform/lark
+// filter byte-identity test pins that equivalence against the real SDK path.
 //
 // Canonicalization is intentionally conservative and order-SENSITIVE: it
 // normalizes only serialization (fixed field order via struct encoding, no
@@ -129,7 +132,7 @@ func condToCanonical(c *FilterCond) *canonCondition {
 	op := c.Op
 	out := &canonCondition{Operand: &operand, Op: &op}
 	// in carries its operands in list_value; eq / contains carry a scalar value.
-	if c.Op == opIn {
+	if c.Op == OpIn {
 		out.ListValue = append([]string(nil), c.ListValue...)
 	} else {
 		value := c.Value

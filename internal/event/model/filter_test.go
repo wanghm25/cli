@@ -1,12 +1,24 @@
 // Copyright (c) 2026 Lark Technologies Pte. Ltd.
 // SPDX-License-Identifier: MIT
 
-package event
+package model
 
 import (
 	"bytes"
 	"testing"
 )
+
+// sampleFilter is a representative composite (an "and" of an eq leaf and an in
+// leaf) shared by the canonicalization / equality tests.
+func sampleFilter() *Filter {
+	return &Filter{Root: &FilterNode{
+		LogicOp: LogicAnd,
+		Children: []*FilterNode{
+			{Condition: &FilterCond{Operand: "sender", Op: OpEq, Value: "ou_abc"}},
+			{Condition: &FilterCond{Operand: "message_type", Op: OpIn, ListValue: []string{"text", "image"}}},
+		},
+	}}
+}
 
 func TestFilter_IsEmpty(t *testing.T) {
 	if !(*Filter)(nil).IsEmpty() {
@@ -37,10 +49,10 @@ func TestCanonicalize_Deterministic(t *testing.T) {
 func TestCanonicalize_OrderSensitive(t *testing.T) {
 	// Same leaves, reversed child order => different canonical bytes.
 	reversed := &Filter{Root: &FilterNode{
-		LogicOp: logicAnd,
+		LogicOp: LogicAnd,
 		Children: []*FilterNode{
-			{Condition: &FilterCond{Operand: "message_type", Op: opIn, ListValue: []string{"text", "image"}}},
-			{Condition: &FilterCond{Operand: "sender", Op: opEq, Value: "ou_abc"}},
+			{Condition: &FilterCond{Operand: "message_type", Op: OpIn, ListValue: []string{"text", "image"}}},
+			{Condition: &FilterCond{Operand: "sender", Op: OpEq, Value: "ou_abc"}},
 		},
 	}}
 	base, _ := sampleFilter().Canonicalize()
@@ -52,17 +64,17 @@ func TestCanonicalize_OrderSensitive(t *testing.T) {
 
 func TestEqual(t *testing.T) {
 	reorderedChildren := &Filter{Root: &FilterNode{
-		LogicOp: logicAnd,
+		LogicOp: LogicAnd,
 		Children: []*FilterNode{
-			{Condition: &FilterCond{Operand: "message_type", Op: opIn, ListValue: []string{"text", "image"}}},
-			{Condition: &FilterCond{Operand: "sender", Op: opEq, Value: "ou_abc"}},
+			{Condition: &FilterCond{Operand: "message_type", Op: OpIn, ListValue: []string{"text", "image"}}},
+			{Condition: &FilterCond{Operand: "sender", Op: OpEq, Value: "ou_abc"}},
 		},
 	}}
 	reorderedList := &Filter{Root: &FilterNode{
-		LogicOp: logicAnd,
+		LogicOp: LogicAnd,
 		Children: []*FilterNode{
-			{Condition: &FilterCond{Operand: "sender", Op: opEq, Value: "ou_abc"}},
-			{Condition: &FilterCond{Operand: "message_type", Op: opIn, ListValue: []string{"image", "text"}}},
+			{Condition: &FilterCond{Operand: "sender", Op: OpEq, Value: "ou_abc"}},
+			{Condition: &FilterCond{Operand: "message_type", Op: OpIn, ListValue: []string{"image", "text"}}},
 		},
 	}}
 
