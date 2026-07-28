@@ -89,10 +89,18 @@ func (d Dimension) String() string {
 // non-empty Reason is a short, classified token (never a raw error or key
 // material — this may be surfaced by the status command). When records when the
 // fact was last set.
+//
+// NextAction is this dimension's OWN recommended recovery step ("" = none) — a
+// short, stable token (reactivate/renew/rebuild/rebind/get). It lives inside the
+// per-dimension Fact, not in a single shared slot, so identity-rebind and
+// subscription-recovery each own their recovery and clearing one dimension
+// (e.g. a successful BindUser clearing Identity) never wipes another's. The
+// single surfaced recommendation is projected by NextAction() below.
 type Fact struct {
-	Reason   string
-	Severity Severity
-	When     time.Time
+	Reason     string
+	Severity   Severity
+	When       time.Time
+	NextAction string
 }
 
 // OK reports whether this dimension is healthy (no fact set).
@@ -125,11 +133,47 @@ func (h *Facts) Degrade(d Dimension, reason string) {
 	h.Set(d, Fact{Reason: reason, Severity: SeverityDegraded})
 }
 
-// Clear resets dimension d to healthy, leaving every other dimension untouched.
+// Clear resets dimension d to healthy — reason AND its recovery next_action
+// together — leaving every other dimension untouched.
 func (h *Facts) Clear(d Dimension) {
 	h.mu.Lock()
 	h.dims[d] = Fact{}
 	h.mu.Unlock()
+}
+
+// SetNextAction records dimension d's OWN recovery next_action, preserving that
+// dimension's Reason/Severity/When (and never touching any other dimension). It
+// is the per-dimension counterpart to the old single shared next_action slot:
+// the lifecycle control plane sets the Subscription dimension's action alongside
+// its degrade, while an identity rebind sets the Identity dimension's action on
+// top of the bind-failure reason the identity gate already recorded. A later
+// Clear(d) (or Degrade(d, ...)) resets it with the rest of the fact.
+func (h *Facts) SetNextAction(d Dimension, action string) {
+	h.mu.Lock()
+	f := h.dims[d]
+	f.NextAction = action
+	if action != "" && f.When.IsZero() {
+		f.When = time.Now()
+	}
+	h.dims[d] = f
+	h.mu.Unlock()
+}
+
+// NextAction projects the single recommended recovery step to surface across all
+// dimensions, in a DEFINED priority: the fixed Dimension order
+// (Identity > Subscription > Decryption > Source > Delivery), the same order
+// Snapshot uses. The first dimension carrying a next_action wins. "" when no
+// dimension recommends one. This is what feeds the status projection's single
+// next_action token, replacing the old last-writer-wins shared slot.
+func (h *Facts) NextAction() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for d := Dimension(0); d < numDimensions; d++ {
+		if h.dims[d].NextAction != "" {
+			return h.dims[d].NextAction
+		}
+	}
+	return ""
 }
 
 // Get returns dimension d's current fact (the zero Fact when healthy).

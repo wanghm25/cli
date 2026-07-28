@@ -1164,7 +1164,7 @@ func TestSubscriptionLifecycleAction_Activated_User_ClearsSuspension_NeverBinds(
 	hub.RegisterAndIsFirst(c)
 	c.SetSuspensionReason("authority_revoked")
 	c.SetSubscriptionDegraded(lifecycle.ReasonRemoteSubscriptionSuspended)
-	c.SetNextAction(lifecycle.NextActionReactivate)
+	c.SetSubscriptionNextAction(lifecycle.NextActionReactivate)
 
 	le := lifecycle.LifecycleEvent{EventType: "event.subscription.activated_v1", EventID: "evt-1", RemoteSubscriptionID: "sub-1", State: "active"}
 	if err := deps.action.Handle(context.Background(), le); err != nil {

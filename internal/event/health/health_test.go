@@ -50,6 +50,63 @@ func TestFacts_ClearOneDimension_LeavesOthers(t *testing.T) {
 	}
 }
 
+// Per-dimension recovery actions: Identity and Subscription each own their OWN
+// next_action; clearing the Subscription dimension must NOT wipe the Identity
+// rebind action — the exact regression the old single shared next_action slot
+// caused.
+func TestFacts_PerDimensionNextAction_IndependentAndClearIsolated(t *testing.T) {
+	h := New()
+	// Identity degraded with a rebind recovery; Subscription degraded with a get.
+	h.Degrade(Identity, "bind_failed: bind_api_error")
+	h.SetNextAction(Identity, "rebind")
+	h.Degrade(Subscription, "remote_subscription_conflict")
+	h.SetNextAction(Subscription, "get")
+
+	if got := h.Get(Identity).NextAction; got != "rebind" {
+		t.Errorf("Identity next_action = %q, want rebind", got)
+	}
+	if got := h.Get(Subscription).NextAction; got != "get" {
+		t.Errorf("Subscription next_action = %q, want get", got)
+	}
+
+	// Clearing Subscription clears ONLY its own reason + next_action.
+	h.Clear(Subscription)
+	if got := h.Get(Subscription).NextAction; got != "" {
+		t.Errorf("Subscription next_action after Clear = %q, want \"\"", got)
+	}
+	if got := h.Get(Identity).NextAction; got != "rebind" {
+		t.Errorf("Identity next_action after Clear(Subscription) = %q, want rebind (must survive)", got)
+	}
+	if got := h.Reason(Identity); got != "bind_failed: bind_api_error" {
+		t.Errorf("Identity reason after Clear(Subscription) = %q, want unchanged", got)
+	}
+}
+
+// NextAction() projects a single recommendation in the defined Dimension-order
+// priority: Identity wins over Subscription when BOTH recommend one.
+func TestFacts_NextAction_ProjectsByDimensionPriority(t *testing.T) {
+	h := New()
+	if got := h.NextAction(); got != "" {
+		t.Errorf("healthy NextAction() = %q, want \"\"", got)
+	}
+	h.Degrade(Subscription, "remote_subscription_suspended")
+	h.SetNextAction(Subscription, "reactivate")
+	if got := h.NextAction(); got != "reactivate" {
+		t.Errorf("NextAction() = %q, want reactivate (only Subscription set)", got)
+	}
+	// Add an Identity rebind: Identity precedes Subscription, so it now wins.
+	h.Degrade(Identity, "bind_failed: uat_unavailable")
+	h.SetNextAction(Identity, "rebind")
+	if got := h.NextAction(); got != "rebind" {
+		t.Errorf("NextAction() = %q, want rebind (Identity outranks Subscription)", got)
+	}
+	// Clearing Identity falls back to the Subscription recommendation.
+	h.Clear(Identity)
+	if got := h.NextAction(); got != "reactivate" {
+		t.Errorf("NextAction() after Clear(Identity) = %q, want reactivate (fallback)", got)
+	}
+}
+
 func TestFacts_Snapshot_ReturnsAllNonHealthyInDimensionOrder(t *testing.T) {
 	h := New()
 	// Set out of order; Snapshot must still return in Dimension order.

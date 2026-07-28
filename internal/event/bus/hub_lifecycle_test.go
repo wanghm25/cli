@@ -146,7 +146,8 @@ func TestHub_Consumers_PopulatesActionFields(t *testing.T) {
 	c.SetSuspensionReason("authority_revoked")
 	c.SetLastAction("reactivate")
 	c.SetLastActionError("missing_scopes")
-	c.SetNextAction(lifecycle.NextActionReactivate)
+	c.SetSubscriptionDegraded(lifecycle.ReasonRemoteSubscriptionSuspended)
+	c.SetSubscriptionNextAction(lifecycle.NextActionReactivate)
 	h.RegisterAndIsFirst(c)
 
 	consumers := h.Consumers()

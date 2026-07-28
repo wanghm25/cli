@@ -51,7 +51,7 @@ func (a *SubscriptionAction) runReactivate(ctx context.Context, le LifecycleEven
 		markActionResult(res.conns, "reactivate", err)
 		for _, c := range res.conns {
 			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionSuspended)
-			c.SetNextAction(NextActionReactivate)
+			c.SetSubscriptionNextAction(NextActionReactivate)
 		}
 		return err
 	}
@@ -61,7 +61,7 @@ func (a *SubscriptionAction) runReactivate(ctx context.Context, le LifecycleEven
 	if callErr != nil {
 		for _, c := range res.conns {
 			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionSuspended)
-			c.SetNextAction(NextActionReactivate)
+			c.SetSubscriptionNextAction(NextActionReactivate)
 		}
 		return callErr
 	}
@@ -72,10 +72,11 @@ func (a *SubscriptionAction) runReactivate(ctx context.Context, le LifecycleEven
 			continue
 		}
 		// A bind failure marks the IDENTITY dimension (via bindConsumer) and
-		// records rebind as the next step; the subscription itself reactivated
-		// OK, so its dimension is not degraded here.
+		// records rebind as THAT dimension's own recovery; the subscription
+		// itself reactivated OK, so its dimension is not degraded here (and its
+		// own next_action is untouched — the rebind lives on Identity).
 		if bindErr := a.gate.BindConsumer(ctx, c); bindErr != nil {
-			c.SetNextAction(NextActionRebind)
+			c.SetIdentityNextAction(NextActionRebind)
 			continue
 		}
 		c.ClearSubscriptionDegraded()
@@ -96,7 +97,7 @@ func (a *SubscriptionAction) runRenew(ctx context.Context, le LifecycleEvent, re
 		markActionResult(res.conns, "renew", err)
 		for _, c := range res.conns {
 			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionExpiringSoon)
-			c.SetNextAction(NextActionRenew)
+			c.SetSubscriptionNextAction(NextActionRenew)
 		}
 		return err
 	}
@@ -106,7 +107,7 @@ func (a *SubscriptionAction) runRenew(ctx context.Context, le LifecycleEvent, re
 	if callErr != nil {
 		for _, c := range res.conns {
 			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionExpiringSoon)
-			c.SetNextAction(NextActionRenew)
+			c.SetSubscriptionNextAction(NextActionRenew)
 		}
 		return callErr
 	}
@@ -139,7 +140,12 @@ func (a *SubscriptionAction) runReconcileGet(ctx context.Context, le LifecycleEv
 	if err != nil {
 		markActionResult(res.conns, "get", err)
 		for _, c := range res.conns {
-			c.SetNextAction(NextActionGet)
+			// Couldn't even build a client to reconcile: the subscription state
+			// is unverified, so degrade the SUBSCRIPTION dimension (its own
+			// next_action = get), mirroring the get-call-error path below rather
+			// than leaving a next_action with no owning dimension.
+			c.SetSubscriptionDegraded(reasonRemoteStateUnreconciled)
+			c.SetSubscriptionNextAction(NextActionGet)
 		}
 		return err
 	}
@@ -149,7 +155,7 @@ func (a *SubscriptionAction) runReconcileGet(ctx context.Context, le LifecycleEv
 	if callErr != nil {
 		for _, c := range res.conns {
 			c.SetSubscriptionDegraded(reasonRemoteStateUnreconciled)
-			c.SetNextAction(NextActionGet)
+			c.SetSubscriptionNextAction(NextActionGet)
 		}
 		return callErr
 	}
@@ -176,15 +182,15 @@ func (a *SubscriptionAction) runReconcileGet(ctx context.Context, le LifecycleEv
 				c.ClearSubscriptionDegraded()
 			} else {
 				c.SetSubscriptionDegraded(ReasonRemoteSubscriptionConflict)
-				c.SetNextAction(NextActionGet)
+				c.SetSubscriptionNextAction(NextActionGet)
 			}
 		case "suspended":
 			c.SetSuspensionReason(suspensionCode)
 			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionSuspended)
-			c.SetNextAction(NextActionReactivate)
+			c.SetSubscriptionNextAction(NextActionReactivate)
 		case "expired":
 			c.SetSubscriptionDegraded(ReasonRemoteSubscriptionExpired)
-			c.SetNextAction(NextActionRebuild)
+			c.SetSubscriptionNextAction(NextActionRebuild)
 		default:
 			// Open vocabulary: don't guess (mirrors status.go's
 			// remoteDegradedAdvisory).

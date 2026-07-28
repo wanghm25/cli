@@ -106,11 +106,10 @@ type Conn struct {
 	remoteState          string
 
 	// --- lifecycle ACTION state ---
-	// suspensionReason/lastAction/lastActionError/nextAction record the real
-	// per-event action lifecycle.SubscriptionAction took (or, per the security
-	// red line, deliberately did NOT take) for this consumer's remote
-	// Subscription. Same identityMu, same writers/readers as the summary
-	// fields just above.
+	// suspensionReason/lastAction/lastActionError record the real per-event
+	// action lifecycle.SubscriptionAction took (or, per the security red line,
+	// deliberately did NOT take) for this consumer's remote Subscription. Same
+	// identityMu, same writers/readers as the summary fields just above.
 	//
 	//   - suspensionReason: body.suspension.code carried VERBATIM from the
 	//     most recent suspended_v1 (an open string, never a closed
@@ -123,14 +122,15 @@ type Conn struct {
 	//     error classification (errs.Problem's Category/Subtype) rather than
 	//     inventing a new private error code — see
 	//     classifyLifecycleActionError.
-	//   - nextAction: a short, stable hint for what an operator/AI should do
-	//     next while this consumer is degraded (e.g. nextActionReactivate —
-	//     the recovery command is uniformly "reactivate", never "reactive"/"resume").
-	//     "" means no outstanding recommendation.
+	//
+	// The recommended recovery next_action is NO LONGER a single shared slot
+	// here: it lives PER-DIMENSION inside health (health.Fact.NextAction), so
+	// an identity rebind and a subscription recovery each own their own and
+	// clearing one dimension never wipes the other. NextAction() below projects
+	// the single surfaced recommendation across dimensions.
 	suspensionReason string
 	lastAction       string
 	lastActionError  string
-	nextAction       string
 
 	// --- decryption state (failure/observability) ---
 	// decryptState is this consumer's most recent per-subscription decryption
@@ -276,11 +276,12 @@ func (c *Conn) BoundConnID() string {
 }
 
 // SetBoundConnID records a successful BindUser for connID and clears ONLY the
-// identity/binding state — the stale flag and the Identity health dimension. A
-// fresh successful bind supersedes the identity state, but it must NOT wipe a
-// still-true Subscription (deleted/expired/...) or Decryption (decrypt_failed)
-// health fact, nor the subscription-tied next_action: a rebind that cleared
-// everything was the bug this per-dimension model fixes.
+// identity/binding state — the stale flag and the Identity health dimension
+// (including that dimension's own rebind next_action). A fresh successful bind
+// supersedes the identity state, but it must NOT wipe a still-true Subscription
+// (deleted/expired/...) or Decryption (decrypt_failed) health fact, nor the
+// subscription dimension's next_action: a rebind that cleared everything was the
+// bug this per-dimension model fixes.
 func (c *Conn) SetBoundConnID(connID string) {
 	c.identityMu.Lock()
 	c.boundConnID = connID
@@ -320,8 +321,26 @@ func (c *Conn) IdentityDegradedReason() string { return c.health.Reason(health.I
 // SetSubscriptionDegraded records a subscription-dimension failure (the remote
 // Subscription is suspended / expired / deleted / conflicting / unreconciled,
 // or the lifecycle executor was at capacity). Written ONLY by the lifecycle
-// control plane.
+// control plane. Resets this dimension's own next_action (the lifecycle plane
+// pairs it with a SetSubscriptionNextAction call that records the recovery).
 func (c *Conn) SetSubscriptionDegraded(reason string) { c.health.Degrade(health.Subscription, reason) }
+
+// SetSubscriptionNextAction records the SUBSCRIPTION dimension's own recovery
+// next_action (reactivate/renew/rebuild/get), paired with SetSubscriptionDegraded
+// by the lifecycle control plane. Kept per-dimension so it is cleared only with
+// the subscription fact (ClearSubscriptionDegraded), never by an identity rebind.
+func (c *Conn) SetSubscriptionNextAction(action string) {
+	c.health.SetNextAction(health.Subscription, action)
+}
+
+// SetIdentityNextAction records the IDENTITY dimension's own recovery next_action
+// (rebind), set on top of the bind-failure reason the identity gate already
+// recorded. Kept per-dimension so ClearSubscriptionDegraded can never wipe a
+// still-needed rebind, and a successful BindUser (SetBoundConnID -> Clear
+// Identity) clears exactly this action with the identity fact.
+func (c *Conn) SetIdentityNextAction(action string) {
+	c.health.SetNextAction(health.Identity, action)
+}
 
 // SubscriptionDegradedReason returns the subscription-dimension reason ("" =
 // healthy).
@@ -428,34 +447,25 @@ func (c *Conn) SetLastActionError(reason string) {
 	c.lastActionError = reason
 }
 
-// NextAction returns the current recommended recovery step ("" = none).
+// NextAction returns the single recommended recovery step to surface ("" =
+// none), PROJECTED across the per-dimension health facts in the defined
+// Dimension-order priority (Identity > Subscription > ...). It replaces the old
+// single shared next_action slot: each dimension owns its own recovery, and this
+// selects which one to display.
 func (c *Conn) NextAction() string {
-	c.identityMu.Lock()
-	defer c.identityMu.Unlock()
-	return c.nextAction
-}
-
-// SetNextAction records the current recommended recovery step ("" = none
-// outstanding). The recovery command is uniformly "reactivate"
-// (never "reactive"/"resume") wherever that's what's being recommended.
-func (c *Conn) SetNextAction(action string) {
-	c.identityMu.Lock()
-	defer c.identityMu.Unlock()
-	c.nextAction = action
+	return c.health.NextAction()
 }
 
 // ClearSubscriptionDegraded clears the subscription-dimension health fact
-// together with the subscription-tied next_action — used whenever a lifecycle
+// together with that dimension's OWN next_action — used whenever a lifecycle
 // action's outcome means "the subscription is healthy again" (a bare
 // successful Reactivate for a bot, or a successful Reactivate+bindConsumer pair
 // for a user; likewise a successful Renew). Deliberately does NOT touch the
-// Identity/Decryption health dimensions, nor the historical
-// suspensionReason/lastAction/lastActionError bookkeeping.
+// Identity/Decryption health dimensions (nor their next_actions — an identity
+// rebind survives), nor the historical suspensionReason/lastAction/
+// lastActionError bookkeeping.
 func (c *Conn) ClearSubscriptionDegraded() {
 	c.health.Clear(health.Subscription)
-	c.identityMu.Lock()
-	c.nextAction = ""
-	c.identityMu.Unlock()
 }
 
 // DecryptState returns this consumer's most recent decryption status ("" =

@@ -34,11 +34,16 @@ type Conn interface {
 	// attempted and its classified outcome ("" on success).
 	SetLastAction(action string)
 	SetLastActionError(reason string)
-	// SetNextAction records the recommended recovery step ("" = none).
-	SetNextAction(action string)
 	// SetSubscriptionDegraded records the SUBSCRIPTION health dimension's reason
-	// (the only dimension the lifecycle control plane owns).
+	// (the only dimension the lifecycle control plane owns). Paired with
+	// SetSubscriptionNextAction to record that dimension's recovery.
 	SetSubscriptionDegraded(reason string)
+	// SetSubscriptionNextAction records the SUBSCRIPTION dimension's OWN recovery
+	// next_action (reactivate/renew/rebuild/get).
+	SetSubscriptionNextAction(action string)
+	// SetIdentityNextAction records the IDENTITY dimension's OWN recovery
+	// next_action (rebind), on top of a bind-failure the identity gate recorded.
+	SetIdentityNextAction(action string)
 	// SubscriptionDegradedReason returns the current subscription-dimension
 	// reason ("" = healthy).
 	SubscriptionDegradedReason() string

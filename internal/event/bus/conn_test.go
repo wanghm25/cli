@@ -15,6 +15,7 @@ import (
 
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
+	"github.com/larksuite/cli/internal/event/health"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
@@ -315,7 +316,7 @@ func TestConn_SetBoundConnID_ClearsOnlyIdentity(t *testing.T) {
 	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
 	conn.SetIdentityDegraded("bind_failed: test")
 	conn.SetSubscriptionDegraded(lifecycle.ReasonRemoteSubscriptionDeleted)
-	conn.SetNextAction(lifecycle.NextActionRebuild)
+	conn.SetSubscriptionNextAction(lifecycle.NextActionRebuild)
 	conn.RecordDecryptFailure()
 	conn.RecordDecryptFailure()
 	conn.RecordDecryptFailure() // cross the degrade threshold
@@ -520,14 +521,54 @@ func TestConn_SetLastAction_And_SetLastActionError_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestConn_SetNextAction_RoundTrips(t *testing.T) {
+// NextAction() projects the surfaced recovery from the per-dimension health
+// facts. A subscription-dimension recovery round-trips through the projection.
+func TestConn_SubscriptionNextAction_RoundTripsThroughProjection(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
 	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
-	conn.SetNextAction(lifecycle.NextActionReactivate)
+	conn.SetSubscriptionDegraded(lifecycle.ReasonRemoteSubscriptionSuspended)
+	conn.SetSubscriptionNextAction(lifecycle.NextActionReactivate)
 	if got := conn.NextAction(); got != lifecycle.NextActionReactivate {
 		t.Errorf("NextAction() = %q, want %q", got, lifecycle.NextActionReactivate)
+	}
+}
+
+// A per-dimension regression: an identity rebind and a subscription recovery are
+// each surfaced independently, and clearing the subscription dimension does NOT
+// clear the identity rebind — the projection then surfaces the surviving rebind.
+func TestConn_PerDimensionNextAction_IdentityRebindSurvivesSubscriptionClear(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
+
+	// Identity degraded + its own rebind recovery; subscription degraded + get.
+	conn.SetIdentityDegraded("bind_failed: bind_api_error")
+	conn.SetIdentityNextAction(lifecycle.NextActionRebind)
+	conn.SetSubscriptionDegraded(lifecycle.ReasonRemoteSubscriptionConflict)
+	conn.SetSubscriptionNextAction(lifecycle.NextActionGet)
+
+	// Both dimensions retain their own recovery (read straight off the facts).
+	if got := conn.health.Get(health.Identity).NextAction; got != lifecycle.NextActionRebind {
+		t.Errorf("Identity next_action = %q, want %q", got, lifecycle.NextActionRebind)
+	}
+	if got := conn.health.Get(health.Subscription).NextAction; got != lifecycle.NextActionGet {
+		t.Errorf("Subscription next_action = %q, want %q", got, lifecycle.NextActionGet)
+	}
+
+	// Clearing subscription must NOT wipe the identity rebind.
+	conn.ClearSubscriptionDegraded()
+	if got := conn.health.Get(health.Subscription).NextAction; got != "" {
+		t.Errorf("Subscription next_action after clear = %q, want \"\"", got)
+	}
+	if got := conn.health.Get(health.Identity).NextAction; got != lifecycle.NextActionRebind {
+		t.Errorf("Identity next_action after ClearSubscriptionDegraded = %q, want %q (must survive)", got, lifecycle.NextActionRebind)
+	}
+	// The projection now surfaces the surviving identity rebind.
+	if got := conn.NextAction(); got != lifecycle.NextActionRebind {
+		t.Errorf("NextAction() = %q, want %q (rebind survives, subscription cleared)", got, lifecycle.NextActionRebind)
 	}
 }
 
@@ -542,7 +583,7 @@ func TestConn_ClearSubscriptionDegraded_ClearsOnlySubscriptionAndNextAction(t *t
 	defer c2.Close()
 	conn := NewConn(c1, nil, "mail.x", []string{"mail.x"}, 999, "")
 	conn.SetSubscriptionDegraded("remote_subscription_suspended")
-	conn.SetNextAction(lifecycle.NextActionReactivate)
+	conn.SetSubscriptionNextAction(lifecycle.NextActionReactivate)
 	conn.SetSuspensionReason("authority_revoked")
 	conn.SetLastAction("reactivate")
 	conn.SetLastActionError("some_error")
@@ -590,7 +631,7 @@ func TestConn_ActionState_ConcurrentAccessRace(t *testing.T) {
 				conn.SetSuspensionReason("authority_revoked")
 				conn.SetLastAction("reactivate")
 				conn.SetLastActionError("")
-				conn.SetNextAction(lifecycle.NextActionReactivate)
+				conn.SetSubscriptionNextAction(lifecycle.NextActionReactivate)
 				conn.ClearSubscriptionDegraded()
 				_ = conn.SuspensionReason()
 				_ = conn.LastAction()

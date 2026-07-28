@@ -279,7 +279,7 @@ func (e *Executor) markFull(le LifecycleEvent) {
 		ReasonExecutorFull, le.RemoteSubscriptionID, le.EventType, le.EventID)
 	for _, c := range e.registry.ConnsByRemoteSubscriptionID(le.RemoteSubscriptionID) {
 		c.SetSubscriptionDegraded(ReasonExecutorFull)
-		c.SetNextAction(NextActionGet)
+		c.SetSubscriptionNextAction(NextActionGet)
 	}
 }
 

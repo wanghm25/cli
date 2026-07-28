@@ -281,7 +281,7 @@ func applySubDecision(conns []Conn, d subDecision) {
 	case subSet:
 		for _, c := range conns {
 			c.SetSubscriptionDegraded(d.reason)
-			c.SetNextAction(d.next)
+			c.SetSubscriptionNextAction(d.next)
 		}
 	case subClearIfSuspended:
 		for _, c := range conns {
