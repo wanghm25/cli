@@ -69,12 +69,138 @@ func TestIMContractCoverageDiagnosticIsNotChangedFileFiltered(t *testing.T) {
 	}
 }
 
+func TestIMContractCoverageRejectsRiskAndStrategyShapeMismatches(t *testing.T) {
+	index, contracts := completeIMCoverageFixture()
+	index.Commands[0].Risk = "write"
+	contracts[1] = imcatalog.Contract{
+		Key: contracts[1].Key,
+		Strategy: imcatalog.Strategy{
+			Kind:     imcatalog.RequiredResultKind,
+			Required: imcatalog.RequiredSpec{Shape: imcatalog.RequiredNestedString, Field: "message"},
+		},
+		ReplayMode: imcatalog.ReplayForbidden,
+	}
+	contracts[2] = imcatalog.Contract{
+		Key: contracts[2].Key,
+		Strategy: imcatalog.Strategy{
+			Kind:            imcatalog.SearchReadKind,
+			CollectionField: "",
+		},
+	}
+	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	if !hasIMContractDiagnostic(diags, index.Commands[0].Path, "requires command risk read") {
+		t.Fatalf("read/write risk diagnostic absent: %#v", diags)
+	}
+	if !hasIMContractDiagnostic(diags, index.Commands[1].Path, "requires a child field") {
+		t.Fatalf("required shape diagnostic absent: %#v", diags)
+	}
+	if !hasIMContractDiagnostic(diags, index.Commands[2].Path, "requires collection field") {
+		t.Fatalf("search shape diagnostic absent: %#v", diags)
+	}
+}
+
+func TestIMContractCoverageAllowsMaterializeReadToWriteLocalOutput(t *testing.T) {
+	index, contracts := completeIMCoverageFixture()
+	index.Commands[0].Risk = "write"
+	contracts[0] = imcatalog.Contract{
+		Key:      contracts[0].Key,
+		Strategy: imcatalog.Strategy{Kind: imcatalog.MaterializeReadKind},
+	}
+	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	for _, diagnostic := range diags {
+		if diagnostic.CommandPath == index.Commands[0].Path &&
+			strings.Contains(diagnostic.Message, "risk") {
+			t.Fatalf("materialize-read local write risk was rejected: %#v", diagnostic)
+		}
+	}
+}
+
+func TestIMContractCoverageRejectsUnknownKindAndNonIMKey(t *testing.T) {
+	index, contracts := completeIMCoverageFixture()
+	contracts[0] = imcatalog.Contract{
+		Key: "docs resource command00", Strategy: imcatalog.Strategy{Kind: imcatalog.StrategyKind("mystery")},
+	}
+	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	if !hasIMContractDiagnostic(diags, "docs resource command00", "must start with") ||
+		!hasIMContractDiagnostic(diags, "docs resource command00", "unknown strategy kind") {
+		t.Fatalf("unknown/non-IM diagnostics absent: %#v", diags)
+	}
+}
+
+func TestIMContractCoverageRejectsIncompleteAndContradictoryEvidence(t *testing.T) {
+	index, contracts := completeIMCoverageFixture()
+	index.Commands[0].Risk = "write"
+	index.Commands[1].Risk = "write"
+	index.Commands[2].Risk = "write"
+	contracts[0] = imcatalog.Contract{
+		Key: contracts[0].Key,
+		Strategy: imcatalog.Strategy{
+			Kind:     imcatalog.BatchPartialKind,
+			Request:  imcatalog.EvidenceSpec{Shape: imcatalog.EvidenceStrings, Field: "ids"},
+			Failures: []imcatalog.EvidenceSpec{{Shape: imcatalog.EvidenceObjects, Field: "failed"}},
+		},
+	}
+	ledger := imcatalog.EvidenceSpec{Shape: imcatalog.EvidenceStatusObjects, Field: "results", IDField: "id"}
+	contracts[1] = imcatalog.Contract{
+		Key: contracts[1].Key,
+		Strategy: imcatalog.Strategy{
+			Kind:         imcatalog.BatchPartialKind,
+			Request:      imcatalog.EvidenceSpec{Shape: imcatalog.EvidenceStrings, Field: "ids"},
+			ResultLedger: &ledger,
+		},
+	}
+	contracts[2] = imcatalog.Contract{
+		Key: contracts[2].Key,
+		Strategy: imcatalog.Strategy{
+			Kind:         imcatalog.ResponseSetAssertionKind,
+			Request:      imcatalog.EvidenceSpec{Shape: imcatalog.EvidenceStrings, Field: "ids"},
+			ResponseSets: []imcatalog.EvidenceSpec{{Shape: imcatalog.EvidenceNestedObjects, Field: "members", IDField: "id"}},
+			Assertion:    imcatalog.AssertRequestedPresent,
+		},
+	}
+
+	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	if !hasIMContractDiagnostic(diags, index.Commands[0].Path, "failure[0] evidence requires an ID field") {
+		t.Fatalf("failure shape diagnostic absent: %#v", diags)
+	}
+	if !hasIMContractDiagnostic(diags, index.Commands[1].Path, "result ledger cannot be combined") {
+		t.Fatalf("contradictory ledger diagnostic absent: %#v", diags)
+	}
+	if !hasIMContractDiagnostic(diags, index.Commands[2].Path, "response set[0] nested evidence requires container and ID fields") {
+		t.Fatalf("response-set shape diagnostic absent: %#v", diags)
+	}
+}
+
+func TestIMContractCoverageRejectsFieldsFromAnotherStrategyKind(t *testing.T) {
+	index, contracts := completeIMCoverageFixture()
+	contracts[0].Strategy.Required = imcatalog.RequiredSpec{
+		Shape: imcatalog.RequiredTopString,
+		Field: "message_id",
+	}
+	contracts[1].Strategy.ResponseSets = []imcatalog.EvidenceSpec{{
+		Shape: imcatalog.EvidenceStrings,
+		Field: "items",
+	}}
+	contracts[2].Strategy.CollectionField = "items"
+
+	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	if !hasIMContractDiagnostic(diags, index.Commands[0].Path, "entity_read must not set strategy field required") {
+		t.Fatalf("entity/required contradiction absent: %#v", diags)
+	}
+	if !hasIMContractDiagnostic(diags, index.Commands[1].Path, "entity_read must not set strategy field response_sets") {
+		t.Fatalf("entity/response-set contradiction absent: %#v", diags)
+	}
+	if !hasIMContractDiagnostic(diags, index.Commands[2].Path, "entity_read must not set strategy field collection_field") {
+		t.Fatalf("entity/search contradiction absent: %#v", diags)
+	}
+}
+
 func completeIMCoverageFixture() (manifest.Manifest, []imcatalog.Contract) {
 	index := manifest.Manifest{SchemaVersion: 1}
 	contracts := make([]imcatalog.Contract, 0, expectedIMLeafCommands)
 	for i := 0; i < expectedIMLeafCommands; i++ {
 		key := fmt.Sprintf("im resource command%02d", i)
-		index.Commands = append(index.Commands, manifest.Command{Path: key, Domain: "im", Runnable: true})
+		index.Commands = append(index.Commands, manifest.Command{Path: key, Domain: "im", Runnable: true, Risk: "read"})
 		contracts = append(contracts, imcatalog.Contract{
 			Key: imcatalog.ContractKey(key), Strategy: imcatalog.Strategy{Kind: imcatalog.EntityReadKind},
 		})

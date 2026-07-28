@@ -99,7 +99,7 @@ Each message contains:
 | `mentions` | Array of @mentions in the message; each item contains `{id, key, name}`. Present only when the message contains @mentions |
 | `thread_id` | Thread ID (`omt_xxx`) if the message has replies in a thread. Present only when replies exist |
 
-If the task requires the complete conversation, inspect this concrete command's `--help` before executing.
+If the task requires the complete conversation, inspect this concrete command's `--help` before executing and require `meta.complete=true` before claiming the history is complete.
 
 ## Common Errors and Troubleshooting
 

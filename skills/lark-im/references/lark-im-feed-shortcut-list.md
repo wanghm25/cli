@@ -10,7 +10,7 @@ Lists the **current user's** feed shortcuts.
 
 - Only **CHAT-type** shortcuts are exposed via OpenAPI today (others in the IDL are not yet whitelisted).
 - Pagination controls are defined by the concrete command's `--help`.
-- Server-side page size is controlled by the service; in normal use one page usually covers the list.
+- The default call is bounded. For an exhaustive task, inspect the leaf help and require `meta.complete=true` before reporting a complete list.
 - Pagination tokens are opaque and can become invalid when the shortcut list changes.
 
 ## Commands
@@ -23,7 +23,7 @@ lark-cli im +feed-shortcut-list --as user
 lark-cli im +feed-shortcut-list --as user --no-detail
 ```
 
-> If the task requires every shortcut, inspect the concrete command's `--help` before executing. If a continuation token is rejected after the shortcut list changes, restart from the beginning.
+> If the task requires every shortcut, inspect the concrete command's `--help` before executing and accept the result as complete only when `meta.complete=true`. If a continuation token is rejected after the shortcut list changes, restart from the beginning.
 
 ## Parameters
 

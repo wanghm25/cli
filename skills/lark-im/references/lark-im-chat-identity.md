@@ -40,7 +40,7 @@ If the query shows that the owner is a third-party user (`owner_id` is neither t
 
 If a bot creates a group and `--users` includes users who are mutually invisible to the bot, the entire request fails with 232043. Use two steps instead:
 
-1. Create the group with the bot first, excluding invisible users: `lark-cli im +chat-create --name "Group Name"`
+1. Generate a UUID once with a UUID library or tool, then create the group with the bot first, excluding invisible users: `lark-cli im +chat-create --name "Group Name" --idempotency-key <generated_uuid>`
 2. Add users later with a user-identity member-management flow
 
 ### Insufficient Privileges

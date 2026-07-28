@@ -62,10 +62,8 @@ This makes `--markdown` the simplest path for lightweight formatted messages.
 - It does **not** promise full CommonMark / GitHub Flavored Markdown support.
 - It always becomes a `post` payload with a single `zh_cn` locale.
 - It does **not** let you set a `post` title. If you need a title, use `--msg-type post --content ...`.
-- Headings are rewritten:
-    - `# Title` becomes `#### Title`
-    - `##` to `######` are normalized to `#####` when the content contains H1-H3
-- Consecutive headings are separated with blank lines after heading normalization.
+- H1 through H6 are preserved outside fenced code blocks.
+- Consecutive headings are separated with blank lines during normalization.
 - Block spacing and line breaks may be normalized during conversion.
 - Code blocks are preserved as code blocks.
 - Excess blank lines are compressed.
@@ -125,6 +123,12 @@ lark-cli im +messages-send --chat-id oc_xxx --content '{"text":"Hello"}' --as bo
 # Send to a direct message (pass open_id)
 lark-cli im +messages-send --user-id ou_xxx --text "Hello" --as bot
 
+# Send text and add a structured user mention (repeat or comma-separate --mention)
+lark-cli im +messages-send --chat-id oc_xxx --text "Please review" --mention ou_xxx --as bot
+
+# Mention all members with a structured at node
+lark-cli im +messages-send --chat-id oc_xxx --text "Release started" --mention-all --as bot
+
 # Send multi-line text while preserving formatting
 lark-cli im +messages-send --chat-id oc_xxx --text $'Line 1\nLine 2\n  indented line' --as bot
 
@@ -153,7 +157,7 @@ lark-cli im +messages-send --chat-id oc_xxx --video ./demo.mp4 --video-cover img
 lark-cli im +messages-send --chat-id oc_xxx --audio ./voice.opus --as bot
 
 # Use an idempotency key (same key sends only once within 1 hour)
-lark-cli im +messages-send --chat-id oc_xxx --text "Hello" --idempotency-key my-unique-id --as bot
+lark-cli im +messages-send --chat-id oc_xxx --text "Hello" --idempotency-key <generated_uuid> --as bot
 
 # Preview the request without executing it
 lark-cli im +messages-send --chat-id oc_xxx --markdown $'## Test\n\nhello' --dry-run --as bot
@@ -189,6 +193,8 @@ lark-cli im +messages-send --chat-id oc_xxx --msg-type interactive --content '<c
 | `--video <path\|url\|key>` | One content option | Cwd-relative local video path, URL, or `file_key` (`file_xxx`). Local paths and URLs are uploaded automatically. **Must be paired with `--video-cover`**                                      |
 | `--video-cover <path\|url\|key>` | **Required with `--video`** | Cwd-relative local cover image path, URL, or `image_key` (`img_xxx`). Local paths and URLs are uploaded automatically                                                                         |
 | `--audio <path\|url\|key>` | One content option | Voice-message audio key, URL, or cwd-relative local path. Local paths and URLs must be Opus (`.opus` or Ogg Opus `.ogg`) |
+| `--mention <id>` | No | Add a structured user mention to a text/post message. Repeat the flag or pass comma-separated IDs; IDs are sent unchanged. |
+| `--mention-all` | No | Add a structured @all node to a text/post message. May be combined with `--mention`; do not pass `all` through `--mention`. |
 | `--msg-type <type>` | No | Message type (default `text`). If you use `--text` / `--markdown` / media flags, the effective type is inferred automatically. Explicitly setting a conflicting `--msg-type` fails validation |
 | `--idempotency-key <key>` | No | Idempotency key, max 50 characters; the same key sends only one message within 1 hour                                                                                                        |
 | `--as <identity>` | No | Identity type: `bot` or `user` (default `bot`)                                                                                                                                                |
@@ -208,12 +214,13 @@ lark-cli im +messages-send --chat-id oc_xxx --msg-type interactive --content '<c
 - Using `--content` without making the JSON match the effective `--msg-type`.
 - Explicitly setting `--msg-type` to something that conflicts with `--text`, `--markdown`, or media flags.
 - Mixing `--text`, `--markdown`, or `--content` with media flags in one command.
+- Hand-writing `<at>` in text/post content. Pass targets with `--mention` / `--mention-all`; those flags are supported only for text and post messages.
 
 ## `content` Format Reference
 
 | `msg_type` | Example `content` |
 |----------|-------------|
-| `text` | `{"text":"Hello <at user_id=\"ou_xxx\">name</at>"}` |
+| `text` | `{"text":"Hello"}`; add mentions through `--mention` / `--mention-all` |
 | `post` | `{"zh_cn":{"title":"Title","content":[[{"tag":"text","text":"Body"}]]}}` |
 | `image` | `{"image_key":"img_xxx"}` |
 | `file` | `{"file_key":"file_xxx"}` |
@@ -237,23 +244,15 @@ lark-cli im +messages-send --chat-id oc_xxx --msg-type interactive --content '<c
 }
 ```
 
-## @Mention Format
+## Structured @Mentions
 
-The `<at>` syntax differs by message type. The shortcut only normalizes mentions for `text` and `post`; `interactive` card content is passed through verbatim, so cards must use the card-native syntax below.
+- For `--text`, `--markdown`, or `--msg-type post --content`, pass each user ID through `--mention`; the flag is repeatable and also accepts comma-separated IDs. Values are sent unchanged, so do not convert between `user_id` and `open_id`.
+- Use `--mention-all` for @all. It may be combined with individual `--mention` values.
+- Do not hand-write `<at>` inside text/post content when using these shortcuts. Mention flags reject non-text/post message types.
+- A returned `mention_result.status` of `complete` means all requested individual mention results were attributed. `accepted_unverified` means the service accepted the message/@all node but delivery is not verified. `partial` or `partial_unattributed` means the message may already exist but mention completion is not fully proven.
+- Follow `data.mention_result.retry_scope`. When it is `none`, do not resend the original message to repair or verify mentions; an extra remedial message is a new user-approved business action. For `partial_unattributed`, do not guess which user failed.
 
-### `text`
-
-- `<at user_id="ou_xxx">name</at>` — the inner text is the mentioned user's display name and is optional (`<at user_id="ou_xxx"></at>` also works)
-- @all: `<at user_id="all"></at>`
-
-### `post`
-
-- Inside a `text` or `md` element, the same inline form as `text` works: `<at user_id="ou_xxx">name</at>`
-- Or use a dedicated `at` element node: `{"tag":"at","user_id":"ou_xxx"}` (use `"all"` to mention everyone)
-
-### `interactive` (card)
-
-Card content is **not** normalized — use the card-native `<at>` syntax inside a `lark_md` / `markdown` element:
+Interactive cards do not use the shortcut mention flags. Use the card-native `<at>` syntax inside a `lark_md` / `markdown` element:
 
 - single user by open_id: `<at id=ou_xxx></at>`
 - multiple users: `<at ids=ou_xxx1,ou_xxx2></at>`

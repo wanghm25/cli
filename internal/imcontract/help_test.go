@@ -63,3 +63,25 @@ func TestHelpTextIsLazyAndRunnableOnly(t *testing.T) {
 		t.Fatalf("parent HelpText() = %q, want empty", got)
 	}
 }
+
+func TestHelpTextAddsSameKeyReplayOnlyToApplicableCommands(t *testing.T) {
+	const approvedSameKeyText = "Idempotent retry: generate the key outside this command, then reuse the same literal with unchanged parameters on every retry."
+	if helpSameKeyReplay != approvedSameKeyText {
+		t.Fatalf("same-key help = %q, want approved text %q", helpSameKeyReplay, approvedSameKeyText)
+	}
+	tests := []struct {
+		key  ContractKey
+		want string
+	}{
+		{"im +messages-send", approvedSameKeyText},
+		{"im +chat-create", approvedSameKeyText},
+		{"im +chat-update", ""},
+	}
+	for _, tt := range tests {
+		cmd := &cobra.Command{Use: "leaf", Run: func(*cobra.Command, []string) {}}
+		AnnotateHelpContract(cmd, tt.key)
+		if got := HelpText(cmd); got != tt.want {
+			t.Fatalf("%s HelpText() = %q, want %q", tt.key, got, tt.want)
+		}
+	}
+}

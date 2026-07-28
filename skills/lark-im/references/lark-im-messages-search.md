@@ -90,6 +90,11 @@ The shortcut automatically performs:
 
 The user does not need to manage the search, detail fetch, or chat-context lookup manually.
 
+Use the returned `meta.complete` as the recovery decision:
+
+- `meta.complete=true`: the result is already materialized. Use its `message_id`, `file_key`, and other IDs directly; do not call `+messages-mget` and do not repeat the search/list.
+- `meta.complete=false`: follow that response's `hint` and query only `materialization.missing_message_ids` with `+messages-mget`. Do not re-query IDs already materialized, rerun the whole search, or infer that missing detail means the message does not exist.
+
 ### 3. Conversation context is enriched automatically
 
 In JSON output, each message automatically includes conversation context:
@@ -174,7 +179,7 @@ When the user asks you to summarize work, generate a weekly report, or compile a
 
 1. **Start with targeted filters** — use `--chat-id`, `--sender`, `--start`, `--end` to narrow the scope.
 2. **Inspect the leaf help before execution** — the concrete command's `--help` owns full-read controls and result guarantees.
-3. **Accumulate before summarizing** — fetch a complete result, then analyze and summarize. Do not summarize a partial response.
+3. **Accumulate before summarizing** — require `meta.complete=true`, then analyze and summarize. If it is false, recover only the returned `missing_message_ids` as directed by the response hint.
 4. **Use structured output** — JSON preserves message IDs and completion metadata needed to verify the evidence set.
 
 ### Example: Weekly work summary from a project chat
@@ -188,6 +193,7 @@ lark-cli im +messages-search --query "" --chat-id oc_xxx --sender ou_me --start 
 ### Key points
 
 - **Require complete evidence** for summary tasks. A partial response is insufficient for a meaningful work summary.
+- When `meta.complete=true`, consume the current messages and IDs directly. Do not use `+messages-mget` as a second lookup or repeat the search.
 - If the user does not specify a time range, default to the current week (Monday to today) for weekly reports, or ask for clarification.
 - When summarizing, group messages by topic/thread rather than by chronological order for better readability.
 

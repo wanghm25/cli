@@ -75,7 +75,20 @@ The four message-pulling shortcuts (`+messages-mget`, `+chat-messages-list`, `+m
 
 Card messages (`interactive` type) are not yet supported for compact conversion in event subscriptions. The raw event data will be returned instead, with a hint printed to stderr.
 
-`interactive` cards support callback events (`card.action.trigger`) — see [`references/lark-im-card-action-reply.md`](references/lark-im-card-action-reply.md).
+`interactive` cards support callback events (`card.action.trigger`). To update the original card after a callback, use the delayed-update raw API documented in [`references/lark-im-card-action-reply.md`](references/lark-im-card-action-reply.md); do not send a replacement card.
+
+### IM Completion and Recovery
+
+- For reads, when `meta.complete` is present it is authoritative: consume IDs and resources directly when `true`; when `false`, perform only the recovery named by that response's `hint`.
+- For writes, when `data.completion` or `data.mention_result` is present, decide recovery only from that result's `retry_scope`. `partial` and `accepted_unverified` are not proof of full business completion, and display-layer errors must not trigger replay of an already completed write.
+
+### Intent Routing
+
+- Send or reply with an @mention through `+messages-send` or `+messages-reply`; use their structured mention inputs and read the leaf reference/help for exact flags. Do not hand-write text/post `<at>` tags. Card-native `<at id=...>` remains card-only.
+- For message search, user identity uses `+messages-search`. Bot identity cannot use it: resolve the chat with `+chat-search --as bot`, then read it with `+chat-messages-list --as bot`.
+- For app, SMS, or phone urgency on an already-sent bot message, use the matching typed raw method: `im messages urgent_app`, `urgent_sms`, or `urgent_phone`. The bot must be the original sender and still be in the conversation.
+- For a callback-token delayed card update, use `lark-cli api POST /open-apis/interactive/v1/card/update --as bot` with the token and the complete new card JSON; see the card action reference.
+- To put an already-sent card/message in a chat's top notice, use the raw escape hatch `POST /open-apis/im/v1/chats/<chat_id>/top_notice/put_top_notice` with `chat_top_notice`; this is not a pin, feed shortcut, or delayed card update.
 
 ### Audio Messages
 
@@ -106,7 +119,7 @@ Feed shortcuts add chats to the current user's feed sidebar. They are distinct f
 Key limits:
 - Only **CHAT-type** (`feed_card_id` is `oc_xxx`) is exposed via OpenAPI; doc/app/subscription shortcuts exist internally but are not yet whitelisted.
 - All three operations (create/remove/list) are **user-identity only** — they sign with `user_access_token`.
-- Batch size is **10 per call** for create/remove; list is a one-page wrapper with opaque `page_token` pagination.
+- Batch size is **10 per call** for create/remove. Listing defaults to a bounded page; for an exhaustive task, inspect the leaf help and require `meta.complete=true` before claiming the list is complete.
 
 ## Shortcuts（推荐优先使用）
 
@@ -114,17 +127,17 @@ Shortcut 是对常用操作的高级封装（`lark-cli im +<verb> [flags]`）。
 
 | Shortcut | 说明 |
 |----------|------|
-| [`+chat-create`](references/lark-im-chat-create.md) | Create a group chat or topic chat; user/bot; --chat-mode group|topic; private/public; invites users/bots; optionally sets bot manager |
+| [`+chat-create`](references/lark-im-chat-create.md) | Create a group chat or topic chat; user/bot; requires a caller-owned idempotency key; supports group/topic, private/public, member invites, and optional bot manager |
 | [`+chat-list`](references/lark-im-chat-list.md) | List chats the current user/bot is a member of; defaults to groups; pass --types=p2p,group to include p2p single chats (user-only); user/bot; supports sorting, pagination, --exclude-muted (user-only) |
 | [`+chat-members-list`](references/lark-im-chat-members-list.md) | List members of a chat; returns separate users[] / bots[] buckets; callable as user or bot; --member-types filters which kinds to return; surfaces truncations[] when the server caps a bucket |
 | [`+chat-messages-list`](references/lark-im-chat-messages-list.md) | List messages in a chat or P2P conversation; user/bot; accepts --chat-id or --user-id, resolves P2P chat_id, supports time range/sort/pagination |
 | [`+chat-search`](references/lark-im-chat-search.md) | Search visible group chats by --query keyword and/or --member-ids; user/bot; e.g. look up chat_id by group name; supports type filters, sorting, pagination, and --exclude-muted (user identity only) |
 | [`+chat-update`](references/lark-im-chat-update.md) | Update group chat name or description; user/bot; updates a chat's name or description |
 | [`+messages-mget`](references/lark-im-messages-mget.md) | Batch get messages by IDs; user/bot; fetches up to 50 om_ message IDs, formats sender names, expands thread replies |
-| [`+messages-reply`](references/lark-im-messages-reply.md) | Reply to a message (supports thread replies); user/bot; supports text/markdown/post/media replies, reply-in-thread, idempotency key |
+| [`+messages-reply`](references/lark-im-messages-reply.md) | Reply to a message (supports thread replies); user/bot; supports text/markdown/post/media replies, structured @mentions, reply-in-thread, idempotency key |
 | [`+messages-resources-download`](references/lark-im-messages-resources-download.md) | Download images/files from a message; user/bot; supports automatic chunked download for large files (8MB chunks), auto-detects file extension from Content-Type |
 | [`+messages-search`](references/lark-im-messages-search.md) | Search messages across chats (supports keyword, sender, time range filters) with user identity; user-only; filters by chat/sender/attachment/time and enriches results via batched mget and chats batch_query |
-| [`+messages-send`](references/lark-im-messages-send.md) | Send a message to a chat or direct message; user/bot; sends to chat-id or user-id with text/markdown/post/media, supports idempotency key |
+| [`+messages-send`](references/lark-im-messages-send.md) | Send a message to a chat or direct message; user/bot; sends to chat-id or user-id with text/markdown/post/media, structured @mentions, and idempotency key |
 | [`+threads-messages-list`](references/lark-im-threads-messages-list.md) | List messages in a thread; user/bot; accepts om_/omt_ input, resolves message IDs to thread_id, supports sort/pagination |
 | [`+flag-create`](references/lark-im-flag-create.md) | Create a bookmark on a message; user-only; defaults to message-layer flag; use --flag-type feed for feed-layer flag (item_type auto-detected from chat mode) |
 | [`+flag-cancel`](references/lark-im-flag-cancel.md) | Cancel (remove) a bookmark. When no --flag-type is given, best-effort double-cancel: removes message layer and (when chat_type is determinable) feed layer |

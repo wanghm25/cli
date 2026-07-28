@@ -211,8 +211,12 @@ description: Manage Drive comments with service command references.
 		},
 	}}
 	for _, contract := range imcatalog.All() {
+		risk := "read"
+		if contract.Strategy.Kind.IsWrite() {
+			risk = "write"
+		}
 		idx.Commands = append(idx.Commands, manifest.Command{
-			Path: string(contract.Key), Domain: "im", Source: manifest.SourceBuiltin, Runnable: true,
+			Path: string(contract.Key), Domain: "im", Source: manifest.SourceBuiltin, Runnable: true, Risk: risk,
 		})
 	}
 	if err := manifest.WriteFile(manifestPath, manifest.KindCommandManifest, m); err != nil {

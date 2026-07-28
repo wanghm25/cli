@@ -143,6 +143,79 @@ List who has read a message you sent.
 lark-cli im messages read_users --message-id <message_id> --user-id-type open_id
 ```
 
+## messages urgent_app
+Send an in-app urgent notification for an existing bot-sent message.
+
+### Avoid when
+- The user asked for a phone call → use [[messages urgent_phone]]
+- The user asked for SMS → use [[messages urgent_sms]]
+- The message has not been sent yet → send it first with [[+messages-send]]
+
+### Prerequisites
+- message_id of a message sent by the calling bot
+- bot identity; the bot must still be in the conversation
+
+## messages urgent_phone
+Send a phone urgent notification for an existing bot-sent message.
+
+### Avoid when
+- The user asked only for an in-app prompt → use [[messages urgent_app]]
+- The user asked for SMS → use [[messages urgent_sms]]
+
+### Prerequisites
+- message_id of a message sent by the calling bot
+- bot identity; the bot must still be in the conversation
+
+## messages urgent_sms
+Send an SMS urgent notification for an existing bot-sent message.
+
+### Avoid when
+- The user asked only for an in-app prompt → use [[messages urgent_app]]
+- The user asked for a phone call → use [[messages urgent_phone]]
+
+### Prerequisites
+- message_id of a message sent by the calling bot
+- bot identity; the bot must still be in the conversation
+
+## interactive card delayed update
+Update the original interactive card after receiving a `card.action.trigger` token.
+
+### Avoid when
+- Sending a new card → use [[+messages-send]] or [[+messages-reply]]
+- Pinning or showing a message as a chat top notice → use the matching IM capability instead
+
+### Prerequisites
+- callback token plus the complete new card JSON; partial card patches are unsupported
+- bot identity
+
+### Examples
+
+```bash
+lark-cli api POST /open-apis/interactive/v1/card/update --as bot \
+  --data '{"token":"<token>","card":<complete_new_card_json>}'
+```
+
+See the `card.action.trigger` reference for token limits and Card 1.0 visibility requirements.
+
+## chat top notice put
+Put an already-sent message or card in a chat's top notice.
+
+### Avoid when
+- Pinning a message in chat history → use [[pins create]]
+- Pinning a chat in the user's feed sidebar → use [[+feed-shortcut-create]]
+- Updating the contents of a card after a callback → use [[interactive card delayed update]]
+
+### Prerequisites
+- chat_id and the existing message/card reference for `chat_top_notice`
+- use the raw API escape hatch; there is no typed IM leaf command for this endpoint
+
+### Examples
+
+```bash
+lark-cli api POST /open-apis/im/v1/chats/<chat_id>/top_notice/put_top_notice --as bot \
+  --data '{"chat_top_notice":<existing_message_reference>}'
+```
+
 ## reactions create
 Add an emoji reaction to a message.
 

@@ -3,10 +3,15 @@
 
 package imcontract
 
-import "github.com/spf13/cobra"
+import (
+	"strings"
+
+	"github.com/spf13/cobra"
+)
 
 const (
 	helpContractAnnotation = "imcontract.help.contract-key"
+	helpSameKeyReplay      = "Idempotent retry: generate the key outside this command, then reuse the same literal with unchanged parameters on every retry."
 )
 
 func AnnotateHelpContract(cmd *cobra.Command, key ContractKey) {
@@ -27,5 +32,12 @@ func HelpText(cmd *cobra.Command) string {
 	if !ok {
 		return ""
 	}
-	return contract.HelpPolicy.Text()
+	var lines []string
+	if policy := contract.HelpPolicy.Text(); policy != "" {
+		lines = append(lines, policy)
+	}
+	if contract.ReplayMode == ReplaySameIdempotencyKey {
+		lines = append(lines, helpSameKeyReplay)
+	}
+	return strings.Join(lines, "\n")
 }
