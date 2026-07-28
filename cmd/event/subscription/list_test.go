@@ -19,6 +19,7 @@ import (
 	"github.com/larksuite/cli/internal/credential"
 	"github.com/larksuite/cli/internal/event/buslocal"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 )
 
 // fakeListAPI is a network-free stand-in for the platform/lark gateway's List —
@@ -27,11 +28,11 @@ import (
 // The gateway already pages/projects, so the fake hands back a domain
 // SubscriptionPage.
 type fakeListAPI struct {
-	page *larkgw.SubscriptionPage
+	page *subown.SubscriptionPage
 	err  error
 }
 
-func (f *fakeListAPI) List(_ context.Context, _ larkgw.ListParams) (*larkgw.SubscriptionPage, error) {
+func (f *fakeListAPI) List(_ context.Context, _ subown.ListParams) (*subown.SubscriptionPage, error) {
 	return f.page, f.err
 }
 
@@ -52,8 +53,8 @@ func okListResp(items []*larkeventv1.SubscriptionDetail, hasMore bool, pageToken
 
 // listPage builds a domain SubscriptionPage from SDK details (projected exactly
 // as the gateway would), for the migrated list command's fake.
-func listPage(items []*larkeventv1.SubscriptionDetail, hasMore bool, pageToken string) *larkgw.SubscriptionPage {
-	page := &larkgw.SubscriptionPage{HasMore: hasMore, NextPageToken: pageToken}
+func listPage(items []*larkeventv1.SubscriptionDetail, hasMore bool, pageToken string) *subown.SubscriptionPage {
+	page := &subown.SubscriptionPage{HasMore: hasMore, NextPageToken: pageToken}
 	for _, d := range items {
 		page.Items = append(page.Items, larkgw.ProjectSubscription(d))
 	}

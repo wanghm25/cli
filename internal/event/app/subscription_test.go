@@ -11,7 +11,6 @@ import (
 	"github.com/larksuite/cli/errs"
 	event "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
-	lark "github.com/larksuite/cli/internal/event/platform/lark"
 	subscription "github.com/larksuite/cli/internal/event/subscription"
 )
 
@@ -235,14 +234,14 @@ type fakeUpdatePort struct {
 	patchErr  error
 
 	patchCalls int
-	patchSpec  lark.PatchSpec
+	patchSpec  subscription.PatchSpec
 }
 
 func (f *fakeUpdatePort) Get(context.Context, string) (*model.RemoteSubscription, error) {
 	return f.getSub, f.getErr
 }
 
-func (f *fakeUpdatePort) Patch(_ context.Context, _ string, spec lark.PatchSpec) (*model.RemoteSubscription, error) {
+func (f *fakeUpdatePort) Patch(_ context.Context, _ string, spec subscription.PatchSpec) (*model.RemoteSubscription, error) {
 	f.patchCalls++
 	f.patchSpec = spec
 	return f.patchResp, f.patchErr

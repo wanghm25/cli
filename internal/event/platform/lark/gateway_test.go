@@ -16,6 +16,7 @@ import (
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
+	"github.com/larksuite/cli/internal/event/subscription"
 )
 
 // fakeClient is a network-free stand-in for the identity-bound, already-
@@ -136,7 +137,7 @@ func TestGateway_Create_NilData_ReturnsInvalidResponse(t *testing.T) {
 	g := newGateway(&fakeClient{createFunc: func(*larkeventv1.CreateSubscriptionReq) (*larkeventv1.CreateSubscriptionResp, error) {
 		return &larkeventv1.CreateSubscriptionResp{}, nil
 	}})
-	_, err := g.Create(context.Background(), CreateSpec{EventType: "im.message.created_v1"})
+	_, err := g.Create(context.Background(), subscription.CreateSpec{EventType: "im.message.created_v1"})
 	assertInvalidResponse(t, err)
 }
 
@@ -146,7 +147,7 @@ func TestGateway_Create_EmptyID_ReturnsInvalidResponse(t *testing.T) {
 			Subscription: &larkeventv1.SubscriptionDetail{State: strPtr("active")},
 		}}, nil
 	}})
-	_, err := g.Create(context.Background(), CreateSpec{EventType: "im.message.created_v1"})
+	_, err := g.Create(context.Background(), subscription.CreateSpec{EventType: "im.message.created_v1"})
 	assertInvalidResponse(t, err)
 }
 
@@ -170,7 +171,7 @@ func TestGateway_Patch_NilData_ReturnsInvalidResponse(t *testing.T) {
 	g := newGateway(&fakeClient{patchFunc: func(*larkeventv1.PatchSubscriptionReq) (*larkeventv1.PatchSubscriptionResp, error) {
 		return &larkeventv1.PatchSubscriptionResp{}, nil
 	}})
-	_, err := g.Patch(context.Background(), "sub_x", PatchSpec{Filter: &event.Filter{}})
+	_, err := g.Patch(context.Background(), "sub_x", subscription.PatchSpec{Filter: &event.Filter{}})
 	assertInvalidResponse(t, err)
 }
 
@@ -245,7 +246,7 @@ func TestGateway_List_ProjectsItemsAndPagination(t *testing.T) {
 			PageToken: strPtr("tok_next"),
 		}}, nil
 	}})
-	page, err := g.List(context.Background(), ListParams{State: "active"})
+	page, err := g.List(context.Background(), subscription.ListParams{State: "active"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -261,7 +262,7 @@ func TestGateway_List_EmptyData_ReturnsEmptyPage(t *testing.T) {
 	g := newGateway(&fakeClient{listFunc: func(_ int, _ *larkeventv1.ListSubscriptionReq) (*larkeventv1.ListSubscriptionResp, error) {
 		return &larkeventv1.ListSubscriptionResp{}, nil
 	}})
-	page, err := g.List(context.Background(), ListParams{})
+	page, err := g.List(context.Background(), subscription.ListParams{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -279,7 +280,7 @@ func TestGateway_WalkSubscriptions_StopsEarlyWhenVisitReturnsFalse(t *testing.T)
 		}}, nil
 	}})
 	var seen []string
-	capped, err := g.WalkSubscriptions(context.Background(), ListParams{}, func(s model.RemoteSubscription) bool {
+	capped, err := g.WalkSubscriptions(context.Background(), subscription.ListParams{}, func(s model.RemoteSubscription) bool {
 		seen = append(seen, s.ID.String())
 		return false // stop after the first
 	})
@@ -303,7 +304,7 @@ func TestBuildPatchBody_SetFilter_ProjectsFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build filter: %v", err)
 	}
-	body := buildPatchBody(PatchSpec{Filter: f})
+	body := buildPatchBody(subscription.PatchSpec{Filter: f})
 	if body.Filter == nil {
 		t.Fatal("body.Filter is nil, want the projected filter")
 	}
@@ -326,7 +327,7 @@ func TestBuildPatchBody_SetFilter_ProjectsFilter(t *testing.T) {
 func TestBuildPatchBody_ClearFilter_IsClearForm(t *testing.T) {
 	for name, f := range map[string]*event.Filter{"nil": nil, "empty": {}} {
 		t.Run(name, func(t *testing.T) {
-			body := buildPatchBody(PatchSpec{Filter: f})
+			body := buildPatchBody(subscription.PatchSpec{Filter: f})
 			if body.Filter == nil {
 				t.Fatal(`clear form must send a non-nil empty filter ({"filter":{}}), not omit the field`)
 			}
@@ -355,7 +356,7 @@ func TestBuildCreateBody_Projection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build filter: %v", err)
 	}
-	body := buildCreateBody(CreateSpec{EventType: "im.message.created_v1", TargetResource: "im.message?chat_id=oc_aaa", IncludeResourceData: true, EncryptKey: "the-key", Filter: f})
+	body := buildCreateBody(subscription.CreateSpec{EventType: "im.message.created_v1", TargetResource: "im.message?chat_id=oc_aaa", IncludeResourceData: true, EncryptKey: "the-key", Filter: f})
 	if body.PayloadOptions == nil || body.PayloadOptions.IncludeResourceData == nil || !*body.PayloadOptions.IncludeResourceData {
 		t.Fatalf("include_resource_data not set: %+v", body.PayloadOptions)
 	}
@@ -366,7 +367,7 @@ func TestBuildCreateBody_Projection(t *testing.T) {
 		t.Error("body.Filter is nil, want the projected filter")
 	}
 
-	plain := buildCreateBody(CreateSpec{EventType: "im.message.created_v1", TargetResource: "im.message?chat_id=oc_aaa"})
+	plain := buildCreateBody(subscription.CreateSpec{EventType: "im.message.created_v1", TargetResource: "im.message?chat_id=oc_aaa"})
 	if plain.PayloadOptions.Encrypt != nil {
 		t.Errorf("Encrypt = %+v, want nil when no key supplied", plain.PayloadOptions.Encrypt)
 	}
@@ -382,7 +383,7 @@ func TestGateway_WalkSubscriptions_HitsCap(t *testing.T) {
 		}}, nil
 	}})
 	fake := g.client.(*fakeClient)
-	capped, err := g.WalkSubscriptions(context.Background(), ListParams{}, func(model.RemoteSubscription) bool { return true })
+	capped, err := g.WalkSubscriptions(context.Background(), subscription.ListParams{}, func(model.RemoteSubscription) bool { return true })
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

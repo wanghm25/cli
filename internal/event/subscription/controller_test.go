@@ -11,7 +11,6 @@ import (
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event/model"
-	lark "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
 // fakeGateway is a network-free stand-in for the subscription.Gateway surface.
@@ -24,7 +23,7 @@ type fakeGateway struct {
 	walkFunc   func(call int) ([]model.RemoteSubscription, bool, error)
 	walkCalls  int
 
-	createSpec  *lark.CreateSpec
+	createSpec  *CreateSpec
 	createResp  *model.RemoteSubscription
 	createErr   error
 	createCalls int
@@ -48,7 +47,7 @@ type fakeGateway struct {
 	encryptErr error
 }
 
-func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ lark.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
+func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
 	call := g.walkCalls
 	g.walkCalls++
 	items, capped, err := g.walkItems, g.walkCapped, g.walkErr
@@ -66,7 +65,7 @@ func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ lark.ListParams, vi
 	return capped, nil
 }
 
-func (g *fakeGateway) Create(_ context.Context, spec lark.CreateSpec) (*model.RemoteSubscription, error) {
+func (g *fakeGateway) Create(_ context.Context, spec CreateSpec) (*model.RemoteSubscription, error) {
 	g.createCalls++
 	s := spec
 	g.createSpec = &s

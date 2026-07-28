@@ -23,7 +23,6 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
-	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
 	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/testutil"
@@ -90,7 +89,7 @@ type fakeGateway struct {
 
 	createResp  *model.RemoteSubscription
 	createErr   error
-	createSpec  *larkgw.CreateSpec
+	createSpec  *subown.CreateSpec
 	createCalls int
 
 	reactivateResp  *model.RemoteSubscription
@@ -103,7 +102,7 @@ type fakeGateway struct {
 	encryptCalls int
 }
 
-func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
+func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ subown.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
 	call := g.walkCalls
 	g.walkCalls++
 	items, capped, err := g.walkItems, g.walkCapped, g.walkErr
@@ -121,7 +120,7 @@ func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, 
 	return capped, nil
 }
 
-func (g *fakeGateway) Create(_ context.Context, spec larkgw.CreateSpec) (*model.RemoteSubscription, error) {
+func (g *fakeGateway) Create(_ context.Context, spec subown.CreateSpec) (*model.RemoteSubscription, error) {
 	g.createCalls++
 	s := spec
 	g.createSpec = &s

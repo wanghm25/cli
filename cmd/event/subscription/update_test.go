@@ -24,6 +24,7 @@ import (
 	"github.com/larksuite/cli/internal/event/buslocal"
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 )
 
 // rowFromDetail maps an SDK SubscriptionDetail through the same
@@ -73,16 +74,16 @@ type fakeUpdateAPI struct {
 	getSub *model.RemoteSubscription
 	getErr error
 
-	patchFunc  func(larkgw.PatchSpec) (*model.RemoteSubscription, error)
+	patchFunc  func(subown.PatchSpec) (*model.RemoteSubscription, error)
 	patchCalls int
-	patchSpec  larkgw.PatchSpec
+	patchSpec  subown.PatchSpec
 }
 
 func (f *fakeUpdateAPI) Get(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	return f.getSub, f.getErr
 }
 
-func (f *fakeUpdateAPI) Patch(_ context.Context, _ string, spec larkgw.PatchSpec) (*model.RemoteSubscription, error) {
+func (f *fakeUpdateAPI) Patch(_ context.Context, _ string, spec subown.PatchSpec) (*model.RemoteSubscription, error) {
 	f.patchCalls++
 	f.patchSpec = spec
 	if f.patchFunc == nil {

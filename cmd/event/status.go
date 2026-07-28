@@ -25,6 +25,7 @@ import (
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
 	"github.com/larksuite/cli/internal/event/session"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/transport"
 	"github.com/larksuite/cli/internal/output"
 )
@@ -449,14 +450,14 @@ func staleIdentityAdvisory(match, applicable bool) string {
 
 // --- weak remote supplement (read-only) ---
 
-// refinedSubscriptionGetter narrows the platform/lark SubscriptionGateway to the
-// two calls the remote supplement needs. Tests substitute a fake with no
-// *lark.Client or network call involved. WalkSubscriptions is included so the
-// supplement can switch from one Get per id to a single bounded List scan when
-// many distinct remote_subscription_ids are present.
+// refinedSubscriptionGetter narrows the domain Gateway port to the two calls the
+// remote supplement needs. Tests substitute a fake with no *lark.Client or
+// network call involved. WalkSubscriptions is included so the supplement can
+// switch from one Get per id to a single bounded List scan when many distinct
+// remote_subscription_ids are present.
 type refinedSubscriptionGetter interface {
 	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
-	WalkSubscriptions(ctx context.Context, params larkgw.ListParams, visit func(model.RemoteSubscription) bool) (bool, error)
+	WalkSubscriptions(ctx context.Context, params subown.ListParams, visit func(model.RemoteSubscription) bool) (bool, error)
 }
 
 // remoteSupplementListThreshold is supplementRefinedConsumers's dedup/List
@@ -714,7 +715,7 @@ func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscription
 	out = make(map[string]model.RemoteSubscription, len(wantIDs))
 	remaining := len(wantIDs)
 
-	capped, err := getter.WalkSubscriptions(ctx, larkgw.ListParams{}, func(sub model.RemoteSubscription) bool {
+	capped, err := getter.WalkSubscriptions(ctx, subown.ListParams{}, func(sub model.RemoteSubscription) bool {
 		if id := sub.ID.String(); id != "" && wantIDs[id] != nil {
 			if _, already := out[id]; !already {
 				out[id] = sub

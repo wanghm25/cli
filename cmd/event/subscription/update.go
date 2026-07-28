@@ -18,19 +18,22 @@ import (
 	"github.com/larksuite/cli/internal/event/buslocal"
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/output"
 )
 
-// updateSubscriptionAPI is the subset of the platform/lark SubscriptionGateway
-// this command calls: Get (the remote read this command always performs first,
-// per the CLI-side read+write invariant, both to report remote_before/impact
-// for --dry-run and — since update carries no EventKey — to learn the event
-// type and current filter the new one is validated and compared against) and
-// Patch (the actual write, which only changes the subscription's server-side
-// filter). See listSubscriptionsAPI (list.go) for the test-seam rationale.
+// updateSubscriptionAPI is the subset of the domain Gateway port this command
+// calls: Get (the remote read this command always performs first, per the
+// CLI-side read+write invariant, both to report remote_before/impact for
+// --dry-run and — since update carries no EventKey — to learn the event type
+// and current filter the new one is validated and compared against) and Patch
+// (the actual write, which only changes the subscription's server-side filter).
+// It matches app.UpdatePort's method set, so the command's gateway drives the
+// use case directly. See listSubscriptionsAPI (list.go) for the test-seam
+// rationale.
 type updateSubscriptionAPI interface {
 	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
-	Patch(ctx context.Context, remoteSubscriptionID string, spec larkgw.PatchSpec) (*model.RemoteSubscription, error)
+	Patch(ctx context.Context, remoteSubscriptionID string, spec subown.PatchSpec) (*model.RemoteSubscription, error)
 }
 
 // updateOpts holds `event subscription update`'s flag values.

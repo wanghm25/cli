@@ -23,6 +23,7 @@ import (
 	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/protocol"
 	"github.com/larksuite/cli/internal/event/session"
 )
@@ -53,7 +54,7 @@ func (f *fakeRefinedGetter) Get(_ context.Context, _ string) (*model.RemoteSubsc
 	return f.sub, f.err
 }
 
-func (f *fakeRefinedGetter) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
+func (f *fakeRefinedGetter) WalkSubscriptions(_ context.Context, _ subown.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
 	f.walkCalls++
 	if f.walkErr != nil {
 		return false, f.walkErr

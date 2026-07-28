@@ -50,8 +50,9 @@ const StateConflictField = "state"
 // encryption conflict matrix for an active, include_resource_data=true match:
 // GetEncryptKey is the ONLY signal that tells a genuinely encrypted,
 // key-retrievable-by-this-identity match apart from a plaintext resource_data
-// match or one whose key this identity cannot retrieve. *lark.Gateway satisfies
-// it (its GetEncryptKey returns the key, or InvalidResponse for an empty one).
+// match or one whose key this identity cannot retrieve. The Gateway port (and
+// the platform/lark adapter that implements it) satisfies it: its GetEncryptKey
+// returns the key, or InvalidResponse for an empty one.
 type encryptKeyProber interface {
 	GetEncryptKey(ctx context.Context, remoteSubscriptionID string) (string, error)
 }

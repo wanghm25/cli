@@ -9,7 +9,6 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
-	lark "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
 // Request is the classify input: the refined key's remote coordinates
@@ -57,9 +56,10 @@ func (o Observation) authorityMatch() *model.RemoteSubscription {
 }
 
 // walker is the narrow read seam the Observer needs from the gateway: the one
-// bounded, ctx-aware paginated List scan. *lark.Gateway satisfies it.
+// bounded, ctx-aware paginated List scan. The full Gateway port (and the
+// platform/lark adapter that implements it) satisfies it.
 type walker interface {
-	WalkSubscriptions(ctx context.Context, params lark.ListParams, visit func(model.RemoteSubscription) bool) (bool, error)
+	WalkSubscriptions(ctx context.Context, params ListParams, visit func(model.RemoteSubscription) bool) (bool, error)
 }
 
 // Observer reads remote Subscription state through the gateway and narrows it to
@@ -86,7 +86,7 @@ func NewObserver(gw walker) Observer { return Observer{gateway: gw} }
 func (o Observer) Observe(ctx context.Context, req Request) (Observation, error) {
 	var match *model.RemoteSubscription
 	capped, err := o.gateway.WalkSubscriptions(ctx,
-		lark.ListParams{EventType: req.EventType, TargetResource: req.TargetResource},
+		ListParams{EventType: req.EventType, TargetResource: req.TargetResource},
 		func(sub model.RemoteSubscription) bool {
 			if authorityMatchesIdentity(sub.Authority, req.Identity) {
 				m := sub

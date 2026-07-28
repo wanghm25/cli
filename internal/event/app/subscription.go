@@ -10,7 +10,6 @@ import (
 	"github.com/larksuite/cli/errs"
 	event "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
-	lark "github.com/larksuite/cli/internal/event/platform/lark"
 	subscription "github.com/larksuite/cli/internal/event/subscription"
 )
 
@@ -129,15 +128,15 @@ func (SubscriptionUseCase) Provision(ctx context.Context, controller Subscriptio
 	}
 }
 
-// UpdatePort is the subset of the platform/lark gateway the update flow drives:
+// UpdatePort is the subset of the domain Gateway port the update flow drives:
 // Get (the mandatory remote read — update carries no EventKey, so the fetched
 // subscription is the only source of the event type --filter is validated
 // against, and of the current filter the no-op guard compares against) and
 // Patch (the write, which changes only the server-side filter). The command's
-// updateSubscriptionAPI seam satisfies it.
+// updateSubscriptionAPI seam (over the platform/lark adapter) satisfies it.
 type UpdatePort interface {
 	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
-	Patch(ctx context.Context, remoteSubscriptionID string, spec lark.PatchSpec) (*model.RemoteSubscription, error)
+	Patch(ctx context.Context, remoteSubscriptionID string, spec subscription.PatchSpec) (*model.RemoteSubscription, error)
 }
 
 // UpdateKind classifies an Update outcome for the command to render.
@@ -235,7 +234,7 @@ func (SubscriptionUseCase) Update(ctx context.Context, svc UpdatePort, remoteSub
 		}
 	}
 
-	after, err := svc.Patch(ctx, remoteSubscriptionID, lark.PatchSpec{Filter: desired})
+	after, err := svc.Patch(ctx, remoteSubscriptionID, subscription.PatchSpec{Filter: desired})
 	if err != nil {
 		return UpdateOutcome{}, err
 	}

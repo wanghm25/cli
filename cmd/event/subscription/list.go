@@ -15,17 +15,19 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/event/buslocal"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/output"
 )
 
-// listSubscriptionsAPI is the subset of the platform/lark SubscriptionGateway
-// this command calls. It exists purely as a test seam: tests substitute a fake
-// implementing just this method, so the request-building/response-mapping
-// logic (listSubscriptions) is exercised without a real *lark.Client or
-// network call (the whole management plane must be testable via a fake
-// gateway). *larkgw.Gateway satisfies this interface structurally.
+// listSubscriptionsAPI is the subset of the domain Gateway port this command
+// calls. It exists purely as a test seam: tests substitute a fake implementing
+// just this method, so the request-building/response-mapping logic
+// (listSubscriptions) is exercised without a real *lark.Client or network call
+// (the whole management plane must be testable via a fake gateway).
+// *larkgw.Gateway (the platform/lark adapter) satisfies this interface
+// structurally.
 type listSubscriptionsAPI interface {
-	List(ctx context.Context, params larkgw.ListParams) (*larkgw.SubscriptionPage, error)
+	List(ctx context.Context, params subown.ListParams) (*subown.SubscriptionPage, error)
 }
 
 // listOpts holds `event subscription list`'s flag values.
@@ -147,7 +149,7 @@ type listResult struct {
 // running local consumers; each row is additively annotated with the one(s)
 // bound to its remote_subscription_id (nil/none leaves `local` omitted).
 func listSubscriptions(ctx context.Context, svc listSubscriptionsAPI, o listOpts, localConsumers []buslocal.Consumer) (*listResult, error) {
-	page, err := svc.List(ctx, larkgw.ListParams{
+	page, err := svc.List(ctx, subown.ListParams{
 		State:     o.state,
 		EventType: o.eventKey,
 		PageToken: o.pageToken,

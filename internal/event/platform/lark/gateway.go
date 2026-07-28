@@ -13,40 +13,17 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
+	"github.com/larksuite/cli/internal/event/subscription"
 )
 
-// SubscriptionGateway is the domain-facing surface of the remote Subscription
-// management plane. Every method takes/returns domain types only — no
-// larkeventv1.* value ever crosses this boundary — so callers never build a
-// request, unwrap a response, or classify an error themselves.
-type SubscriptionGateway interface {
-	// List returns one page of Subscriptions matching params, with the raw
-	// pagination signals for user-driven paging.
-	List(ctx context.Context, params ListParams) (*SubscriptionPage, error)
-	// WalkSubscriptions pages through Subscriptions matching params (bounded by
-	// event.MaxSubscriptionListPages), invoking visit for each projected item
-	// until visit returns false or the pages are exhausted. capped is true when
-	// the page cap was reached with visit still returning true — NOT a
-	// confirmed "no more results", only "none more within the pages read".
-	WalkSubscriptions(ctx context.Context, params ListParams, visit func(model.RemoteSubscription) bool) (capped bool, err error)
-	// Get returns one Subscription by remote_subscription_id.
-	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
-	// Create creates a Subscription from spec.
-	Create(ctx context.Context, spec CreateSpec) (*model.RemoteSubscription, error)
-	// Patch applies spec (currently the filter) to a Subscription.
-	Patch(ctx context.Context, remoteSubscriptionID string, spec PatchSpec) (*model.RemoteSubscription, error)
-	// Renew extends a Subscription's TTL and returns its refreshed state.
-	Renew(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
-	// Reactivate resumes delivery on a suspended Subscription and returns its
-	// refreshed state.
-	Reactivate(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
-	// Delete removes a Subscription. It carries no subscription payload, so it
-	// returns only an error.
-	Delete(ctx context.Context, remoteSubscriptionID string) error
-	// GetEncryptKey returns a Subscription's encrypt_key. Callers must never log
-	// the returned key.
-	GetEncryptKey(ctx context.Context, remoteSubscriptionID string) (string, error)
-}
+// The Gateway port this adapter implements lives in the domain
+// (internal/event/subscription): subscription.Gateway, with its request specs
+// subscription.CreateSpec/PatchSpec/ListParams/SubscriptionPage. This *Gateway
+// implements it inward — every method takes/returns those domain types only, no
+// larkeventv1.* value ever crosses the boundary, so callers never build a
+// request, unwrap a response, or classify an error themselves. It also provides
+// the List/Patch/Delete management-plane methods consumers narrow to via their
+// own interfaces (app.UpdatePort, the command *API seams).
 
 // subscriptionClient is the identity-bound, already-classifying SDK client the
 // gateway calls. *SubscriptionClient (client.go, this package) satisfies it
@@ -72,11 +49,12 @@ type Gateway struct {
 	client subscriptionClient
 }
 
-// compile-time assertions: the concrete gateway satisfies its interface, and
-// the identity-bound client satisfies the wrapped seam.
+// compile-time assertions: the concrete gateway satisfies the domain's Gateway
+// port (the dependency-inversion boundary), and the identity-bound client
+// satisfies the wrapped SDK seam.
 var (
-	_ SubscriptionGateway = (*Gateway)(nil)
-	_ subscriptionClient  = (*SubscriptionClient)(nil)
+	_ subscription.Gateway = (*Gateway)(nil)
+	_ subscriptionClient   = (*SubscriptionClient)(nil)
 )
 
 // NewSubscriptionGateway builds a Gateway bound to sdk (already configured with
@@ -101,12 +79,12 @@ func newGateway(client subscriptionClient) *Gateway {
 }
 
 // List issues one List page.
-func (g *Gateway) List(ctx context.Context, params ListParams) (*SubscriptionPage, error) {
+func (g *Gateway) List(ctx context.Context, params subscription.ListParams) (*subscription.SubscriptionPage, error) {
 	resp, err := g.client.List(ctx, buildListReq(params))
 	if err != nil {
 		return nil, err
 	}
-	page := &SubscriptionPage{Items: []model.RemoteSubscription{}}
+	page := &subscription.SubscriptionPage{Items: []model.RemoteSubscription{}}
 	if resp == nil || resp.Data == nil {
 		return page, nil
 	}
@@ -126,7 +104,7 @@ func (g *Gateway) List(ctx context.Context, params ListParams) (*SubscriptionPag
 // bounded, ctx-aware pager (and its exact cap/early-stop/capped semantics) every
 // other List-scan caller in the event subsystem uses, projecting each SDK item
 // to the domain type before handing it to visit.
-func (g *Gateway) WalkSubscriptions(ctx context.Context, params ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
+func (g *Gateway) WalkSubscriptions(ctx context.Context, params subscription.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
 	buildReq := func(pageToken string) *larkeventv1.ListSubscriptionReq {
 		p := params
 		p.PageToken = pageToken
@@ -147,7 +125,7 @@ func (g *Gateway) Get(ctx context.Context, remoteSubscriptionID string) (*model.
 }
 
 // Create issues a Create from spec and validates its payload.
-func (g *Gateway) Create(ctx context.Context, spec CreateSpec) (*model.RemoteSubscription, error) {
+func (g *Gateway) Create(ctx context.Context, spec subscription.CreateSpec) (*model.RemoteSubscription, error) {
 	req := larkeventv1.NewCreateSubscriptionReqBuilder().Body(buildCreateBody(spec)).Build()
 	resp, err := g.client.Create(ctx, req)
 	if err != nil {
@@ -157,7 +135,7 @@ func (g *Gateway) Create(ctx context.Context, spec CreateSpec) (*model.RemoteSub
 }
 
 // Patch issues a Patch and validates its payload.
-func (g *Gateway) Patch(ctx context.Context, remoteSubscriptionID string, spec PatchSpec) (*model.RemoteSubscription, error) {
+func (g *Gateway) Patch(ctx context.Context, remoteSubscriptionID string, spec subscription.PatchSpec) (*model.RemoteSubscription, error) {
 	req := larkeventv1.NewPatchSubscriptionReqBuilder().
 		SubscriptionId(remoteSubscriptionID).
 		Body(buildPatchBody(spec)).
@@ -177,7 +155,7 @@ func (g *Gateway) Patch(ctx context.Context, remoteSubscriptionID string, spec P
 // the projection is directly assertable against a plain, fully-inspectable
 // *larkeventv1.PatchSubscriptionReqBody (the built *PatchSubscriptionReq stores
 // its body in an internal field the SDK transport reads, not readably back).
-func buildPatchBody(spec PatchSpec) *larkeventv1.PatchSubscriptionReqBody {
+func buildPatchBody(spec subscription.PatchSpec) *larkeventv1.PatchSubscriptionReqBody {
 	return larkeventv1.NewPatchSubscriptionReqBodyBuilder().
 		Filter(FilterToSDK(spec.Filter)).
 		Build()
@@ -242,7 +220,7 @@ func (g *Gateway) requireSubscription(detail *larkeventv1.SubscriptionDetail, op
 
 // buildListReq builds the List request from params, adding only the filters the
 // caller actually set.
-func buildListReq(params ListParams) *larkeventv1.ListSubscriptionReq {
+func buildListReq(params subscription.ListParams) *larkeventv1.ListSubscriptionReq {
 	b := larkeventv1.NewListSubscriptionReqBuilder()
 	if params.State != "" {
 		b = b.State(params.State)
@@ -266,7 +244,7 @@ func buildListReq(params ListParams) *larkeventv1.ListSubscriptionReq {
 // include_resource_data and (when present) the encrypt_key on the SAME
 // payload_options so the two are always submitted atomically, and sending the
 // filter only when one was requested.
-func buildCreateBody(spec CreateSpec) *larkeventv1.CreateSubscriptionReqBody {
+func buildCreateBody(spec subscription.CreateSpec) *larkeventv1.CreateSubscriptionReqBody {
 	payloadOptions := larkeventv1.NewCreatePayloadOptionsBuilder().IncludeResourceData(spec.IncludeResourceData)
 	if spec.EncryptKey != "" {
 		payloadOptions = payloadOptions.Encrypt(larkeventv1.NewPayloadOptionsEncryptBuilder().EncryptKey(spec.EncryptKey).Build())

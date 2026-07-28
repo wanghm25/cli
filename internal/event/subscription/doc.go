@@ -8,10 +8,10 @@
 // (the classify) and the create/consume Apply helpers into three collaborators
 // plus a Policy:
 //
-//   - Observer reads remote state through the platform/lark gateway
-//     (List/Walk) and reports an Observation: the authority-narrowed match (if
-//     any) plus whether the scan was Complete or Indeterminate (a paginated scan
-//     that hit the page cap without a definitive answer). It never writes.
+//   - Observer reads remote state through the Gateway port (List/Walk) and
+//     reports an Observation: the authority-narrowed match (if any) plus whether
+//     the scan was Complete or Indeterminate (a paginated scan that hit the page
+//     cap without a definitive answer). It never writes.
 //   - Planner classifies an Observation against a request and a Policy into a
 //     SubscriptionPlan (Create/Reuse/Reactivate/Update/Block/Indeterminate),
 //     preserving every conflict dimension the old reconcile enforced:
@@ -19,9 +19,10 @@
 //     filter contents), authority match, and the encrypted-active encrypt_key
 //     probe. It never writes except the read-only GetEncryptKey probe.
 //   - Controller is the single remote-write path: it turns a writable plan into
-//     an ApplyReceipt via the gateway (Create/Reactivate), generating a fresh
-//     per-subscription encrypt_key for an encrypted create and guaranteeing a
-//     non-empty model.RemoteSubscriptionID (an empty id is an InvalidResponse).
+//     an ApplyReceipt through the Gateway port (Create/Reactivate), generating a
+//     fresh per-subscription encrypt_key for an encrypted create and
+//     guaranteeing a non-empty model.RemoteSubscriptionID (an empty id is an
+//     InvalidResponse).
 //
 // Policy encodes the differences between callers explicitly, as data on the
 // Policy rather than as branches in each caller: whether an active encrypted
@@ -30,7 +31,9 @@
 // compatible suspended match is Blocked (ManagementCreate) or Reactivated
 // (ConsumeBootstrap).
 //
-// The package depends on the SDK-free domain projection (platform/lark's
-// RemoteSubscription, internal/event/model) and the CLI Filter model; it never
-// imports the Lark SDK's service/event/v1 itself — the gateway owns that.
+// The package owns the outbound Gateway port (gateway.go) and its domain specs
+// (CreateSpec/PatchSpec/ListParams/SubscriptionPage), all expressed in SDK-free
+// domain types (internal/event/model, the CLI Filter model). It depends on
+// neither the Lark SDK's service/event/v1 nor the platform/lark adapter that
+// implements the port — the dependency runs inward, adapter -> domain.
 package subscription

@@ -3,8 +3,9 @@
 
 // Package app owns the event subsystem's use-case orchestration — the layer
 // between the Cobra commands (cmd/event, cmd/event/subscription) and the
-// owners built in PR1/PR2 (the catalog, the subscription Observe/Plan/Apply
-// Controller, and the platform/lark gateway).
+// owners built in PR1/PR2 (the catalog and the subscription Observe/Plan/Apply
+// Controller). It depends on the domain's Gateway port, never on the
+// platform/lark adapter that implements it.
 //
 // A command's RunE resolves flags + identity, builds the identity-bound
 // dependencies, then hands them to a use case here and renders the domain

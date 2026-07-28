@@ -10,7 +10,6 @@ import (
 
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event/model"
-	lark "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
 // fakeWalker emulates the gateway's bounded, early-stopping List scan: it visits
@@ -20,10 +19,10 @@ type fakeWalker struct {
 	items           []model.RemoteSubscription
 	cappedIfExhaust bool
 	err             error
-	lastParams      lark.ListParams
+	lastParams      ListParams
 }
 
-func (f *fakeWalker) WalkSubscriptions(_ context.Context, params lark.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
+func (f *fakeWalker) WalkSubscriptions(_ context.Context, params ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
 	f.lastParams = params
 	if f.err != nil {
 		return false, f.err

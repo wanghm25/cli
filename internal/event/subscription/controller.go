@@ -9,25 +9,11 @@ import (
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
-	lark "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
-// Gateway is the remote-Subscription surface the Controller (and its embedded
-// Observer/Planner) drives: the bounded List scan and the point Get read, the
-// three writes it performs (Create/Reactivate/Renew), and the encrypt-key probe.
-// *lark.Gateway satisfies it. Get and Renew back the Controller's
-// lifecycle-recovery entry points (Get/Reactivate/Renew below): the subscription
-// lifecycle control plane drives its state-source-of-truth Get and its
-// Reactivate/Renew writes through the Controller, so every remote write funnels
-// through this one owner instead of reaching platform/lark directly.
-type Gateway interface {
-	WalkSubscriptions(ctx context.Context, params lark.ListParams, visit func(model.RemoteSubscription) bool) (bool, error)
-	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
-	Create(ctx context.Context, spec lark.CreateSpec) (*model.RemoteSubscription, error)
-	Reactivate(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
-	Renew(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
-	GetEncryptKey(ctx context.Context, remoteSubscriptionID string) (string, error)
-}
+// The Gateway port (the remote-Subscription surface the Controller and its
+// embedded Observer/Planner drive) is defined in gateway.go, alongside the
+// domain specs it takes.
 
 // ApplyReceipt records the outcome of a completed writable plan. RemoteID is the
 // non-empty remote subscription id the caller threads onward (into the create
@@ -228,7 +214,7 @@ func (c *Controller) reactivate(ctx context.Context, plan SubscriptionPlan) (App
 // create (fail-closed, never a plaintext fallback). The key is never logged,
 // persisted, or returned.
 func (c *Controller) create(ctx context.Context, req Request) (ApplyReceipt, error) {
-	spec := lark.CreateSpec{
+	spec := CreateSpec{
 		EventType:           req.EventType,
 		TargetResource:      req.TargetResource,
 		IncludeResourceData: req.IncludeResourceData,

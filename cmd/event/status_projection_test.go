@@ -15,6 +15,7 @@ import (
 
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
@@ -37,7 +38,7 @@ func (g blockingGetter) Get(ctx context.Context, _ string) (*model.RemoteSubscri
 	return nil, ctx.Err()
 }
 
-func (g blockingGetter) WalkSubscriptions(ctx context.Context, _ larkgw.ListParams, _ func(model.RemoteSubscription) bool) (bool, error) {
+func (g blockingGetter) WalkSubscriptions(ctx context.Context, _ subown.ListParams, _ func(model.RemoteSubscription) bool) (bool, error) {
 	if g.walkStarted != nil {
 		close(g.walkStarted)
 	}

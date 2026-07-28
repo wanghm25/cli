@@ -10,7 +10,6 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
 	"github.com/larksuite/cli/internal/event/model"
-	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	subown "github.com/larksuite/cli/internal/event/subscription"
 )
 
@@ -37,7 +36,7 @@ type fakeControllerGateway struct {
 	createCalls     int
 }
 
-func (g *fakeControllerGateway) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, _ func(model.RemoteSubscription) bool) (bool, error) {
+func (g *fakeControllerGateway) WalkSubscriptions(_ context.Context, _ subown.ListParams, _ func(model.RemoteSubscription) bool) (bool, error) {
 	return false, nil
 }
 
@@ -46,7 +45,7 @@ func (g *fakeControllerGateway) Get(_ context.Context, _ string) (*model.RemoteS
 	return nil, nil
 }
 
-func (g *fakeControllerGateway) Create(_ context.Context, _ larkgw.CreateSpec) (*model.RemoteSubscription, error) {
+func (g *fakeControllerGateway) Create(_ context.Context, _ subown.CreateSpec) (*model.RemoteSubscription, error) {
 	g.createCalls++
 	return nil, nil
 }
