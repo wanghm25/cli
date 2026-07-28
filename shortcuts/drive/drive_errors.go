@@ -5,6 +5,9 @@ package drive
 
 import (
 	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/larksuite/cli/errs"
@@ -19,6 +22,33 @@ func wrapDriveNetworkErr(err error, format string, args ...any) error {
 		return err
 	}
 	return errs.NewNetworkError(errs.SubtypeNetworkTransport, format, args...).WithCause(err)
+}
+
+// withDriveDownloadForbiddenPreviewHint keeps the HTTP 403 network error from
+// +download intact while giving callers a preview-based path to view content.
+func withDriveDownloadForbiddenPreviewHint(err error, fileToken string) error {
+	problem, ok := errs.ProblemOf(err)
+	if !ok || problem.Category != errs.CategoryNetwork || problem.Code != http.StatusForbidden {
+		return err
+	}
+	if strings.Contains(problem.Hint, "drive +preview") {
+		return err
+	}
+	hint := driveDownloadForbiddenPreviewHint(fileToken)
+	if strings.TrimSpace(problem.Hint) == "" {
+		problem.Hint = hint
+		return err
+	}
+	problem.Hint = strings.TrimSpace(problem.Hint) + " " + hint
+	return err
+}
+
+func driveDownloadForbiddenPreviewHint(fileToken string) string {
+	tokenArg := "<FILE_TOKEN>"
+	if trimmed := strings.TrimSpace(fileToken); trimmed != "" {
+		tokenArg = strconv.Quote(trimmed)
+	}
+	return fmt.Sprintf("Direct Drive download returned HTTP 403. To view file content through preview artifacts, try `lark-cli drive +preview --file-token %s --type source_file --output <path>`; for PDF/text/image preview choices, run `lark-cli drive +preview --file-token %s --list-only`.", tokenArg, tokenArg)
 }
 
 // driveInputStatError maps a FileIO.Stat/Open error for input file validation

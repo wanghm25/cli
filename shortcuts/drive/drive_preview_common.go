@@ -27,6 +27,8 @@ const (
 	drivePreviewIfExistsError     = "error"
 	drivePreviewIfExistsOverwrite = "overwrite"
 	drivePreviewIfExistsRename    = "rename"
+	drivePreviewTypeSourceFile    = "16"
+	drivePreviewSourceFileHint    = "Preview candidates are unavailable for this file. To fetch the source file artifact, rerun with --type source_file --output <path>."
 )
 
 type drivePreviewCandidate struct {
@@ -88,7 +90,9 @@ var drivePreviewMimeToExt = map[string]string{
 	"image/webp":               ".webp",
 	"text/csv":                 ".csv",
 	"text/html":                ".html",
+	"text/markdown":            ".md",
 	"text/plain":               ".txt",
+	"text/x-markdown":          ".md",
 	"text/xml":                 ".xml",
 	"video/mp4":                ".mp4",
 	"application/octet-stream": "",
@@ -802,6 +806,27 @@ func wrapDrivePreviewNotReady(fileToken, requested string, candidate drivePrevie
 	}
 	hint := fmt.Sprintf("rerun `lark-cli drive +preview --file-token %s --list-only` to inspect current candidate status", fileToken)
 	return errs.NewValidationError(errs.SubtypeFailedPrecondition, reason).WithHint(hint).WithParam("--type")
+}
+
+// withDrivePreviewSourceFileHint adds source_file guidance to preview candidate
+// API failures without changing their classification or server diagnostics.
+func withDrivePreviewSourceFileHint(err error) error {
+	problem, ok := errs.ProblemOf(err)
+	if !ok || problem.Category != errs.CategoryAPI {
+		return err
+	}
+	if problem.Retryable || problem.Subtype == errs.SubtypeRateLimit {
+		return err
+	}
+	if strings.Contains(problem.Hint, "--type source_file") {
+		return err
+	}
+	if strings.TrimSpace(problem.Hint) == "" {
+		problem.Hint = drivePreviewSourceFileHint
+		return err
+	}
+	problem.Hint = strings.TrimSpace(problem.Hint) + " " + drivePreviewSourceFileHint
+	return err
 }
 
 // wrapDriveCoverUnavailable builds a validation error for an unknown cover
