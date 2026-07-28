@@ -129,7 +129,7 @@ func (c *APIClient) paginateLoopWithStatus(
 			params["page_token"] = nextToken
 		}
 
-		result, err := c.CallAPI(ctx, RawApiRequest{
+		resp, err := c.DoAPI(ctx, RawApiRequest{
 			Method:    request.Method,
 			URL:       request.URL,
 			Params:    params,
@@ -144,6 +144,18 @@ func (c *APIClient) paginateLoopWithStatus(
 			status.NextPageToken = nextToken
 			return results, status, err
 		}
+		result, err := ParseJSONResponse(resp)
+		if err != nil {
+			err = WrapJSONResponseParseError(err, resp.RawBody)
+			if opts.NormalizeHTTPError != nil && resp.StatusCode >= 400 {
+				err = opts.NormalizeHTTPError(resp.StatusCode, streamLogID(resp.Header), err)
+			}
+			status.StopReason = StopReasonTransportError
+			status.Cause = err
+			status.HasMore = nextToken != ""
+			status.NextPageToken = nextToken
+			return results, status, err
+		}
 		identity := opts.Identity
 		if identity == "" {
 			identity = request.As
@@ -151,7 +163,11 @@ func (c *APIClient) paginateLoopWithStatus(
 		if identity == "" {
 			identity = core.AsUser
 		}
-		if apiErr := c.CheckResponse(result, identity); apiErr != nil {
+		apiErr := c.CheckResponse(result, identity)
+		if opts.NormalizeHTTPError != nil && resp.StatusCode >= 400 {
+			apiErr = opts.NormalizeHTTPError(resp.StatusCode, streamLogID(resp.Header), apiErr)
+		}
+		if apiErr != nil {
 			status.StopReason = StopReasonAPIError
 			status.Cause = apiErr
 			status.HasMore = nextToken != ""

@@ -195,6 +195,19 @@ func (e *Emitter) Hint(hint string) error {
 	return e.emitHint(EmitOptions{Hint: hint, HintToStderr: true})
 }
 
+// RedactedFallback atomically emits an already allowlisted fallback envelope.
+// It deliberately skips safety scanning and jq: callers use it only after
+// presentation failed, and must construct the envelope from fixed public
+// fields rather than from the blocked payload.
+func (e *Emitter) RedactedFallback(env Envelope) error {
+	if err := e.requireOutput(); err != nil {
+		return err
+	}
+	return e.emit(func(w io.Writer) error {
+		return WriteJSON(w, env)
+	})
+}
+
 func (e *Emitter) emitEnvelope(data interface{}, ok bool, opts EmitOptions) error {
 	scanResult := ScanForSafety(e.commandPath, data, e.errOut)
 	if scanResult.Blocked {

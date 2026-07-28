@@ -168,7 +168,7 @@ func TestModerationAcceptedUnverified(t *testing.T) {
 	if completion["status"] != "accepted_unverified" || completion["final_state_verified"] != false {
 		t.Fatalf("completion = %#v", completion)
 	}
-	if got.Hint != "" {
+	if got.Hint != HelpAcceptanceOnly.Text() {
 		t.Fatalf("hint = %q", got.Hint)
 	}
 }
@@ -221,6 +221,32 @@ func TestReplaySafety(t *testing.T) {
 	p, _ = errs.ProblemOf(got)
 	if !p.Retryable || p.Hint != "specify --item-type explicitly" {
 		t.Fatalf("preflight problem was rewritten: %#v", p)
+	}
+}
+
+func TestWriteRateLimitNeverAuthorizesReplay(t *testing.T) {
+	for _, key := range []ContractKey{
+		"im +feed-shortcut-create",
+		"im +messages-send",
+	} {
+		t.Run(string(key), func(t *testing.T) {
+			contract, _ := Lookup(key)
+			session := NewSession(contract)
+			session.ObserveRequest(map[string]any{"uuid": "stable-key"})
+			session.RecordFact(Fact{Kind: FactWriteAttempted})
+			rateLimit := errs.NewAPIError(errs.SubtypeRateLimit, "too many requests").
+				WithRetryable().
+				WithHint("retry later")
+
+			got := session.FinalizeError(rateLimit)
+			problem, ok := errs.ProblemOf(got)
+			if !ok {
+				t.Fatalf("FinalizeError returned untyped error %T: %v", got, got)
+			}
+			if problem.Retryable || problem.Hint != "" {
+				t.Fatalf("rate limit authorized replay for %s: %#v", key, problem)
+			}
+		})
 	}
 }
 

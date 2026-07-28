@@ -36,13 +36,16 @@ type ReadResult struct {
 	Cause    error `json:"-"`
 }
 
-// ReadSession is independent from the write Session. It only records one
-// pagination outcome and never observes request or response bodies.
+// ReadSession is independent from the write Session. It records typed
+// pagination and, for explicitly opted-in searches, materialization evidence;
+// it never observes raw request or response bodies.
 type ReadSession struct {
-	contract Contract
-	options  ReadOptions
-	status   client.PaginationStatus
-	observed bool
+	contract                Contract
+	options                 ReadOptions
+	status                  client.PaginationStatus
+	observed                bool
+	materialization         MaterializationStatus
+	materializationObserved bool
 }
 
 func NewReadSession(contract Contract, options ReadOptions) (*ReadSession, error) {
@@ -61,8 +64,25 @@ func (s *ReadSession) ObservePagination(status client.PaginationStatus) {
 	s.observed = true
 }
 
+func (s *ReadSession) ObserveMaterialization(status MaterializationStatus) {
+	s.materialization = status
+	s.materializationObserved = true
+}
+
 func (s *ReadSession) RequiresPagination() bool {
 	return s.contract.Strategy.Kind == CollectionReadKind || s.contract.Strategy.Kind == SearchReadKind
+}
+
+// FinalizeError applies the IM read retry contract to a typed error. Reads may
+// be retried after transport failures and server errors. Rate limits and all
+// other API or validation failures do not authorize an Agent retry.
+func (s *ReadSession) FinalizeError(err error) error {
+	problem, ok := errs.ProblemOf(err)
+	if !ok {
+		return err
+	}
+	normalizeReadProblem(problem)
+	return err
 }
 
 func (s *ReadSession) Finalize(data any) (ReadResult, error) {
@@ -92,10 +112,71 @@ func (s *ReadSession) Finalize(data any) (ReadResult, error) {
 	if err != nil {
 		return ReadResult{}, err
 	}
+	if s.contract.Strategy.RequiresMaterialization {
+		result, err = s.finalizeMaterialization(result)
+		if err != nil {
+			return ReadResult{}, err
+		}
+	}
 	if s.contract.Strategy.Kind == SearchReadKind &&
 		s.status.StopReason == client.StopReasonExhausted &&
 		searchCollectionEmpty(data, s.contract.Strategy.CollectionField) {
 		result.Hint = joinHints(result.Hint, hintSearchEmpty)
+	}
+	return result, nil
+}
+
+func (s *ReadSession) finalizeMaterialization(result ReadResult) (ReadResult, error) {
+	if !s.materializationObserved {
+		return ReadResult{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"IM search completed without materialization status",
+		)
+	}
+	data, ok := result.Data.(map[string]any)
+	if !ok {
+		return ReadResult{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"IM search materialization requires an object result",
+		)
+	}
+	data["materialization"] = s.materialization.ledger()
+	result.Data = data
+
+	materializationComplete := s.materialization.complete()
+	if result.Meta == nil || result.Meta.Complete == nil {
+		return ReadResult{}, errs.NewInternalError(
+			errs.SubtypeInvalidResponse,
+			"IM search materialization requires pagination completeness",
+		)
+	}
+	*result.Meta.Complete = *result.Meta.Complete && materializationComplete
+	if materializationComplete {
+		if *result.Meta.Complete {
+			result.Hint = "Results are ready to use. Use message_id/file_key directly; do not call messages-mget."
+		}
+		return result, nil
+	}
+
+	result.OK = false
+	if result.ExitCode == 0 {
+		result.ExitCode = output.ExitAPI
+	}
+	materializationHint := ""
+	if len(s.materialization.MissingMessageIDs) > 0 {
+		materializationHint = "The search is incomplete. Query only materialization.missing_message_ids with im +messages-mget."
+	} else {
+		materializationHint = "The search is incomplete and cannot be safely recovered by message ID. Narrow the query before retrying."
+	}
+	result.Hint = joinHints(result.Hint, materializationHint)
+	if result.Error == nil && s.materialization.Cause != nil {
+		if problem, ok := errs.ProblemOf(s.materialization.Cause); ok {
+			copied := *problem
+			normalizeReadProblem(&copied)
+			result.Error = &copied
+			result.Cause = s.materialization.Cause
+			result.ExitCode = output.ExitCodeOf(s.materialization.Cause)
+		}
 	}
 	return result, nil
 }
@@ -145,6 +226,7 @@ func finalizePagedRead(data any, status client.PaginationStatus, fullRead bool) 
 			)
 		}
 		copied := *problem
+		normalizeReadProblem(&copied)
 		result.OK = false
 		result.Error = &copied
 		result.ExitCode = output.ExitCodeOf(status.Cause)
@@ -164,6 +246,14 @@ func finalizePagedRead(data any, status client.PaginationStatus, fullRead bool) 
 	}
 	*result.Meta.Complete = complete
 	return result, nil
+}
+
+func normalizeReadProblem(problem *errs.Problem) {
+	if problem == nil {
+		return
+	}
+	problem.Retryable = problem.Category == errs.CategoryNetwork ||
+		(problem.Category == errs.CategoryAPI && problem.Subtype == errs.SubtypeServerError)
 }
 
 func searchCollectionEmpty(data any, field string) bool {

@@ -89,8 +89,8 @@ func TestReadRegistryCoverage(t *testing.T) {
 		t.Fatalf("read contracts = %d, want 24", len(gotKeys))
 	}
 	wantCounts := map[StrategyKind]int{
-		EntityReadKind:      7,
-		CollectionReadKind:  14,
+		EntityReadKind:      9,
+		CollectionReadKind:  12,
 		SearchReadKind:      2,
 		MaterializeReadKind: 1,
 	}

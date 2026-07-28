@@ -316,6 +316,51 @@ func TestPaginateAllWithStatusPreservesPartialResultAndTypedLateError(t *testing
 	})
 }
 
+func TestPaginateAllWithStatusHTTPNormalizerIsOptIn(t *testing.T) {
+	newClient := func(t *testing.T) *APIClient {
+		t.Helper()
+		response := jsonResponse(pageResult(false, "", false, "1"))
+		response.StatusCode = http.StatusServiceUnavailable
+		ac, _ := newTestAPIClient(t, roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			return response, nil
+		}))
+		return ac
+	}
+
+	t.Run("normalizer classifies HTTP status", func(t *testing.T) {
+		marker := errors.New("normalized HTTP failure")
+		ac := newClient(t)
+		_, status, err := ac.PaginateAllWithStatus(context.Background(), &RawApiRequest{
+			Method: "GET",
+			URL:    "/open-apis/test",
+			As:     "bot",
+		}, PaginationOptions{
+			PageDelay: -1,
+			NormalizeHTTPError: func(status int, _ string, err error) error {
+				if status != http.StatusServiceUnavailable || err != nil {
+					t.Fatalf("normalizer input = status %d, err %v", status, err)
+				}
+				return marker
+			},
+		})
+		if !errors.Is(err, marker) || status.StopReason != StopReasonAPIError {
+			t.Fatalf("err = %v, status = %#v", err, status)
+		}
+	})
+
+	t.Run("nil normalizer preserves legacy behavior", func(t *testing.T) {
+		ac := newClient(t)
+		_, status, err := ac.PaginateAllWithStatus(context.Background(), &RawApiRequest{
+			Method: "GET",
+			URL:    "/open-apis/test",
+			As:     "bot",
+		}, PaginationOptions{PageDelay: -1})
+		if err != nil || status.StopReason != StopReasonExhausted {
+			t.Fatalf("err = %v, status = %#v", err, status)
+		}
+	})
+}
+
 func TestStreamPagesWithStatusPreservesEmittedPagesOnLateError(t *testing.T) {
 	calls := 0
 	ac, _ := newTestAPIClient(t, roundTripFunc(func(_ *http.Request) (*http.Response, error) {

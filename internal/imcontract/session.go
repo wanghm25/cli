@@ -77,6 +77,13 @@ func (s *Session) FinalizeSuccess(data any) (Result, error) {
 		if !requiredResultPresent(data, s.contract.Strategy.Required) {
 			return Result{}, s.FinalizeError(invalidRequiredResult(requiredLabel(s.contract.Strategy.Required)))
 		}
+		if supportsMessageMentionResult(s.contract.Key) {
+			result, err := finalizeMessageMentions(data)
+			if err != nil {
+				return Result{}, s.FinalizeError(err)
+			}
+			return result, nil
+		}
 		return Result{OK: true, Data: data}, nil
 	case BatchPartialKind:
 		return finalizeBatch(s, data)
@@ -104,7 +111,7 @@ func (s *Session) FinalizeSuccess(data any) (Result, error) {
 			"final_state_verified": false,
 			"retry_scope":          "none",
 		}
-		return Result{OK: true, Data: m}, nil
+		return Result{OK: true, Data: m, Hint: s.contract.HelpPolicy.Text()}, nil
 	default:
 		return Result{}, errs.NewInternalError(
 			errs.SubtypeInvalidResponse,
@@ -112,6 +119,10 @@ func (s *Session) FinalizeSuccess(data any) (Result, error) {
 			s.contract.Strategy.Kind,
 		)
 	}
+}
+
+func supportsMessageMentionResult(key ContractKey) bool {
+	return key == "im +messages-send" || key == "im +messages-reply"
 }
 
 func requiredLabel(spec requiredSpec) string {
@@ -124,6 +135,11 @@ func requiredLabel(spec requiredSpec) string {
 func (s *Session) FinalizeError(err error) error {
 	problem, ok := errs.ProblemOf(err)
 	if !ok {
+		return err
+	}
+	if problem.Subtype == errs.SubtypeRateLimit {
+		problem.Retryable = false
+		problem.Hint = ""
 		return err
 	}
 	transient := problem.Category == errs.CategoryNetwork ||

@@ -15,7 +15,7 @@ func TestHelpPolicyTextUsesOnlyApprovedTemplates(t *testing.T) {
 		want   string
 	}{
 		{HelpCompleteness, "Completeness: use --page-all --page-limit 0 for exhaustive output; only meta.complete=true proves completion."},
-		{HelpAcceptanceOnly, "Guarantee: success confirms request acceptance only; independently query the final moderator state before claiming completion."},
+		{HelpAcceptanceOnly, "Verify the final state with lark-cli im chat.moderation get --chat-id <same_chat_id> --as <same_identity>."},
 		{HelpPolicy("unknown"), ""},
 	}
 	for _, tt := range tests {

@@ -106,8 +106,9 @@ type Strategy struct {
 	// CollectionField is only used by the two fixed IM search strategies to
 	// determine whether an exhausted search returned no candidates. It is not
 	// a general response path or field extractor.
-	CollectionField string
-	ReadHint        string
+	CollectionField         string
+	RequiresMaterialization bool
+	ReadHint                string
 }
 
 type HelpPolicy string
@@ -123,7 +124,7 @@ func (p HelpPolicy) Text() string {
 	case HelpCompleteness:
 		return "Completeness: use --page-all --page-limit 0 for exhaustive output; only meta.complete=true proves completion."
 	case HelpAcceptanceOnly:
-		return "Guarantee: success confirms request acceptance only; independently query the final moderator state before claiming completion."
+		return "Verify the final state with lark-cli im chat.moderation get --chat-id <same_chat_id> --as <same_identity>."
 	default:
 		return ""
 	}

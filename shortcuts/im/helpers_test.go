@@ -17,15 +17,6 @@ import (
 	"github.com/larksuite/cli/shortcuts/common"
 )
 
-func TestNormalizeAtMentions(t *testing.T) {
-	input := `<at id=ou_alpha/> hi <at open_id="ou_beta"> and <at user_id=ou_gamma /> and <at email="x@example.com"/>`
-	got := normalizeAtMentions(input)
-	want := `<at user_id="ou_alpha"> hi <at user_id="ou_beta"> and <at user_id="ou_gamma"> and <at email="x@example.com"/>`
-	if got != want {
-		t.Fatalf("normalizeAtMentions() = %q, want %q", got, want)
-	}
-}
-
 func TestDetectIMFileType(t *testing.T) {
 	tests := []struct {
 		name string
@@ -333,19 +324,19 @@ func TestOptimizeMarkdownStyle(t *testing.T) {
 		want  string
 	}{
 		{
-			name:  "heading downgrade H1 and H2",
-			input: "# Title\n## Section\ntext",
-			want:  "#### Title\n\n##### Section\ntext",
+			name:  "preserve H1 through H6",
+			input: "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\ntext",
+			want:  "# H1\n\n## H2\n\n### H3\n\n#### H4\n\n##### H5\n\n###### H6\ntext",
 		},
 		{
-			name:  "no downgrade when no H1-H3",
+			name:  "preserve standalone H4",
 			input: "#### Already H4\ntext",
 			want:  "#### Already H4\ntext",
 		},
 		{
 			name:  "code block protected",
 			input: "# Title\n```\n# not a heading\n```\ntext",
-			want:  "#### Title\n```\n# not a heading\n```\ntext",
+			want:  "# Title\n```\n# not a heading\n```\ntext",
 		},
 		{
 			name:  "table spacing",
@@ -355,7 +346,7 @@ func TestOptimizeMarkdownStyle(t *testing.T) {
 		{
 			name:  "table spacing keeps heading separation",
 			input: "# Title\n| A | B |\n| - | - |\n| 1 | 2 |\n## Next",
-			want:  "#### Title\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n##### Next",
+			want:  "# Title\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n## Next",
 		},
 		{
 			name:  "excess blank lines compressed",

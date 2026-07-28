@@ -19,6 +19,7 @@ import (
 	"github.com/larksuite/cli/extension/fileio"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/imcontract"
 	"github.com/larksuite/cli/internal/output"
 )
 
@@ -169,6 +170,69 @@ func TestRunShortcut_OutRawWriteErrorPropagates(t *testing.T) {
 	}
 	if got := output.ExitCodeOf(err); got != output.ExitInternal {
 		t.Fatalf("runShortcut() exit code = %d, want %d", got, output.ExitInternal)
+	}
+}
+
+func TestIMContractWriteJQRuntimeFailureUsesBufferedCompletionFallback(t *testing.T) {
+	const secret = "SECRET_MARKER"
+	rctx, stdout, stderr := newJqTestContext(
+		`.data.items[] | if . == "SECRET_MARKER" then error("SECRET_MARKER") else . end`,
+		"",
+	)
+	contract, _ := imcontract.Lookup("im +messages-send")
+	rctx.contractSession = imcontract.NewSession(contract)
+
+	rctx.Out(map[string]any{
+		"message_id": "om_x",
+		"items":      []any{"safe-prefix", secret},
+	}, nil)
+
+	if output.ExitCodeOf(rctx.outputErr) != output.ExitAPI {
+		t.Fatalf("output error = %T %v", rctx.outputErr, rctx.outputErr)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "safe-prefix") || strings.Contains(stdout.String(), secret) ||
+		strings.Contains(rctx.outputErr.Error(), secret) {
+		t.Fatalf("jq output leaked before failure: stdout=%q err=%v", stdout.String(), rctx.outputErr)
+	}
+	var env map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("fallback is not one JSON envelope: %v\n%s", err, stdout.String())
+	}
+	if len(env) != 3 || env["ok"] != false {
+		t.Fatalf("fallback = %#v", env)
+	}
+	data, _ := env["data"].(map[string]any)
+	completion, _ := data["completion"].(map[string]any)
+	if len(data) != 1 || completion["status"] != "complete" || completion["retry_scope"] != "none" {
+		t.Fatalf("completion = %#v", completion)
+	}
+	problem, _ := env["error"].(map[string]any)
+	if problem["type"] != "api" || problem["subtype"] != "unknown" ||
+		problem["message"] != "Output failed after the IM write completed" {
+		t.Fatalf("error = %#v", problem)
+	}
+	if _, exists := env["presentation"]; exists {
+		t.Fatalf("fallback introduced presentation: %#v", env)
+	}
+}
+
+func TestNonIMJQRuntimeFailureKeepsEmitterAtomicOutput(t *testing.T) {
+	const secret = "SECRET_MARKER"
+	rctx, stdout, stderr := newJqTestContext(
+		`.data.items[] | if . == "SECRET_MARKER" then error("SECRET_MARKER") else . end`,
+		"",
+	)
+
+	rctx.Out(map[string]any{"items": []any{"safe-prefix", secret}}, nil)
+
+	if stdout.Len() != 0 {
+		t.Fatalf("non-IM jq emitted partial output: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "error:") {
+		t.Fatalf("non-IM jq error reporting changed: %q", stderr.String())
 	}
 }
 

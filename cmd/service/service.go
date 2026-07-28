@@ -497,7 +497,10 @@ func serviceMethodRun(opts *ServiceMethodOptions) error {
 	resp, err := ac.DoAPI(opts.Ctx, request)
 	if err != nil {
 		if contractSession != nil {
-			return contractSession.FinalizeError(err)
+			return contractSession.FinalizeError(normalizeIMContractJSONError(err))
+		}
+		if readSession != nil {
+			return readSession.FinalizeError(normalizeIMContractJSONError(err))
 		}
 		return err
 	}
@@ -540,14 +543,20 @@ func handleIMReadContractResponse(
 		CheckError:  checkErr,
 	}
 	if resp.StatusCode >= 400 {
-		return client.HandleResponse(resp, responseOpts)
+		responseErr := client.HandleResponse(resp, responseOpts)
+		responseErr = imcontract.NormalizeHTTPError(
+			resp.StatusCode,
+			resp.Header.Get("x-tt-logid"),
+			responseErr,
+		)
+		return session.FinalizeError(responseErr)
 	}
-	parsed, err := client.ParseJSONResponse(resp)
+	parsed, err := parseIMContractJSONResponse(resp)
 	if err != nil {
-		return client.HandleResponse(resp, responseOpts)
+		return session.FinalizeError(err)
 	}
 	if apiErr := checkErr(parsed, opts.As); apiErr != nil {
-		return apiErr
+		return session.FinalizeError(apiErr)
 	}
 	data := output.SuccessEnvelopeData(parsed)
 	if session.RequiresPagination() {
@@ -569,9 +578,10 @@ func servicePaginateIMRead(
 	session *imcontract.ReadSession,
 ) error {
 	pagOpts := client.PaginationOptions{
-		PageLimit: opts.PageLimit,
-		PageDelay: opts.PageDelay,
-		Identity:  opts.As,
+		PageLimit:          opts.PageLimit,
+		PageDelay:          opts.PageDelay,
+		Identity:           opts.As,
+		NormalizeHTTPError: imcontract.NormalizeHTTPError,
 	}
 	if opts.JqExpr == "" && (format == output.FormatNDJSON || format == output.FormatTable || format == output.FormatCSV) {
 		return streamIMReadPages(opts, ac, request, format, session, pagOpts)
@@ -613,7 +623,7 @@ func streamIMReadPages(
 		return emitter.StreamPage(items, output.StreamOptions{Format: format.String()})
 	})
 	if pageErr != nil && status.StopReason == "" {
-		return pageErr
+		return session.FinalizeError(pageErr)
 	}
 	session.ObservePagination(status)
 	result, err := session.Finalize(map[string]interface{}{})
@@ -762,11 +772,17 @@ func handleIMWriteContractResponse(
 		CheckError:  checkErr,
 	}
 	if resp.StatusCode >= 400 {
-		return session.FinalizeError(client.HandleResponse(resp, responseOpts))
+		responseErr := client.HandleResponse(resp, responseOpts)
+		responseErr = imcontract.NormalizeHTTPError(
+			resp.StatusCode,
+			resp.Header.Get("x-tt-logid"),
+			responseErr,
+		)
+		return session.FinalizeError(responseErr)
 	}
-	parsed, err := client.ParseJSONResponse(resp)
+	parsed, err := parseIMContractJSONResponse(resp)
 	if err != nil {
-		return session.FinalizeError(client.HandleResponse(resp, responseOpts))
+		return session.FinalizeError(err)
 	}
 	if apiErr := checkErr(parsed, opts.As); apiErr != nil {
 		return session.FinalizeError(apiErr)
@@ -780,7 +796,7 @@ func handleIMWriteContractResponse(
 		return err
 	}
 
-	if err := emitIMServiceResult(
+	emitErr := emitIMServiceResult(
 		opts,
 		format,
 		result.Data,
@@ -789,13 +805,76 @@ func handleIMWriteContractResponse(
 		nil,
 		result.Hint,
 		false,
-	); err != nil {
-		return err
+	)
+	if emitErr != nil {
+		if errs.IsContentSafety(emitErr) {
+			return writeIMContentSafetyFallback(opts, result)
+		}
+		if opts.JqExpr != "" {
+			return writeIMJQFallback(opts, result)
+		}
+		return emitErr
 	}
 	if result.ExitCode != 0 {
 		return output.PartialFailure(result.ExitCode)
 	}
 	return nil
+}
+
+func parseIMContractJSONResponse(resp *larkcore.ApiResp) (interface{}, error) {
+	if resp == nil {
+		return nil, newIMContractJSONResponseError(resp)
+	}
+	parsed, err := client.ParseJSONResponse(resp)
+	if err != nil {
+		return nil, newIMContractJSONResponseError(resp)
+	}
+	return parsed, nil
+}
+
+func newIMContractJSONResponseError(resp *larkcore.ApiResp) *errs.InternalError {
+	contractErr := errs.NewInternalError(
+		errs.SubtypeInvalidResponse,
+		"IM contract response must be valid JSON",
+	)
+	if resp == nil {
+		return contractErr
+	}
+	if logID := resp.Header.Get("x-tt-logid"); logID != "" {
+		contractErr.WithLogID(logID)
+	}
+	return contractErr
+}
+
+func normalizeIMContractJSONError(err error) error {
+	problem, ok := errs.ProblemOf(err)
+	if ok && problem.Subtype == errs.SubtypeInvalidResponse {
+		normalized := newIMContractJSONResponseError(nil)
+		if problem.Code != 0 {
+			normalized.WithCode(problem.Code)
+		}
+		if problem.LogID != "" {
+			normalized.WithLogID(problem.LogID)
+		}
+		return normalized
+	}
+	return err
+}
+
+func writeIMJQFallback(opts *ServiceMethodOptions, result imcontract.Result) error {
+	env, signal := imcontract.BuildJQOutputFallback(result)
+	if err := newIMServiceEmitter(opts).RedactedFallback(env); err != nil {
+		return err
+	}
+	return signal
+}
+
+func writeIMContentSafetyFallback(opts *ServiceMethodOptions, result imcontract.Result) error {
+	env, signal := imcontract.BuildContentSafetyOutputFallback(result)
+	if err := newIMServiceEmitter(opts).RedactedFallback(env); err != nil {
+		return err
+	}
+	return signal
 }
 
 // checkServiceScopes pre-checks user scopes before making the API call.

@@ -41,13 +41,17 @@ func read(key string, kind StrategyKind) Contract {
 }
 
 func search(key, collectionField string) Contract {
-	return Contract{
+	contract := Contract{
 		Key: ContractKey(key),
 		Strategy: Strategy{
 			Kind:            SearchReadKind,
 			CollectionField: collectionField,
 		},
 	}
+	if key == "im +messages-search" {
+		contract.Strategy.RequiresMaterialization = true
+	}
+	return contract
 }
 
 func topString(field string) RequiredSpec {
@@ -112,9 +116,9 @@ func buildContracts() map[ContractKey]Contract {
 		read("im +feed-shortcut-list", CollectionReadKind),
 		read("im +flag-list", CollectionReadKind),
 		read("im +threads-messages-list", CollectionReadKind),
-		read("im chat.members bots", CollectionReadKind),
+		read("im chat.members bots", EntityReadKind),
 		read("im chat.members get", CollectionReadKind),
-		read("im chat.moderation get", CollectionReadKind),
+		read("im chat.moderation get", EntityReadKind),
 		read("im messages read_users", CollectionReadKind),
 		read("im pins list", CollectionReadKind),
 		read("im reactions list", CollectionReadKind),
@@ -134,7 +138,7 @@ func buildContracts() map[ContractKey]Contract {
 		ack("im messages delete"),
 		ack("im pins delete"),
 
-		required("im +chat-create", topString("chat_id"), ReplayForbidden),
+		required("im +chat-create", topString("chat_id"), ReplaySameIdempotencyKey),
 		required("im +messages-reply", topString("message_id"), ReplaySameIdempotencyKey),
 		required("im +messages-send", topString("message_id"), ReplaySameIdempotencyKey),
 		required("im chats create", topString("chat_id"), ReplaySameIdempotencyKey),

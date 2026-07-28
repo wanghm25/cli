@@ -529,6 +529,10 @@ func (ctx *RuntimeContext) DoAPIJSONTyped(method, apiPath string, query larkcore
 		return nil, typedOrInternal(err)
 	}
 	data, err := ctx.ClassifyAPIResponse(resp)
+	if ctx.contractSession != nil || ctx.readSession != nil {
+		logID, _ := logIDFromHeader(resp)["log_id"].(string)
+		err = imcontract.NormalizeHTTPError(resp.StatusCode, logID, err)
+	}
 	if ctx.contractSession != nil && err == nil {
 		ctx.contractSession.ObserveResponse(data)
 	}
@@ -557,6 +561,14 @@ func (ctx *RuntimeContext) RecordContractFact(f imcontract.Fact) {
 func (ctx *RuntimeContext) RecordPagination(status client.PaginationStatus) {
 	if ctx.readSession != nil {
 		ctx.readSession.ObservePagination(status)
+	}
+}
+
+// RecordMaterialization gives the IM read contract the evidence collected
+// while resolving search hits into directly consumable message records.
+func (ctx *RuntimeContext) RecordMaterialization(status imcontract.MaterializationStatus) {
+	if ctx.readSession != nil {
+		ctx.readSession.ObserveMaterialization(status)
 	}
 }
 
@@ -789,12 +801,16 @@ func (ctx *RuntimeContext) emitFinalized(
 	var resultExit int
 	var resultError interface{}
 	var resultCause error
+	var contractResult imcontract.Result
+	hasContractResult := false
 	if ctx.contractSession != nil {
 		result, err := ctx.contractSession.FinalizeSuccess(data)
 		if err != nil {
 			ctx.outputErrOnce.Do(func() { ctx.outputErr = err })
 			return
 		}
+		contractResult = result
+		hasContractResult = true
 		data = result.Data
 		ok = result.OK
 		hint = result.Hint
@@ -845,8 +861,18 @@ func (ctx *RuntimeContext) emitFinalized(
 	} else {
 		emitErr = emitter.Success(data, emitOpts)
 	}
-	ctx.handleEmitterError(emitErr)
 	if emitErr != nil {
+		if hasContractResult {
+			if errs.IsContentSafety(emitErr) {
+				ctx.writeIMContentSafetyFallback(contractResult)
+				return
+			}
+			if ctx.JqExpr != "" {
+				ctx.writeIMJQFallback(contractResult)
+				return
+			}
+		}
+		ctx.handleEmitterError(emitErr)
 		return
 	}
 	if resultExit != 0 {
@@ -873,6 +899,24 @@ func (ctx *RuntimeContext) OutFormat(data interface{}, meta *output.Meta, pretty
 // Use this when the data contains XML/HTML content that should be preserved as-is.
 func (ctx *RuntimeContext) OutFormatRaw(data interface{}, meta *output.Meta, prettyFn func(w io.Writer)) {
 	ctx.emitFinalized(data, meta, true, true, ctx.Format, wrapLegacyPrettyRenderer(prettyFn))
+}
+
+func (ctx *RuntimeContext) writeIMJQFallback(result imcontract.Result) {
+	env, signal := imcontract.BuildJQOutputFallback(result)
+	if err := ctx.newEmitter().RedactedFallback(env); err != nil {
+		ctx.handleEmitterError(err)
+		return
+	}
+	ctx.outputErrOnce.Do(func() { ctx.outputErr = signal })
+}
+
+func (ctx *RuntimeContext) writeIMContentSafetyFallback(result imcontract.Result) {
+	env, signal := imcontract.BuildContentSafetyOutputFallback(result)
+	if err := ctx.newEmitter().RedactedFallback(env); err != nil {
+		ctx.handleEmitterError(err)
+		return
+	}
+	ctx.outputErrOnce.Do(func() { ctx.outputErr = signal })
 }
 
 // ── Scope pre-check ──
@@ -1059,6 +1103,9 @@ func runShortcut(cmd *cobra.Command, f *cmdutil.Factory, s *Shortcut, botOnly bo
 		if rctx.contractSession != nil {
 			return rctx.contractSession.FinalizeError(err)
 		}
+		if rctx.readSession != nil {
+			return rctx.readSession.FinalizeError(err)
+		}
 		return err
 	}
 	return rctx.outputErr
@@ -1108,7 +1155,7 @@ func newRuntimeContext(cmd *cobra.Command, f *cmdutil.Factory, s *Shortcut, conf
 			rctx.contractSession = imcontract.NewSession(contract)
 		case contract.Strategy.Kind.IsRead():
 			readSession, readErr := imcontract.NewReadSession(contract, imcontract.ReadOptions{
-				FullRead: shortcutBoolFlag(cmd, "page-all"),
+				FullRead: imContractFullRead(cmd, contract.Key),
 			})
 			if readErr != nil {
 				return nil, readErr
@@ -1139,6 +1186,21 @@ func shortcutBoolFlag(cmd *cobra.Command, name string) bool {
 	}
 	value, _ := cmd.Flags().GetBool(name)
 	return value
+}
+
+func imContractFullRead(cmd *cobra.Command, key imcontract.ContractKey) bool {
+	if shortcutBoolFlag(cmd, "page-all") {
+		return true
+	}
+	if key != "im +messages-search" || cmd == nil {
+		return false
+	}
+	flag := cmd.Flags().Lookup("page-limit")
+	if flag == nil || !flag.Changed {
+		return false
+	}
+	limit, err := cmd.Flags().GetInt("page-limit")
+	return err == nil && limit == 0
 }
 
 func mergeIMReadMeta(base, contract *output.Meta) *output.Meta {

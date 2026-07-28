@@ -124,6 +124,50 @@ func TestIMContractPartialWritesOneResultEnvelope(t *testing.T) {
 	}
 }
 
+func TestIMContractPartialPresentationFallbackKeepsCountsWithoutItems(t *testing.T) {
+	const secret = "SECRET_MARKER"
+	cfg := &core.CliConfig{Brand: core.BrandFeishu, AppID: "cli_x"}
+	f, stdout, stderr, _ := cmdutil.TestFactory(t, cfg)
+	rt := TestNewRuntimeContextForAPI(context.Background(), &cobra.Command{Use: "urgent_app"}, cfg, f, core.AsBot)
+	rt.JqExpr = `.data.completion | .status, error("SECRET_MARKER")`
+	contract, _ := imcontract.Lookup("im messages urgent_app")
+	rt.contractSession = imcontract.NewSession(contract)
+	if err := rt.contractSession.ObserveRequest(map[string]any{"user_id_list": []any{"ou_a", secret}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt.Out(map[string]any{"invalid_user_id_list": []any{secret}}, nil)
+
+	if output.ExitCodeOf(rt.outputErr) != output.ExitAPI {
+		t.Fatalf("output error = %T %v", rt.outputErr, rt.outputErr)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if strings.Contains(stdout.String(), secret) || strings.Contains(rt.outputErr.Error(), secret) {
+		t.Fatalf("fallback leaked item or jq detail: stdout=%q err=%v", stdout.String(), rt.outputErr)
+	}
+	var env map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("fallback is not JSON: %v\n%s", err, stdout.String())
+	}
+	data, _ := env["data"].(map[string]any)
+	completion, _ := data["completion"].(map[string]any)
+	if completion["status"] != "partial" ||
+		completion["requested_count"] != float64(2) ||
+		completion["succeeded_count"] != float64(1) ||
+		completion["failed_count"] != float64(1) ||
+		completion["pending_count"] != float64(0) ||
+		completion["retry_scope"] != "failed_items_only" {
+		t.Fatalf("completion = %#v", completion)
+	}
+	for _, forbidden := range []string{"succeeded_items", "failed_items", "pending_items"} {
+		if _, exists := completion[forbidden]; exists {
+			t.Fatalf("completion copied %s: %#v", forbidden, completion)
+		}
+	}
+}
+
 func TestIMContractFlagCancelPendingLayerIsPartial(t *testing.T) {
 	cfg := &core.CliConfig{Brand: core.BrandFeishu, AppID: "cli_x"}
 	f, stdout, _, _ := cmdutil.TestFactory(t, cfg)
@@ -176,6 +220,76 @@ func TestRunShortcutAppliesIMReplayPolicy(t *testing.T) {
 	}
 	if p.Retryable || p.Hint != "The write result is unknown. Do not replay the original request." {
 		t.Fatalf("problem = %#v", p)
+	}
+}
+
+func TestRunShortcutAppliesIMReadRetryPolicy(t *testing.T) {
+	cfg := &core.CliConfig{Brand: core.BrandFeishu, AppID: "cli_x", AppSecret: "secret"}
+	f, _, _, _ := cmdutil.TestFactory(t, cfg)
+	parent := &cobra.Command{Use: "im"}
+	shortcut := Shortcut{
+		Service:     "im",
+		Command:     "+chat-list",
+		Description: "test",
+		Risk:        "read",
+		AuthTypes:   []string{"bot"},
+		Execute: func(_ context.Context, _ *RuntimeContext) error {
+			return errs.NewAPIError(errs.SubtypeServerError, "server unavailable")
+		},
+	}
+	shortcut.Mount(parent, f)
+	parent.SetArgs([]string{"+chat-list", "--as", "bot"})
+
+	err := parent.Execute()
+	problem, ok := errs.ProblemOf(err)
+	if !ok {
+		t.Fatalf("expected typed error, got %T %v", err, err)
+	}
+	if problem.Category != errs.CategoryAPI || problem.Subtype != errs.SubtypeServerError ||
+		!problem.Retryable {
+		t.Fatalf("problem = %#v", problem)
+	}
+}
+
+func TestMessagesSearchExplicitUnlimitedLimitRequiresCompleteRead(t *testing.T) {
+	cfg := &core.CliConfig{Brand: core.BrandFeishu, AppID: "cli_x", AppSecret: "secret"}
+	f, stdout, _, _ := cmdutil.TestFactory(t, cfg)
+	parent := &cobra.Command{Use: "im"}
+	shortcut := Shortcut{
+		Service:     "im",
+		Command:     "+messages-search",
+		Description: "test",
+		Risk:        "read",
+		AuthTypes:   []string{"bot"},
+		Flags: []Flag{
+			{Name: "page-all", Type: "bool"},
+			{Name: "page-limit", Type: "int", Default: "40"},
+		},
+		Execute: func(_ context.Context, runtime *RuntimeContext) error {
+			runtime.RecordPagination(client.PaginationStatus{
+				PagesFetched: 1,
+				StopReason:   client.StopReasonServerTruncation,
+			})
+			runtime.RecordMaterialization(imcontract.MaterializationStatus{})
+			runtime.Out(map[string]any{"messages": []any{}}, nil)
+			return nil
+		},
+	}
+	shortcut.Mount(parent, f)
+	parent.SetArgs([]string{"+messages-search", "--as", "bot", "--page-limit", "0"})
+
+	err := parent.Execute()
+	if output.ExitCodeOf(err) != output.ExitAPI {
+		t.Fatalf("error = %T %v, exit=%d want %d", err, err, output.ExitCodeOf(err), output.ExitAPI)
+	}
+	var envelope map[string]any
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &envelope); jsonErr != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", jsonErr, stdout.String())
+	}
+	meta, _ := envelope["meta"].(map[string]any)
+	if envelope["ok"] != false || meta["complete"] != false ||
+		meta["stop_reason"] != string(client.StopReasonServerTruncation) {
+		t.Fatalf("envelope = %#v", envelope)
 	}
 }
 

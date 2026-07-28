@@ -5,6 +5,7 @@ package imcontract
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/larksuite/cli/errs"
@@ -97,6 +98,225 @@ func TestReadFailureErrorWireShapeDoesNotSerializeCause(t *testing.T) {
 	}
 	if string(wire) == "" || containsAny(string(wire), secret, "opaque-token") {
 		t.Fatalf("unsafe error wire: %s", wire)
+	}
+}
+
+func TestReadFinalizeErrorRetryMatrix(t *testing.T) {
+	contract := mustReadContract(t, "im +messages-mget")
+	tests := []struct {
+		name          string
+		err           error
+		wantRetryable bool
+	}{
+		{
+			name:          "transport",
+			err:           errs.NewNetworkError(errs.SubtypeNetworkTransport, "connection reset"),
+			wantRetryable: true,
+		},
+		{
+			name:          "server error",
+			err:           errs.NewAPIError(errs.SubtypeServerError, "upstream failed"),
+			wantRetryable: true,
+		},
+		{
+			name:          "rate limit is not authorized",
+			err:           errs.NewAPIError(errs.SubtypeRateLimit, "too many requests").WithRetryable(),
+			wantRetryable: false,
+		},
+		{
+			name:          "permission",
+			err:           errs.NewPermissionError(errs.SubtypeMissingScope, "missing scope"),
+			wantRetryable: false,
+		},
+		{
+			name:          "not found",
+			err:           errs.NewAPIError(errs.SubtypeNotFound, "missing"),
+			wantRetryable: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session, err := NewReadSession(contract, ReadOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := session.FinalizeError(tt.err)
+			problem, ok := errs.ProblemOf(got)
+			if !ok {
+				t.Fatalf("FinalizeError returned untyped error %T: %v", got, got)
+			}
+			if problem.Retryable != tt.wantRetryable {
+				t.Fatalf("Retryable = %v, want %v: %#v", problem.Retryable, tt.wantRetryable, problem)
+			}
+		})
+	}
+}
+
+func TestPagedReadNormalizesRateLimitToNonRetryable(t *testing.T) {
+	contract := mustReadContract(t, "im +chat-list")
+	session, err := NewReadSession(contract, ReadOptions{FullRead: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rateLimit := errs.NewAPIError(errs.SubtypeRateLimit, "too many requests").WithRetryable()
+	session.ObservePagination(client.PaginationStatus{
+		PagesFetched: 1,
+		HasMore:      true,
+		StopReason:   client.StopReasonAPIError,
+		Cause:        rateLimit,
+	})
+	result, err := session.Finalize(map[string]any{"items": []any{"kept"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Error == nil {
+		t.Fatal("expected typed partial read error")
+	}
+	if result.Error.Retryable {
+		t.Fatalf("429/rate_limit must not authorize retry: %#v", result.Error)
+	}
+}
+
+func TestSearchMaterializationControlsFinalCompleteness(t *testing.T) {
+	contract := mustReadContract(t, "im +messages-search")
+	tests := []struct {
+		name         string
+		status       MaterializationStatus
+		wantOK       bool
+		wantComplete bool
+		wantHint     string
+	}{
+		{
+			name: "complete",
+			status: MaterializationStatus{
+				RequestedIDs: []string{"om_a", "om_b"},
+				ResolvedIDs:  []string{"om_a", "om_b"},
+			},
+			wantOK:       true,
+			wantComplete: true,
+			wantHint:     "Results are ready to use. Use message_id/file_key directly; do not call messages-mget.",
+		},
+		{
+			name: "missing details",
+			status: MaterializationStatus{
+				RequestedIDs:      []string{"om_a", "om_b"},
+				ResolvedIDs:       []string{"om_a"},
+				MissingMessageIDs: []string{"om_b"},
+			},
+			wantOK:       false,
+			wantComplete: false,
+			wantHint:     "The search is incomplete. Query only materialization.missing_message_ids with im +messages-mget.",
+		},
+		{
+			name: "unresolved hit",
+			status: MaterializationStatus{
+				RequestedIDs:       []string{"om_a"},
+				ResolvedIDs:        []string{"om_a"},
+				UnresolvedHitCount: 1,
+			},
+			wantOK:       false,
+			wantComplete: false,
+			wantHint:     "The search is incomplete and cannot be safely recovered by message ID. Narrow the query before retrying.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session, err := NewReadSession(contract, ReadOptions{FullRead: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session.ObservePagination(client.PaginationStatus{PagesFetched: 2, StopReason: client.StopReasonExhausted})
+			session.ObserveMaterialization(tt.status)
+			result, err := session.Finalize(map[string]any{"messages": []any{map[string]any{"message_id": "om_a"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.OK != tt.wantOK || result.Meta == nil || result.Meta.Complete == nil ||
+				*result.Meta.Complete != tt.wantComplete {
+				t.Fatalf("result = %#v, want OK/complete %v/%v", result, tt.wantOK, tt.wantComplete)
+			}
+			if result.Hint != tt.wantHint {
+				t.Fatalf("hint = %q, want %q", result.Hint, tt.wantHint)
+			}
+			data := result.Data.(map[string]any)
+			ledger, ok := data["materialization"].(map[string]any)
+			if !ok {
+				t.Fatalf("materialization ledger missing: %#v", data)
+			}
+			wantStatus := "partial"
+			if tt.wantComplete {
+				wantStatus = "complete"
+			}
+			if ledger["status"] != wantStatus {
+				t.Fatalf("materialization status = %q, want %q", ledger["status"], wantStatus)
+			}
+		})
+	}
+}
+
+func TestSearchMaterializationRequiredButUnobservedFailsClosed(t *testing.T) {
+	contract := mustReadContract(t, "im +messages-search")
+	session, err := NewReadSession(contract, ReadOptions{FullRead: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.ObservePagination(client.PaginationStatus{PagesFetched: 1, StopReason: client.StopReasonExhausted})
+	_, err = session.Finalize(map[string]any{"messages": []any{}})
+	problem, ok := errs.ProblemOf(err)
+	if !ok || problem.Subtype != errs.SubtypeInvalidResponse {
+		t.Fatalf("error = %T %v, want invalid_response", err, err)
+	}
+}
+
+func TestSearchMaterializationDoesNotOverwritePaginationFailure(t *testing.T) {
+	contract := mustReadContract(t, "im +messages-search")
+	session, err := NewReadSession(contract, ReadOptions{FullRead: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageErr := errs.NewNetworkError(errs.SubtypeNetworkTransport, "later page failed")
+	session.ObservePagination(client.PaginationStatus{
+		PagesFetched:  1,
+		HasMore:       true,
+		NextPageToken: "next",
+		StopReason:    client.StopReasonTransportError,
+		Cause:         pageErr,
+	})
+	session.ObserveMaterialization(MaterializationStatus{
+		RequestedIDs:      []string{"om_a", "om_b"},
+		ResolvedIDs:       []string{"om_a"},
+		MissingMessageIDs: []string{"om_b"},
+	})
+
+	result, err := session.Finalize(map[string]any{"messages": []any{map[string]any{"message_id": "om_a"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.OK || result.ExitCode != output.ExitNetwork || result.Cause != pageErr {
+		t.Fatalf("pagination failure was overwritten: %#v", result)
+	}
+	if result.Error == nil || !result.Error.Retryable {
+		t.Fatalf("pagination problem was not preserved: %#v", result.Error)
+	}
+	for _, want := range []string{hintReadFailed, "materialization.missing_message_ids"} {
+		if !strings.Contains(result.Hint, want) {
+			t.Fatalf("combined hint = %q, want %q", result.Hint, want)
+		}
+	}
+}
+
+func TestSearchMaterializationDoesNotExposeUnexpectedIDs(t *testing.T) {
+	status := MaterializationStatus{
+		RequestedIDs:           []string{"om_requested"},
+		ResolvedIDs:            []string{"om_requested"},
+		UnexpectedMessageCount: 1,
+	}
+	wire, err := json.Marshal(status.ledger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsAny(string(wire), "om_requested", "om_unknown_secret") {
+		t.Fatalf("ledger leaked internal IDs: %s", wire)
 	}
 }
 

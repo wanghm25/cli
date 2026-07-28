@@ -160,6 +160,37 @@ func TestMediaHelperMarksSendAndReplyPreuploadAsNonReplayable(t *testing.T) {
 	}
 }
 
+func TestIMContractJSON5xxUsesHTTPStatusForReplayPolicy(t *testing.T) {
+	runtime := newBotShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return shortcutJSONResponse(http.StatusServiceUnavailable, map[string]any{
+			"code": 123456,
+			"msg":  "unclassified business error",
+		}), nil
+	}))
+	contract, _ := imcontract.Lookup("im +messages-send")
+	session := imcontract.NewSession(contract)
+	setRuntimeField(t, runtime, "contractSession", session)
+
+	_, err := runtime.DoWriteAPIJSONTyped(
+		http.MethodPost,
+		"/open-apis/im/v1/messages",
+		nil,
+		map[string]any{"uuid": "stable-key"},
+	)
+	if err == nil {
+		t.Fatal("expected HTTP 503 error")
+	}
+	got := session.FinalizeError(err)
+	problem, ok := errs.ProblemOf(got)
+	if !ok || problem.Category != errs.CategoryNetwork ||
+		problem.Subtype != errs.SubtypeNetworkServer ||
+		problem.Code != http.StatusServiceUnavailable ||
+		!problem.Retryable ||
+		problem.Hint != "The write result is unknown. Retry only with the same idempotency key." {
+		t.Fatalf("problem = %#v, err=%T %v", problem, got, got)
+	}
+}
+
 func TestResolveP2PChatID(t *testing.T) {
 	runtime := newUserShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch {
