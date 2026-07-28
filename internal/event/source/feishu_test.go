@@ -17,6 +17,7 @@ import (
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 
 	"github.com/larksuite/cli/internal/event"
+	lark "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
@@ -767,7 +768,7 @@ func TestBuildDispatcher_LifecycleUpdated_CapturesFilter(t *testing.T) {
 		LogicOp:  "and",
 		Children: []*event.FilterNode{{Condition: &event.FilterCond{Operand: "chat_id", Op: "eq", Value: "oc_f"}}},
 	}}
-	filterJSON, err := json.Marshal(event.FilterToSDK(wantFilter))
+	filterJSON, err := json.Marshal(lark.FilterToSDK(wantFilter))
 	if err != nil {
 		t.Fatalf("marshal filter: %v", err)
 	}

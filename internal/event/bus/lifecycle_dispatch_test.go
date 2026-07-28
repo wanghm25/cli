@@ -139,7 +139,7 @@ func buildGetSubActiveWithFilter(targetResource, authorityUserOpenID string, inc
 		TargetResource(targetResource).
 		Authority(authorityBuilder.Build()).
 		PayloadOptions(larkeventv1.NewPayloadOptionsBuilder().IncludeResourceData(includeResourceData).Build()).
-		Filter(event.FilterToSDK(f)).
+		Filter(larkgw.FilterToSDK(f)).
 		Build()
 	sub := larkgw.ProjectSubscription(d)
 	return &sub

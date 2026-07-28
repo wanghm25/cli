@@ -109,7 +109,7 @@ func TestProjectSubscription_WithFilter_ProjectsCLIModel(t *testing.T) {
 	}
 	sub := ProjectSubscription(&larkeventv1.SubscriptionDetail{
 		SubscriptionId: strPtr("sub_f"),
-		Filter:         event.FilterToSDK(f),
+		Filter:         FilterToSDK(f),
 	})
 	if sub.Filter.IsEmpty() {
 		t.Fatal("sub.Filter is empty, want the projected remote filter")

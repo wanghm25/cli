@@ -1,22 +1,24 @@
 // Copyright (c) 2026 Lark Technologies Pte. Ltd.
 // SPDX-License-Identifier: MIT
 
-package event
+package lark
 
 import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/larksuite/cli/internal/event/model"
 )
 
 // sampleFilter is a representative composite (an "and" of an eq leaf and an in
-// leaf) shared by the projection and canonicalization tests.
-func sampleFilter() *Filter {
-	return &Filter{Root: &FilterNode{
-		LogicOp: logicAnd,
-		Children: []*FilterNode{
-			{Condition: &FilterCond{Operand: "sender", Op: opEq, Value: "ou_abc"}},
-			{Condition: &FilterCond{Operand: "message_type", Op: opIn, ListValue: []string{"text", "image"}}},
+// leaf) shared by the projection and byte-identity tests.
+func sampleFilter() *model.Filter {
+	return &model.Filter{Root: &model.FilterNode{
+		LogicOp: model.LogicAnd,
+		Children: []*model.FilterNode{
+			{Condition: &model.FilterCond{Operand: "sender", Op: model.OpEq, Value: "ou_abc"}},
+			{Condition: &model.FilterCond{Operand: "message_type", Op: model.OpIn, ListValue: []string{"text", "image"}}},
 		},
 	}}
 }
@@ -55,7 +57,7 @@ func TestFilterProjection_RoundTrip(t *testing.T) {
 
 	back := FilterFromSDK(FilterToSDK(original))
 
-	if !Equal(original, back) {
+	if !model.Equal(original, back) {
 		oc, _ := original.Canonicalize()
 		bc, _ := back.Canonicalize()
 		t.Fatalf("round-trip changed the filter:\n from: %s\n to:   %s", oc, bc)
@@ -63,7 +65,7 @@ func TestFilterProjection_RoundTrip(t *testing.T) {
 }
 
 func TestFilterToSDK_ClearForm(t *testing.T) {
-	for name, f := range map[string]*Filter{
+	for name, f := range map[string]*model.Filter{
 		"nil":         nil,
 		"empty-model": {},
 	} {
@@ -90,7 +92,7 @@ func TestFilterFromSDK_NilAndEmptyAreEmpty(t *testing.T) {
 	if !FilterFromSDK(nil).IsEmpty() {
 		t.Error("FilterFromSDK(nil) should be empty")
 	}
-	if !FilterFromSDK(FilterToSDK(&Filter{})).IsEmpty() {
+	if !FilterFromSDK(FilterToSDK(&model.Filter{})).IsEmpty() {
 		t.Error("round-tripped empty filter should be empty")
 	}
 }

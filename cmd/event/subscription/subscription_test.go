@@ -432,7 +432,7 @@ func TestMapRemoteSubscription_WithRemoteFilter_SurfacesCanonicalJSON(t *testing
 	d := &larkeventv1.SubscriptionDetail{
 		SubscriptionId: strPtr("sub_f"),
 		EventType:      strPtr("im.message.created_v1"),
-		Filter:         eventlib.FilterToSDK(f),
+		Filter:         larkgw.FilterToSDK(f),
 	}
 	row := mapRemoteSubscription(larkgw.ProjectSubscription(d))
 	if len(row.Filter) == 0 {

@@ -58,7 +58,7 @@ func mustParseCreatedFilter(t *testing.T, raw string) *eventlib.Filter {
 // clear-a-present-filter cases.
 func activeSubWithFilter(id string, f *eventlib.Filter) larkgw.RemoteSubscription {
 	d := activeDetail(id, false, "user")
-	d.Filter = eventlib.FilterToSDK(f)
+	d.Filter = larkgw.FilterToSDK(f)
 	return larkgw.ProjectSubscription(d)
 }
 

@@ -169,16 +169,16 @@ func (g *Gateway) Patch(ctx context.Context, remoteSubscriptionID string, spec P
 }
 
 // buildPatchBody projects a PatchSpec into the Patch request body, which carries
-// only the filter (the sole field a patch changes). event.FilterToSDK projects
-// the desired filter; an empty/cleared filter becomes the {"filter":{}} clear
-// form (a non-nil empty SDK filter) rather than an omitted field, so a clear is
+// only the filter (the sole field a patch changes). FilterToSDK projects the
+// desired filter; an empty/cleared filter becomes the {"filter":{}} clear form
+// (a non-nil empty SDK filter) rather than an omitted field, so a clear is
 // distinguishable on the wire from "leave the filter unchanged". Split out so
 // the projection is directly assertable against a plain, fully-inspectable
 // *larkeventv1.PatchSubscriptionReqBody (the built *PatchSubscriptionReq stores
 // its body in an internal field the SDK transport reads, not readably back).
 func buildPatchBody(spec PatchSpec) *larkeventv1.PatchSubscriptionReqBody {
 	return larkeventv1.NewPatchSubscriptionReqBodyBuilder().
-		Filter(event.FilterToSDK(spec.Filter)).
+		Filter(FilterToSDK(spec.Filter)).
 		Build()
 }
 
@@ -275,7 +275,7 @@ func buildCreateBody(spec CreateSpec) *larkeventv1.CreateSubscriptionReqBody {
 		TargetResource(spec.TargetResource).
 		PayloadOptions(payloadOptions.Build())
 	if !spec.Filter.IsEmpty() {
-		b = b.Filter(event.FilterToSDK(spec.Filter))
+		b = b.Filter(FilterToSDK(spec.Filter))
 	}
 	return b.Build()
 }

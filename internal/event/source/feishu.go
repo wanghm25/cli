@@ -24,6 +24,7 @@ import (
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"github.com/larksuite/cli/internal/event"
+	lark "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
@@ -448,7 +449,7 @@ func (s *FeishuSource) handleSubscriptionUpdated(ctx context.Context, e *larkeve
 	// one stays FilterPresent==false (resolved authoritatively via a Get later),
 	// never guessed as a confirmed "no filter".
 	if after.Filter != nil {
-		le.Filter = event.FilterFromSDK(after.Filter)
+		le.Filter = lark.FilterFromSDK(after.Filter)
 		le.FilterPresent = true
 	}
 	s.dispatchLifecycleEvent(ctx, le)

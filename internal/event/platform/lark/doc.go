@@ -14,8 +14,10 @@
 // subscription` commands, `event status`'s remote supplement, and the bus
 // lifecycle control plane are all insulated from the SDK's exact type spelling.
 //
-// The package imports internal/event for the CLI Filter model and its SDK
-// projection (event.FilterFromSDK / event.WalkSubscriptionPages); that keeps
-// the Filter projection in its existing single home rather than duplicating it
-// here.
+// The package owns the Filter SDK projection (FilterToSDK / FilterFromSDK) — the
+// sole remaining SDK toucher for filters, kept here beside the gateway that uses
+// it so the Filter model itself (internal/event/model) stays SDK-free. Filter
+// values cross the boundary as the SDK-free model.Filter. It imports
+// internal/event only for the shared, bounded subscription pager
+// (event.WalkSubscriptionPages).
 package lark

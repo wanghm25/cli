@@ -6,7 +6,6 @@ package lark
 import (
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
-	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
 )
 
@@ -44,7 +43,7 @@ type RemoteSubscription struct {
 	// Filter is the server-side event filter as the CLI Filter model. It is
 	// never nil — an unfiltered subscription projects to an empty *event.Filter
 	// (Filter.IsEmpty() == true) — so callers compare/canonicalize it directly.
-	Filter *event.Filter
+	Filter *model.Filter
 
 	// State is the remote subscription state (open vocabulary: "active",
 	// "suspended", "expired", ...).
@@ -71,14 +70,14 @@ type CreateSpec struct {
 	// Filter is the requested server-side filter; a nil/empty filter omits the
 	// field entirely (create's "no server-side filter", distinct from the
 	// update-only {"filter":{}} clear form).
-	Filter *event.Filter
+	Filter *model.Filter
 }
 
 // PatchSpec is the domain request for patching a remote Subscription. Patch
 // carries only the filter (the sole field update changes); an empty/cleared
 // filter is sent as the {"filter":{}} clear form rather than an omitted field.
 type PatchSpec struct {
-	Filter *event.Filter
+	Filter *model.Filter
 }
 
 // ListParams narrows a Subscription List to one CLI-relevant scope. Every field
@@ -115,7 +114,7 @@ func ProjectSubscription(d *larkeventv1.SubscriptionDetail) RemoteSubscription {
 		EventType:      strVal(d.EventType),
 		TargetResource: strVal(d.TargetResource),
 		Authority:      projectAuthority(d.Authority),
-		Filter:         event.FilterFromSDK(d.Filter),
+		Filter:         FilterFromSDK(d.Filter),
 		State:          strVal(d.State),
 		ExpireTime:     d.ExpireTime,
 		CreateTime:     d.CreateTime,

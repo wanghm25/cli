@@ -279,7 +279,7 @@ func TestMapRemoteSubscriptionInfo_WithFilter_SurfacesCanonicalJSON(t *testing.T
 	if err != nil {
 		t.Fatalf("build filter: %v", err)
 	}
-	info := mapRemoteSubscriptionInfo(larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{State: strPtr("enabled"), Filter: eventlib.FilterToSDK(f)}))
+	info := mapRemoteSubscriptionInfo(larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{State: strPtr("enabled"), Filter: larkgw.FilterToSDK(f)}))
 	if len(info.Filter) == 0 {
 		t.Fatal("info.Filter empty, want canonical JSON")
 	}
