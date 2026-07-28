@@ -357,12 +357,29 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 			return refinedDecryptKeyUnavailableError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
 		case protocol.RejectReasonBindFailed:
 			return refinedBindFailedError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
+		case protocol.RejectReasonSourceNotReady:
+			return refinedSourceNotReadyError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
+		case protocol.RejectReasonMalformedUserIdentity:
+			return refinedMalformedUserIdentityError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
 		case protocol.RejectReasonIncompleteRefinedHello:
 			return refinedIncompleteHelloError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
 		}
 	}
 	if rejErr := rejectionError(ack, resolved.MaterializedKey); rejErr != nil {
 		return applyOkRejectedError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt, rejErr)
+	}
+
+	// #19: the REAL connection is authoritative for capability. Even though the
+	// ack succeeded, a refined consume MUST see refined_routing + hello_v2 echoed
+	// on it; a bus too old to echo them (or missing either) would silently
+	// misroute or drop this consumer's dual-indexed events, so fail closed —
+	// closing the connection (the deferred conn.Close above) — rather than consume
+	// against it. This is the gate the separate pre-probe cannot be: that probe
+	// reads a DIFFERENT (status) connection, so only this echo proves the very
+	// connection this consumer will receive events on is capable, closing the
+	// probe's time-of-check-to-time-of-use window.
+	if !ackAdvertisesRefinedCapabilities(ack) {
+		return refinedBusCapabilityMissingError(resolved, opts.Identity, remoteSubscriptionID, createdByThisAttempt)
 	}
 
 	consumeOpts := Options{
@@ -480,6 +497,49 @@ func refinedIncompleteHelloError(resolved event.ResolvedEventKey, identity core.
 		"cannot start consuming %s: the event bus rejected the registration as incomplete (incomplete_refined_hello) — the refined Hello carried no target_resource",
 		resolved.MaterializedKey).
 		WithHint("the consumer was NOT started. This is an internal inconsistency (a refined consumer should always resolve a target_resource); please report it if it persists. %s",
+			applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+}
+
+// refinedSourceNotReadyError turns the bus's source_not_ready Hello rejection
+// into a typed error. The bus fails closed when its WS source did not come up
+// within the bounded pre-ack wait — for ANY identity (a bot, like a user, must
+// not ready before the source is up). Usually transient (a bus still connecting
+// its WebSocket), so the guidance is to retry; the consumer never registered or
+// readied, so there is nothing to roll back.
+func refinedSourceNotReadyError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool) error {
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"cannot start consuming %s: the event bus's WebSocket source did not become ready in time (source_not_ready)",
+		resolved.MaterializedKey).
+		WithHint("the consumer was NOT started. This is usually transient (the bus was still connecting its WebSocket) — retry shortly; if it persists, run `lark-cli event stop` to retire the bus and retry, and check connectivity to the Lark/Feishu open platform. %s",
+			applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+}
+
+// refinedMalformedUserIdentityError turns the bus's malformed_user_identity
+// Hello rejection into a typed error. The bus fails closed when a Hello declares
+// Identity == "user" but carries no user_open_id (it cannot be owner-gated,
+// bound, or delivery-gated). A refined consumer resolves its owner user_open_id
+// from --as/--profile, so an empty one is an internal inconsistency (a user
+// identity with no resolved open_id) rather than an operator-fixable condition.
+func refinedMalformedUserIdentityError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool) error {
+	return errs.NewInternalError(errs.SubtypeUnknown,
+		"cannot start consuming %s: the event bus rejected the registration as a malformed user identity (malformed_user_identity) — identity=user with no resolved user_open_id",
+		resolved.MaterializedKey).
+		WithHint("the consumer was NOT started. Ensure a user is logged in for this profile (`lark-cli auth login`) so a user identity resolves an open_id, or use --as bot. If it persists with a logged-in user, please report it. %s",
+			applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
+}
+
+// refinedBusCapabilityMissingError is the #19 fail-closed error for when the
+// hello_ack succeeded but did NOT echo the required refined capabilities
+// (refined_routing + hello_v2) on the real connection: the running local bus
+// predates refined-subscription support, so attaching this refined consumer to
+// it would silently misroute or drop its dual-indexed events. The connection is
+// closed (the caller's deferred conn.Close) and the consumer never readies. The
+// fix is operator-actionable: retire the old bus and retry against a fresh one.
+func refinedBusCapabilityMissingError(resolved event.ResolvedEventKey, identity core.Identity, remoteSubscriptionID string, createdByThisAttempt bool) error {
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"cannot start consuming %s: the running local event bus did not advertise refined-subscription support on the consume connection (missing refined_routing/hello_v2 in its hello_ack)",
+		resolved.MaterializedKey).
+		WithHint("the consumer was NOT started (the connection was closed). The running bus predates refined-subscription support — run `lark-cli event stop` to retire it, then retry; a freshly started bus carries the required capabilities. %s",
 			applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
 }
 

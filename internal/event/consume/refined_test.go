@@ -731,7 +731,7 @@ func TestRunRefinedChain_StrictOrder_ProbePlanApplyStartBusHello(t *testing.T) {
 			if remoteSubscriptionID != "sub_new" {
 				t.Errorf("hello received remoteSubscriptionID=%q, want %q (apply's output)", remoteSubscriptionID, "sub_new")
 			}
-			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true}, bufio.NewReader(conn), nil
+			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true, Capabilities: []string{protocol.CapabilityRefinedRouting, protocol.CapabilityHelloV2}}, bufio.NewReader(conn), nil
 		},
 	}
 
@@ -1145,7 +1145,7 @@ func TestRunRefinedChain_Suspended_NonDryRun_AppliesReactivateNotError(t *testin
 		},
 		startBus: func(context.Context) (net.Conn, error) { return client, nil },
 		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
-			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true}, bufio.NewReader(conn), nil
+			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true, Capabilities: []string{protocol.CapabilityRefinedRouting, protocol.CapabilityHelloV2}}, bufio.NewReader(conn), nil
 		},
 	}
 	opts := RefinedOptions{Quiet: true, ErrOut: io.Discard, Out: io.Discard, Identity: core.AsUser, Timeout: 500 * time.Millisecond}
@@ -1352,6 +1352,78 @@ func TestRunRefinedChain_HelloRejectedOther_UsesGenericRejectionPath(t *testing.
 	}
 	if strings.Contains(err.Error(), "decrypt_key_unavailable") {
 		t.Errorf("a non-decrypt rejection must NOT be classified decrypt_key_unavailable, got: %v", err)
+	}
+}
+
+// ---- #19: post-ack capability re-validation on the REAL connection ----
+
+// A SUCCESS hello_ack that does NOT echo the required refined capabilities
+// (an old bus that predates refined support, on the very connection this
+// consumer will receive events on) must FAIL CLOSED even though the ack
+// succeeded: the chain returns a failed_precondition guiding `event stop`,
+// never emits the ready marker, and closes the consume connection.
+func TestRunRefinedChain_HelloAckMissingCapabilities_FailsClosed_ClosesConn(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	var stderr bytes.Buffer
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
+		},
+		apply:    func(context.Context, subown.SubscriptionPlan) (string, bool, error) { return "sub_old", true, nil },
+		startBus: func(context.Context) (net.Conn, error) { return client, nil },
+		hello: func(_ context.Context, conn net.Conn, _ string) (*protocol.HelloAck, *bufio.Reader, error) {
+			// Success ack from a bus too old to echo refined capabilities.
+			return &protocol.HelloAck{Type: protocol.MsgTypeHelloAck, FirstForKey: true}, bufio.NewReader(conn), nil
+		},
+	}
+	// Quiet=false so a ready marker WOULD be written if the chain reached it.
+	opts := RefinedOptions{Quiet: false, ErrOut: &stderr, Out: io.Discard, Identity: core.AsUser}
+
+	err := runRefinedChain(context.Background(), refinedFixture(), opts, deps)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+	}
+	if ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
+	}
+	if !strings.Contains(ve.Hint, "event stop") {
+		t.Errorf("Hint = %q, want it to guide `event stop` to retire the old bus", ve.Hint)
+	}
+	if strings.Contains(stderr.String(), "[event] ready") {
+		t.Errorf("a capability-missing ack must fail closed BEFORE the ready marker; stderr:\n%s", stderr.String())
+	}
+	// The consume connection (returned by startBus) must be closed by the chain's
+	// deferred conn.Close: a write to the other end now fails.
+	if _, werr := client.Write([]byte("x")); werr == nil {
+		t.Error("expected the consume connection to be closed after a capability-missing ack")
+	}
+}
+
+// ackAdvertisesRefinedCapabilities: both markers required; a nil ack, or one
+// missing either, fails closed — the gate the post-ack check applies.
+func TestAckAdvertisesRefinedCapabilities(t *testing.T) {
+	cases := []struct {
+		name string
+		ack  *protocol.HelloAck
+		want bool
+	}{
+		{"nil ack", nil, false},
+		{"no capabilities", &protocol.HelloAck{}, false},
+		{"only refined_routing", &protocol.HelloAck{Capabilities: []string{protocol.CapabilityRefinedRouting}}, false},
+		{"only hello_v2", &protocol.HelloAck{Capabilities: []string{protocol.CapabilityHelloV2}}, false},
+		{"both present", &protocol.HelloAck{Capabilities: []string{protocol.CapabilityRefinedRouting, protocol.CapabilityHelloV2}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ackAdvertisesRefinedCapabilities(tc.ack); got != tc.want {
+				t.Errorf("ackAdvertisesRefinedCapabilities(%+v) = %v, want %v", tc.ack, got, tc.want)
+			}
+		})
 	}
 }
 

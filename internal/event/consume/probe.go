@@ -159,6 +159,22 @@ func busAdvertisesRefinedCapabilities(resp *protocol.StatusResponse) bool {
 		hasCapability(resp.Capabilities, protocol.CapabilityHelloV2)
 }
 
+// ackAdvertisesRefinedCapabilities is busAdvertisesRefinedCapabilities's
+// hello_ack counterpart (#19): the AUTHORITATIVE capability gate, checked on the
+// REAL consume connection the ack came back on — not the separate status
+// connection the pre-probe reads. Both specific capability strings must be
+// present (a HelloAck carries no ProtocolVersion — its Capabilities slice is the
+// whole signal). A nil ack, or one missing either marker (an old bus that does
+// not echo capabilities), fails closed — same fail-closed-on-partial stance as
+// busAdvertisesRefinedCapabilities.
+func ackAdvertisesRefinedCapabilities(ack *protocol.HelloAck) bool {
+	if ack == nil {
+		return false
+	}
+	return hasCapability(ack.Capabilities, protocol.CapabilityRefinedRouting) &&
+		hasCapability(ack.Capabilities, protocol.CapabilityHelloV2)
+}
+
 func hasCapability(capabilities []string, want string) bool {
 	for _, c := range capabilities {
 		if c == want {
