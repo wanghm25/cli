@@ -22,6 +22,7 @@ import (
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
 	"github.com/larksuite/cli/internal/event/protocol"
+	"github.com/larksuite/cli/internal/event/session"
 	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/transport"
 )
@@ -108,15 +109,22 @@ type RefinedOptions struct {
 	Controller refinedSubscriptionController
 }
 
-// refinedDeps are RunRefined's injectable seams for the 5 ordered stages
+// refinedDeps are RunRefined's injectable seams for the ordered stages
 // so refined_test.go can assert strict
-// order — probe < plan < apply < startBus < hello — and the dry-run
+// order — probe < plan < gate < apply < startBus < hello — and the dry-run
 // short-circuit with a call-recorder, never touching a real network or bus.
 // Production wiring is prodRefinedDeps below; tests substitute their own
 // closures directly.
+//
+// gate is the owner==current fail-closed check run BEFORE apply's remote write
+// (see refinedOwnerGate). Production always wires it; a test that constructs
+// refinedDeps directly may leave it nil to opt out (equivalent to an
+// owner==current admit) — runRefinedChain nil-guards it. The bus's Hello-time
+// gate remains regardless, so a nil here never opens a real hole.
 type refinedDeps struct {
 	probe    func(ctx context.Context) error
 	plan     func(ctx context.Context) (subown.SubscriptionPlan, error)
+	gate     func(ctx context.Context) error
 	apply    func(ctx context.Context, plan subown.SubscriptionPlan) (remoteSubscriptionID string, createdByThisAttempt bool, err error)
 	startBus func(ctx context.Context) (net.Conn, error)
 	hello    func(ctx context.Context, conn net.Conn, remoteSubscriptionID string) (*protocol.HelloAck, *bufio.Reader, error)
@@ -125,6 +133,7 @@ type refinedDeps struct {
 // RunRefined drives the refined-subscription `event consume` startup chain:
 // ProbeBusEligibility (read-only) ->
 // PlanRemoteSubscription (List/Get) -> [--dry-run exits here] ->
+// owner==current gate (fail closed before any write) ->
 // ApplyRemoteSubscriptionPlan (the ONLY remote write: Create/Reactivate) ->
 // StartOrConnectBus -> HelloV2 -> consumeLoop. This is the refined
 // counterpart to Run; it reuses Run's own package-private helpers
@@ -160,6 +169,12 @@ func prodRefinedDeps(tr transport.IPC, appID, profileName, domain string, resolv
 			// empty filter compares as "no filter", so an unfiltered consume against
 			// an unfiltered match still reuses).
 			return opts.Controller.Plan(ctx, subown.ConsumeBootstrap, refinedRequest(opts, eventType, targetResource))
+		},
+		gate: func(context.Context) error {
+			// Consult the shared owner==current policy against the FRESH current
+			// identity (session.ResolveCurrentIdentity reads config on every call —
+			// never a startup-cached value), exactly like the bus's own gates.
+			return refinedOwnerGate(resolved, opts.Identity, opts.OwnerRef, session.ResolveCurrentIdentity)
 		},
 		apply: func(ctx context.Context, plan subown.SubscriptionPlan) (string, bool, error) {
 			receipt, err := opts.Controller.Apply(ctx, plan, subown.ConsumeBootstrap, refinedRequest(opts, eventType, targetResource))
@@ -287,13 +302,28 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 		return refinedIndeterminateError(resolved, opts.Identity)
 	}
 
-	// ---- 4. ApplyRemoteSubscriptionPlan (the ONLY remote write) ----
+	// ---- 4. Owner==current gate: fail closed BEFORE the remote write ----
+	// The owning identity must be the active one before Apply may Create/
+	// Reactivate. An explicitly-selected non-active-user --profile (owner !=
+	// current) fails closed HERE with a typed error and NO remote write — instead
+	// of writing first and only being rejected later at the bus Hello (which still
+	// applies the SAME session.Gate policy, kept as defense in depth). A bot/legacy
+	// owner is never identity-gated and passes straight through. Placed after the
+	// Block/Indeterminate switch (those already fail closed without writing) and
+	// before apply, so it guards precisely the write path.
+	if deps.gate != nil {
+		if err := deps.gate(ctx); err != nil {
+			return err
+		}
+	}
+
+	// ---- 5. ApplyRemoteSubscriptionPlan (the ONLY remote write) ----
 	remoteSubscriptionID, createdByThisAttempt, err := deps.apply(ctx, plan)
 	if err != nil {
 		return err
 	}
 
-	// ---- 5. StartOrConnectBus ----
+	// ---- 6. StartOrConnectBus ----
 	conn, err := deps.startBus(ctx)
 	if err != nil {
 		// Apply already succeeded (a remote write may have just happened) —
@@ -305,7 +335,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 	}
 	defer conn.Close()
 
-	// ---- 6. HelloV2 ----
+	// ---- 7. HelloV2 ----
 	ack, br, err := deps.hello(ctx, conn, remoteSubscriptionID)
 	if err != nil {
 		// Same rationale as the startBus-fail branch above: Apply already
@@ -506,6 +536,61 @@ func refinedIndeterminateError(resolved event.ResolvedEventKey, identity core.Id
 		resolved.MaterializedKey, event.MaxSubscriptionListPages).
 		WithParam("event_key").
 		WithHint("the consumer was NOT started. Run `lark-cli event subscription list --as %s --json` to inspect existing subscriptions (this is NOT confirmed absence, only \"no match within the pages read\"), then retry once you have confirmed none matches", identity)
+}
+
+// refinedOwnerGate is the consume bootstrap's owner==current fail-closed gate,
+// run BEFORE the single remote write (Apply's Create/Reactivate) rather than only
+// later at the bus Hello. It reuses the ONE shared session.Gate policy unchanged —
+// this only moves WHERE consume consults it, never what it decides — so an
+// explicitly-selected non-active-user --profile (owner != current) never triggers
+// a wasted or wrong remote write first. resolveCurrent is session.ResolveCurrentIdentity
+// in production (a fresh config read every call) and a controllable seam in tests.
+//
+// The decision mirrors the other three call sites exactly: a bot/legacy owner
+// (empty UserOpenID) is never identity-gated and admits; a user owner admits only
+// when the freshly resolved current identity matches it; anything else fails
+// closed with a typed error and no remote write. The bus's Hello-time gate remains
+// as defense in depth.
+func refinedOwnerGate(resolved event.ResolvedEventKey, identity core.Identity, owner model.OwnerRef, resolveCurrent func() (session.CurrentIdentity, error)) error {
+	cur, curErr := resolveCurrent()
+	switch session.Gate(owner, cur, curErr) {
+	case session.AdmitStale:
+		return refinedStaleIdentityError(resolved, identity, owner)
+	case session.AdmitUnresolved:
+		return refinedUnresolvedIdentityError(resolved)
+	default: // AdmitDeliver
+		return nil
+	}
+}
+
+// refinedStaleIdentityError is the fail-closed error when the owner this consumer
+// would register as is NOT the active identity (owner != current). It fires BEFORE
+// the single remote write, so — unlike the post-Apply / Hello-time failures — NO
+// remote subscription was created or reactivated and there is nothing to
+// reconcile; the message says so, and carries no post-Apply recovery triple.
+func refinedStaleIdentityError(resolved event.ResolvedEventKey, identity core.Identity, owner model.OwnerRef) error {
+	who := owner.Profile
+	if who == "" {
+		who = string(identity)
+	}
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"cannot start consuming %s as %q: the selected owner is not the active identity, so consuming would act as the wrong user",
+		resolved.MaterializedKey, who).
+		WithParam("--profile").
+		WithHint("the consumer was NOT started and NO remote subscription was created or changed. Switch to the owning profile/user (or run without an explicit --profile/--as so the active identity is used), then retry `lark-cli event consume %s`",
+			resolved.MaterializedKey)
+}
+
+// refinedUnresolvedIdentityError is the fail-closed error when the active identity
+// could not be resolved at all (config unreadable / no current app), so
+// owner==current cannot be checked. Like the stale case it fires BEFORE any remote
+// write. Fail closed: never bootstrap a subscription under an unresolved identity.
+func refinedUnresolvedIdentityError(resolved event.ResolvedEventKey) error {
+	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
+		"cannot start consuming %s: the active identity could not be resolved, so ownership of the subscription cannot be verified",
+		resolved.MaterializedKey).
+		WithHint("the consumer was NOT started and NO remote subscription was created or changed. Ensure a profile is logged in (`lark-cli auth login`), then retry `lark-cli event consume %s`",
+			resolved.MaterializedKey)
 }
 
 // applyOkRecoveryHint builds the recovery guidance shared by EVERY
