@@ -18,6 +18,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
 )
 
@@ -130,7 +131,7 @@ func TestApplyReactivate_AlreadyActive_RealRun_NoReactivateCall(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := applyReactivate(context.Background(), fake, &buf, "sub_1", core.AsUser, reactivateOpts{}, before, true); err != nil {
+	if err := applyReactivate(context.Background(), fake, &buf, "sub_1", eventlib.CommandContext{Identity: core.AsUser}, reactivateOpts{}, before, true); err != nil {
 		t.Fatalf("applyReactivate: unexpected error: %v", err)
 	}
 	if fake.reactivateCalls != 0 {
@@ -150,7 +151,7 @@ func TestApplyReactivate_Suspended_RealRun_CallsReactivate(t *testing.T) {
 		t.Fatalf("getSubscription: %v", err)
 	}
 
-	if err := applyReactivate(context.Background(), fake, io.Discard, "sub_1", core.AsUser, reactivateOpts{}, before, true); err != nil {
+	if err := applyReactivate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser}, reactivateOpts{}, before, true); err != nil {
 		t.Fatalf("applyReactivate: unexpected error: %v", err)
 	}
 	if fake.reactivateCalls != 1 {
@@ -169,7 +170,7 @@ func TestApplyReactivate_ExpiredState_FailsClosed_NoReactivateCall(t *testing.T)
 		t.Fatalf("getSubscription: %v", err)
 	}
 
-	err = applyReactivate(context.Background(), fake, io.Discard, "sub_1", core.AsUser, reactivateOpts{}, before, true)
+	err = applyReactivate(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser}, reactivateOpts{}, before, true)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) || ve.Subtype != errs.SubtypeFailedPrecondition {
 		t.Fatalf("err = %v (%T), want a failed_precondition ValidationError", err, err)

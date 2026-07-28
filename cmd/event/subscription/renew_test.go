@@ -16,6 +16,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
 )
 
@@ -120,7 +121,7 @@ func TestApplyRenew_Active_CallsRenew(t *testing.T) {
 		t.Fatalf("getSubscription: %v", err)
 	}
 
-	if err := applyRenew(context.Background(), fake, io.Discard, "sub_1", core.AsUser, renewOpts{}, before, true); err != nil {
+	if err := applyRenew(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser}, renewOpts{}, before, true); err != nil {
 		t.Fatalf("applyRenew: unexpected error: %v", err)
 	}
 	if fake.renewCalls != 1 {
@@ -138,7 +139,7 @@ func TestApplyRenew_ExpiredState_FailsClosed_NoRenewCall(t *testing.T) {
 		t.Fatalf("getSubscription: %v", err)
 	}
 
-	err = applyRenew(context.Background(), fake, io.Discard, "sub_1", core.AsUser, renewOpts{}, before, true)
+	err = applyRenew(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser}, renewOpts{}, before, true)
 	var ve *errs.ValidationError
 	if !errors.As(err, &ve) || ve.Subtype != errs.SubtypeFailedPrecondition {
 		t.Fatalf("err = %v (%T), want a failed_precondition ValidationError", err, err)

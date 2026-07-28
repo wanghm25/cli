@@ -12,7 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/larksuite/cli/internal/cmdutil"
-	"github.com/larksuite/cli/internal/core"
+	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
@@ -123,7 +123,8 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 	if err != nil {
 		return err
 	}
-	return applyRenew(ctx, client, f.IOStreams.Out, remoteSubscriptionID, identity, o, before, scopesVerified)
+	cmdCtx := eventlib.CommandContext{Profile: cfg.ProfileName, Identity: identity}
+	return applyRenew(ctx, client, f.IOStreams.Out, remoteSubscriptionID, cmdCtx, o, before, scopesVerified)
 }
 
 // applyRenew is renew's testable core: given the already-read remote state
@@ -133,11 +134,11 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 // classifyMutation predicate — so renew never issues a write against an
 // indeterminate state. It never reads remote state itself; runRenew's
 // getSubscription supplies before. Exercised against a fake renewSubscriptionAPI.
-func applyRenew(ctx context.Context, svc renewSubscriptionAPI, out io.Writer, remoteSubscriptionID string, identity core.Identity, o renewOpts, before *subscriptionRow, scopesVerified bool) error {
+func applyRenew(ctx context.Context, svc renewSubscriptionAPI, out io.Writer, remoteSubscriptionID string, cmdCtx eventlib.CommandContext, o renewOpts, before *subscriptionRow, scopesVerified bool) error {
 	if o.dryRun {
 		// Plan from the OBSERVED remote state, not a static assumption.
 		plannedAction, nextAction := mutationDryRunPlan("renew", remoteSubscriptionID, before.Remote.State)
-		result := buildMutationDryRunResult("renew", remoteSubscriptionID, identity, scopesVerified, before,
+		result := buildMutationDryRunResult("renew", remoteSubscriptionID, cmdCtx.Identity, scopesVerified, before,
 			plannedAction, false, renewLocalImpactNote, nextAction)
 		if o.asJSON {
 			output.PrintJson(out, result)
@@ -156,7 +157,7 @@ func applyRenew(ctx context.Context, svc renewSubscriptionAPI, out io.Writer, re
 		return err
 	}
 	result := buildMutationResult("renew", *sub,
-		fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to confirm the new expire_time", remoteSubscriptionID, identity))
+		fmt.Sprintf("run `%s event subscription get %s --as %s --json` to confirm the new expire_time", cmdCtx.CLIHead(), remoteSubscriptionID, cmdCtx.Identity))
 	if o.asJSON {
 		output.PrintJson(out, result)
 		return nil

@@ -12,7 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/larksuite/cli/internal/cmdutil"
-	"github.com/larksuite/cli/internal/core"
+	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
@@ -123,7 +123,8 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 	if err != nil {
 		return err
 	}
-	return applyReactivate(ctx, client, f.IOStreams.Out, remoteSubscriptionID, identity, o, before, scopesVerified)
+	cmdCtx := eventlib.CommandContext{Profile: cfg.ProfileName, Identity: identity}
+	return applyReactivate(ctx, client, f.IOStreams.Out, remoteSubscriptionID, cmdCtx, o, before, scopesVerified)
 }
 
 // applyReactivate is reactivate's testable core: given the already-read remote
@@ -134,12 +135,12 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 // Reactivate happens. It never reads remote state itself; runReactivate's
 // getSubscription supplies before. Exercised against a fake reactivateSubscriptionAPI
 // in tests.
-func applyReactivate(ctx context.Context, svc reactivateSubscriptionAPI, out io.Writer, remoteSubscriptionID string, identity core.Identity, o reactivateOpts, before *subscriptionRow, scopesVerified bool) error {
+func applyReactivate(ctx context.Context, svc reactivateSubscriptionAPI, out io.Writer, remoteSubscriptionID string, cmdCtx eventlib.CommandContext, o reactivateOpts, before *subscriptionRow, scopesVerified bool) error {
 	if o.dryRun {
 		// Plan from the OBSERVED remote state: an already-active subscription is a
 		// no-op, not a fresh reactivation.
 		plannedAction, nextAction := mutationDryRunPlan("reactivate", remoteSubscriptionID, before.Remote.State)
-		result := buildMutationDryRunResult("reactivate", remoteSubscriptionID, identity, scopesVerified, before,
+		result := buildMutationDryRunResult("reactivate", remoteSubscriptionID, cmdCtx.Identity, scopesVerified, before,
 			plannedAction, false, reactivateLocalImpactNote, nextAction)
 		if o.asJSON {
 			output.PrintJson(out, result)
@@ -179,7 +180,7 @@ func applyReactivate(ctx context.Context, svc reactivateSubscriptionAPI, out io.
 		return err
 	}
 	result := buildMutationResult("reactivate", *sub,
-		fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to confirm it is active again; start a local consumer with `lark-cli event consume <refined EventKey> --as %s` if none is running", remoteSubscriptionID, identity, identity))
+		fmt.Sprintf("run `%s event subscription get %s --as %s --json` to confirm it is active again; start a local consumer with `%s event consume <refined EventKey> --as %s` if none is running", cmdCtx.CLIHead(), remoteSubscriptionID, cmdCtx.Identity, cmdCtx.CLIHead(), cmdCtx.Identity))
 	if o.asJSON {
 		output.PrintJson(out, result)
 		return nil
