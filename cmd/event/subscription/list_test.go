@@ -339,10 +339,10 @@ func TestListEventTypeFilter(t *testing.T) {
 // EVERY filter/identity flag from this invocation, not just --page-token, so it
 // is directly runnable.
 func TestListNextAction_CarriesAllFlags(t *testing.T) {
-	o := listOpts{state: "active", eventKey: "im.message.created_v1/chat-id/oc_aaa", pageSize: 20, as: "bot"}
+	o := listOpts{state: "active", eventKey: "im.message.created_v1/chat-id/oc_aaa", pageSize: 20, as: "bot", profile: "B"}
 	got := listNextAction(o, "tok_next")
 	for _, want := range []string{
-		"--page-token tok_next", "--state active",
+		"--profile B", "--page-token tok_next", "--state active",
 		"--event-key im.message.created_v1/chat-id/oc_aaa",
 		"--page-size 20", "--as bot", "--json",
 	} {
@@ -353,10 +353,10 @@ func TestListNextAction_CarriesAllFlags(t *testing.T) {
 }
 
 // TestListNextAction_OmitsUnsetFlags: with no filters set, the next action still
-// carries --page-token and --json but omits the unset filter/identity flags.
+// carries --page-token and --json but omits the unset filter/identity/profile flags.
 func TestListNextAction_OmitsUnsetFlags(t *testing.T) {
 	got := listNextAction(listOpts{}, "tok_next")
-	for _, absent := range []string{"--state", "--event-key", "--page-size", "--as "} {
+	for _, absent := range []string{"--state", "--event-key", "--page-size", "--as ", "--profile"} {
 		if strings.Contains(got, absent) {
 			t.Errorf("next action %q should omit unset flag %q", got, absent)
 		}
@@ -379,12 +379,12 @@ func TestListSubscriptions_NextActionCarriesFilters(t *testing.T) {
 		},
 	}, true, "tok_next")}
 
-	o := listOpts{state: "active", eventKey: "im.message.created_v1/chat-id/oc_aaa", pageSize: 20, as: "bot"}
+	o := listOpts{state: "active", eventKey: "im.message.created_v1/chat-id/oc_aaa", pageSize: 20, as: "bot", profile: "B"}
 	result, err := listSubscriptions(context.Background(), fake, o, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	for _, want := range []string{"--page-token tok_next", "--state active", "--event-key im.message.created_v1/chat-id/oc_aaa", "--page-size 20", "--as bot"} {
+	for _, want := range []string{"--profile B", "--page-token tok_next", "--state active", "--event-key im.message.created_v1/chat-id/oc_aaa", "--page-size 20", "--as bot"} {
 		if !strings.Contains(result.NextAction, want) {
 			t.Errorf("NextAction = %q, missing %q", result.NextAction, want)
 		}

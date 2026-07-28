@@ -38,9 +38,13 @@ type listOpts struct {
 	pageSize  int
 	pageToken string
 	asJSON    bool
-	// as is the raw --as flag value ("user"/"bot"/"auto"), captured so the
-	// next-page action can echo it back — a fully-composable next command.
-	as string
+	// as / profile are the raw --as and global --profile flag values, captured so
+	// the next-page action can echo them back — a fully-composable next command
+	// that runs against the SAME identity AND the same app/credential (--profile
+	// is a global persistent flag, not a list-local one, so it must be gathered
+	// explicitly or the next page silently falls back to the default profile).
+	as      string
+	profile string
 }
 
 // NewCmdList builds `event subscription list`: read-only,
@@ -106,9 +110,12 @@ func runList(cmd *cobra.Command, f *cmdutil.Factory, o listOpts) error {
 	if err != nil {
 		return err
 	}
-	// Capture the raw --as value so the next-page action can reproduce this
-	// invocation's identity verbatim.
+	// Capture the raw --as and global --profile values so the next-page action
+	// reproduces this invocation's identity AND app/credential verbatim. --profile
+	// is inherited from the root persistent flags; an unset value stays "" and is
+	// omitted (the next page then defaults exactly as this call did).
 	o.as, _ = cmd.Flags().GetString("as")
+	o.profile, _ = cmd.Flags().GetString("profile")
 
 	uat, _, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionReadScopes)
 	if err != nil {
@@ -206,7 +213,13 @@ func listEventTypeFilter(eventKey string) string {
 // echoes the caller's original input (which listEventTypeFilter accepts on the
 // way back in).
 func listNextAction(o listOpts, nextToken string) string {
-	cmd := "lark-cli event subscription list --page-token " + nextToken
+	cmd := "lark-cli event subscription list"
+	// --profile selects the app/credential; without it the next page could run
+	// against a different profile. Echoed first (app selection) when explicitly set.
+	if o.profile != "" {
+		cmd += " --profile " + o.profile
+	}
+	cmd += " --page-token " + nextToken
 	if o.state != "" {
 		cmd += " --state " + o.state
 	}
