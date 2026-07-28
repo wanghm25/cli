@@ -6,11 +6,13 @@ package subscription
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
@@ -121,7 +123,18 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 	if err != nil {
 		return err
 	}
+	return applyReactivate(ctx, client, f.IOStreams.Out, remoteSubscriptionID, identity, o, before, scopesVerified)
+}
 
+// applyReactivate is reactivate's testable core: given the already-read remote
+// state (before), it renders the --dry-run preview, the already-active NO-OP, or
+// the real Reactivate + result. The no-op path must NOT call Reactivate — it
+// mirrors the --dry-run's "noop" plan via the shared reactivateIsNoop predicate,
+// so the preview and the execution can never disagree about whether a redundant
+// Reactivate happens. It never reads remote state itself; runReactivate's
+// getSubscription supplies before. Exercised against a fake reactivateSubscriptionAPI
+// in tests.
+func applyReactivate(ctx context.Context, svc reactivateSubscriptionAPI, out io.Writer, remoteSubscriptionID string, identity core.Identity, o reactivateOpts, before *subscriptionRow, scopesVerified bool) error {
 	if o.dryRun {
 		// Plan from the OBSERVED remote state: an already-active subscription is a
 		// no-op, not a fresh reactivation.
@@ -129,24 +142,43 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 		result := buildMutationDryRunResult("reactivate", remoteSubscriptionID, identity, scopesVerified, before,
 			plannedAction, false, reactivateLocalImpactNote, nextAction)
 		if o.asJSON {
-			output.PrintJson(f.IOStreams.Out, result)
+			output.PrintJson(out, result)
 			return nil
 		}
-		writeMutationDryRunText(f.IOStreams.Out, result)
+		writeMutationDryRunText(out, result)
 		return nil
 	}
 
-	sub, err := doReactivateSubscription(ctx, client, remoteSubscriptionID)
+	if reactivateIsNoop(before.Remote.State) {
+		// Already active — mirror the --dry-run's "noop" plan EXACTLY (same
+		// reactivateIsNoop predicate): a real run must not issue a redundant
+		// Reactivate the preview promised was unnecessary. Echo the record we
+		// just read (before is already the mapped row) instead of calling the API.
+		result := &mutationResult{
+			Operation:            "reactivate",
+			RemoteSubscriptionID: before.RemoteSubscriptionID,
+			Subscription:         *before,
+			NextAction:           fmt.Sprintf("remote_subscription_id=%s is already active; no reactivation was needed", remoteSubscriptionID),
+		}
+		if o.asJSON {
+			output.PrintJson(out, result)
+			return nil
+		}
+		writeMutationResultText(out, "No change to", result)
+		return nil
+	}
+
+	sub, err := doReactivateSubscription(ctx, svc, remoteSubscriptionID)
 	if err != nil {
 		return err
 	}
 	result := buildMutationResult("reactivate", *sub,
 		fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to confirm it is active again; start a local consumer with `lark-cli event consume <refined EventKey> --as %s` if none is running", remoteSubscriptionID, identity, identity))
 	if o.asJSON {
-		output.PrintJson(f.IOStreams.Out, result)
+		output.PrintJson(out, result)
 		return nil
 	}
-	writeMutationResultText(f.IOStreams.Out, "Reactivated", result)
+	writeMutationResultText(out, "Reactivated", result)
 	return nil
 }
 

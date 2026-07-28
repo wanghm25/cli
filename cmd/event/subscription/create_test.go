@@ -745,8 +745,11 @@ func TestBuildDryRunResult_NotFound_ShapeAndNoRemoteBefore(t *testing.T) {
 		t.Errorf("Operation = %q, want create", result.Operation)
 	}
 	// #22.3: an unverified scope pre-check must report "unknown", never a green light.
-	if result.Preflight.ScopesOK != "unknown" {
-		t.Errorf("Preflight.ScopesOK = %q, want unknown when scopes were not verified", result.Preflight.ScopesOK)
+	if result.Preflight.ScopesOK {
+		t.Errorf("Preflight.ScopesOK = %v, want false when scopes were not verified", result.Preflight.ScopesOK)
+	}
+	if result.Preflight.ScopeStatus != "unknown" {
+		t.Errorf("Preflight.ScopeStatus = %q, want unknown when scopes were not verified", result.Preflight.ScopeStatus)
 	}
 	if !result.DryRun {
 		t.Error("DryRun = false, want true")
@@ -784,8 +787,11 @@ func TestBuildDryRunResult_ActiveCompatible_RemoteBeforePopulated(t *testing.T) 
 		t.Errorf("PlannedChange.Action = %q, want reuse", result.PlannedChange.Action)
 	}
 	// #22.3: a verified scope pre-check reports "verified".
-	if result.Preflight.ScopesOK != "verified" {
-		t.Errorf("Preflight.ScopesOK = %q, want verified", result.Preflight.ScopesOK)
+	if !result.Preflight.ScopesOK {
+		t.Errorf("Preflight.ScopesOK = %v, want true when scopes were verified", result.Preflight.ScopesOK)
+	}
+	if result.Preflight.ScopeStatus != "verified" {
+		t.Errorf("Preflight.ScopeStatus = %q, want verified", result.Preflight.ScopeStatus)
 	}
 	if result.RemoteBefore == nil {
 		t.Fatal("RemoteBefore = nil, want the existing subscription row")

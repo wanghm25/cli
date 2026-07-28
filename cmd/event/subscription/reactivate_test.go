@@ -4,10 +4,12 @@
 package subscription
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -110,6 +112,49 @@ func TestReactivateDryRun_EndToEndViaFakeService_JSONShapeAndNoReactivateCall(t 
 	}
 	if fake.reactivateCalls != 0 {
 		t.Errorf("reactivateCalls = %d, want 0: --dry-run must never issue a write", fake.reactivateCalls)
+	}
+}
+
+// ---- applyReactivate: real-run no-op parity with the dry-run ----
+
+// TestApplyReactivate_AlreadyActive_RealRun_NoReactivateCall locks the fix: a
+// REAL reactivate (not --dry-run) of an already-active subscription is a no-op —
+// it must NOT call Reactivate, mirroring the --dry-run's planned_action=noop via
+// the shared reactivateIsNoop predicate. Before the fix the real path called
+// svc.Reactivate unconditionally, so the preview and the execution disagreed.
+func TestApplyReactivate_AlreadyActive_RealRun_NoReactivateCall(t *testing.T) {
+	fake := &fakeReactivateAPI{getSub: subPtr(activeSub("sub_1", false, "user"))}
+	before, err := getSubscription(context.Background(), fake, "sub_1")
+	if err != nil {
+		t.Fatalf("getSubscription: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := applyReactivate(context.Background(), fake, &buf, "sub_1", core.AsUser, reactivateOpts{}, before, true); err != nil {
+		t.Fatalf("applyReactivate: unexpected error: %v", err)
+	}
+	if fake.reactivateCalls != 0 {
+		t.Errorf("reactivateCalls = %d, want 0: an already-active real reactivate must be a no-op (matching the dry-run)", fake.reactivateCalls)
+	}
+	if !strings.Contains(buf.String(), "already active") {
+		t.Errorf("output = %q, want it to state the subscription is already active", buf.String())
+	}
+}
+
+// TestApplyReactivate_Suspended_RealRun_CallsReactivate locks the other side: a
+// suspended subscription (the real reactivate target) IS reactivated exactly once.
+func TestApplyReactivate_Suspended_RealRun_CallsReactivate(t *testing.T) {
+	fake := &fakeReactivateAPI{getSub: subPtr(suspendedSub("sub_1", "authority_revoked"))}
+	before, err := getSubscription(context.Background(), fake, "sub_1")
+	if err != nil {
+		t.Fatalf("getSubscription: %v", err)
+	}
+
+	if err := applyReactivate(context.Background(), fake, io.Discard, "sub_1", core.AsUser, reactivateOpts{}, before, true); err != nil {
+		t.Fatalf("applyReactivate: unexpected error: %v", err)
+	}
+	if fake.reactivateCalls != 1 {
+		t.Errorf("reactivateCalls = %d, want 1: a suspended subscription must be reactivated", fake.reactivateCalls)
 	}
 }
 

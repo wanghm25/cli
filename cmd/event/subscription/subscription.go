@@ -74,9 +74,12 @@ not strictly need it.
 
 SAFETY: 'delete' is a high-risk write on a resource other identities/
 processes may share and requires --yes after a human confirms — without
-it, a typed confirmation-required error (exit code 10); create/update/
-renew/reactivate never prompt for confirmation (a filter change, like a
-renew or reactivate, is reversible). Every subcommand except list/get
+it, a typed confirmation-required error (exit code 10); 'update' requires
+--yes when a filter change affects — or, if a discovered local bus cannot be
+queried, cannot be confirmed NOT to affect — a running local consumer (same
+exit code 10), and never prompts otherwise; create/renew/reactivate never
+prompt for confirmation (a renew or reactivate is reversible). Every
+subcommand except list/get
 supports --dry-run (parse + identity + scope preflight + a remote read +
 impact analysis, zero writes). 'delete' removing the remote Subscription is
 NOT a substitute for stopping a local 'event consume' process still bound
@@ -391,10 +394,14 @@ func errEmptyRemoteSubscriptionID() error {
 // AuthTypes check), so there is no MatchedTemplate field.
 type mutationPreflight struct {
 	Identity string `json:"identity"`
-	// ScopesOK is a tri-state token ("verified" | "unknown"), not a bare bool:
-	// the local scope pre-check cannot always confirm satisfaction, and a dry-run
-	// must not report a green light it never verified. See scopeStateLabel.
-	ScopesOK string `json:"scopes_ok"`
+	// ScopesOK stays a bool (backward-compatible for existing scripts / typed
+	// decoders): true ONLY when the local scope pre-check actually confirmed the
+	// required scopes, false when it could not be determined — never a green
+	// light we did not verify. ScopeStatus is the additive nuance that
+	// distinguishes "verified" from "unknown" (a definitively-missing scope
+	// never reaches a dry-run: it errors out earlier). See scopeStateLabel.
+	ScopesOK    bool   `json:"scopes_ok"`
+	ScopeStatus string `json:"scope_status"`
 }
 
 // mutationDryRunResult is the shared --dry-run JSON shape for update/renew/
@@ -432,10 +439,17 @@ type mutationDryRunResult struct {
 // delete/update supply their own planned action + next_action (their plans do not
 // vary by lifecycle state this way) and do not use this. The "active"/"suspended"
 // spellings match the remote-state vocabulary the subscription Planner uses.
+// reactivateIsNoop reports whether reactivating a subscription in the given
+// remote state is a no-op (it is already active). BOTH the --dry-run preview
+// (mutationDryRunPlan) and the real reactivate path consult this single
+// predicate, so the preview and the execution can never disagree about whether
+// a Reactivate call actually happens.
+func reactivateIsNoop(state string) bool { return state == "active" }
+
 func mutationDryRunPlan(operation, remoteSubscriptionID, state string) (plannedAction, nextAction string) {
 	switch operation {
 	case "reactivate":
-		if state == "active" {
+		if reactivateIsNoop(state) {
 			return "noop", fmt.Sprintf("remote_subscription_id=%s is already active; no reactivation is needed", remoteSubscriptionID)
 		}
 		return "reactivate", fmt.Sprintf("run without --dry-run to reactivate remote_subscription_id=%s", remoteSubscriptionID)
@@ -475,8 +489,9 @@ func buildMutationDryRunResult(operation, remoteSubscriptionID string, identity 
 		RemoteSubscriptionID: remoteSubscriptionID,
 		RequiredScopes:       subscriptionMutationScopes,
 		Preflight: mutationPreflight{
-			Identity: string(identity),
-			ScopesOK: scopeStateLabel(scopesVerified),
+			Identity:    string(identity),
+			ScopesOK:    scopesVerified,
+			ScopeStatus: scopeStateLabel(scopesVerified),
 		},
 		RemoteBefore: before,
 		PlannedChange: plannedChange{

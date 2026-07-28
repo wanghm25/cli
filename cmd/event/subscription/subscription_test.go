@@ -507,24 +507,28 @@ func TestNewCmdSubscription_RegistersListAndGetAsRead(t *testing.T) {
 	}
 }
 
-// ---- #22.3 dry-run scopes_ok tri-state ----
+// ---- #22.3 dry-run scopes_ok bool + additive scope_status ----
 
-// TestBuildMutationDryRunResult_ScopesOK_TriState locks that the mutation
-// dry-run preflight reports scope satisfaction honestly: "verified" only when
-// the pre-check actually confirmed it, "unknown" when it could not — never a
-// bare true that asserts a green light we never checked.
-func TestBuildMutationDryRunResult_ScopesOK_TriState(t *testing.T) {
+// TestBuildMutationDryRunResult_ScopesOK locks that the mutation dry-run
+// preflight reports scope satisfaction honestly AND backward-compatibly:
+// scopes_ok stays a bool (true ONLY when the pre-check actually confirmed the
+// scopes, false when it could not — never a green light we never checked), and
+// the additive scope_status carries the "verified" vs "unknown" nuance.
+func TestBuildMutationDryRunResult_ScopesOK(t *testing.T) {
 	for _, tc := range []struct {
-		verified bool
-		want     string
+		verified   bool
+		wantStatus string
 	}{
 		{true, "verified"},
 		{false, "unknown"},
 	} {
 		result := buildMutationDryRunResult("renew", "sub_1", core.AsUser, tc.verified, nil,
 			"renew", false, "", "next")
-		if result.Preflight.ScopesOK != tc.want {
-			t.Errorf("scopesVerified=%v -> ScopesOK=%q, want %q", tc.verified, result.Preflight.ScopesOK, tc.want)
+		if result.Preflight.ScopesOK != tc.verified {
+			t.Errorf("scopesVerified=%v -> ScopesOK=%v, want %v", tc.verified, result.Preflight.ScopesOK, tc.verified)
+		}
+		if result.Preflight.ScopeStatus != tc.wantStatus {
+			t.Errorf("scopesVerified=%v -> ScopeStatus=%q, want %q", tc.verified, result.Preflight.ScopeStatus, tc.wantStatus)
 		}
 	}
 }

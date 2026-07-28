@@ -458,10 +458,13 @@ type createDryRunResult struct {
 type createPreflight struct {
 	Identity        string `json:"identity"`
 	MatchedTemplate string `json:"matched_template"`
-	// ScopesOK is a tri-state token ("verified" | "unknown"), not a bare bool:
-	// the local scope pre-check cannot always confirm satisfaction, and a dry-run
-	// must not report a green light it never verified. See scopeStateLabel.
-	ScopesOK string `json:"scopes_ok"`
+	// ScopesOK stays a bool (backward-compatible for existing scripts / typed
+	// decoders): true ONLY when the local scope pre-check actually confirmed the
+	// required scopes, false when it could not be determined — never a green
+	// light we did not verify. ScopeStatus is the additive nuance ("verified" vs
+	// "unknown"). See scopeStateLabel.
+	ScopesOK    bool   `json:"scopes_ok"`
+	ScopeStatus string `json:"scope_status"`
 }
 
 // plannedChange describes what a real (non-dry-run) run would do, per
@@ -525,9 +528,11 @@ func buildDryRunResult(resolved eventlib.ResolvedEventKey, identity core.Identit
 		Preflight: createPreflight{
 			Identity:        string(identity),
 			MatchedTemplate: resolved.Template.Template,
-			// "verified" only when the pre-check actually confirmed the scopes;
-			// "unknown" when scope data was unavailable (never a false green light).
-			ScopesOK: scopeStateLabel(scopesVerified),
+			// scopes_ok true ONLY when the pre-check actually confirmed the scopes;
+			// false when scope data was unavailable — never a false green light.
+			// scope_status carries the "verified" vs "unknown" nuance additively.
+			ScopesOK:    scopesVerified,
+			ScopeStatus: scopeStateLabel(scopesVerified),
 		},
 		RemoteBefore:  remoteBefore,
 		PlannedChange: pc,
