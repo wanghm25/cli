@@ -33,11 +33,10 @@ type updateSubscriptionAPI interface {
 
 // updateOpts holds `event subscription update`'s flag values.
 type updateOpts struct {
-	filter              string
-	clearFilter         bool
-	includeResourceData bool
-	dryRun              bool
-	asJSON              bool
+	filter      string
+	clearFilter bool
+	dryRun      bool
+	asJSON      bool
 }
 
 // NewCmdUpdate builds `event subscription update <remote_subscription_id>`.
@@ -55,9 +54,9 @@ type updateOpts struct {
 //
 // include_resource_data is deliberately not updatable: the platform's Patch
 // API carries only a filter, and resource-data delivery (with the encryption
-// it implies) is fixed when a Subscription is created. --include-resource-data
-// is kept as a recognized flag purely so a caller reaching for it gets a
-// specific, actionable rejection instead of an "unknown flag" error.
+// it implies) is fixed when a Subscription is created. Changing it is only ever
+// done by deleting the Subscription and creating a new one (after human
+// confirmation), so update exposes no flag for it and touches only the filter.
 func NewCmdUpdate(f *cmdutil.Factory) *cobra.Command {
 	var o updateOpts
 	cmd := &cobra.Command{
@@ -91,7 +90,8 @@ keeps its current filter until it re-syncs — check 'lark-cli event status'.
 SAFETY: changing a filter is reversible with another update, so update is NOT
 a high-risk confirmation-gated action and does not accept --yes. Use
 --dry-run to preview the change without patching anything. Resource-data
-delivery cannot be changed here — see --include-resource-data.`,
+delivery (include_resource_data) cannot be changed here at all; to change it,
+delete the subscription and create a new one after human confirmation.`,
 		Example: `  lark-cli event subscription update sub_xxx --clear-filter --dry-run --as bot --json
   lark-cli event subscription update sub_xxx --filter '{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"eq","value":"text"}}]}}' --as bot --json`,
 		Args: cobra.ExactArgs(1),
@@ -104,8 +104,6 @@ delivery cannot be changed here — see --include-resource-data.`,
 		"Inline `json` event filter to set server-side, replacing any current filter; validated against this subscription's event type (see 'event schema <key> --json'). Mutually exclusive with --clear-filter.")
 	cmd.Flags().BoolVar(&o.clearFilter, "clear-filter", false,
 		"Remove the server-side event filter from this subscription so every matching event is delivered. Mutually exclusive with --filter.")
-	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
-		"Not updatable: whether delivered events include resource data is fixed when a subscription is created and cannot be changed via update. Passing this flag is always rejected; delete and recreate (after human confirmation) to change it.")
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the plan (identity/scope preflight + remote read + impact analysis) without changing the filter")
 	cmd.Flags().BoolVar(&o.asJSON, "json", false, "Emit the result as JSON (for AI / scripts)")
@@ -118,15 +116,6 @@ delivery cannot be changed here — see --include-resource-data.`,
 func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID string, o updateOpts) error {
 	if strings.TrimSpace(remoteSubscriptionID) == "" {
 		return errEmptyRemoteSubscriptionID()
-	}
-
-	// include_resource_data is not updatable at all — reject before resolving
-	// an identity, checking scopes, or touching the network. That the Patch
-	// API is filter-only (and resource-data delivery is fixed at create time)
-	// is a structural fact about the request, independent of remote state, so
-	// this short-circuits here exactly as it did when update did nothing else.
-	if cmd.Flags().Changed("include-resource-data") {
-		return errUpdateCannotSwitchEncryption(remoteSubscriptionID, o.includeResourceData)
 	}
 
 	// Exactly one of --filter / --clear-filter selects the change to make.
@@ -271,26 +260,6 @@ func updateSuccessNextAction(remoteSubscriptionID string, identity core.Identity
 		what = "that the filter was removed"
 	}
 	return fmt.Sprintf("run `lark-cli event subscription get %s --as %s --json` to confirm %s; a running local `event consume` process picks up the change only after it re-syncs — check `lark-cli event status`", remoteSubscriptionID, identity, what)
-}
-
-// errUpdateCannotSwitchEncryption reports the by-design refusal to change
-// include_resource_data (and the encryption it implies) on an existing remote
-// Subscription via update, in either direction: the platform's Patch API is
-// filter-only and carries no field that could touch it, and `encrypt` is
-// create-only. desiredIncludeResourceData is the value the caller asked for,
-// echoed into the delete+recreate example so the guidance is directionally
-// correct either way.
-//
-// Changing resource-data delivery is therefore only ever done by deleting the
-// Subscription and creating a new one (or creating a separate new one), after
-// a human confirms — the CLI never leaves a Subscription in an inconsistent
-// state (resource data toggled while its key can be neither added nor
-// removed).
-func errUpdateCannotSwitchEncryption(remoteSubscriptionID string, desiredIncludeResourceData bool) error {
-	return errs.NewValidationError(errs.SubtypeFailedPrecondition,
-		"cannot change include_resource_data on an existing subscription via update").
-		WithParam("--include-resource-data").
-		WithHint("resource-data delivery (and the encryption it implies) is decided when a subscription is created and cannot be changed via update; after human confirmation, delete this subscription and create a new one (or create a separate new subscription) — e.g. `lark-cli event subscription delete %s` then `lark-cli event subscription create <refined-event-key> --include-resource-data=%t`", remoteSubscriptionID, desiredIncludeResourceData)
 }
 
 // updateLocalImpact returns the honest local-consumer impact for update's

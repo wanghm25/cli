@@ -375,12 +375,11 @@ func TestRunUpdate_EmptyID_RejectedBeforeNetwork(t *testing.T) {
 	}
 }
 
-// TestRunUpdate_IncludeResourceData_RejectedBeforeNetwork locks that trying to
-// change include_resource_data via update is refused, in either direction,
-// with a typed failed_precondition — purely locally, before any
-// identity/scope/network step (it short-circuits ahead of even the filter-flag
-// checks).
-func TestRunUpdate_IncludeResourceData_RejectedBeforeNetwork(t *testing.T) {
+// TestRunUpdate_IncludeResourceDataFlagRemoved locks that update no longer
+// exposes --include-resource-data at all: passing it fails as an unknown flag
+// (resource-data delivery is fixed at create time and update changes only the
+// filter), rather than the old typed failed_precondition rejection.
+func TestRunUpdate_IncludeResourceDataFlagRemoved(t *testing.T) {
 	for _, value := range []string{"true", "false"} {
 		t.Run(value, func(t *testing.T) {
 			f := &cmdutil.Factory{}
@@ -390,23 +389,11 @@ func TestRunUpdate_IncludeResourceData_RejectedBeforeNetwork(t *testing.T) {
 			cmd.SetArgs([]string{"sub_1", "--include-resource-data=" + value})
 
 			err := cmd.Execute()
-			var ve *errs.ValidationError
-			if !errors.As(err, &ve) {
-				t.Fatalf("expected *errs.ValidationError, got %T: %v", err, err)
+			if err == nil {
+				t.Fatal("expected an unknown-flag error, got nil")
 			}
-			if ve.Subtype != errs.SubtypeFailedPrecondition {
-				t.Errorf("Subtype = %s, want %s", ve.Subtype, errs.SubtypeFailedPrecondition)
-			}
-			if ve.Param != "--include-resource-data" {
-				t.Errorf("Param = %q, want --include-resource-data", ve.Param)
-			}
-			if !strings.Contains(ve.Error(), "include_resource_data") {
-				t.Errorf("Error() = %q, want it to mention include_resource_data", ve.Error())
-			}
-			for _, want := range []string{"delete", "create", "confirm", "sub_1", "--include-resource-data=" + value} {
-				if !strings.Contains(ve.Hint, want) {
-					t.Errorf("Hint = %q, want it to mention %q", ve.Hint, want)
-				}
+			if !strings.Contains(err.Error(), "include-resource-data") {
+				t.Errorf("Error() = %q, want it to name the unknown flag", err.Error())
 			}
 		})
 	}
@@ -507,16 +494,19 @@ func TestRunUpdate_MissingWriteScope_ReturnsPermissionError(t *testing.T) {
 }
 
 // TestNewCmdUpdate_HasExpectedFlags locks update's flag surface: the two
-// filter flags, the kept-for-a-clear-rejection --include-resource-data,
-// --dry-run/--json/--as, no --yes (update is not confirmation-gated), and
-// risk=write.
+// filter flags, --dry-run/--json/--as, no --include-resource-data (update
+// changes only the filter; resource-data delivery is fixed at create time), no
+// --yes (update is not confirmation-gated), and risk=write.
 func TestNewCmdUpdate_HasExpectedFlags(t *testing.T) {
 	f := &cmdutil.Factory{}
 	cmd := NewCmdUpdate(f)
-	for _, name := range []string{"filter", "clear-filter", "include-resource-data", "dry-run", "json", "as"} {
+	for _, name := range []string{"filter", "clear-filter", "dry-run", "json", "as"} {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Errorf("NewCmdUpdate missing --%s flag", name)
 		}
+	}
+	if cmd.Flags().Lookup("include-resource-data") != nil {
+		t.Error("NewCmdUpdate must not expose --include-resource-data (update changes only the filter)")
 	}
 	if cmd.Flags().Lookup("yes") != nil {
 		t.Error("NewCmdUpdate must not expose --yes (a filter change is reversible, not confirmation-gated)")
