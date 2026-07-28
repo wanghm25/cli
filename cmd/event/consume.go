@@ -622,6 +622,9 @@ func runRefinedConsume(cmd *cobra.Command, f *cmdutil.Factory, cfg *core.CliConf
 		Runtime:             runtime,
 		Out:                 f.IOStreams.Out,
 		ErrOut:              errOut,
+		// The dry-run plan preview is the payload of --dry-run and stays even
+		// under --quiet (which only discards the chatty errOut above).
+		PreviewOut:          f.IOStreams.ErrOut,
 		RemoteAPIClient:     botRuntime,
 		MaxEvents:           o.maxEvents,
 		Timeout:             o.timeout,

@@ -86,7 +86,7 @@ func TestRenewDryRun_EndToEndViaFakeService_JSONShapeAndNoRenewCall(t *testing.T
 	if err != nil {
 		t.Fatalf("getSubscription: unexpected error: %v", err)
 	}
-	result := buildMutationDryRunResult("renew", "sub_1", core.AsUser, before, "renew", false, renewLocalImpactNote,
+	result := buildMutationDryRunResult("renew", "sub_1", core.AsUser, true, before, "renew", false, renewLocalImpactNote,
 		"run without --dry-run to renew remote_subscription_id=sub_1")
 
 	raw, err := json.Marshal(result)

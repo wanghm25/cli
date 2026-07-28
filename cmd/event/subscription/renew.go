@@ -103,7 +103,7 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 	if err != nil {
 		return err
 	}
-	uat, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionMutationScopes)
+	uat, scopesVerified, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionMutationScopes)
 	if err != nil {
 		return err
 	}
@@ -123,9 +123,10 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 	}
 
 	if o.dryRun {
-		result := buildMutationDryRunResult("renew", remoteSubscriptionID, identity, before,
-			"renew", false, renewLocalImpactNote,
-			fmt.Sprintf("run without --dry-run to renew remote_subscription_id=%s", remoteSubscriptionID))
+		// Plan from the OBSERVED remote state, not a static assumption.
+		plannedAction, nextAction := mutationDryRunPlan("renew", remoteSubscriptionID, before.Remote.State)
+		result := buildMutationDryRunResult("renew", remoteSubscriptionID, identity, scopesVerified, before,
+			plannedAction, false, renewLocalImpactNote, nextAction)
 		if o.asJSON {
 			output.PrintJson(f.IOStreams.Out, result)
 			return nil

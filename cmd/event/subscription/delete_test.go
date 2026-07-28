@@ -133,7 +133,7 @@ func TestBuildDeleteDryRun_AffectedConsumer_ListsItAndFlagsImpact(t *testing.T) 
 	before := rowFromDetail(t, activeDetail("sub_1", false, "user"))
 	matched := []localConsumerInfo{{PID: 4242, EventKey: "im.message.created_v1/chat-id/oc_aaa"}}
 
-	result := buildDeleteDryRun("sub_1", core.AsUser, before, matched)
+	result := buildDeleteDryRun("sub_1", core.AsUser, before, matched, true)
 
 	if !result.LocalImpact.LocalConsumerAffected {
 		t.Error("local_consumer_affected = false, want true when a local consumer is bound")
@@ -170,7 +170,7 @@ func TestBuildDeleteDryRun_AffectedConsumer_ListsItAndFlagsImpact(t *testing.T) 
 func TestBuildDeleteDryRun_NoBus_NoLocalImpact(t *testing.T) {
 	before := rowFromDetail(t, activeDetail("sub_1", false, "user"))
 
-	result := buildDeleteDryRun("sub_1", core.AsUser, before, nil)
+	result := buildDeleteDryRun("sub_1", core.AsUser, before, nil, true)
 
 	if result.LocalImpact.LocalConsumerAffected {
 		t.Error("local_consumer_affected = true, want false when no consumer is known")
@@ -238,7 +238,7 @@ func TestDeleteDryRun_EndToEndViaFakeService_JSONShapeAndNoDeleteCall(t *testing
 	if err != nil {
 		t.Fatalf("getSubscription: unexpected error: %v", err)
 	}
-	result := buildMutationDryRunResult("delete", "sub_1", core.AsUser, before, "delete", false, deleteLocalImpactNote,
+	result := buildMutationDryRunResult("delete", "sub_1", core.AsUser, true, before, "delete", false, deleteLocalImpactNote,
 		"run with --yes (after a human confirms) to permanently delete remote_subscription_id=sub_1")
 
 	raw, err := json.Marshal(result)

@@ -43,6 +43,11 @@ type updateOpts struct {
 	dryRun      bool
 	yes         bool
 	asJSON      bool
+	// scopesVerified is NOT a flag: it is the resolved scope-preflight state
+	// (resolveUATAndCheckScopes's second return) that runUpdate stamps on before
+	// calling applyUpdate, so the --dry-run preview reports scopes_ok honestly
+	// ("verified" vs "unknown"). Defaults to false (unknown) in tests.
+	scopesVerified bool
 }
 
 // NewCmdUpdate builds `event subscription update <remote_subscription_id>`.
@@ -177,10 +182,12 @@ func runUpdate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 	if err != nil {
 		return err
 	}
-	uat, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionMutationScopes)
+	uat, scopesVerified, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionMutationScopes)
 	if err != nil {
 		return err
 	}
+	// Carry the honest scope-preflight state into the dry-run preview.
+	o.scopesVerified = scopesVerified
 
 	sdk, err := f.LarkClient()
 	if err != nil {
@@ -235,7 +242,7 @@ func applyUpdate(ctx context.Context, svc updateSubscriptionAPI, out io.Writer, 
 		// A real change (not a no-op) affects local consumers only when one is
 		// actually running for this subscription.
 		affected := !outcome.NoChange && len(affectedConsumers) > 0
-		result := buildMutationDryRunResult("update", remoteSubscriptionID, identity, &beforeRow,
+		result := buildMutationDryRunResult("update", remoteSubscriptionID, identity, o.scopesVerified, &beforeRow,
 			updatePlannedAction(outcome.NoChange), affected, updateImpactNote(outcome.NoChange, affectedConsumers),
 			updateDryRunNextAction(remoteSubscriptionID, o.clearFilter, outcome.NoChange))
 		if affected {

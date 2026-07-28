@@ -114,7 +114,7 @@ func runDelete(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 	if err != nil {
 		return err
 	}
-	uat, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionMutationScopes)
+	uat, scopesVerified, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionMutationScopes)
 	if err != nil {
 		return err
 	}
@@ -138,7 +138,7 @@ func runDelete(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID stri
 	affectedConsumers := matchLocalConsumers(queryLocalConsumers(), remoteSubscriptionID)
 
 	if o.dryRun {
-		result := buildDeleteDryRun(remoteSubscriptionID, identity, before, affectedConsumers)
+		result := buildDeleteDryRun(remoteSubscriptionID, identity, before, affectedConsumers, scopesVerified)
 		if o.asJSON {
 			output.PrintJson(f.IOStreams.Out, result)
 			return nil
@@ -182,8 +182,8 @@ func applyDelete(ctx context.Context, svc deleteSubscriptionAPI, remoteSubscript
 // subscription), so the preview truthfully reflects what a delete disrupts
 // instead of the old hardcoded "no local impact". Empty matched (no bus / none
 // bound) reports no local impact.
-func buildDeleteDryRun(remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, matched []localConsumerInfo) *mutationDryRunResult {
-	result := buildMutationDryRunResult("delete", remoteSubscriptionID, identity, before,
+func buildDeleteDryRun(remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, matched []localConsumerInfo, scopesVerified bool) *mutationDryRunResult {
+	result := buildMutationDryRunResult("delete", remoteSubscriptionID, identity, scopesVerified, before,
 		"delete", len(matched) > 0, deleteImpactNote(matched),
 		fmt.Sprintf("run with --yes (after a human confirms) to permanently delete remote_subscription_id=%s; this does not stop any local `event consume` process", remoteSubscriptionID))
 	if len(matched) > 0 {

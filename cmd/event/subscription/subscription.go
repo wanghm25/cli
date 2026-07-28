@@ -175,31 +175,55 @@ func resolveEffectiveIdentity(cmd *cobra.Command, f *cmdutil.Factory) (core.Iden
 // Scopes==""), so in practice this fast local path only ever fires for user
 // identity; bot permission failures are still caught — just by the real
 // API call's error classification (internal/errclass) instead of here.
-func resolveUATAndCheckScopes(ctx context.Context, f *cmdutil.Factory, appID string, as core.Identity, required []string) (string, error) {
+// scopesVerified reports whether the local pre-check actually confirmed the
+// required scopes are present (true) or could not determine it (false — scope
+// data unavailable, so the real OAPI call stays authoritative). A dry-run
+// preflight must surface this honestly ("verified" vs "unknown") rather than
+// asserting a green light it never checked; see scopeStateLabel.
+func resolveUATAndCheckScopes(ctx context.Context, f *cmdutil.Factory, appID string, as core.Identity, required []string) (token string, scopesVerified bool, err error) {
 	result, err := f.Credential.ResolveToken(ctx, credential.NewTokenSpec(as, appID))
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return "", err
+			return "", false, err
 		}
 		// Best-effort: the gateway's identity binding itself fails closed
 		// (typed AuthenticationError) for user identity when no token is
 		// available; for bot identity the real API call surfaces any real
-		// auth problem instead.
-		return "", nil
+		// auth problem instead. Scope satisfaction is UNVERIFIED here.
+		return "", false, nil
 	}
 	if result == nil {
-		return "", nil
+		return "", false, nil
 	}
-	if result.Scopes != "" {
-		if missing := auth.MissingScopes(result.Scopes, required); len(missing) > 0 {
-			return "", errs.NewPermissionError(errs.SubtypeMissingScope,
-				"missing required scope(s) for event subscription (as %s): %s", as, strings.Join(missing, ", ")).
-				WithIdentity(string(as)).
-				WithMissingScopes(missing...).
-				WithHint("%s", scopeRemediationHint(as, missing))
-		}
+	if result.Scopes == "" {
+		// The provider did not populate scopes (the common bot/tenant-token
+		// case), so we cannot confirm satisfaction locally: return the token but
+		// mark scopes unverified so the dry-run reports "unknown", not a false OK.
+		return result.Token, false, nil
 	}
-	return result.Token, nil
+	if missing := auth.MissingScopes(result.Scopes, required); len(missing) > 0 {
+		return "", false, errs.NewPermissionError(errs.SubtypeMissingScope,
+			"missing required scope(s) for event subscription (as %s): %s", as, strings.Join(missing, ", ")).
+			WithIdentity(string(as)).
+			WithMissingScopes(missing...).
+			WithHint("%s", scopeRemediationHint(as, missing))
+	}
+	// Scopes were present AND satisfied — a genuine verification.
+	return result.Token, true, nil
+}
+
+// scopeStateLabel renders a dry-run preflight's scope satisfaction as a tri-state
+// token: "verified" when the local scope pre-check confirmed the required scopes
+// are present, "unknown" when it could not be determined (scope data
+// unavailable — the real call remains authoritative). Never a bare true, which
+// would tell the caller a green light that was not actually verified. (A
+// definitively-missing scope never reaches a dry-run: resolveUATAndCheckScopes
+// returns a typed permission error first.)
+func scopeStateLabel(verified bool) string {
+	if verified {
+		return "verified"
+	}
+	return "unknown"
 }
 
 // scopeRemediationHint returns an identity-appropriate fix for missing
@@ -367,7 +391,10 @@ func errEmptyRemoteSubscriptionID() error {
 // AuthTypes check), so there is no MatchedTemplate field.
 type mutationPreflight struct {
 	Identity string `json:"identity"`
-	ScopesOK bool   `json:"scopes_ok"`
+	// ScopesOK is a tri-state token ("verified" | "unknown"), not a bare bool:
+	// the local scope pre-check cannot always confirm satisfaction, and a dry-run
+	// must not report a green light it never verified. See scopeStateLabel.
+	ScopesOK string `json:"scopes_ok"`
 }
 
 // mutationDryRunResult is the shared --dry-run JSON shape for update/renew/
@@ -391,10 +418,43 @@ type mutationDryRunResult struct {
 	NextAction           string            `json:"next_action"`
 }
 
-// buildMutationDryRunResult builds the shared --dry-run result. identity has
-// already passed the scope preflight by the time this is called, so
-// Preflight.ScopesOK is unconditionally true here — mirroring create.go's
-// buildDryRunResult's own ScopesOK comment. plannedAction is the
+// mutationDryRunPlan derives the state-appropriate planned action and next_action
+// for a renew/reactivate --dry-run from the OBSERVED remote state (getSubscription
+// runs before the dry-run branch, so the preview plans from what a real run would
+// actually find rather than a static assumption):
+//
+//   - reactivate targets a SUSPENDED subscription. On an already-active one it is
+//     a no-op (planned_action "noop"); on any other state it reactivates.
+//   - renew extends the expiry from any live state, but leaves a SUSPENDED
+//     subscription suspended — so a renew of a suspended subscription is still a
+//     renew, with next_action noting delivery stays paused until reactivate.
+//
+// delete/update supply their own planned action + next_action (their plans do not
+// vary by lifecycle state this way) and do not use this. The "active"/"suspended"
+// spellings match the remote-state vocabulary the subscription Planner uses.
+func mutationDryRunPlan(operation, remoteSubscriptionID, state string) (plannedAction, nextAction string) {
+	switch operation {
+	case "reactivate":
+		if state == "active" {
+			return "noop", fmt.Sprintf("remote_subscription_id=%s is already active; no reactivation is needed", remoteSubscriptionID)
+		}
+		return "reactivate", fmt.Sprintf("run without --dry-run to reactivate remote_subscription_id=%s", remoteSubscriptionID)
+	case "renew":
+		if state == "suspended" {
+			return "renew", fmt.Sprintf("run without --dry-run to renew remote_subscription_id=%s; it stays suspended — run `lark-cli event subscription reactivate %s` to resume delivery", remoteSubscriptionID, remoteSubscriptionID)
+		}
+		return "renew", fmt.Sprintf("run without --dry-run to renew remote_subscription_id=%s", remoteSubscriptionID)
+	default:
+		return operation, fmt.Sprintf("run without --dry-run to %s remote_subscription_id=%s", operation, remoteSubscriptionID)
+	}
+}
+
+// buildMutationDryRunResult builds the shared --dry-run result. scopesVerified
+// is the preflight's honest scope-satisfaction state (resolveUATAndCheckScopes's
+// second return): the caller has passed the preflight (a definitively-missing
+// scope errored out earlier), but "passed" only means "not proven missing" —
+// scopeStateLabel renders it "verified" or "unknown" so the dry-run never asserts
+// a green light it could not confirm. plannedAction is the
 // planned_change.action value (e.g. "renew", or a blocked-state variant
 // such as "blocked_suspended" — the dry-run always reports the plan
 // informationally rather than erroring on remote business state; only the
@@ -408,7 +468,7 @@ type mutationDryRunResult struct {
 // true and lets impactNote carry the "re-sync a running consumer" guidance
 // (update cannot cheaply tell whether one is actually running, so it discloses
 // the possible impact rather than asserting none).
-func buildMutationDryRunResult(operation, remoteSubscriptionID string, identity core.Identity, before *subscriptionRow, plannedAction string, localConsumerAffected bool, impactNote, nextAction string) *mutationDryRunResult {
+func buildMutationDryRunResult(operation, remoteSubscriptionID string, identity core.Identity, scopesVerified bool, before *subscriptionRow, plannedAction string, localConsumerAffected bool, impactNote, nextAction string) *mutationDryRunResult {
 	return &mutationDryRunResult{
 		Operation:            operation,
 		DryRun:               true,
@@ -416,7 +476,7 @@ func buildMutationDryRunResult(operation, remoteSubscriptionID string, identity 
 		RequiredScopes:       subscriptionMutationScopes,
 		Preflight: mutationPreflight{
 			Identity: string(identity),
-			ScopesOK: true,
+			ScopesOK: scopeStateLabel(scopesVerified),
 		},
 		RemoteBefore: before,
 		PlannedChange: plannedChange{

@@ -44,8 +44,10 @@ per-template check — this command carries no EventKey context).
 SCOPE: event:subscription:read.
 
 OUTPUT: {remote_subscription_id, event_key, target_resource, identity,
-payload_options, remote{state, expire_time, suspension_reason, create_time,
-update_time}}. The 'local' field is reserved for a future change once
+user_open_id, payload_options, remote{state, expire_time, suspension_reason,
+create_time, update_time}}. identity is the exact --as token ('bot' | 'user');
+user_open_id carries the owning user's open_id. The 'local' field is reserved
+for a future change once
 local-consumer association ('event consume' <-> remote subscription)
 exists; it is always omitted for now.
 
@@ -84,7 +86,7 @@ func runGet(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID string,
 		return err
 	}
 
-	uat, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionReadScopes)
+	uat, _, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionReadScopes)
 	if err != nil {
 		return err
 	}

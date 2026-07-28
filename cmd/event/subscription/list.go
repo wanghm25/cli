@@ -103,7 +103,7 @@ func runList(cmd *cobra.Command, f *cmdutil.Factory, o listOpts) error {
 		return err
 	}
 
-	uat, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionReadScopes)
+	uat, _, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionReadScopes)
 	if err != nil {
 		return err
 	}

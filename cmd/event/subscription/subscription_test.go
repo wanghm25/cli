@@ -88,12 +88,16 @@ func boolPtr(b bool) *bool    { return &b }
 func TestResolveUATAndCheckScopes_UserAllScopesGranted_ReturnsToken(t *testing.T) {
 	f := factoryWithToken(&credential.TokenResult{Token: "u-tok", Scopes: "event:subscription:read event:subscription:write"}, nil)
 
-	uat, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsUser, subscriptionReadScopes)
+	uat, verified, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsUser, subscriptionReadScopes)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if uat != "u-tok" {
 		t.Errorf("uat = %q, want %q", uat, "u-tok")
+	}
+	// Scopes were present AND satisfied -> a genuine verification.
+	if !verified {
+		t.Error("scopesVerified = false, want true when the granted scopes were checked")
 	}
 }
 
@@ -105,7 +109,7 @@ func TestResolveUATAndCheckScopes_UserAllScopesGranted_ReturnsToken(t *testing.T
 func TestResolveUATAndCheckScopes_MissingReadScope_ReturnsTypedPermissionError(t *testing.T) {
 	f := factoryWithToken(&credential.TokenResult{Token: "u-tok", Scopes: "im:message:send"}, nil)
 
-	_, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsUser, subscriptionReadScopes)
+	_, _, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsUser, subscriptionReadScopes)
 	if err == nil {
 		t.Fatal("expected an error when the required scope is missing, got nil")
 	}
@@ -139,7 +143,7 @@ func TestResolveUATAndCheckScopes_MissingReadScope_ReturnsTypedPermissionError(t
 func TestResolveUATAndCheckScopes_BotMissingScope_HintPointsAtConsole(t *testing.T) {
 	f := factoryWithToken(&credential.TokenResult{Token: "t-tok", Scopes: "im:message"}, nil)
 
-	_, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsBot, subscriptionReadScopes)
+	_, _, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsBot, subscriptionReadScopes)
 	if err == nil {
 		t.Fatal("expected an error when the required scope is missing, got nil")
 	}
@@ -168,12 +172,16 @@ func TestResolveUATAndCheckScopes_BotMissingScope_HintPointsAtConsole(t *testing
 func TestResolveUATAndCheckScopes_ScopesUnknown_SkipsCheck(t *testing.T) {
 	f := factoryWithToken(&credential.TokenResult{Token: "t-tok", Scopes: ""}, nil)
 
-	uat, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsBot, subscriptionReadScopes)
+	uat, verified, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsBot, subscriptionReadScopes)
 	if err != nil {
 		t.Fatalf("unknown scopes must skip the local check, got error: %v", err)
 	}
 	if uat != "t-tok" {
 		t.Errorf("uat = %q, want %q", uat, "t-tok")
+	}
+	// Scope data was unavailable -> satisfaction was NOT verified.
+	if verified {
+		t.Error("scopesVerified = true, want false when scope data was unavailable")
 	}
 }
 
@@ -186,19 +194,23 @@ func TestResolveUATAndCheckScopes_ScopesUnknown_SkipsCheck(t *testing.T) {
 func TestResolveUATAndCheckScopes_TokenResolutionFails_BestEffortSkips(t *testing.T) {
 	f := factoryWithToken(nil, errors.New("token cache unavailable"))
 
-	uat, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsUser, subscriptionReadScopes)
+	uat, verified, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsUser, subscriptionReadScopes)
 	if err != nil {
 		t.Fatalf("expected best-effort skip (nil error), got: %v", err)
 	}
 	if uat != "" {
 		t.Errorf("uat = %q, want empty on resolution failure", uat)
 	}
+	// Token resolution failed -> nothing was verified.
+	if verified {
+		t.Error("scopesVerified = true, want false when token resolution failed")
+	}
 }
 
 func TestResolveUATAndCheckScopes_ContextCanceled_Propagates(t *testing.T) {
 	f := factoryWithToken(nil, context.Canceled)
 
-	_, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsUser, subscriptionReadScopes)
+	_, _, err := resolveUATAndCheckScopes(context.Background(), f, "cli_x", core.AsUser, subscriptionReadScopes)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled to propagate", err)
 	}
@@ -492,5 +504,61 @@ func TestNewCmdSubscription_RegistersListAndGetAsRead(t *testing.T) {
 		if !ok || level != cmdutil.RiskRead {
 			t.Errorf("%q risk = (%q, %v), want (%q, true)", name, level, ok, cmdutil.RiskRead)
 		}
+	}
+}
+
+// ---- #22.3 dry-run scopes_ok tri-state ----
+
+// TestBuildMutationDryRunResult_ScopesOK_TriState locks that the mutation
+// dry-run preflight reports scope satisfaction honestly: "verified" only when
+// the pre-check actually confirmed it, "unknown" when it could not — never a
+// bare true that asserts a green light we never checked.
+func TestBuildMutationDryRunResult_ScopesOK_TriState(t *testing.T) {
+	for _, tc := range []struct {
+		verified bool
+		want     string
+	}{
+		{true, "verified"},
+		{false, "unknown"},
+	} {
+		result := buildMutationDryRunResult("renew", "sub_1", core.AsUser, tc.verified, nil,
+			"renew", false, "", "next")
+		if result.Preflight.ScopesOK != tc.want {
+			t.Errorf("scopesVerified=%v -> ScopesOK=%q, want %q", tc.verified, result.Preflight.ScopesOK, tc.want)
+		}
+	}
+}
+
+// ---- #22.4 renew/reactivate dry-run plans from real remote state ----
+
+// TestMutationDryRunPlan_StateAppropriate locks that the renew/reactivate
+// dry-run plan is derived from the OBSERVED remote state, not a static
+// assumption: reactivating an already-active subscription is a no-op, while a
+// suspended one reactivates; renewing extends the expiry but leaves a suspended
+// subscription suspended.
+func TestMutationDryRunPlan_StateAppropriate(t *testing.T) {
+	cases := []struct {
+		name         string
+		operation    string
+		state        string
+		wantAction   string
+		nextContains string
+	}{
+		{"reactivate active -> noop", "reactivate", "active", "noop", "already active"},
+		{"reactivate suspended -> reactivate", "reactivate", "suspended", "reactivate", "run without --dry-run to reactivate"},
+		{"reactivate unknown -> reactivate", "reactivate", "", "reactivate", "run without --dry-run to reactivate"},
+		{"renew active -> renew", "renew", "active", "renew", "run without --dry-run to renew"},
+		{"renew suspended -> renew, stays suspended", "renew", "suspended", "renew", "stays suspended"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			action, next := mutationDryRunPlan(c.operation, "sub_1", c.state)
+			if action != c.wantAction {
+				t.Errorf("plannedAction = %q, want %q", action, c.wantAction)
+			}
+			if !strings.Contains(next, c.nextContains) {
+				t.Errorf("nextAction = %q, want it to contain %q", next, c.nextContains)
+			}
+		})
 	}
 }

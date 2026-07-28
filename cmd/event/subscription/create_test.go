@@ -739,10 +739,14 @@ func TestBuildDryRunResult_NotFound_ShapeAndNoRemoteBefore(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
 	plan := subown.SubscriptionPlan{Action: subown.ActionCreate}
 
-	result := buildDryRunResult(resolved, core.AsUser, plan, false)
+	result := buildDryRunResult(resolved, core.AsUser, plan, false, false /* scopesVerified: unknown */)
 
 	if result.Operation != "create" {
 		t.Errorf("Operation = %q, want create", result.Operation)
+	}
+	// #22.3: an unverified scope pre-check must report "unknown", never a green light.
+	if result.Preflight.ScopesOK != "unknown" {
+		t.Errorf("Preflight.ScopesOK = %q, want unknown when scopes were not verified", result.Preflight.ScopesOK)
 	}
 	if !result.DryRun {
 		t.Error("DryRun = false, want true")
@@ -774,10 +778,14 @@ func TestBuildDryRunResult_ActiveCompatible_RemoteBeforePopulated(t *testing.T) 
 	resolved := resolveCreatedChatID(t)
 	plan := subown.SubscriptionPlan{Action: subown.ActionReuse, Before: remotePtr(activeRemote("sub_existing", false, "user"))}
 
-	result := buildDryRunResult(resolved, core.AsUser, plan, false)
+	result := buildDryRunResult(resolved, core.AsUser, plan, false, true /* scopesVerified */)
 
 	if result.PlannedChange.Action != "reuse" {
 		t.Errorf("PlannedChange.Action = %q, want reuse", result.PlannedChange.Action)
+	}
+	// #22.3: a verified scope pre-check reports "verified".
+	if result.Preflight.ScopesOK != "verified" {
+		t.Errorf("Preflight.ScopesOK = %q, want verified", result.Preflight.ScopesOK)
 	}
 	if result.RemoteBefore == nil {
 		t.Fatal("RemoteBefore = nil, want the existing subscription row")
@@ -798,7 +806,7 @@ func TestBuildDryRunResult_IncludeResourceDataTrue_RequiredScopesIncludesEncrypt
 	resolved := resolveCreatedChatID(t)
 	plan := subown.SubscriptionPlan{Action: subown.ActionCreate}
 
-	result := buildDryRunResult(resolved, core.AsUser, plan, true)
+	result := buildDryRunResult(resolved, core.AsUser, plan, true, false)
 
 	want := map[string]bool{"event:subscription:read": true, "event:subscription:write": true, "event:encrypt_key:read": true}
 	if len(result.RequiredScopes) != len(want) {

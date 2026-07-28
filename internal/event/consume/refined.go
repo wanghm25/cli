@@ -57,6 +57,14 @@ type RefinedOptions struct {
 	Out       io.Writer // nil falls back to os.Stdout
 	ErrOut    io.Writer // nil falls back to os.Stderr
 
+	// PreviewOut is the writer the --dry-run plan preview is written to. It is
+	// the REAL stderr even under --quiet (which the command implements by
+	// discarding ErrOut for the chatty probe/listening/exit lines), because the
+	// preview is the whole point of --dry-run and must not be discarded. nil
+	// falls back to ErrOut, so library callers/tests that only set ErrOut still
+	// capture the preview.
+	PreviewOut io.Writer
+
 	// RemoteAPIClient is used for ProbeBusEligibility's remote-connection
 	// check AND (unchanged) inside EnsureBus/StartOrConnectBus's own copy of
 	// that same check. nil disables both (probe skips it; EnsureBus already
@@ -238,6 +246,15 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 	if errOut == nil {
 		errOut = os.Stderr //nolint:forbidigo // library-caller fallback
 	}
+	// The --dry-run preview is the PAYLOAD of --dry-run, so it must survive
+	// --quiet (which the command implements by discarding errOut). PreviewOut is
+	// the real stderr the command supplies for exactly that; it falls back to
+	// errOut for library callers/tests that don't set it. The chatty probe /
+	// listening / exit lines keep writing to the quiet-gated errOut.
+	previewOut := opts.PreviewOut
+	if previewOut == nil {
+		previewOut = errOut
+	}
 
 	// --timeout bounds the WHOLE session (Probe through consumeLoop), same
 	// as Run's own placement before EnsureBus/doHello — "exit after
@@ -282,7 +299,7 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 
 	// ---- 3. --dry-run exits HERE: no Apply, no bus, no remote write ----
 	if opts.DryRun {
-		writeRefinedDryRunPreview(errOut, resolved, plan)
+		writeRefinedDryRunPreview(previewOut, resolved, opts.Identity, plan)
 		return nil
 	}
 
@@ -291,15 +308,11 @@ func runRefinedChain(ctx context.Context, resolved event.ResolvedEventKey, opts 
 	// reactivate all proceed below. A real run fails closed instead of guessing. A
 	// compatible suspended match is never a Block under ConsumeBootstrap (it plans
 	// a Reactivate), so a Block here is either a configuration conflict or a match
-	// in an unrecognized remote state (fail-closed).
-	switch plan.Action {
-	case subown.ActionBlock:
-		if subown.ConflictOnState(plan.ConflictFields) {
-			return refinedUnknownStateError(resolved, opts.Identity, plan)
-		}
-		return refinedConflictError(resolved, opts.Identity, plan)
-	case subown.ActionIndeterminate:
-		return refinedIndeterminateError(resolved, opts.Identity)
+	// in an unrecognized remote state (fail-closed). The --dry-run preview above
+	// consults the SAME refinedBlockOutcome so it can report a would-Block plan
+	// truthfully rather than inviting the caller to remove --dry-run.
+	if blockErr := refinedBlockOutcome(resolved, opts.Identity, plan); blockErr != nil {
+		return blockErr
 	}
 
 	// ---- 4. Owner==current gate: fail closed BEFORE the remote write ----
@@ -711,19 +724,61 @@ func applyOkRejectedError(resolved event.ResolvedEventKey, identity core.Identit
 	return ve.WithHint("%s; %s", ve.Hint, applyOkRecoveryHint(resolved, identity, remoteSubscriptionID, createdByThisAttempt))
 }
 
+// refinedBlockOutcome returns the fail-closed error a REAL refined consume run
+// produces for a plan Apply cannot resolve — an ActionBlock (a configuration
+// conflict, or a match in an unrecognized remote state) or an ActionIndeterminate
+// (an inconclusive remote scan) — and nil for a Create/Reuse/Reactivate plan that
+// would proceed to Apply. It is the SINGLE source of the block decision, shared by
+// runRefinedChain's real run and the --dry-run preview, so the preview mirrors the
+// real outcome exactly and can never invite removing --dry-run for a path that
+// cannot succeed.
+func refinedBlockOutcome(resolved event.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) error {
+	switch plan.Action {
+	case subown.ActionBlock:
+		if subown.ConflictOnState(plan.ConflictFields) {
+			return refinedUnknownStateError(resolved, identity, plan)
+		}
+		return refinedConflictError(resolved, identity, plan)
+	case subown.ActionIndeterminate:
+		return refinedIndeterminateError(resolved, identity)
+	default:
+		return nil
+	}
+}
+
 // writeRefinedDryRunPreview reports the plan on stderr — stdout is reserved
 // for business-event NDJSON even during a real run, so a
 // --dry-run preview (never a business event) never touches it; a dry-run
 // leaves stdout completely empty. Structured, no secrets: only the event
 // key/target resource/planned action/existing remote id, nothing UAT- or
 // token-shaped ever flows through this.
-func writeRefinedDryRunPreview(errOut io.Writer, resolved event.ResolvedEventKey, plan subown.SubscriptionPlan) {
+//
+// The next_action MIRRORS the real outcome: for a plan a real run would proceed
+// to apply it says "run without --dry-run", but for a plan the real run would
+// fail closed on (would-Block / inconclusive) it says the run would Block and
+// carries the SAME message + recovery guidance the real error would — never
+// "run without --dry-run" for a path that cannot succeed.
+func writeRefinedDryRunPreview(errOut io.Writer, resolved event.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan) {
 	fmt.Fprintf(errOut, "[event] dry-run: event_key=%s target_resource=%s planned_action=%s",
 		resolved.MaterializedKey, resolved.TargetResource, plan.Action)
 	if plan.Before != nil {
 		fmt.Fprintf(errOut, " remote_subscription_id=%s", plan.Before.ID.String())
 	}
 	fmt.Fprintln(errOut)
+
+	if blockErr := refinedBlockOutcome(resolved, identity, plan); blockErr != nil {
+		reason := "the plan cannot be applied"
+		hint := ""
+		if p, ok := errs.ProblemOf(blockErr); ok {
+			reason = p.Message
+			hint = p.Hint
+		}
+		fmt.Fprintf(errOut, "[event] dry-run: outcome=would_block: %s\n", reason)
+		if hint != "" {
+			fmt.Fprintf(errOut, "[event] dry-run: next_action=%s\n", hint)
+		}
+		return
+	}
 	fmt.Fprintf(errOut, "[event] dry-run: next_action=run without --dry-run to apply this plan and start consuming %s\n", resolved.MaterializedKey)
 }
 

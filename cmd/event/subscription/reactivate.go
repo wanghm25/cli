@@ -103,7 +103,7 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 	if err != nil {
 		return err
 	}
-	uat, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionMutationScopes)
+	uat, scopesVerified, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionMutationScopes)
 	if err != nil {
 		return err
 	}
@@ -123,9 +123,11 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 	}
 
 	if o.dryRun {
-		result := buildMutationDryRunResult("reactivate", remoteSubscriptionID, identity, before,
-			"reactivate", false, reactivateLocalImpactNote,
-			fmt.Sprintf("run without --dry-run to reactivate remote_subscription_id=%s", remoteSubscriptionID))
+		// Plan from the OBSERVED remote state: an already-active subscription is a
+		// no-op, not a fresh reactivation.
+		plannedAction, nextAction := mutationDryRunPlan("reactivate", remoteSubscriptionID, before.Remote.State)
+		result := buildMutationDryRunResult("reactivate", remoteSubscriptionID, identity, scopesVerified, before,
+			plannedAction, false, reactivateLocalImpactNote, nextAction)
 		if o.asJSON {
 			output.PrintJson(f.IOStreams.Out, result)
 			return nil

@@ -35,6 +35,12 @@ type createOpts struct {
 	dryRun              bool
 	asJSON              bool
 	filter              string
+	// scopesVerified is NOT a flag: it is the resolved scope-preflight state
+	// (resolveUATAndCheckScopes's second return) that runCreate stamps on before
+	// calling applyCreate, so the --dry-run preview reports scopes_ok honestly
+	// ("verified" vs "unknown") instead of a hardcoded green light. Defaults to
+	// false (unknown) — the correct value in tests that never ran a real check.
+	scopesVerified bool
 }
 
 // NewCmdCreate builds `event subscription create <refined EventKey>`.
@@ -189,10 +195,12 @@ func runCreate(cmd *cobra.Command, f *cmdutil.Factory, eventKeyArg string, o cre
 	if err != nil {
 		return err
 	}
-	uat, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, createRequiredScopes(o.includeResourceData))
+	uat, scopesVerified, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, createRequiredScopes(o.includeResourceData))
 	if err != nil {
 		return err
 	}
+	// Carry the honest scope-preflight state into the dry-run preview.
+	o.scopesVerified = scopesVerified
 
 	sdk, err := f.LarkClient()
 	if err != nil {
@@ -238,7 +246,7 @@ func applyCreate(ctx context.Context, controller createController, out io.Writer
 
 	switch outcome.Kind {
 	case app.ProvisionPreview:
-		result := buildDryRunResult(resolved, identity, outcome.Plan, o.includeResourceData)
+		result := buildDryRunResult(resolved, identity, outcome.Plan, o.includeResourceData, o.scopesVerified)
 		if o.asJSON {
 			output.PrintJson(out, result)
 			return nil
@@ -450,7 +458,10 @@ type createDryRunResult struct {
 type createPreflight struct {
 	Identity        string `json:"identity"`
 	MatchedTemplate string `json:"matched_template"`
-	ScopesOK        bool   `json:"scopes_ok"`
+	// ScopesOK is a tri-state token ("verified" | "unknown"), not a bare bool:
+	// the local scope pre-check cannot always confirm satisfaction, and a dry-run
+	// must not report a green light it never verified. See scopeStateLabel.
+	ScopesOK string `json:"scopes_ok"`
 }
 
 // plannedChange describes what a real (non-dry-run) run would do, per
@@ -494,7 +505,7 @@ func legacyPlanAction(plan subown.SubscriptionPlan) string {
 	}
 }
 
-func buildDryRunResult(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan, includeResourceData bool) *createDryRunResult {
+func buildDryRunResult(resolved eventlib.ResolvedEventKey, identity core.Identity, plan subown.SubscriptionPlan, includeResourceData, scopesVerified bool) *createDryRunResult {
 	var remoteBefore *subscriptionRow
 	if plan.Before != nil {
 		row := mapRemoteSubscription(*plan.Before)
@@ -514,7 +525,9 @@ func buildDryRunResult(resolved eventlib.ResolvedEventKey, identity core.Identit
 		Preflight: createPreflight{
 			Identity:        string(identity),
 			MatchedTemplate: resolved.Template.Template,
-			ScopesOK:        true, // reaching this point already passed the scope preflight
+			// "verified" only when the pre-check actually confirmed the scopes;
+			// "unknown" when scope data was unavailable (never a false green light).
+			ScopesOK: scopeStateLabel(scopesVerified),
 		},
 		RemoteBefore:  remoteBefore,
 		PlannedChange: pc,

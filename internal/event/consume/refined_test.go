@@ -836,6 +836,92 @@ func TestRunRefinedChain_DryRun_EvenOnConflictingPlan_ReportsInformationallyNoEr
 	if err := runRefinedChain(context.Background(), refinedFixture(), opts, deps); err != nil {
 		t.Fatalf("dry-run must report a conflicting plan informationally, not error: %v", err)
 	}
+	// #22.1: the preview must MIRROR the real outcome — say the plan would BLOCK
+	// (with the same recovery guidance the real run's typed error carries), and
+	// never invite removing --dry-run for a path that cannot succeed.
+	out := stderr.String()
+	if !strings.Contains(out, "would_block") {
+		t.Errorf("conflict dry-run must report outcome=would_block; got: %q", out)
+	}
+	if strings.Contains(out, "run without --dry-run to apply") {
+		t.Errorf("conflict dry-run must NOT invite removing --dry-run for a blocked plan; got: %q", out)
+	}
+	if !strings.Contains(out, "sub_conflict") {
+		t.Errorf("conflict dry-run should surface the conflicting remote_subscription_id; got: %q", out)
+	}
+}
+
+// TestRunRefinedChain_DryRun_ProceedablePlan_SaysRunWithoutDryRun is the other
+// side of #22.1: a plan a real run WOULD apply (create/reuse/reactivate) keeps
+// the "run without --dry-run to apply" next_action — only would-Block plans are
+// reported as blocked.
+func TestRunRefinedChain_DryRun_ProceedablePlan_SaysRunWithoutDryRun(t *testing.T) {
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
+		},
+		apply: func(context.Context, subown.SubscriptionPlan) (string, bool, error) {
+			t.Fatal("apply must not run under dry-run")
+			return "", false, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) {
+			t.Fatal("startBus must not run under dry-run")
+			return nil, nil
+		},
+		hello: func(context.Context, net.Conn, string) (*protocol.HelloAck, *bufio.Reader, error) {
+			t.Fatal("hello must not run under dry-run")
+			return nil, nil, nil
+		},
+	}
+	var stderr bytes.Buffer
+	opts := RefinedOptions{DryRun: true, Out: io.Discard, ErrOut: &stderr, Identity: core.AsUser}
+	if err := runRefinedChain(context.Background(), refinedFixture(), opts, deps); err != nil {
+		t.Fatalf("dry-run: unexpected error: %v", err)
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "run without --dry-run to apply") {
+		t.Errorf("a proceedable plan's dry-run should invite running without --dry-run; got: %q", out)
+	}
+	if strings.Contains(out, "would_block") {
+		t.Errorf("a create plan must not be reported as would_block; got: %q", out)
+	}
+}
+
+// TestRunRefinedChain_DryRunQuiet_PreviewGoesToPreviewOut is #22.2: --quiet must
+// not discard the --dry-run preview. The command implements --quiet by handing
+// runRefinedChain a discarded ErrOut (the chatty channel) but the real stderr as
+// PreviewOut; the preview payload must land on PreviewOut regardless.
+func TestRunRefinedChain_DryRunQuiet_PreviewGoesToPreviewOut(t *testing.T) {
+	deps := refinedDeps{
+		probe: func(context.Context) error { return nil },
+		plan: func(context.Context) (subown.SubscriptionPlan, error) {
+			return subown.SubscriptionPlan{Action: subown.ActionCreate}, nil
+		},
+		apply: func(context.Context, subown.SubscriptionPlan) (string, bool, error) {
+			t.Fatal("apply must not run under dry-run")
+			return "", false, nil
+		},
+		startBus: func(context.Context) (net.Conn, error) {
+			t.Fatal("startBus must not run under dry-run")
+			return nil, nil
+		},
+		hello: func(context.Context, net.Conn, string) (*protocol.HelloAck, *bufio.Reader, error) {
+			t.Fatal("hello must not run under dry-run")
+			return nil, nil, nil
+		},
+	}
+	var chatty, preview bytes.Buffer
+	opts := RefinedOptions{DryRun: true, Quiet: true, Out: io.Discard, ErrOut: &chatty, PreviewOut: &preview, Identity: core.AsUser}
+	if err := runRefinedChain(context.Background(), refinedFixture(), opts, deps); err != nil {
+		t.Fatalf("dry-run: unexpected error: %v", err)
+	}
+	if !strings.Contains(preview.String(), "dry-run") {
+		t.Errorf("--dry-run --quiet must still write the preview to PreviewOut; got: %q", preview.String())
+	}
+	if strings.Contains(chatty.String(), "dry-run") {
+		t.Errorf("the preview must go to PreviewOut, not the (discarded-under-quiet) ErrOut; chatty got: %q", chatty.String())
+	}
 }
 
 func TestRunRefinedChain_PlanConflict_NonDryRun_ReturnsTypedErrorBeforeApply(t *testing.T) {
