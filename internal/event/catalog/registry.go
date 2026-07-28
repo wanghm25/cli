@@ -68,7 +68,13 @@ func RegisterKey(def KeyDefinition) {
 	if def.Workers <= 0 {
 		def.Workers = 1
 	}
-	keys[def.Key] = &def
+	// Store a DEEP COPY, not &def: a struct parameter copies only the slice/map/
+	// json.RawMessage headers, so &def would still alias the caller's Scopes,
+	// Params, Schema.Raw, … — letting a caller mutate the validated registry
+	// entry after registration (and copy-on-read would faithfully hand back the
+	// tampered data). cloneKeyDefinition severs every mutable field, mirroring
+	// RegisterFilterMeta's clone-on-write, so the registry owns its own copy.
+	keys[def.Key] = cloneKeyDefinition(&def)
 }
 
 // validateSchema: exactly one of Native/Custom; Native incompatible with Process.

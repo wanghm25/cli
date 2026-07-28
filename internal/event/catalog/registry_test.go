@@ -421,6 +421,67 @@ func TestLookup_ResultDoesNotAliasRegistry(t *testing.T) {
 	}
 }
 
+// TestRegisterKey_DoesNotAliasCallerDefinition proves the WRITE-side
+// immutability: a caller that mutates the ORIGINAL KeyDefinition (its Scopes/
+// Params/Schema.Raw/…) AFTER registration cannot tamper with the validated
+// registry entry. Without the clone-on-write in RegisterKey, storing &def would
+// alias the caller's slices/maps (a struct param copies only slice/map headers),
+// and copy-on-read would then faithfully hand back the tampered data.
+func TestRegisterKey_DoesNotAliasCallerDefinition(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+	def := KeyDefinition{
+		Key:                   "t.writeimm_v1",
+		EventType:             "t.writeimm_v1",
+		ResourceType:          "t.writeimm",
+		Schema:                SchemaDef{Custom: &SchemaSpec{Raw: json.RawMessage(`{"type":"object"}`)}},
+		AuthTypes:             []string{"user", "bot"},
+		Scopes:                []string{"scope:one"},
+		RequiredConsoleEvents: []string{"e1"},
+		Params:                []ParamDef{{Name: "mode", Type: ParamEnum, Values: []ParamValue{{Value: "a", Desc: "A"}}}},
+		RefinedSubscription:   true,
+		KeyTemplates: []KeyTemplate{{
+			Template: "t.writeimm_v1/x-id/{x}", Example: "t.writeimm_v1/x-id/x1",
+			SelectorKey: "x_id", PathSegment: "x-id", AuthTypes: []string{"user"},
+		}},
+	}
+	RegisterKey(def)
+
+	// Mutate every mutable reference-typed part of the caller's ORIGINAL def
+	// AFTER registration — a clone-on-write registry must be unaffected.
+	def.Scopes[0] = "HACKED"
+	def.AuthTypes[0] = "HACKED"
+	def.RequiredConsoleEvents[0] = "HACKED"
+	def.Params[0].Name = "HACKED"
+	def.Params[0].Values[0].Value = "HACKED"
+	def.Schema.Custom.Raw[0] = 'X'
+	def.KeyTemplates[0].SelectorKey = "HACKED"
+	def.KeyTemplates[0].AuthTypes[0] = "HACKED"
+
+	got, ok := Lookup("t.writeimm_v1")
+	if !ok {
+		t.Fatal("Lookup failed")
+	}
+	switch {
+	case got.Scopes[0] != "scope:one":
+		t.Errorf("Scopes tampered via caller's def after registration: %q", got.Scopes[0])
+	case got.AuthTypes[0] != "user":
+		t.Errorf("AuthTypes tampered: %q", got.AuthTypes[0])
+	case got.RequiredConsoleEvents[0] != "e1":
+		t.Errorf("RequiredConsoleEvents tampered: %q", got.RequiredConsoleEvents[0])
+	case got.Params[0].Name != "mode":
+		t.Errorf("Params[0].Name tampered: %q", got.Params[0].Name)
+	case got.Params[0].Values[0].Value != "a":
+		t.Errorf("Params[0].Values tampered: %q", got.Params[0].Values[0].Value)
+	case string(got.Schema.Custom.Raw) != `{"type":"object"}`:
+		t.Errorf("Schema.Custom.Raw tampered: %s", got.Schema.Custom.Raw)
+	case got.KeyTemplates[0].SelectorKey != "x_id":
+		t.Errorf("KeyTemplates[0].SelectorKey tampered: %q", got.KeyTemplates[0].SelectorKey)
+	case got.KeyTemplates[0].AuthTypes[0] != "user":
+		t.Errorf("KeyTemplates[0].AuthTypes tampered: %q", got.KeyTemplates[0].AuthTypes[0])
+	}
+}
+
 // TestListAll_ResultDoesNotAliasRegistry proves the same immutability for the
 // ListAll read path.
 func TestListAll_ResultDoesNotAliasRegistry(t *testing.T) {
