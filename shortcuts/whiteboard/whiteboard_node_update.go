@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/shortcuts/common"
 )
 
@@ -19,8 +18,8 @@ var wbNodeUpdateScopes = []string{"board:whiteboard:node:update"}
 var wbNodeUpdateAuthTypes = []string{"user", "bot"}
 var wbNodeUpdateFlags = []common.Flag{
 	{Name: "whiteboard-token", Desc: "whiteboard token of the whiteboard to update nodes in. You need edit permission on the whiteboard.", Required: true},
-	{Name: "source", Desc: `JSON payload containing a non-empty "nodes" array. Each node must include "id"; the update body sends every other field.`, Required: true, Input: []string{common.Stdin, common.File}},
-	{Name: "idempotent-token", Desc: "idempotent token reserved for future batch update compatibility. Default is empty. Minimum length is 10.", Required: false},
+	{Name: "source", Desc: `JSON payload containing a non-empty "nodes" array. Each node must include "id"; the batch_update body sends the full nodes array.`, Required: true, Input: []string{common.Stdin, common.File}},
+	{Name: "idempotent-token", Desc: "idempotent token to make batch update requests retry-safe. Default is empty. Minimum length is 10.", Required: false},
 }
 
 func wbNodeUpdateValidate(_ context.Context, runtime *common.RuntimeContext) error {
@@ -40,12 +39,12 @@ func wbNodeUpdateDryRun(_ context.Context, runtime *common.RuntimeContext) *comm
 		return common.NewDryRunAPI().Desc("parse input failed: " + err.Error())
 	}
 
-	dry := common.NewDryRunAPI()
-	for _, node := range payload.Nodes {
-		nodeID := node["id"].(string)
-		dry.PUT(wbNodeUpdateDryRunURL(runtime.Str("whiteboard-token"), nodeID)).
-			Body(whiteboardNodeUpdateBody(node)).
-			Desc("update a node in the whiteboard.")
+	dry := common.NewDryRunAPI().
+		PUT(wbNodeBatchUpdateDryRunURL(runtime.Str("whiteboard-token"))).
+		Body(whiteboardNodeBatchUpdateBody(payload)).
+		Desc("batch update nodes in the whiteboard.")
+	if params := wbNodeUpdateParams(runtime); len(params) > 0 {
+		dry.Params(params)
 	}
 	return dry
 }
@@ -56,21 +55,18 @@ func wbNodeUpdateExecute(ctx context.Context, runtime *common.RuntimeContext) er
 		return err
 	}
 
-	updatedNodeIDs := make([]string, 0, len(payload.Nodes))
-	// Temporary compatibility path until whiteboard.node batch_update is available; keep public input contract unchanged.
-	for i, node := range payload.Nodes {
-		nodeID := node["id"].(string)
-		if _, err := callWhiteboardNodeWrite(
-			ctx,
-			runtime,
-			http.MethodPut,
-			wbNodeUpdateURL(runtime.Str("whiteboard-token"), nodeID),
-			nil,
-			whiteboardNodeUpdateBody(node),
-		); err != nil {
-			return wbNodeUpdateFanoutError(i, nodeID, err)
-		}
-		updatedNodeIDs = append(updatedNodeIDs, nodeID)
+	data, err := runtime.CallAPITyped(
+		http.MethodPut,
+		wbNodeBatchUpdateURL(runtime.Str("whiteboard-token")),
+		wbNodeUpdateParams(runtime),
+		whiteboardNodeBatchUpdateBody(payload),
+	)
+	if err != nil {
+		return err
+	}
+	updatedNodeIDs, err := whiteboardNodeUpdateIDs(data)
+	if err != nil {
+		return err
 	}
 
 	outData := map[string]interface{}{
@@ -84,37 +80,45 @@ func wbNodeUpdateExecute(ctx context.Context, runtime *common.RuntimeContext) er
 	return nil
 }
 
-func wbNodeUpdateURL(token string, nodeID string) string {
-	return fmt.Sprintf("/open-apis/board/v1/whiteboards/%s/nodes/%s", url.PathEscape(token), url.PathEscape(nodeID))
+func wbNodeBatchUpdateURL(token string) string {
+	return fmt.Sprintf("/open-apis/board/v1/whiteboards/%s/nodes/batch_update", url.PathEscape(token))
 }
 
-func wbNodeUpdateDryRunURL(token string, nodeID string) string {
-	return fmt.Sprintf("/open-apis/board/v1/whiteboards/%s/nodes/%s", common.MaskToken(url.PathEscape(token)), url.PathEscape(nodeID))
+func wbNodeBatchUpdateDryRunURL(token string) string {
+	return fmt.Sprintf("/open-apis/board/v1/whiteboards/%s/nodes/batch_update", common.MaskToken(url.PathEscape(token)))
 }
 
-func whiteboardNodeUpdateBody(node map[string]interface{}) map[string]interface{} {
-	body := make(map[string]interface{}, len(node))
-	for key, value := range node {
-		if key == "id" {
-			continue
+func wbNodeUpdateParams(runtime *common.RuntimeContext) map[string]interface{} {
+	params := map[string]interface{}{}
+	if token := runtime.Str("idempotent-token"); token != "" {
+		params["client_token"] = token
+	}
+	return params
+}
+
+func whiteboardNodeBatchUpdateBody(payload whiteboardNodeBatchPayload) map[string]interface{} {
+	return map[string]interface{}{"nodes": payload.Nodes}
+}
+
+func whiteboardNodeUpdateIDs(data map[string]interface{}) ([]string, error) {
+	switch raw := data["ids"].(type) {
+	case nil:
+		return nil, nil
+	case []interface{}:
+		out := make([]string, 0, len(raw))
+		for i, value := range raw {
+			id, ok := value.(string)
+			if !ok {
+				return nil, wbInvalidResponse("update whiteboard nodes failed: data.ids[%d] must be a string", i)
+			}
+			out = append(out, id)
 		}
-		body[key] = value
+		return out, nil
+	case []string:
+		return append([]string(nil), raw...), nil
+	default:
+		return nil, wbInvalidResponse("update whiteboard nodes failed: data.ids must be an array of strings")
 	}
-	return map[string]interface{}{"node": body}
-}
-
-func wbNodeUpdateFanoutError(index int, nodeID string, err error) error {
-	if p, ok := errs.ProblemOf(err); ok {
-		p.Message = fmt.Sprintf("update whiteboard node failed at nodes[%d] id %q: %s", index, nodeID, p.Message)
-		return err
-	}
-	return errs.NewInternalError(
-		errs.SubtypeUnknown,
-		"update whiteboard node failed at nodes[%d] id %q: %s",
-		index,
-		nodeID,
-		err.Error(),
-	).WithCause(err)
 }
 
 // WhiteboardNodeUpdate registers the `whiteboard +node-update` shortcut.
@@ -128,9 +132,8 @@ var WhiteboardNodeUpdate = common.Shortcut{
 	Flags:       wbNodeUpdateFlags,
 	Tips: []string{
 		`Pass --source as JSON with a non-empty "nodes" array; each node must include "id".`,
-		`Temporary behavior: +node-update fans out to single-node update calls until whiteboard.node batch_update is available.`,
-		`Current +node-update execution is non-atomic; earlier nodes may already be updated if a later node fails.`,
-		`The CLI input contract will stay batch-shaped when the internal transport moves to batch_update.`,
+		`Execution sends one whiteboard.node batch_update request and preserves node ids in the request body.`,
+		`Use --idempotent-token for retry-safe batch_update requests; the token is sent as client_token only when provided.`,
 	},
 	Validate: wbNodeUpdateValidate,
 	DryRun:   wbNodeUpdateDryRun,

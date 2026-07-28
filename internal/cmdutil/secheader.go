@@ -6,6 +6,7 @@ package cmdutil
 import (
 	"context"
 	"net/http"
+	"os"
 	"reflect"
 	"runtime/debug"
 	"strings"
@@ -197,14 +198,27 @@ func ShortcutHeaderOpts(ctx context.Context) larkcore.RequestOptionFunc {
 // ShortcutHeaders extracts Shortcut info from the context and returns
 // the corresponding HTTP headers. Returns nil if the context has no Shortcut info.
 func ShortcutHeaders(ctx context.Context) http.Header {
-	name, ok := ShortcutNameFromContext(ctx)
-	if !ok {
+	h := make(http.Header)
+	if name, ok := ShortcutNameFromContext(ctx); ok {
+		h.Set(HeaderShortcut, name)
+		if eid, ok := ExecutionIdFromContext(ctx); ok {
+			h.Set(HeaderExecutionId, eid)
+		}
+	}
+	if name, value := extraHeaderFromEnv(); name != "" && value != "" {
+		h.Set(name, value)
+	}
+	if len(h) == 0 {
 		return nil
 	}
-	h := make(http.Header)
-	h.Set(HeaderShortcut, name)
-	if eid, ok := ExecutionIdFromContext(ctx); ok {
-		h.Set(HeaderExecutionId, eid)
-	}
 	return h
+}
+
+func extraHeaderFromEnv() (string, string) {
+	name := strings.TrimSpace(os.Getenv(envvars.CliExtraHeaderName))
+	value := strings.TrimSpace(os.Getenv(envvars.CliExtraHeaderValue))
+	if name == "" || value == "" {
+		return "", ""
+	}
+	return name, value
 }

@@ -98,6 +98,26 @@ func TestCallAPITyped_Success(t *testing.T) {
 	}
 }
 
+func TestCallAPITyped_ExtraHeaderFromEnv(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_EXTRA_HEADER_NAME", "x-tt-env")
+	t.Setenv("LARKSUITE_CLI_EXTRA_HEADER_VALUE", "boe_whiteboard_test")
+	rt, reg := newCallAPITypedRuntime(t)
+	stub := &httpmock.Stub{
+		Method: "PUT",
+		URL:    "/open-apis/board/v1/whiteboards/wb/nodes/batch_update",
+		Body:   map[string]interface{}{"code": float64(0), "data": map[string]interface{}{"ids": []interface{}{"a1:1"}}},
+	}
+	reg.Register(stub)
+
+	_, err := rt.CallAPITyped("PUT", "/open-apis/board/v1/whiteboards/wb/nodes/batch_update", nil, map[string]any{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := stub.CapturedHeaders.Get("x-tt-env"); got != "boe_whiteboard_test" {
+		t.Fatalf("x-tt-env header = %q, want boe_whiteboard_test", got)
+	}
+}
+
 // TestAPIClassifyContext verifies the classify context is built from the
 // runtime: Brand / AppID from config, Identity from the resolved caller, and
 // LarkCmd from the running command path.

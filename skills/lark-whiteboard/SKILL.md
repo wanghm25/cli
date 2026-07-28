@@ -43,7 +43,7 @@ metadata:
 | [`+export`](references/lark-whiteboard-export.md) | 导出画板为预览图片、SVG 矢量图、代码或原始节点结构。 |
 | [`+update`](references/lark-whiteboard-update.md) | 更新画板，支持 PlantUML、Mermaid、SVG 或 OpenAPI 原生格式 |
 | [`+node-create`](references/lark-whiteboard-node-create.md) | 向已有画板追加 OpenAPI 节点；适合已由工具生成节点数据的增量新增 |
-| [`+node-update`](references/lark-whiteboard-node-update.md) | 按节点 id 更新已有节点；当前批量输入会逐节点执行，非原子 |
+| [`+node-update`](references/lark-whiteboard-node-update.md) | 按节点 id 批量更新已有节点；执行层发起一次 batch_update 请求 |
 | [`+node-delete`](references/lark-whiteboard-node-delete.md) | 按节点 id 删除已有节点；高风险写操作，执行前必须确认目标节点 |
 
 ---

@@ -2,7 +2,7 @@
 
 > **前置条件:** 先阅读 [`../../lark-shared/SKILL.md`](../../lark-shared/SKILL.md) 了解认证、全局参数和安全规则。画板节点操作默认使用 `--as user`。
 
-按 node id 更新已有节点字段。当前 CLI 输入是批量形态, 但执行层会逐节点调用单节点 update OpenAPI；等 `batch_update` 上线后, 输入格式保持不变, 只替换底层调用。
+按 node id 更新已有节点字段。CLI 输入是批量形态, 执行层会发起一次 `batch_update` OpenAPI 请求。
 
 ## 适用场景
 
@@ -35,7 +35,7 @@ lark-cli whiteboard +export \
 |---|---|---|
 | `--whiteboard-token` | 是 | 画板 token。 |
 | `--source` | 是 | JSON, 必须包含非空 `nodes` 数组, 每个 node 必须包含 `id`。支持 `@path` 文件读取或 `-` stdin。 |
-| `--idempotent-token` | 否 | 为未来 `batch_update` 兼容保留, 最少 10 个字符；当前逐节点 update 调用不会发送该 token。 |
+| `--idempotent-token` | 否 | 幂等 token, 最少 10 个字符；非空时作为 `client_token` 随 batch_update 请求发送。 |
 
 ## 输入
 
@@ -59,10 +59,11 @@ CLI 输入保持批量形态:
 }
 ```
 
-执行时每个节点会拆成:
+执行时所有节点会保持在同一个请求中:
 
-- `PUT /open-apis/board/v1/whiteboards/:whiteboard_id/nodes/:node_id`
-- body 为 `{"node": <去掉 id 后的节点字段>}`
+- `PUT /open-apis/board/v1/whiteboards/:whiteboard_id/nodes/batch_update`
+- body 为 `{"nodes": [...]}`, 节点内的 `id` 会保留。
+- `--idempotent-token` 非空时, query 参数带 `client_token=<token>`。
 
 ## 示例
 
@@ -70,12 +71,14 @@ CLI 输入保持批量形态:
 lark-cli whiteboard +node-update \
   --whiteboard-token <whiteboard_token> \
   --source @./node-updates.json \
+  --idempotent-token <10+字符唯一串> \
   --as user \
   --dry-run
 
 lark-cli whiteboard +node-update \
   --whiteboard-token <whiteboard_token> \
   --source @./node-updates.json \
+  --idempotent-token <10+字符唯一串> \
   --as user
 ```
 
@@ -92,7 +95,6 @@ lark-cli whiteboard +node-update \
 
 ## Safety
 
-- 当前执行非原子: 多节点更新时, 如果后面的节点失败, 前面的节点可能已经更新成功。
-- 多节点更新前先使用 `--dry-run` 检查将要发起的每个单节点请求。
-- 失败信息会带 `nodes[i]` 和 node id；不要在未确认失败位置前改用整图覆盖。
+- 多节点更新前先使用 `--dry-run` 检查 batch_update method、URL、params 和 body。
+- batch_update 后端不承诺跨阶段事务回滚；如服务端提示请求未完整完成, 需用 `+export --output-type raw` 读回目标节点确认状态。
 - 不要在节点更新失败时自动回退到 `+update --overwrite`, 除非用户明确要求替换整个画板。

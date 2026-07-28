@@ -159,8 +159,7 @@ func cachedLarkClientFunc(f *Factory, workspaceConfig workspaceConfigSource) fun
 			Transport:     sdkTransport,
 			CheckRedirect: safeRedirectPolicy,
 		}))
-		ep := core.ResolveEndpoints(acct.Brand)
-		opts = append(opts, lark.WithOpenBaseUrl(ep.Open))
+		opts = append(opts, lark.WithOpenBaseUrl(core.ResolveOpenBaseURL(acct.Brand)))
 		return lark.NewClient(acct.AppID, credential.RuntimeAppSecret(acct.AppSecret), opts...), nil
 	})
 }

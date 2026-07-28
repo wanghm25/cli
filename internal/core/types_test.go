@@ -58,6 +58,13 @@ func TestResolveOpenBaseURL(t *testing.T) {
 	}
 }
 
+func TestResolveOpenBaseURL_EnvOverride(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_OPEN_BASE_URL", "https://open.feishu-boe.cn/")
+	if got := ResolveOpenBaseURL(BrandFeishu); got != "https://open.feishu-boe.cn" {
+		t.Errorf("ResolveOpenBaseURL(feishu with env override) = %q", got)
+	}
+}
+
 func TestParseBrand(t *testing.T) {
 	cases := []struct {
 		in   string

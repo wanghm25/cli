@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -58,73 +59,71 @@ func TestWhiteboardNodeUpdateDryRun_RequestShape(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("unmarshal dry-run: %v\njson=%s", err, string(data))
 	}
-	if len(got.API) != 2 {
-		t.Fatalf("api len = %d, want 2; json=%s", len(got.API), string(data))
+	if len(got.API) != 1 {
+		t.Fatalf("api len = %d, want 1; json=%s", len(got.API), string(data))
 	}
-	wantURLs := []string{
-		"/open-apis/board/v1/whiteboards/test...oard/nodes/nodeA",
-		"/open-apis/board/v1/whiteboards/test...oard/nodes/nodeB",
+	if got.API[0].Method != "PUT" {
+		t.Fatalf("method = %q, want PUT", got.API[0].Method)
+	}
+	if got.API[0].URL != "/open-apis/board/v1/whiteboards/test...oard/nodes/batch_update" {
+		t.Fatalf("url = %q, want masked batch_update URL", got.API[0].URL)
+	}
+	if got.API[0].Params["client_token"] != "update-token-12345" {
+		t.Fatalf("params.client_token = %#v, want update-token-12345", got.API[0].Params["client_token"])
+	}
+	nodes, ok := got.API[0].Body["nodes"].([]interface{})
+	if !ok || len(nodes) != 2 {
+		t.Fatalf("body.nodes = %#v, want two nodes", got.API[0].Body["nodes"])
 	}
 	wantText := []string{"hello A", "hello B"}
-	for i := range got.API {
-		if got.API[i].Method != "PUT" {
-			t.Fatalf("api[%d].method = %q, want PUT", i, got.API[i].Method)
-		}
-		if got.API[i].URL != wantURLs[i] {
-			t.Fatalf("api[%d].url = %q, want %q", i, got.API[i].URL, wantURLs[i])
-		}
-		if len(got.API[i].Params) != 0 {
-			t.Fatalf("api[%d].params = %#v, want empty because single-node update does not accept client_token", i, got.API[i].Params)
-		}
-		node, ok := got.API[i].Body["node"].(map[string]interface{})
+	for i := range nodes {
+		node, ok := nodes[i].(map[string]interface{})
 		if !ok {
-			t.Fatalf("api[%d].body.node = %T, want map; body=%#v", i, got.API[i].Body["node"], got.API[i].Body)
+			t.Fatalf("body.nodes[%d] = %T, want map; nodes=%#v", i, nodes[i], nodes)
 		}
-		if _, exists := node["id"]; exists {
-			t.Fatalf("api[%d].body.node.id = %#v, want absent", i, node["id"])
+		if node["id"] != []string{"nodeA", "nodeB"}[i] {
+			t.Fatalf("body.nodes[%d].id = %#v", i, node["id"])
 		}
 		text, ok := node["text"].(map[string]interface{})
 		if !ok || text["content"] != wantText[i] {
-			t.Fatalf("api[%d].body.node.text = %#v, want content %q", i, node["text"], wantText[i])
+			t.Fatalf("body.nodes[%d].text = %#v, want content %q", i, node["text"], wantText[i])
 		}
 	}
 }
 
-func TestWhiteboardNodeUpdateExecute_PatchesNodes(t *testing.T) {
+func TestWhiteboardNodeUpdateExecute_BatchUpdatesNodes(t *testing.T) {
 	factory, stdout, reg := newUpdateExecuteFactory(t)
 
-	stubA := &httpmock.Stub{
+	var capturedQuery string
+	stub := &httpmock.Stub{
 		Method: "PUT",
-		URL:    "/open-apis/board/v1/whiteboards/test-board/nodes/nodeA",
+		URL:    "/open-apis/board/v1/whiteboards/test-board/nodes/batch_update",
 		Body: map[string]interface{}{
 			"code": 0,
 			"msg":  "success",
-			"data": map[string]interface{}{},
+			"data": map[string]interface{}{
+				"ids": []string{"nodeA", "nodeB"},
+			},
+		},
+		OnMatch: func(req *http.Request) {
+			capturedQuery = req.URL.RawQuery
 		},
 	}
-	stubB := &httpmock.Stub{
-		Method: "PUT",
-		URL:    "/open-apis/board/v1/whiteboards/test-board/nodes/nodeB",
-		Body: map[string]interface{}{
-			"code": 0,
-			"msg":  "success",
-			"data": map[string]interface{}{},
-		},
-	}
-	reg.Register(stubA)
-	reg.Register(stubB)
+	reg.Register(stub)
 
 	source := `{"nodes":[` +
 		`{"id":"nodeA","type":"text","text":{"content":"hello A"}},` +
 		`{"id":"nodeB","type":"text","text":{"content":"hello B"}}` +
 		`]}`
-	args := []string{"+node-update", "--whiteboard-token", "test-board", "--source", source}
+	args := []string{"+node-update", "--whiteboard-token", "test-board", "--source", source, "--idempotent-token", "update-token-12345"}
 	if err := runUpdateShortcut(t, WhiteboardNodeUpdate, args, factory, stdout); err != nil {
 		t.Fatalf("err=%v", err)
 	}
 
-	assertNodeUpdateCapturedBody(t, stubA.CapturedBody, "hello A")
-	assertNodeUpdateCapturedBody(t, stubB.CapturedBody, "hello B")
+	assertNodeBatchUpdateCapturedBody(t, stub.CapturedBody, []string{"hello A", "hello B"})
+	if !strings.Contains(capturedQuery, "client_token=update-token-12345") {
+		t.Fatalf("query = %q, want client_token", capturedQuery)
+	}
 	if !strings.Contains(stdout.String(), `"ids": "nodeA,nodeB"`) {
 		t.Fatalf("stdout=%s, want ids nodeA,nodeB", stdout.String())
 	}
@@ -133,21 +132,42 @@ func TestWhiteboardNodeUpdateExecute_PatchesNodes(t *testing.T) {
 	}
 }
 
-func TestWhiteboardNodeUpdateExecute_PartialFailureIncludesNodeContext(t *testing.T) {
+func TestWhiteboardNodeUpdateExecute_WithoutIdempotentTokenOmitsClientToken(t *testing.T) {
+	factory, stdout, reg := newUpdateExecuteFactory(t)
+
+	var capturedQuery string
+	stub := &httpmock.Stub{
+		Method: "PUT",
+		URL:    "/open-apis/board/v1/whiteboards/test-board/nodes/batch_update",
+		Body: map[string]interface{}{
+			"code": 0,
+			"msg":  "success",
+			"data": map[string]interface{}{
+				"ids": []string{"nodeA"},
+			},
+		},
+		OnMatch: func(req *http.Request) {
+			capturedQuery = req.URL.RawQuery
+		},
+	}
+	reg.Register(stub)
+
+	source := `{"nodes":[{"id":"nodeA","type":"text","text":{"content":"hello A"}}]}`
+	args := []string{"+node-update", "--whiteboard-token", "test-board", "--source", source}
+	if err := runUpdateShortcut(t, WhiteboardNodeUpdate, args, factory, stdout); err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if capturedQuery != "" {
+		t.Fatalf("query = %q, want empty when --idempotent-token is absent", capturedQuery)
+	}
+}
+
+func TestWhiteboardNodeUpdateExecute_BatchFailureReturnsAPIError(t *testing.T) {
 	factory, stdout, reg := newUpdateExecuteFactory(t)
 
 	reg.Register(&httpmock.Stub{
 		Method: "PUT",
-		URL:    "/open-apis/board/v1/whiteboards/test-board/nodes/nodeA",
-		Body: map[string]interface{}{
-			"code": 0,
-			"msg":  "success",
-			"data": map[string]interface{}{},
-		},
-	})
-	reg.Register(&httpmock.Stub{
-		Method: "PUT",
-		URL:    "/open-apis/board/v1/whiteboards/test-board/nodes/nodeB",
+		URL:    "/open-apis/board/v1/whiteboards/test-board/nodes/batch_update",
 		Body: map[string]interface{}{
 			"code": 1254001,
 			"msg":  "node not found",
@@ -162,10 +182,7 @@ func TestWhiteboardNodeUpdateExecute_PartialFailureIncludesNodeContext(t *testin
 	args := []string{"+node-update", "--whiteboard-token", "test-board", "--source", source}
 	err := runUpdateShortcut(t, WhiteboardNodeUpdate, args, factory, stdout)
 	if err == nil {
-		t.Fatal("expected partial failure error, got nil")
-	}
-	if !strings.Contains(err.Error(), "nodeB") || !strings.Contains(err.Error(), "nodes[1]") {
-		t.Fatalf("err=%v, want nodeB and nodes[1] context", err)
+		t.Fatal("expected batch update failure error, got nil")
 	}
 	problem, ok := errs.ProblemOf(err)
 	if !ok {
@@ -173,9 +190,6 @@ func TestWhiteboardNodeUpdateExecute_PartialFailureIncludesNodeContext(t *testin
 	}
 	if problem.Category != errs.CategoryAPI {
 		t.Fatalf("Category = %q, want %q", problem.Category, errs.CategoryAPI)
-	}
-	if !strings.Contains(problem.Message, "nodeB") || !strings.Contains(problem.Message, "nodes[1]") {
-		t.Fatalf("Problem message = %q, want nodeB and nodes[1] context", problem.Message)
 	}
 	var apiErr *errs.APIError
 	if !errors.As(err, &apiErr) {
@@ -187,28 +201,39 @@ func TestWhiteboardNodeUpdateTips_MentionTemporaryNonAtomicBehavior(t *testing.T
 	t.Parallel()
 
 	tips := strings.Join(WhiteboardNodeUpdate.Tips, "\n")
-	for _, want := range []string{"non-atomic", "batch_update", "fans out"} {
+	for _, want := range []string{"batch_update", "client_token", "one whiteboard.node batch_update request"} {
 		if !strings.Contains(tips, want) {
 			t.Fatalf("tips = %q, want substring %q", tips, want)
 		}
 	}
+	for _, banned := range []string{"fans out", "non-atomic", "Temporary behavior"} {
+		if strings.Contains(tips, banned) {
+			t.Fatalf("tips = %q, should not contain old fan-out wording %q", tips, banned)
+		}
+	}
 }
 
-func assertNodeUpdateCapturedBody(t *testing.T, raw []byte, wantContent string) {
+func assertNodeBatchUpdateCapturedBody(t *testing.T, raw []byte, wantContent []string) {
 	t.Helper()
 	var body map[string]interface{}
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("unmarshal captured body: %v\nraw=%s", err, string(raw))
 	}
-	node, ok := body["node"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("body.node = %T, want map; body=%s", body["node"], string(raw))
+	nodes, ok := body["nodes"].([]interface{})
+	if !ok || len(nodes) != len(wantContent) {
+		t.Fatalf("body.nodes = %#v, want %d nodes; body=%s", body["nodes"], len(wantContent), string(raw))
 	}
-	if _, exists := node["id"]; exists {
-		t.Fatalf("body.node.id = %#v, want absent; body=%s", node["id"], string(raw))
-	}
-	text, ok := node["text"].(map[string]interface{})
-	if !ok || text["content"] != wantContent {
-		t.Fatalf("body.node.text = %#v, want content %q; body=%s", node["text"], wantContent, string(raw))
+	for i, rawNode := range nodes {
+		node, ok := rawNode.(map[string]interface{})
+		if !ok {
+			t.Fatalf("body.nodes[%d] = %T, want map; body=%s", i, rawNode, string(raw))
+		}
+		if _, exists := node["id"]; !exists {
+			t.Fatalf("body.nodes[%d].id absent; body=%s", i, string(raw))
+		}
+		text, ok := node["text"].(map[string]interface{})
+		if !ok || text["content"] != wantContent[i] {
+			t.Fatalf("body.nodes[%d].text = %#v, want content %q; body=%s", i, node["text"], wantContent[i], string(raw))
+		}
 	}
 }

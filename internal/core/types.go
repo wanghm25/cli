@@ -3,7 +3,12 @@
 
 package core
 
-import "strings"
+import (
+	"os"
+	"strings"
+
+	"github.com/larksuite/cli/internal/envvars"
+)
 
 // LarkBrand represents the Lark platform brand.
 // "feishu" targets China-mainland, "lark" targets international.
@@ -61,5 +66,8 @@ func ResolveEndpoints(brand LarkBrand) Endpoints {
 
 // ResolveOpenBaseURL returns the Open API base URL for the given brand.
 func ResolveOpenBaseURL(brand LarkBrand) string {
+	if override := strings.TrimRight(strings.TrimSpace(os.Getenv(envvars.CliOpenBaseURL)), "/"); override != "" {
+		return override
+	}
 	return ResolveEndpoints(brand).Open
 }
