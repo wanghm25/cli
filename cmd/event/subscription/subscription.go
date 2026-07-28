@@ -276,10 +276,10 @@ type remoteState struct {
 // remote_subscription_id. It stays nil/omitted when no local consumer is known
 // (no bus reachable, or none bound), so the field is purely additive.
 type subscriptionRow struct {
-	RemoteSubscriptionID string              `json:"remote_subscription_id"`
-	EventKey             string              `json:"event_key"`
-	EventType            string              `json:"event_type"`
-	TargetResource       string              `json:"target_resource,omitempty"`
+	RemoteSubscriptionID string `json:"remote_subscription_id"`
+	EventKey             string `json:"event_key"`
+	EventType            string `json:"event_type"`
+	TargetResource       string `json:"target_resource,omitempty"`
 	// Identity is the subscription owner's authority as the exact `--as` token
 	// ("bot" / "user"), so it can be copied straight into `--as <value>` on a
 	// follow-up command. The owning user's open_id (lost from this composable

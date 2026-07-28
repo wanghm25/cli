@@ -38,13 +38,6 @@ type listOpts struct {
 	pageSize  int
 	pageToken string
 	asJSON    bool
-	// as / profile are the raw --as and global --profile flag values, captured so
-	// the next-page action can echo them back — a fully-composable next command
-	// that runs against the SAME identity AND the same app/credential (--profile
-	// is a global persistent flag, not a list-local one, so it must be gathered
-	// explicitly or the next page silently falls back to the default profile).
-	as      string
-	profile string
 }
 
 // NewCmdList builds `event subscription list`: read-only,
@@ -110,12 +103,6 @@ func runList(cmd *cobra.Command, f *cmdutil.Factory, o listOpts) error {
 	if err != nil {
 		return err
 	}
-	// Capture the raw --as and global --profile values so the next-page action
-	// reproduces this invocation's identity AND app/credential verbatim. --profile
-	// is inherited from the root persistent flags; an unset value stays "" and is
-	// omitted (the next page then defaults exactly as this call did).
-	o.as, _ = cmd.Flags().GetString("as")
-	o.profile, _ = cmd.Flags().GetString("profile")
 
 	uat, _, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionReadScopes)
 	if err != nil {
@@ -131,9 +118,14 @@ func runList(cmd *cobra.Command, f *cmdutil.Factory, o listOpts) error {
 		return err
 	}
 
+	// Command-rendering context: the RESOLVED profile + identity, so the
+	// next-page action targets the same app + identity, not the default (see
+	// eventlib.CommandContext). cfg.ProfileName round-trips as a --profile value.
+	cmdCtx := eventlib.CommandContext{Profile: cfg.ProfileName, Identity: identity}
+
 	// Best-effort local-consumer facts: a down/unreachable bus yields none and
 	// never fails this read-only command.
-	result, err := listSubscriptions(ctx, client, o, queryLocalConsumers())
+	result, err := listSubscriptions(ctx, client, o, cmdCtx, queryLocalConsumers())
 	if err != nil {
 		return err
 	}
@@ -162,7 +154,7 @@ type listResult struct {
 // server-side. localConsumers is the already-queried (best-effort) set of
 // running local consumers; each row is additively annotated with the one(s)
 // bound to its remote_subscription_id (nil/none leaves `local` omitted).
-func listSubscriptions(ctx context.Context, svc listSubscriptionsAPI, o listOpts, localConsumers []buslocal.Consumer) (*listResult, error) {
+func listSubscriptions(ctx context.Context, svc listSubscriptionsAPI, o listOpts, cmdCtx eventlib.CommandContext, localConsumers []buslocal.Consumer) (*listResult, error) {
 	page, err := svc.List(ctx, subown.ListParams{
 		State:     o.state,
 		EventType: listEventTypeFilter(o.eventKey),
@@ -185,7 +177,7 @@ func listSubscriptions(ctx context.Context, svc listSubscriptionsAPI, o listOpts
 	result.HasMore = page.HasMore
 	result.NextPageToken = page.NextPageToken
 	if result.HasMore && result.NextPageToken != "" {
-		result.NextAction = listNextAction(o, result.NextPageToken)
+		result.NextAction = listNextAction(o, cmdCtx, result.NextPageToken)
 	}
 	return result, nil
 }
@@ -208,18 +200,13 @@ func listEventTypeFilter(eventKey string) string {
 }
 
 // listNextAction builds the fully-composable next-page command, carrying EVERY
-// filter/identity flag from THIS invocation (not just --page-token), so the
-// suggested command reproduces the same query on the next page. --event-key
-// echoes the caller's original input (which listEventTypeFilter accepts on the
-// way back in).
-func listNextAction(o listOpts, nextToken string) string {
-	cmd := "lark-cli event subscription list"
-	// --profile selects the app/credential; without it the next page could run
-	// against a different profile. Echoed first (app selection) when explicitly set.
-	if o.profile != "" {
-		cmd += " --profile " + o.profile
-	}
-	cmd += " --page-token " + nextToken
+// query-determining input from THIS invocation — not just --page-token but the
+// filters AND the global app/identity context (via cmdCtx.CLIHead's --profile +
+// cmdCtx.AsFlag's --as) — so the suggested command reproduces the same query,
+// against the same app + identity, on the next page. --event-key echoes the
+// caller's original input (which listEventTypeFilter accepts on the way back in).
+func listNextAction(o listOpts, cmdCtx eventlib.CommandContext, nextToken string) string {
+	cmd := cmdCtx.CLIHead() + " event subscription list --page-token " + nextToken
 	if o.state != "" {
 		cmd += " --state " + o.state
 	}
@@ -229,9 +216,7 @@ func listNextAction(o listOpts, nextToken string) string {
 	if o.pageSize > 0 {
 		cmd += fmt.Sprintf(" --page-size %d", o.pageSize)
 	}
-	if o.as != "" {
-		cmd += " --as " + o.as
-	}
+	cmd += cmdCtx.AsFlag()
 	cmd += " --json"
 	return "run `" + cmd + "` for the next page"
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/buslocal"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	subown "github.com/larksuite/cli/internal/event/subscription"
@@ -87,7 +88,7 @@ func TestListSubscriptions_TwoItems_JSONShape(t *testing.T) {
 		},
 	}, true, "tok_next")}
 
-	result, err := listSubscriptions(context.Background(), fake, listOpts{}, nil)
+	result, err := listSubscriptions(context.Background(), fake, listOpts{}, eventlib.CommandContext{}, nil)
 	if err != nil {
 		t.Fatalf("listSubscriptions: unexpected error: %v", err)
 	}
@@ -171,7 +172,7 @@ func TestListSubscriptions_TwoItems_JSONShape(t *testing.T) {
 func TestListSubscriptions_EmptyResult_NoNextAction(t *testing.T) {
 	fake := &fakeListAPI{page: listPage(nil, false, "")}
 
-	result, err := listSubscriptions(context.Background(), fake, listOpts{}, nil)
+	result, err := listSubscriptions(context.Background(), fake, listOpts{}, eventlib.CommandContext{}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -212,7 +213,7 @@ func TestListSubscriptions_SurfacesRunningLocalConsumer(t *testing.T) {
 	// One running consumer, bound to sub_1 only.
 	consumers := []buslocal.Consumer{{AppID: "cli_x", PID: 4242, EventKey: "im.message.created_v1/chat-id/oc_aaa", RemoteSubscriptionID: "sub_1"}}
 
-	result, err := listSubscriptions(context.Background(), fake, listOpts{}, consumers)
+	result, err := listSubscriptions(context.Background(), fake, listOpts{}, eventlib.CommandContext{}, consumers)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -254,7 +255,7 @@ func TestListSubscriptions_SurfacesRunningLocalConsumer(t *testing.T) {
 func TestListSubscriptions_TransportError_PropagatesTyped(t *testing.T) {
 	fake := &fakeListAPI{err: errors.New("boom: connection reset")}
 
-	_, err := listSubscriptions(context.Background(), fake, listOpts{}, nil)
+	_, err := listSubscriptions(context.Background(), fake, listOpts{}, eventlib.CommandContext{}, nil)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -339,8 +340,9 @@ func TestListEventTypeFilter(t *testing.T) {
 // EVERY filter/identity flag from this invocation, not just --page-token, so it
 // is directly runnable.
 func TestListNextAction_CarriesAllFlags(t *testing.T) {
-	o := listOpts{state: "active", eventKey: "im.message.created_v1/chat-id/oc_aaa", pageSize: 20, as: "bot", profile: "B"}
-	got := listNextAction(o, "tok_next")
+	o := listOpts{state: "active", eventKey: "im.message.created_v1/chat-id/oc_aaa", pageSize: 20}
+	cmdCtx := eventlib.CommandContext{Profile: "B", Identity: core.AsBot}
+	got := listNextAction(o, cmdCtx, "tok_next")
 	for _, want := range []string{
 		"--profile B", "--page-token tok_next", "--state active",
 		"--event-key im.message.created_v1/chat-id/oc_aaa",
@@ -355,7 +357,7 @@ func TestListNextAction_CarriesAllFlags(t *testing.T) {
 // TestListNextAction_OmitsUnsetFlags: with no filters set, the next action still
 // carries --page-token and --json but omits the unset filter/identity/profile flags.
 func TestListNextAction_OmitsUnsetFlags(t *testing.T) {
-	got := listNextAction(listOpts{}, "tok_next")
+	got := listNextAction(listOpts{}, eventlib.CommandContext{}, "tok_next")
 	for _, absent := range []string{"--state", "--event-key", "--page-size", "--as ", "--profile"} {
 		if strings.Contains(got, absent) {
 			t.Errorf("next action %q should omit unset flag %q", got, absent)
@@ -379,8 +381,9 @@ func TestListSubscriptions_NextActionCarriesFilters(t *testing.T) {
 		},
 	}, true, "tok_next")}
 
-	o := listOpts{state: "active", eventKey: "im.message.created_v1/chat-id/oc_aaa", pageSize: 20, as: "bot", profile: "B"}
-	result, err := listSubscriptions(context.Background(), fake, o, nil)
+	o := listOpts{state: "active", eventKey: "im.message.created_v1/chat-id/oc_aaa", pageSize: 20}
+	cmdCtx := eventlib.CommandContext{Profile: "B", Identity: core.AsBot}
+	result, err := listSubscriptions(context.Background(), fake, o, cmdCtx, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
