@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
@@ -304,5 +305,88 @@ func TestNewCmdList_HasExpectedFlags(t *testing.T) {
 	}
 	if level, ok := cmdutil.GetRisk(cmd); !ok || level != cmdutil.RiskRead {
 		t.Errorf("risk = (%q, %v), want (%q, true)", level, ok, cmdutil.RiskRead)
+	}
+}
+
+// ---- P3: composable --event-key + rich next-page action ----
+
+// TestListEventTypeFilter locks that --event-key is round-trippable: a
+// materialized event_key from list output resolves to its OAPI event_type, a
+// raw/bare event_type passes through as itself, and an unknown value is passed
+// verbatim so a server-defined type still filters.
+func TestListEventTypeFilter(t *testing.T) {
+	registerCreateFixtures(t) // registers im.message.created_v1 (refined, chat-id template)
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty stays empty", "", ""},
+		{"materialized event_key -> event_type", "im.message.created_v1/chat-id/oc_aaa", "im.message.created_v1"},
+		{"bare refined base -> verbatim (already the event_type)", "im.message.created_v1", "im.message.created_v1"},
+		{"unknown server-defined type -> verbatim", "some.server.type_v9", "some.server.type_v9"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := listEventTypeFilter(c.input); got != c.want {
+				t.Errorf("listEventTypeFilter(%q) = %q, want %q", c.input, got, c.want)
+			}
+		})
+	}
+}
+
+// TestListNextAction_CarriesAllFlags locks that the next-page action reproduces
+// EVERY filter/identity flag from this invocation, not just --page-token, so it
+// is directly runnable.
+func TestListNextAction_CarriesAllFlags(t *testing.T) {
+	o := listOpts{state: "active", eventKey: "im.message.created_v1/chat-id/oc_aaa", pageSize: 20, as: "bot"}
+	got := listNextAction(o, "tok_next")
+	for _, want := range []string{
+		"--page-token tok_next", "--state active",
+		"--event-key im.message.created_v1/chat-id/oc_aaa",
+		"--page-size 20", "--as bot", "--json",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("next action %q missing %q", got, want)
+		}
+	}
+}
+
+// TestListNextAction_OmitsUnsetFlags: with no filters set, the next action still
+// carries --page-token and --json but omits the unset filter/identity flags.
+func TestListNextAction_OmitsUnsetFlags(t *testing.T) {
+	got := listNextAction(listOpts{}, "tok_next")
+	for _, absent := range []string{"--state", "--event-key", "--page-size", "--as "} {
+		if strings.Contains(got, absent) {
+			t.Errorf("next action %q should omit unset flag %q", got, absent)
+		}
+	}
+	if !strings.Contains(got, "--page-token tok_next") || !strings.Contains(got, "--json") {
+		t.Errorf("next action %q must always carry --page-token and --json", got)
+	}
+}
+
+// TestListSubscriptions_NextActionCarriesFilters is the integration check: the
+// flags flow from listOpts through listSubscriptions into a runnable NextAction.
+func TestListSubscriptions_NextActionCarriesFilters(t *testing.T) {
+	registerCreateFixtures(t)
+	fake := &fakeListAPI{page: listPage([]*larkeventv1.SubscriptionDetail{
+		{
+			SubscriptionId: strPtr("sub_1"),
+			EventType:      strPtr("im.message.created_v1"),
+			TargetResource: strPtr("im.message?chat_id=oc_aaa"),
+			Authority:      &larkeventv1.Authority{Type: strPtr("user"), OpenId: strPtr("ou_aaa")},
+		},
+	}, true, "tok_next")}
+
+	o := listOpts{state: "active", eventKey: "im.message.created_v1/chat-id/oc_aaa", pageSize: 20, as: "bot"}
+	result, err := listSubscriptions(context.Background(), fake, o, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{"--page-token tok_next", "--state active", "--event-key im.message.created_v1/chat-id/oc_aaa", "--page-size 20", "--as bot"} {
+		if !strings.Contains(result.NextAction, want) {
+			t.Errorf("NextAction = %q, missing %q", result.NextAction, want)
+		}
 	}
 }

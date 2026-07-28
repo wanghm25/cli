@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/larksuite/cli/internal/cmdutil"
+	eventlib "github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/buslocal"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	subown "github.com/larksuite/cli/internal/event/subscription"
@@ -37,6 +38,9 @@ type listOpts struct {
 	pageSize  int
 	pageToken string
 	asJSON    bool
+	// as is the raw --as flag value ("user"/"bot"/"auto"), captured so the
+	// next-page action can echo it back — a fully-composable next command.
+	as string
 }
 
 // NewCmdList builds `event subscription list`: read-only,
@@ -81,7 +85,7 @@ SAFETY: read-only; never writes, never requires --yes.`,
 	}
 
 	cmd.Flags().StringVar(&o.state, "state", "", "Filter by remote subscription state: active | suspended | expired")
-	cmd.Flags().StringVar(&o.eventKey, "event-key", "", "Filter by EventKey (matched against the OAPI event_type; use 'event schema' to look up a key's event_type)")
+	cmd.Flags().StringVar(&o.eventKey, "event-key", "", "Filter by EventKey: accepts a materialized event_key straight from list output, or a raw event_type; resolved to the OAPI event_type for the server-side filter")
 	cmd.Flags().IntVar(&o.pageSize, "page-size", 0, "Max subscriptions per page (0 = server default)")
 	cmd.Flags().StringVar(&o.pageToken, "page-token", "", "Resume from this page token (from a previous list response's next_page_token)")
 	cmd.Flags().BoolVar(&o.asJSON, "json", false, "Emit the subscription list as JSON (for AI / scripts)")
@@ -102,6 +106,9 @@ func runList(cmd *cobra.Command, f *cmdutil.Factory, o listOpts) error {
 	if err != nil {
 		return err
 	}
+	// Capture the raw --as value so the next-page action can reproduce this
+	// invocation's identity verbatim.
+	o.as, _ = cmd.Flags().GetString("as")
 
 	uat, _, err := resolveUATAndCheckScopes(ctx, f, cfg.AppID, identity, subscriptionReadScopes)
 	if err != nil {
@@ -151,7 +158,7 @@ type listResult struct {
 func listSubscriptions(ctx context.Context, svc listSubscriptionsAPI, o listOpts, localConsumers []buslocal.Consumer) (*listResult, error) {
 	page, err := svc.List(ctx, subown.ListParams{
 		State:     o.state,
-		EventType: o.eventKey,
+		EventType: listEventTypeFilter(o.eventKey),
 		PageToken: o.pageToken,
 		PageSize:  o.pageSize,
 	})
@@ -171,9 +178,49 @@ func listSubscriptions(ctx context.Context, svc listSubscriptionsAPI, o listOpts
 	result.HasMore = page.HasMore
 	result.NextPageToken = page.NextPageToken
 	if result.HasMore && result.NextPageToken != "" {
-		result.NextAction = fmt.Sprintf("run `lark-cli event subscription list --page-token %s --json` for the next page", result.NextPageToken)
+		result.NextAction = listNextAction(o, result.NextPageToken)
 	}
 	return result, nil
+}
+
+// listEventTypeFilter resolves the --event-key value to the OAPI event_type to
+// filter on. It accepts BOTH a raw event_type AND a materialized event_key from
+// a previous list's output (e.g. "im.message.created_v1/chat-id/oc_xxx"): a
+// resolvable key maps to its registered event_type; anything else (a bare
+// refined base, or a server-defined type this CLI does not model) passes through
+// verbatim so the filter still works. Empty stays empty (no filter). This makes
+// the list output's `event_key` directly re-composable into `--event-key`.
+func listEventTypeFilter(eventKey string) string {
+	if eventKey == "" {
+		return ""
+	}
+	if resolved, err := eventlib.ResolveEventKey(eventKey); err == nil && resolved.Definition != nil {
+		return resolved.Definition.EventType
+	}
+	return eventKey
+}
+
+// listNextAction builds the fully-composable next-page command, carrying EVERY
+// filter/identity flag from THIS invocation (not just --page-token), so the
+// suggested command reproduces the same query on the next page. --event-key
+// echoes the caller's original input (which listEventTypeFilter accepts on the
+// way back in).
+func listNextAction(o listOpts, nextToken string) string {
+	cmd := "lark-cli event subscription list --page-token " + nextToken
+	if o.state != "" {
+		cmd += " --state " + o.state
+	}
+	if o.eventKey != "" {
+		cmd += " --event-key " + o.eventKey
+	}
+	if o.pageSize > 0 {
+		cmd += fmt.Sprintf(" --page-size %d", o.pageSize)
+	}
+	if o.as != "" {
+		cmd += " --as " + o.as
+	}
+	cmd += " --json"
+	return "run `" + cmd + "` for the next page"
 }
 
 func writeListText(out io.Writer, result *listResult) {
@@ -199,7 +246,7 @@ func writeListText(out io.Writer, result *listResult) {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", s.RemoteSubscriptionID, s.EventKey, identity, state, expire, formatLocalConsumersColumn(s.Local))
 	}
 	w.Flush()
-	if result.HasMore {
-		fmt.Fprintf(out, "\nMore results available; use --page-token %s to continue.\n", result.NextPageToken)
+	if result.HasMore && result.NextAction != "" {
+		fmt.Fprintf(out, "\nMore results available — %s\n", result.NextAction)
 	}
 }
