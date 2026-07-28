@@ -231,3 +231,83 @@ func TestDedupFilter_ConcurrentRingEviction(t *testing.T) {
 		t.Error("evicted ID should not be reported as duplicate")
 	}
 }
+
+// Claim is the atomic check-and-mark: the first caller wins (true), a second
+// within the TTL loses (false).
+func TestDedupFilter_Claim_FirstWinsSecondLoses(t *testing.T) {
+	d := NewDedupFilter()
+	if !d.Claim("k") {
+		t.Error("first Claim must win (key not yet seen)")
+	}
+	if d.Claim("k") {
+		t.Error("second Claim within TTL must lose (key already claimed)")
+	}
+}
+
+// IsDuplicate is the exact negative-sense complement of Claim.
+func TestDedupFilter_Claim_IsComplementOfIsDuplicate(t *testing.T) {
+	d := NewDedupFilter()
+	if d.Claim("a") == d.IsDuplicate("b") {
+		// Claim("a")=true (first), IsDuplicate("b")=false (first) — must differ.
+		t.Error("first Claim and first IsDuplicate on fresh keys must have opposite sense")
+	}
+	// Same key: after a winning Claim, IsDuplicate must report true.
+	d.Claim("c")
+	if !d.IsDuplicate("c") {
+		t.Error("IsDuplicate must report a previously-claimed key as duplicate")
+	}
+}
+
+// A claim expires via the TTL, so the key becomes re-claimable — this is what
+// bounds the seen-set in time (stale ids do not linger forever).
+func TestDedupFilter_Claim_TTLExpiry(t *testing.T) {
+	d := NewDedupFilterWithSize(defaultRingSize, 10*time.Millisecond)
+	if !d.Claim("k") {
+		t.Fatal("first Claim must win")
+	}
+	if d.Claim("k") {
+		t.Fatal("second Claim within TTL must lose")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if !d.Claim("k") {
+		t.Error("Claim after TTL expiry must win again — a claim must not be retained past its TTL")
+	}
+}
+
+// The ring bounds the seen-set in size: an id pushed out of the ring (and past
+// its TTL) becomes claimable again, so memory stays bounded under an unbounded
+// stream of distinct keys.
+func TestDedupFilter_Claim_BoundedByRingEviction(t *testing.T) {
+	d := NewDedupFilterWithSize(4, 10*time.Millisecond)
+	if !d.Claim("first") {
+		t.Fatal("first Claim must win")
+	}
+	time.Sleep(20 * time.Millisecond)
+	for i := 0; i < 8; i++ {
+		d.Claim("filler-" + string(rune('a'+i)))
+	}
+	if !d.Claim("first") {
+		t.Error("an evicted + expired id must be claimable again — claim memory must stay bounded")
+	}
+}
+
+// Under N goroutines racing the SAME key, exactly one Claim wins. This is the
+// atomicity the delivery gate relies on to never double-deliver.
+func TestDedupFilter_Claim_ConcurrentExactlyOneWinner(t *testing.T) {
+	const n = 256
+	d := NewDedupFilter()
+
+	results := make(chan bool, n)
+	for i := 0; i < n; i++ {
+		go func() { results <- d.Claim("same-key") }()
+	}
+	wins := 0
+	for i := 0; i < n; i++ {
+		if <-results {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Errorf("exactly one Claim must win among %d concurrent claimers, got %d", n, wins)
+	}
+}

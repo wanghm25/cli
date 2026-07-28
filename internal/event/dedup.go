@@ -34,32 +34,50 @@ func NewDedupFilterWithSize(ringSize int, ttl time.Duration) *DedupFilter {
 	}
 }
 
-func (d *DedupFilter) IsDuplicate(eventID string) bool {
+// Claim atomically checks whether key was already seen within the TTL and, if
+// not, marks it seen — the check and the mark happen under ONE lock, in one
+// step. It returns true iff THIS caller is the first to claim key (it was NOT a
+// live duplicate), so among any set of callers racing the same key exactly one
+// wins. This is the single dedup decision point a delivery gate needs: gate the
+// side effect on the claim and only the winner proceeds, which closes the
+// check-then-commit TOCTOU where two concurrent same-key callers could both pass
+// a separate read-only check before either committed and thus both proceed. An
+// entry past its TTL is evicted and freshly re-claimable; the ring bounds the
+// seen-set so memory stays bounded even under an unbounded stream of keys.
+func (d *DedupFilter) Claim(key string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	now := time.Now()
 
-	if ts, ok := d.seen[eventID]; ok {
+	if ts, ok := d.seen[key]; ok {
 		if now.Sub(ts) < d.ttl {
-			return true
+			return false
 		}
-		delete(d.seen, eventID)
+		delete(d.seen, key)
 	}
 
-	d.seen[eventID] = now
+	d.seen[key] = now
 
-	if old := d.ring[d.pos]; old != "" && old != eventID {
+	if old := d.ring[d.pos]; old != "" && old != key {
 		delete(d.seen, old)
 	}
-	d.ring[d.pos] = eventID
+	d.ring[d.pos] = key
 	d.pos = (d.pos + 1) % len(d.ring)
 
 	if d.pos%1000 == 0 {
 		d.cleanupExpired(now)
 	}
 
-	return false
+	return true
+}
+
+// IsDuplicate reports whether eventID was already seen within the TTL, marking
+// it seen as a side effect. It is the negative-sense complement of Claim —
+// IsDuplicate(k) == !Claim(k) — kept for callers and tests that read more
+// naturally as "is this a duplicate?" than "did I win the claim?".
+func (d *DedupFilter) IsDuplicate(eventID string) bool {
+	return !d.Claim(eventID)
 }
 
 // Seen reports whether key was recorded within the TTL, WITHOUT recording it —
@@ -83,9 +101,12 @@ func (d *DedupFilter) Seen(eventID string) bool {
 }
 
 // Record marks key as seen now (idempotent — a re-record just refreshes the
-// timestamp). It performs the same ring/overflow bookkeeping as IsDuplicate's
-// commit half, so Seen()+Record() together are equivalent to IsDuplicate()
-// except the commit is deferred to the caller's discretion.
+// timestamp). It performs the same ring/overflow bookkeeping as Claim's mark
+// half, so Seen()+Record() together are equivalent to a single Claim() except
+// the commit is deferred to the caller's discretion. This split is for a caller
+// that already holds its OWN lock across the Seen/Record pair AND must be able
+// to abandon the check without committing (e.g. drop the key on a full queue so
+// a retry stays processable); a plain delivery gate wants Claim instead.
 func (d *DedupFilter) Record(eventID string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
