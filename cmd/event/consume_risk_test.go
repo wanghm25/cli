@@ -41,6 +41,14 @@ func TestConsumeArgAwareRisk(t *testing.T) {
 		// SAFETY: a value flag whose value resembles a legacy key must NOT be read
 		// as the positional and downgrade a refined (write) invocation to read.
 		{"value flag value is not the key", []string{"event", "consume", riskTestRefinedKey, "--jq", riskTestLegacyKey}, "write", true},
+		// --help must NOT abort the refinement: a legacy consume WITH a key and
+		// --help/-h still resolves to read, so `event consume <legacy> --help`
+		// shows "Risk: read" and is not pruned under a max_risk:read policy.
+		// (Before the fix, pflag special-cased an undefined help flag and returned
+		// ErrHelp, so the parse failed and the fallback kept the static "write".)
+		{"legacy key with --help -> read", []string{"event", "consume", riskTestLegacyKey, "--help"}, "read", true},
+		{"legacy key with -h -> read", []string{"event", "consume", riskTestLegacyKey, "-h"}, "read", true},
+		{"refined key with --help stays write", []string{"event", "consume", riskTestRefinedKey, "--help"}, "write", true},
 		// Conservative fallback paths: keep the static "write".
 		{"not a consume invocation", []string{"event", "status"}, "", false},
 		{"no positional (help)", []string{"event", "consume", "--help"}, "", false},

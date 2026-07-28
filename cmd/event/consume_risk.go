@@ -81,14 +81,21 @@ func consumeInvocationFromArgs(rawArgs []string) (key string, dryRun bool, ok bo
 	// EventKey — the guard against a --jq/--filter value that happens to resemble a
 	// key being read as the key. Non-key value types (--max-events int,
 	// --timeout duration) are declared as strings here because only value
-	// CONSUMPTION matters, not the parsed value. Bool flags
-	// (--quiet/--include-resource-data/--help) need no entry: an unknown bare flag
-	// never swallows the following token. --dry-run is declared so it is both
-	// consumed and read.
+	// CONSUMPTION matters, not the parsed value. Plain bool flags
+	// (--quiet/--include-resource-data) need no entry: an unknown bare flag never
+	// swallows the following token. --dry-run is declared so it is both consumed
+	// and read. --help/-h MUST be declared: pflag special-cases an UNDEFINED
+	// help flag and returns ErrHelp from Parse (even under the UnknownFlags
+	// whitelist), which would abort the refinement and leave a legacy `event
+	// consume <key> --help` mislabeled "write" — so it renders the wrong Risk line
+	// and is pruned out under a `max_risk: read` policy. Defining help as an
+	// ordinary bool makes pflag parse it normally, so the positional key is still
+	// extracted and the risk refined.
 	var (
 		strSink   string
 		arraySink []string
 		dryVal    bool
+		helpVal   bool
 	)
 	fs.StringVar(&strSink, "profile", "", "")
 	fs.StringArrayVarP(&arraySink, "param", "p", nil, "")
@@ -99,6 +106,7 @@ func consumeInvocationFromArgs(rawArgs []string) (key string, dryRun bool, ok bo
 	fs.StringVar(&strSink, "as", "", "")
 	fs.StringVar(&strSink, "filter", "", "")
 	fs.BoolVar(&dryVal, "dry-run", false, "")
+	fs.BoolVarP(&helpVal, "help", "h", false, "")
 
 	if err := fs.Parse(rest); err != nil {
 		return "", false, false
