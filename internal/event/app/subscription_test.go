@@ -10,6 +10,7 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	event "github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/model"
 	lark "github.com/larksuite/cli/internal/event/platform/lark"
 	subscription "github.com/larksuite/cli/internal/event/subscription"
 )
@@ -228,27 +229,27 @@ func nonEmptyFilter(t *testing.T) *event.Filter {
 // fakeUpdatePort is a network-free UpdatePort: Get hands back a canned
 // subscription; Patch captures its spec and returns a canned result.
 type fakeUpdatePort struct {
-	getSub    *lark.RemoteSubscription
+	getSub    *model.RemoteSubscription
 	getErr    error
-	patchResp *lark.RemoteSubscription
+	patchResp *model.RemoteSubscription
 	patchErr  error
 
 	patchCalls int
 	patchSpec  lark.PatchSpec
 }
 
-func (f *fakeUpdatePort) Get(context.Context, string) (*lark.RemoteSubscription, error) {
+func (f *fakeUpdatePort) Get(context.Context, string) (*model.RemoteSubscription, error) {
 	return f.getSub, f.getErr
 }
 
-func (f *fakeUpdatePort) Patch(_ context.Context, _ string, spec lark.PatchSpec) (*lark.RemoteSubscription, error) {
+func (f *fakeUpdatePort) Patch(_ context.Context, _ string, spec lark.PatchSpec) (*model.RemoteSubscription, error) {
 	f.patchCalls++
 	f.patchSpec = spec
 	return f.patchResp, f.patchErr
 }
 
-func emptyFilterSub() *lark.RemoteSubscription {
-	return &lark.RemoteSubscription{EventType: updateTestEventType, Filter: &event.Filter{}}
+func emptyFilterSub() *model.RemoteSubscription {
+	return &model.RemoteSubscription{EventType: updateTestEventType, Filter: &event.Filter{}}
 }
 
 // TestUpdate_GetError_Propagates locks that the mandatory read's error
@@ -268,7 +269,7 @@ func TestUpdate_GetError_Propagates(t *testing.T) {
 // TestUpdate_MissingEventType_TypedError locks the wire-anomaly guard: a Get
 // that omits event_type is an InvalidResponse, never a guess, and never patches.
 func TestUpdate_MissingEventType_TypedError(t *testing.T) {
-	svc := &fakeUpdatePort{getSub: &lark.RemoteSubscription{EventType: "", Filter: &event.Filter{}}}
+	svc := &fakeUpdatePort{getSub: &model.RemoteSubscription{EventType: "", Filter: &event.Filter{}}}
 	_, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
 	var ie *errs.InternalError
 	if !errors.As(err, &ie) || ie.Subtype != errs.SubtypeInvalidResponse {
@@ -318,9 +319,9 @@ func TestUpdate_ClearFilter_Noop_WhenAlreadyEmpty(t *testing.T) {
 // issues exactly one Patch with the empty/clear form and returns the fresh
 // subscription as After.
 func TestUpdate_ClearFilter_Patches(t *testing.T) {
-	after := &lark.RemoteSubscription{EventType: updateTestEventType, Filter: &event.Filter{}}
+	after := &model.RemoteSubscription{EventType: updateTestEventType, Filter: &event.Filter{}}
 	svc := &fakeUpdatePort{
-		getSub:    &lark.RemoteSubscription{EventType: updateTestEventType, Filter: nonEmptyFilter(t)},
+		getSub:    &model.RemoteSubscription{EventType: updateTestEventType, Filter: nonEmptyFilter(t)},
 		patchResp: after,
 	}
 	out, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)
@@ -342,7 +343,7 @@ func TestUpdate_ClearFilter_Patches(t *testing.T) {
 func TestUpdate_PatchError_Propagates(t *testing.T) {
 	sentinel := errors.New("patch failed")
 	svc := &fakeUpdatePort{
-		getSub:   &lark.RemoteSubscription{EventType: updateTestEventType, Filter: nonEmptyFilter(t)},
+		getSub:   &model.RemoteSubscription{EventType: updateTestEventType, Filter: nonEmptyFilter(t)},
 		patchErr: sentinel,
 	}
 	_, err := NewSubscriptionUseCase().Update(context.Background(), svc, "sub_1", "", true, false)

@@ -16,24 +16,24 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
-	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	"github.com/larksuite/cli/internal/event/model"
 )
 
 // fakeReactivateAPI is a network-free stand-in for the platform/lark gateway's
 // Get+Reactivate — the reactivateSubscriptionAPI test seam.
 type fakeReactivateAPI struct {
-	getSub *larkgw.RemoteSubscription
+	getSub *model.RemoteSubscription
 	getErr error
 
-	reactivateFunc  func() (*larkgw.RemoteSubscription, error)
+	reactivateFunc  func() (*model.RemoteSubscription, error)
 	reactivateCalls int
 }
 
-func (f *fakeReactivateAPI) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (f *fakeReactivateAPI) Get(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	return f.getSub, f.getErr
 }
 
-func (f *fakeReactivateAPI) Reactivate(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (f *fakeReactivateAPI) Reactivate(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	f.reactivateCalls++
 	if f.reactivateFunc == nil {
 		return subPtr(activeSub("sub_1", false, "user")), nil
@@ -44,7 +44,7 @@ func (f *fakeReactivateAPI) Reactivate(_ context.Context, _ string) (*larkgw.Rem
 // ---- doReactivateSubscription ----
 
 func TestDoReactivateSubscription_CallsReactivateAndReturnsDetail(t *testing.T) {
-	fake := &fakeReactivateAPI{reactivateFunc: func() (*larkgw.RemoteSubscription, error) {
+	fake := &fakeReactivateAPI{reactivateFunc: func() (*model.RemoteSubscription, error) {
 		return subPtr(activeSub("sub_1", false, "user")), nil
 	}}
 
@@ -62,7 +62,7 @@ func TestDoReactivateSubscription_CallsReactivateAndReturnsDetail(t *testing.T) 
 
 func TestDoReactivateSubscription_TransportError_PropagatesUnchanged(t *testing.T) {
 	sentinel := errors.New("boom: connection reset")
-	fake := &fakeReactivateAPI{reactivateFunc: func() (*larkgw.RemoteSubscription, error) { return nil, sentinel }}
+	fake := &fakeReactivateAPI{reactivateFunc: func() (*model.RemoteSubscription, error) { return nil, sentinel }}
 
 	_, err := doReactivateSubscription(context.Background(), fake, "sub_1")
 	if !errors.Is(err, sentinel) {

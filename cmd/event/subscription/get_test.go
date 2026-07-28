@@ -16,6 +16,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
@@ -25,11 +26,11 @@ import (
 // or a typed error; a fixture simulating a failure sets `err`, and success sets
 // `sub`.
 type fakeGetAPI struct {
-	sub *larkgw.RemoteSubscription
+	sub *model.RemoteSubscription
 	err error
 }
 
-func (f *fakeGetAPI) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (f *fakeGetAPI) Get(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	return f.sub, f.err
 }
 

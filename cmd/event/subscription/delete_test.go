@@ -17,7 +17,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
-	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	"github.com/larksuite/cli/internal/event/model"
 	"github.com/larksuite/cli/internal/output"
 )
 
@@ -25,14 +25,14 @@ import (
 // Get+Delete — the deleteSubscriptionAPI test seam. Delete carries no payload,
 // so the gateway (and this fake) returns only an error.
 type fakeDeleteAPI struct {
-	getSub *larkgw.RemoteSubscription
+	getSub *model.RemoteSubscription
 	getErr error
 
 	deleteFunc  func() error
 	deleteCalls int
 }
 
-func (f *fakeDeleteAPI) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (f *fakeDeleteAPI) Get(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	return f.getSub, f.getErr
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
@@ -22,8 +23,8 @@ import (
 // which resumes delivery on a suspended subscription). See
 // listSubscriptionsAPI (list.go) for the test-seam rationale.
 type reactivateSubscriptionAPI interface {
-	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
-	Reactivate(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
+	Reactivate(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 }
 
 // reactivateOpts holds `event subscription reactivate`'s flag values.
@@ -153,7 +154,7 @@ func runReactivate(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID 
 // remote_subscription_id -> a typed InvalidResponse). Any error it returns
 // (transport, an already-classified business failure, or that validation) is
 // passed through unchanged.
-func doReactivateSubscription(ctx context.Context, svc reactivateSubscriptionAPI, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error) {
+func doReactivateSubscription(ctx context.Context, svc reactivateSubscriptionAPI, remoteSubscriptionID string) (*model.RemoteSubscription, error) {
 	return svc.Reactivate(ctx, remoteSubscriptionID)
 }
 

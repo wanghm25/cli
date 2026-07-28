@@ -21,6 +21,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	eventlib "github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
 	"github.com/larksuite/cli/internal/event/session"
@@ -35,24 +36,24 @@ import (
 // TestGateway_WalkSubscriptions_*); here the fake reports capped directly so the
 // supplement's dedup/threshold/fan-out/degrade logic is exercised in isolation.
 type fakeRefinedGetter struct {
-	sub   *larkgw.RemoteSubscription
+	sub   *model.RemoteSubscription
 	err   error
 	calls int
 
 	// walk seam: the items the scan yields, whether it reports capped, and any
 	// error — plus a call counter so a test can assert the Get-vs-scan switch.
-	walkItems  []larkgw.RemoteSubscription
+	walkItems  []model.RemoteSubscription
 	walkCapped bool
 	walkErr    error
 	walkCalls  int
 }
 
-func (f *fakeRefinedGetter) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (f *fakeRefinedGetter) Get(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	f.calls++
 	return f.sub, f.err
 }
 
-func (f *fakeRefinedGetter) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, visit func(larkgw.RemoteSubscription) bool) (bool, error) {
+func (f *fakeRefinedGetter) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
 	f.walkCalls++
 	if f.walkErr != nil {
 		return false, f.walkErr
@@ -72,7 +73,7 @@ var errBoom = errors.New("boom: unreachable")
 
 // remoteSub / subRef build the domain fixtures the migrated supplement fakes
 // hand back, projected exactly as the gateway would from an SDK detail.
-func remoteSub(state string, expireTime int, includeResourceData bool) larkgw.RemoteSubscription {
+func remoteSub(state string, expireTime int, includeResourceData bool) model.RemoteSubscription {
 	return larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{
 		State:          &state,
 		ExpireTime:     &expireTime,
@@ -80,11 +81,11 @@ func remoteSub(state string, expireTime int, includeResourceData bool) larkgw.Re
 	})
 }
 
-func remoteSubID(id, state string) larkgw.RemoteSubscription {
+func remoteSubID(id, state string) model.RemoteSubscription {
 	return larkgw.ProjectSubscription(&larkeventv1.SubscriptionDetail{SubscriptionId: &id, State: &state})
 }
 
-func subRef(s larkgw.RemoteSubscription) *larkgw.RemoteSubscription { return &s }
+func subRef(s model.RemoteSubscription) *model.RemoteSubscription { return &s }
 
 // --- local current_profile_match (no scope, always available) ---
 //
@@ -624,7 +625,7 @@ func TestSupplementRefinedConsumers_DedupsSharedRemoteSubscriptionID(t *testing.
 func TestSupplementRefinedConsumers_ManyDistinctIDs_UsesScanNotManyGets(t *testing.T) {
 	n := remoteSupplementListThreshold + 1
 	consumers := make([]protocol.ConsumerInfo, 0, n)
-	items := make([]larkgw.RemoteSubscription, 0, n)
+	items := make([]model.RemoteSubscription, 0, n)
 	for i := 0; i < n; i++ {
 		c := refinedConsumer()
 		c.PID = 100 + i
@@ -706,7 +707,7 @@ func TestSupplementRefinedConsumers_ScanMissingID_StaysLocalOnly(t *testing.T) {
 func TestSupplementRefinedConsumers_ScanYieldsAllWantedIDs_Supplemented(t *testing.T) {
 	n := remoteSupplementListThreshold + 1
 	consumers := make([]protocol.ConsumerInfo, 0, n)
-	items := make([]larkgw.RemoteSubscription, 0, n)
+	items := make([]model.RemoteSubscription, 0, n)
 	for i := 0; i < n; i++ {
 		c := refinedConsumer()
 		c.PID = 100 + i
@@ -752,7 +753,7 @@ func TestSupplementRefinedConsumers_CappedScan_DegradesGracefully_NotFalseNotExi
 	}
 	// The scan reports capped and only ever yielded unrelated subscriptions.
 	getter := &fakeRefinedGetter{
-		walkItems:  []larkgw.RemoteSubscription{remoteSubID("unrelated_1", "active")},
+		walkItems:  []model.RemoteSubscription{remoteSubID("unrelated_1", "active")},
 		walkCapped: true,
 	}
 
@@ -851,7 +852,7 @@ func TestApplyRefinedSupplement_PaginationCapped_BubblesUpToCaller(t *testing.T)
 	}
 	statuses := []appStatus{{AppID: "cli_a", State: stateRunning, Consumers: consumers}}
 	getter := &fakeRefinedGetter{
-		walkItems:  []larkgw.RemoteSubscription{remoteSubID("unrelated_1", "active")},
+		walkItems:  []model.RemoteSubscription{remoteSubID("unrelated_1", "active")},
 		walkCapped: true,
 	}
 
@@ -947,7 +948,7 @@ func TestResolveRemoteSupplementGetter_LarkClientError_ReturnsNil(t *testing.T) 
 // verbatim SuspensionCode capture. suspensionCode=="" omits
 // the Suspension object entirely (a suspended response with no suspension
 // details, which must still produce a suspended advisory with no code).
-func suspendedRemoteSub(suspensionCode string) larkgw.RemoteSubscription {
+func suspendedRemoteSub(suspensionCode string) model.RemoteSubscription {
 	d := &larkeventv1.SubscriptionDetail{State: strPtr("suspended")}
 	if suspensionCode != "" {
 		d.Suspension = &larkeventv1.Suspension{Code: &suspensionCode}

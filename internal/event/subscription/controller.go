@@ -16,9 +16,9 @@ import (
 // Observer/Planner) drives: the bounded List scan, the two writes it performs
 // (Create/Reactivate), and the encrypt-key probe. *lark.Gateway satisfies it.
 type Gateway interface {
-	WalkSubscriptions(ctx context.Context, params lark.ListParams, visit func(lark.RemoteSubscription) bool) (bool, error)
-	Create(ctx context.Context, spec lark.CreateSpec) (*lark.RemoteSubscription, error)
-	Reactivate(ctx context.Context, remoteSubscriptionID string) (*lark.RemoteSubscription, error)
+	WalkSubscriptions(ctx context.Context, params lark.ListParams, visit func(model.RemoteSubscription) bool) (bool, error)
+	Create(ctx context.Context, spec lark.CreateSpec) (*model.RemoteSubscription, error)
+	Reactivate(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 	GetEncryptKey(ctx context.Context, remoteSubscriptionID string) (string, error)
 }
 
@@ -33,8 +33,8 @@ type ApplyReceipt struct {
 	RemoteID         model.RemoteSubscriptionID
 	Action           Action
 	CreatedByAttempt bool
-	Before           *lark.RemoteSubscription
-	After            *lark.RemoteSubscription
+	Before           *model.RemoteSubscription
+	After            *model.RemoteSubscription
 }
 
 // Controller is the single remote-write path for the Observe -> Plan -> Apply
@@ -218,7 +218,7 @@ func (c *Controller) create(ctx context.Context, req Request) (ApplyReceipt, err
 // subscriptionID reads a (possibly nil) gateway result's id. The gateway already
 // validates non-empty on success, but this stays nil-safe so requireID produces
 // one uniform InvalidResponse.
-func subscriptionID(sub *lark.RemoteSubscription) model.RemoteSubscriptionID {
+func subscriptionID(sub *model.RemoteSubscription) model.RemoteSubscriptionID {
 	if sub == nil {
 		return ""
 	}

@@ -21,6 +21,7 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
 	eventlib "github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
@@ -56,7 +57,7 @@ func mustParseCreatedFilter(t *testing.T, raw string) *eventlib.Filter {
 // activeSubWithFilter is activeSub carrying an existing server-side filter
 // (projected exactly as a gateway read would surface it), for the no-op /
 // clear-a-present-filter cases.
-func activeSubWithFilter(id string, f *eventlib.Filter) larkgw.RemoteSubscription {
+func activeSubWithFilter(id string, f *eventlib.Filter) model.RemoteSubscription {
 	d := activeDetail(id, false, "user")
 	d.Filter = larkgw.FilterToSDK(f)
 	return larkgw.ProjectSubscription(d)
@@ -68,19 +69,19 @@ func activeSubWithFilter(id string, f *eventlib.Filter) larkgw.RemoteSubscriptio
 // Get+Patch — the updateSubscriptionAPI test seam. Get hands back a domain
 // RemoteSubscription; Patch captures the PatchSpec and returns one.
 type fakeUpdateAPI struct {
-	getSub *larkgw.RemoteSubscription
+	getSub *model.RemoteSubscription
 	getErr error
 
-	patchFunc  func(larkgw.PatchSpec) (*larkgw.RemoteSubscription, error)
+	patchFunc  func(larkgw.PatchSpec) (*model.RemoteSubscription, error)
 	patchCalls int
 	patchSpec  larkgw.PatchSpec
 }
 
-func (f *fakeUpdateAPI) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (f *fakeUpdateAPI) Get(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	return f.getSub, f.getErr
 }
 
-func (f *fakeUpdateAPI) Patch(_ context.Context, _ string, spec larkgw.PatchSpec) (*larkgw.RemoteSubscription, error) {
+func (f *fakeUpdateAPI) Patch(_ context.Context, _ string, spec larkgw.PatchSpec) (*model.RemoteSubscription, error) {
 	f.patchCalls++
 	f.patchSpec = spec
 	if f.patchFunc == nil {

@@ -16,6 +16,7 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/bus/lifecycle"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/session"
 )
@@ -48,20 +49,20 @@ type fakeSubscriptionActionClient struct {
 	reactivateCalls int
 	renewCalls      int
 
-	getSub        *larkgw.RemoteSubscription
+	getSub        *model.RemoteSubscription
 	getErr        error
 	reactivateErr error
 	renewErr      error
 }
 
-func (f *fakeSubscriptionActionClient) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (f *fakeSubscriptionActionClient) Get(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.getCalls++
 	return f.getSub, f.getErr
 }
 
-func (f *fakeSubscriptionActionClient) Reactivate(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (f *fakeSubscriptionActionClient) Reactivate(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reactivateCalls++
@@ -70,7 +71,7 @@ func (f *fakeSubscriptionActionClient) Reactivate(_ context.Context, _ string) (
 	return nil, f.reactivateErr
 }
 
-func (f *fakeSubscriptionActionClient) Renew(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (f *fakeSubscriptionActionClient) Renew(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.renewCalls++
@@ -96,7 +97,7 @@ func (f *fakeSubscriptionActionClient) renewCount() int {
 // buildGetSub constructs a minimal RemoteSubscription reporting state (and, when
 // non-empty, a verbatim suspension code) -- exactly the shape reconcileWithGet
 // reads -- projected through the gateway's projection as production would.
-func buildGetSub(state, suspensionCode string) *larkgw.RemoteSubscription {
+func buildGetSub(state, suspensionCode string) *model.RemoteSubscription {
 	b := larkeventv1.NewSubscriptionDetailBuilder().State(state)
 	if suspensionCode != "" {
 		b = b.Suspension(larkeventv1.NewSuspensionBuilder().Code(suspensionCode).Build())
@@ -111,7 +112,7 @@ func buildGetSub(state, suspensionCode string) *larkgw.RemoteSubscription {
 // against the lead conn's own stored intent. authorityUserOpenID=="" builds an
 // "app" authority; non-empty builds "user:<id>" (mirrors
 // lifecycle.AuthorityMatchesOwner's own vocabulary).
-func buildGetSubActive(targetResource, authorityUserOpenID string, includeResourceData bool) *larkgw.RemoteSubscription {
+func buildGetSubActive(targetResource, authorityUserOpenID string, includeResourceData bool) *model.RemoteSubscription {
 	authorityBuilder := larkeventv1.NewAuthorityBuilder().Type("app")
 	if authorityUserOpenID != "" {
 		authorityBuilder = larkeventv1.NewAuthorityBuilder().Type("user").OpenId(authorityUserOpenID)
@@ -129,7 +130,7 @@ func buildGetSubActive(targetResource, authorityUserOpenID string, includeResour
 // buildGetSubActiveWithFilter is buildGetSubActive plus a server-side filter on
 // the returned snapshot, for exercising the filter dimension of
 // reconcileWithGet's "active" projection.
-func buildGetSubActiveWithFilter(targetResource, authorityUserOpenID string, includeResourceData bool, f *event.Filter) *larkgw.RemoteSubscription {
+func buildGetSubActiveWithFilter(targetResource, authorityUserOpenID string, includeResourceData bool, f *event.Filter) *model.RemoteSubscription {
 	authorityBuilder := larkeventv1.NewAuthorityBuilder().Type("app")
 	if authorityUserOpenID != "" {
 		authorityBuilder = larkeventv1.NewAuthorityBuilder().Type("user").OpenId(authorityUserOpenID)

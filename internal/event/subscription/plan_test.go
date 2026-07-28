@@ -11,14 +11,13 @@ import (
 
 	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/model"
-	lark "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
 // ---- fixtures ----
 
-func activeSub(id string, includeResourceData bool, authorityType string) lark.RemoteSubscription {
+func activeSub(id string, includeResourceData bool, authorityType string) model.RemoteSubscription {
 	ird := includeResourceData
-	return lark.RemoteSubscription{
+	return model.RemoteSubscription{
 		ID:                    model.RemoteSubscriptionID(id),
 		EventType:             "im.message.created_v1",
 		TargetResource:        "im.message?chat_id=oc_aaa",
@@ -30,8 +29,8 @@ func activeSub(id string, includeResourceData bool, authorityType string) lark.R
 	}
 }
 
-func suspendedSub(id, reason string) lark.RemoteSubscription {
-	return lark.RemoteSubscription{
+func suspendedSub(id, reason string) model.RemoteSubscription {
+	return model.RemoteSubscription{
 		ID:               model.RemoteSubscriptionID(id),
 		EventType:        "im.message.created_v1",
 		TargetResource:   "im.message?chat_id=oc_aaa",
@@ -42,8 +41,8 @@ func suspendedSub(id, reason string) lark.RemoteSubscription {
 	}
 }
 
-func stateSub(id, state string) lark.RemoteSubscription {
-	return lark.RemoteSubscription{
+func stateSub(id, state string) model.RemoteSubscription {
+	return model.RemoteSubscription{
 		ID:             model.RemoteSubscriptionID(id),
 		EventType:      "im.message.created_v1",
 		TargetResource: "im.message?chat_id=oc_aaa",
@@ -69,7 +68,7 @@ func filterAlt() *event.Filter {
 	}}
 }
 
-func completeObs(subs ...lark.RemoteSubscription) Observation {
+func completeObs(subs ...model.RemoteSubscription) Observation {
 	return Observation{Completeness: Complete, Matches: subs}
 }
 
@@ -320,7 +319,7 @@ func TestPlan_EncryptedDeferred_ReusesWithoutProbing(t *testing.T) {
 
 // ---- Planner: filter reuse dimension (active) ----
 
-func filteredActive(id, authorityType string, f *event.Filter) lark.RemoteSubscription {
+func filteredActive(id, authorityType string, f *event.Filter) model.RemoteSubscription {
 	sub := activeSub(id, false, authorityType)
 	sub.Filter = f
 	return sub

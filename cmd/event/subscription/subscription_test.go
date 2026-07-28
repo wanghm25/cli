@@ -20,25 +20,26 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
 	eventlib "github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
 // activeSub / suspendedSub are the domain (gateway-projected) counterparts of
 // activeDetail / suspendedDetail (create_test.go), for the migrated
-// read/simple-write command fakes that now speak larkgw.RemoteSubscription
+// read/simple-write command fakes that now speak model.RemoteSubscription
 // instead of the SDK type. Projecting the SDK fixture keeps the domain fixture
 // byte-identical to what the gateway would hand a command in production.
-func activeSub(id string, includeResourceData bool, authorityType string) larkgw.RemoteSubscription {
+func activeSub(id string, includeResourceData bool, authorityType string) model.RemoteSubscription {
 	return larkgw.ProjectSubscription(activeDetail(id, includeResourceData, authorityType))
 }
 
-func suspendedSub(id, reason string) larkgw.RemoteSubscription {
+func suspendedSub(id, reason string) model.RemoteSubscription {
 	return larkgw.ProjectSubscription(suspendedDetail(id, reason))
 }
 
-// subPtr returns a pointer to s, for building the *larkgw.RemoteSubscription
+// subPtr returns a pointer to s, for building the *model.RemoteSubscription
 // values the domain command fakes hand back from Get/Renew/Reactivate/Patch.
-func subPtr(s larkgw.RemoteSubscription) *larkgw.RemoteSubscription { return &s }
+func subPtr(s model.RemoteSubscription) *model.RemoteSubscription { return &s }
 
 // The subscription tests build minimal catalog fixtures instead of importing the
 // full events catalog, so they seed im.message.created_v1's filter capability

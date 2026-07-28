@@ -6,7 +6,7 @@ package lifecycle
 import (
 	"context"
 
-	lark "github.com/larksuite/cli/internal/event/platform/lark"
+	"github.com/larksuite/cli/internal/event/model"
 )
 
 // runEffect executes the single side effect a reduction returned. The reducer
@@ -202,7 +202,7 @@ func (a *SubscriptionAction) runReconcileGet(ctx context.Context, le LifecycleEv
 // than trusting state=="active" alone. sub==nil projects to the zero value:
 // every dimension reads "absent", which classifyUpdateCompatibility treats as
 // "unclear" rather than a confirmed match — never silently "compatible".
-func projectSubscriptionCompatibility(sub *lark.RemoteSubscription) LifecycleEvent {
+func projectSubscriptionCompatibility(sub *model.RemoteSubscription) LifecycleEvent {
 	if sub == nil {
 		return LifecycleEvent{}
 	}

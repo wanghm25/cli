@@ -9,6 +9,7 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	event "github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/model"
 	lark "github.com/larksuite/cli/internal/event/platform/lark"
 	subscription "github.com/larksuite/cli/internal/event/subscription"
 )
@@ -135,8 +136,8 @@ func (SubscriptionUseCase) Provision(ctx context.Context, controller Subscriptio
 // Patch (the write, which changes only the server-side filter). The command's
 // updateSubscriptionAPI seam satisfies it.
 type UpdatePort interface {
-	Get(ctx context.Context, remoteSubscriptionID string) (*lark.RemoteSubscription, error)
-	Patch(ctx context.Context, remoteSubscriptionID string, spec lark.PatchSpec) (*lark.RemoteSubscription, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
+	Patch(ctx context.Context, remoteSubscriptionID string, spec lark.PatchSpec) (*model.RemoteSubscription, error)
 }
 
 // UpdateKind classifies an Update outcome for the command to render.
@@ -160,8 +161,8 @@ const (
 // whether a real run would no-op (already matches) or patch.
 type UpdateOutcome struct {
 	Kind     UpdateKind
-	Before   lark.RemoteSubscription
-	After    lark.RemoteSubscription
+	Before   model.RemoteSubscription
+	After    model.RemoteSubscription
 	NoChange bool
 }
 

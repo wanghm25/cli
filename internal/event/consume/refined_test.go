@@ -82,18 +82,18 @@ func refinedFixture() event.ResolvedEventKey {
 // internal/event/subscription/controller_test.go). walkFunc lets a test vary the
 // List result by call; createSpec captures the spec Create built.
 type fakeGateway struct {
-	walkItems  []larkgw.RemoteSubscription
+	walkItems  []model.RemoteSubscription
 	walkCapped bool
 	walkErr    error
-	walkFunc   func(call int) ([]larkgw.RemoteSubscription, bool, error)
+	walkFunc   func(call int) ([]model.RemoteSubscription, bool, error)
 	walkCalls  int
 
-	createResp  *larkgw.RemoteSubscription
+	createResp  *model.RemoteSubscription
 	createErr   error
 	createSpec  *larkgw.CreateSpec
 	createCalls int
 
-	reactivateResp  *larkgw.RemoteSubscription
+	reactivateResp  *model.RemoteSubscription
 	reactivateErr   error
 	reactivateID    string
 	reactivateCalls int
@@ -103,7 +103,7 @@ type fakeGateway struct {
 	encryptCalls int
 }
 
-func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, visit func(larkgw.RemoteSubscription) bool) (bool, error) {
+func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
 	call := g.walkCalls
 	g.walkCalls++
 	items, capped, err := g.walkItems, g.walkCapped, g.walkErr
@@ -121,7 +121,7 @@ func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, 
 	return capped, nil
 }
 
-func (g *fakeGateway) Create(_ context.Context, spec larkgw.CreateSpec) (*larkgw.RemoteSubscription, error) {
+func (g *fakeGateway) Create(_ context.Context, spec larkgw.CreateSpec) (*model.RemoteSubscription, error) {
 	g.createCalls++
 	s := spec
 	g.createSpec = &s
@@ -131,7 +131,7 @@ func (g *fakeGateway) Create(_ context.Context, spec larkgw.CreateSpec) (*larkgw
 	return g.createResp, nil
 }
 
-func (g *fakeGateway) Reactivate(_ context.Context, id string) (*larkgw.RemoteSubscription, error) {
+func (g *fakeGateway) Reactivate(_ context.Context, id string) (*model.RemoteSubscription, error) {
 	g.reactivateCalls++
 	g.reactivateID = id
 	if g.reactivateErr != nil {
@@ -146,9 +146,9 @@ func (g *fakeGateway) GetEncryptKey(_ context.Context, _ string) (string, error)
 }
 
 // activeRemote is an active authority match as the domain projection.
-func activeRemote(id, authorityType string, includeResourceData bool) larkgw.RemoteSubscription {
+func activeRemote(id, authorityType string, includeResourceData bool) model.RemoteSubscription {
 	ird := includeResourceData
-	return larkgw.RemoteSubscription{
+	return model.RemoteSubscription{
 		ID:                    model.RemoteSubscriptionID(id),
 		EventType:             "im.message.created_v1",
 		TargetResource:        "im.message?chat_id=oc_aaa",
@@ -161,7 +161,7 @@ func activeRemote(id, authorityType string, includeResourceData bool) larkgw.Rem
 }
 
 // activeFilteredRemote is a plaintext active authority match carrying filter f.
-func activeFilteredRemote(id, authorityType string, f *event.Filter) larkgw.RemoteSubscription {
+func activeFilteredRemote(id, authorityType string, f *event.Filter) model.RemoteSubscription {
 	sub := activeRemote(id, authorityType, false)
 	sub.Filter = f
 	return sub
@@ -591,7 +591,7 @@ func refinedFilterWith(t *testing.T, messageType string) *event.Filter {
 // that differs from an active match's plans a Block carrying a filter field.
 func TestProdRefinedDeps_Plan_FilterMismatch_ReturnsConflictWithFilterField(t *testing.T) {
 	resolved := refinedFixture()
-	gw := &fakeGateway{walkItems: []larkgw.RemoteSubscription{activeFilteredRemote("sub_1", "user", refinedFilterWith(t, "text"))}}
+	gw := &fakeGateway{walkItems: []model.RemoteSubscription{activeFilteredRemote("sub_1", "user", refinedFilterWith(t, "text"))}}
 	opts := RefinedOptions{Identity: core.AsUser, Controller: subown.NewController(gw), Filter: refinedFilterWith(t, "image")}
 	deps := prodRefinedDeps(failDialTransport{}, "cli_x", "test-profile", "", resolved, opts)
 
@@ -618,7 +618,7 @@ func TestProdRefinedDeps_Plan_FilterMismatch_ReturnsConflictWithFilterField(t *t
 func TestProdRefinedDeps_Plan_EncryptedActiveMatch_ReusesWithZeroGetEncryptKeyCalls(t *testing.T) {
 	resolved := refinedFixture()
 	gw := &fakeGateway{
-		walkItems: []larkgw.RemoteSubscription{activeRemote("sub_enc", "user", true)},
+		walkItems: []model.RemoteSubscription{activeRemote("sub_enc", "user", true)},
 		// If the front-end ever probed, this would be its response — it must
 		// stay untouched.
 		encryptKey: "SHOULD_NOT_BE_FETCHED",
@@ -649,7 +649,7 @@ func TestProdRefinedDeps_Plan_PaginationCapped_ReturnsIndeterminate(t *testing.T
 	resolved := refinedFixture()
 	gw := &fakeGateway{
 		// A non-matching (app-authority) item, and the scan reports capped.
-		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_other", "app", false)},
+		walkItems:  []model.RemoteSubscription{activeRemote("sub_other", "app", false)},
 		walkCapped: true,
 	}
 	opts := RefinedOptions{Identity: core.AsUser, Controller: subown.NewController(gw)}
@@ -801,7 +801,7 @@ func TestRunRefinedChain_DryRun_EvenOnConflictingPlan_ReportsInformationallyNoEr
 	// dry-run ALWAYS reports the plan informationally, even
 	// conflict/suspended -- only preflight itself can fail a dry-run. Only a
 	// REAL (non-dry-run) run turns a conflict into a typed error.
-	existing := &larkgw.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_conflict")}
+	existing := &model.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_conflict")}
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
 		plan: func(context.Context) (subown.SubscriptionPlan, error) {
@@ -830,7 +830,7 @@ func TestRunRefinedChain_DryRun_EvenOnConflictingPlan_ReportsInformationallyNoEr
 
 func TestRunRefinedChain_PlanConflict_NonDryRun_ReturnsTypedErrorBeforeApply(t *testing.T) {
 	var applyCalled, startBusCalled, helloCalled bool
-	existing := &larkgw.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_conflict")}
+	existing := &model.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_conflict")}
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
 		plan: func(context.Context) (subown.SubscriptionPlan, error) {
@@ -877,7 +877,7 @@ func TestRunRefinedChain_PlanConflict_NonDryRun_ReturnsTypedErrorBeforeApply(t *
 // apply/startBus/hello -- never silently creating a possible duplicate.
 func TestRunRefinedChain_UnknownState_FailsClosedNoApply(t *testing.T) {
 	var applyCalled, startBusCalled, helloCalled bool
-	existing := &larkgw.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_weird"), State: "pending"}
+	existing := &model.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_weird"), State: "pending"}
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
 		plan: func(context.Context) (subown.SubscriptionPlan, error) {
@@ -1126,7 +1126,7 @@ func TestRunRefinedChain_Suspended_NonDryRun_AppliesReactivateNotError(t *testin
 	deps := refinedDeps{
 		probe: func(context.Context) error { return nil },
 		plan: func(context.Context) (subown.SubscriptionPlan, error) {
-			return subown.SubscriptionPlan{Action: subown.ActionReactivate, Before: &larkgw.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_susp")}}, nil
+			return subown.SubscriptionPlan{Action: subown.ActionReactivate, Before: &model.RemoteSubscription{ID: model.RemoteSubscriptionID("sub_susp")}}, nil
 		},
 		apply: func(_ context.Context, plan subown.SubscriptionPlan) (string, bool, error) {
 			appliedAction = plan.Action

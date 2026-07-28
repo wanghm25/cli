@@ -128,9 +128,9 @@ func suspendedDetail(id, reason string) *larkeventv1.SubscriptionDetail {
 
 // activeRemote / suspendedRemote are the domain-projected (platform/lark)
 // fixtures create's Observe -> Plan -> Apply flow actually sees.
-func activeRemote(id string, includeResourceData bool, authorityType string) larkgw.RemoteSubscription {
+func activeRemote(id string, includeResourceData bool, authorityType string) model.RemoteSubscription {
 	ird := includeResourceData
-	return larkgw.RemoteSubscription{
+	return model.RemoteSubscription{
 		ID:                    model.RemoteSubscriptionID(id),
 		EventType:             "im.message.created_v1",
 		TargetResource:        "im.message?chat_id=oc_aaa",
@@ -142,8 +142,8 @@ func activeRemote(id string, includeResourceData bool, authorityType string) lar
 	}
 }
 
-func suspendedRemote(id, reason string) larkgw.RemoteSubscription {
-	return larkgw.RemoteSubscription{
+func suspendedRemote(id, reason string) model.RemoteSubscription {
+	return model.RemoteSubscription{
 		ID:               model.RemoteSubscriptionID(id),
 		EventType:        "im.message.created_v1",
 		TargetResource:   "im.message?chat_id=oc_aaa",
@@ -156,8 +156,8 @@ func suspendedRemote(id, reason string) larkgw.RemoteSubscription {
 
 // stateRemote builds an authority-matching remote in an arbitrary state, for the
 // unrecognized-state fail-closed path.
-func stateRemote(id, state string) larkgw.RemoteSubscription {
-	return larkgw.RemoteSubscription{
+func stateRemote(id, state string) model.RemoteSubscription {
+	return model.RemoteSubscription{
 		ID:             model.RemoteSubscriptionID(id),
 		EventType:      "im.message.created_v1",
 		TargetResource: "im.message?chat_id=oc_aaa",
@@ -167,7 +167,7 @@ func stateRemote(id, state string) larkgw.RemoteSubscription {
 	}
 }
 
-func remotePtr(s larkgw.RemoteSubscription) *larkgw.RemoteSubscription { return &s }
+func remotePtr(s model.RemoteSubscription) *model.RemoteSubscription { return &s }
 
 // ---- fake gateway (subown.Gateway) ----
 
@@ -176,18 +176,18 @@ func remotePtr(s larkgw.RemoteSubscription) *larkgw.RemoteSubscription { return 
 // reconcile-after-a-failed-create pass reads a second time); createSpec captures
 // the exact spec create built (for the atomic-encrypt-key assertion).
 type fakeCreateGateway struct {
-	walkItems  []larkgw.RemoteSubscription
+	walkItems  []model.RemoteSubscription
 	walkCapped bool
 	walkErr    error
-	walkFunc   func(call int) ([]larkgw.RemoteSubscription, bool, error)
+	walkFunc   func(call int) ([]model.RemoteSubscription, bool, error)
 	walkCalls  int
 
 	createSpec  *larkgw.CreateSpec
-	createResp  *larkgw.RemoteSubscription
+	createResp  *model.RemoteSubscription
 	createErr   error
 	createCalls int
 
-	reactivateResp  *larkgw.RemoteSubscription
+	reactivateResp  *model.RemoteSubscription
 	reactivateErr   error
 	reactivateCalls int
 
@@ -196,7 +196,7 @@ type fakeCreateGateway struct {
 	getEncryptKeyCalls int
 }
 
-func (g *fakeCreateGateway) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, visit func(larkgw.RemoteSubscription) bool) (bool, error) {
+func (g *fakeCreateGateway) WalkSubscriptions(_ context.Context, _ larkgw.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
 	call := g.walkCalls
 	g.walkCalls++
 	items, capped, err := g.walkItems, g.walkCapped, g.walkErr
@@ -214,7 +214,7 @@ func (g *fakeCreateGateway) WalkSubscriptions(_ context.Context, _ larkgw.ListPa
 	return capped, nil
 }
 
-func (g *fakeCreateGateway) Create(_ context.Context, spec larkgw.CreateSpec) (*larkgw.RemoteSubscription, error) {
+func (g *fakeCreateGateway) Create(_ context.Context, spec larkgw.CreateSpec) (*model.RemoteSubscription, error) {
 	g.createCalls++
 	s := spec
 	g.createSpec = &s
@@ -224,7 +224,7 @@ func (g *fakeCreateGateway) Create(_ context.Context, spec larkgw.CreateSpec) (*
 	return g.createResp, nil
 }
 
-func (g *fakeCreateGateway) Reactivate(_ context.Context, id string) (*larkgw.RemoteSubscription, error) {
+func (g *fakeCreateGateway) Reactivate(_ context.Context, id string) (*model.RemoteSubscription, error) {
 	g.reactivateCalls++
 	if g.reactivateErr != nil {
 		return nil, g.reactivateErr
@@ -270,7 +270,7 @@ func TestApplyCreate_NotFound_Creates(t *testing.T) {
 
 func TestApplyCreate_ActiveCompatible_ReusesWithoutCreate(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{activeRemote("sub_existing", false, "user")}}
+	gw := &fakeCreateGateway{walkItems: []model.RemoteSubscription{activeRemote("sub_existing", false, "user")}}
 	var buf bytes.Buffer
 
 	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{asJSON: true}, nil)
@@ -291,7 +291,7 @@ func TestApplyCreate_ActiveCompatible_ReusesWithoutCreate(t *testing.T) {
 
 func TestApplyCreate_ActiveConflict_ReturnsTypedFailedPrecondition(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{activeRemote("sub_conflict", true, "user")}}
+	gw := &fakeCreateGateway{walkItems: []model.RemoteSubscription{activeRemote("sub_conflict", true, "user")}}
 
 	// requested include_resource_data=false mismatches the existing true.
 	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
@@ -319,7 +319,7 @@ func TestApplyCreate_ActiveConflict_ReturnsTypedFailedPrecondition(t *testing.T)
 func TestApplyCreate_Suspended_ReturnsTypedFailedPrecondition_GuidesReactivate(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
 	// A distinct reason so the assertion proves suspendedError read this fixture.
-	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{suspendedRemote("sub_susp", "identity_revoked")}}
+	gw := &fakeCreateGateway{walkItems: []model.RemoteSubscription{suspendedRemote("sub_susp", "identity_revoked")}}
 
 	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
 	var ve *errs.ValidationError
@@ -345,7 +345,7 @@ func TestApplyCreate_Suspended_ReturnsTypedFailedPrecondition_GuidesReactivate(t
 // -- a typed failed_precondition naming the state and the id, never a Create.
 func TestApplyCreate_UnrecognizedState_ReturnsTypedFailedPrecondition_NoCreate(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{stateRemote("sub_weird", "pending")}}
+	gw := &fakeCreateGateway{walkItems: []model.RemoteSubscription{stateRemote("sub_weird", "pending")}}
 
 	err := applyCreate(context.Background(), subown.NewController(gw), io.Discard, resolved, core.AsUser, createOpts{}, nil)
 	var ve *errs.ValidationError
@@ -374,7 +374,7 @@ func TestApplyCreate_Indeterminate_ReturnsTypedFailedPrecondition_NoCreate(t *te
 	// (the #七 must-fix: an inconclusive scan no longer silently Creates).
 	resolved := resolveCreatedChatID(t)
 	gw := &fakeCreateGateway{
-		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_other", false, "app")}, // "app" never matches AsUser
+		walkItems:  []model.RemoteSubscription{activeRemote("sub_other", false, "app")}, // "app" never matches AsUser
 		walkCapped: true,
 	}
 
@@ -395,12 +395,12 @@ func TestApplyCreate_CreateFails_ReconcileFindsCompatible_ReturnsReused(t *testi
 	resolved := resolveCreatedChatID(t)
 	gw := &fakeCreateGateway{
 		createErr: errors.New("duplicate"),
-		walkFunc: func(call int) ([]larkgw.RemoteSubscription, bool, error) {
+		walkFunc: func(call int) ([]model.RemoteSubscription, bool, error) {
 			if call == 0 {
 				return nil, false, nil // first Plan: nothing yet -> Create
 			}
 			// reconcile-after-failure: someone raced a compatible one in.
-			return []larkgw.RemoteSubscription{activeRemote("sub_raced", false, "user")}, false, nil
+			return []model.RemoteSubscription{activeRemote("sub_raced", false, "user")}, false, nil
 		},
 	}
 	var buf bytes.Buffer
@@ -425,11 +425,11 @@ func TestApplyCreate_CreateFails_ReconcileFindsConflict_ReturnsTypedFail(t *test
 	resolved := resolveCreatedChatID(t)
 	gw := &fakeCreateGateway{
 		createErr: errors.New("duplicate"),
-		walkFunc: func(call int) ([]larkgw.RemoteSubscription, bool, error) {
+		walkFunc: func(call int) ([]model.RemoteSubscription, bool, error) {
 			if call == 0 {
 				return nil, false, nil
 			}
-			return []larkgw.RemoteSubscription{activeRemote("sub_raced_conflict", true, "user")}, false, nil
+			return []model.RemoteSubscription{activeRemote("sub_raced_conflict", true, "user")}, false, nil
 		},
 	}
 
@@ -486,7 +486,7 @@ func TestApplyCreate_Encrypted_NotFound_CreatesAtomicallyWithKey(t *testing.T) {
 func TestApplyCreate_Encrypted_RemoteFalse_ReturnsConflict_NeverProbes(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
 	gw := &fakeCreateGateway{
-		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_plain", false, "app")}, // "app" matches AsBot
+		walkItems:  []model.RemoteSubscription{activeRemote("sub_plain", false, "app")}, // "app" matches AsBot
 		encryptKey: "usable-key",
 	}
 
@@ -509,7 +509,7 @@ func TestApplyCreate_Encrypted_RemoteFalse_ReturnsConflict_NeverProbes(t *testin
 func TestApplyCreate_Encrypted_RemoteTrueUsableKey_ReusesNoNewCreateNoNewKey(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
 	gw := &fakeCreateGateway{
-		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_already_encrypted", true, "app")},
+		walkItems:  []model.RemoteSubscription{activeRemote("sub_already_encrypted", true, "app")},
 		encryptKey: "usable-remote-key",
 	}
 	keyGen := 0
@@ -541,7 +541,7 @@ func TestApplyCreate_Encrypted_RemoteTrueUsableKey_ReusesNoNewCreateNoNewKey(t *
 func TestApplyCreate_Encrypted_RemoteTrueKeyUnavailable_ReturnsConflictHumanHint(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
 	gw := &fakeCreateGateway{
-		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_key_unavailable", true, "app")},
+		walkItems:  []model.RemoteSubscription{activeRemote("sub_key_unavailable", true, "app")},
 		encryptErr: errors.New("boom: synthetic permission failure"),
 	}
 
@@ -569,11 +569,11 @@ func TestApplyCreate_Encrypted_CreateFails_SecondReconcileStillRequiresEncryptio
 	resolved := resolveCreatedChatID(t)
 	gw := &fakeCreateGateway{
 		createErr: errors.New("boom: synthetic create failure"),
-		walkFunc: func(call int) ([]larkgw.RemoteSubscription, bool, error) {
+		walkFunc: func(call int) ([]model.RemoteSubscription, bool, error) {
 			if call == 0 {
 				return nil, false, nil
 			}
-			return []larkgw.RemoteSubscription{activeRemote("sub_raced_plaintext", false, "user")}, false, nil
+			return []model.RemoteSubscription{activeRemote("sub_raced_plaintext", false, "user")}, false, nil
 		},
 	}
 
@@ -700,7 +700,7 @@ func TestDryRun_IncludeResourceDataTrue_NotFound_GeneratesNoKeyAndNoCreateCall(t
 func TestDryRun_IncludeResourceDataTrue_ActiveMatch_ProbesButGeneratesNoKey(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
 	gw := &fakeCreateGateway{
-		walkItems:  []larkgw.RemoteSubscription{activeRemote("sub_enc", true, "app")},
+		walkItems:  []model.RemoteSubscription{activeRemote("sub_enc", true, "app")},
 		encryptKey: "usable-key-from-remote",
 	}
 	keyGen := 0
@@ -838,7 +838,7 @@ func TestDryRun_NotFound_EndToEnd_JSONShapeAndNoCreateCall(t *testing.T) {
 
 func TestDryRun_ActiveConflicting_EndToEnd_ReportsInformationallyNoCreateCall(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{activeRemote("sub_conflict", true, "user")}}
+	gw := &fakeCreateGateway{walkItems: []model.RemoteSubscription{activeRemote("sub_conflict", true, "user")}}
 	var buf bytes.Buffer
 
 	// requested include_resource_data=false mismatches the existing true -> conflict.
@@ -869,7 +869,7 @@ func TestDryRun_ActiveConflicting_EndToEnd_ReportsInformationallyNoCreateCall(t 
 
 func TestDryRun_Suspended_EndToEnd_ReportsInformationallyNoCreateCall(t *testing.T) {
 	resolved := resolveCreatedChatID(t)
-	gw := &fakeCreateGateway{walkItems: []larkgw.RemoteSubscription{suspendedRemote("sub_susp", "authority_revoked")}}
+	gw := &fakeCreateGateway{walkItems: []model.RemoteSubscription{suspendedRemote("sub_susp", "authority_revoked")}}
 	var buf bytes.Buffer
 
 	err := applyCreate(context.Background(), subown.NewController(gw), &buf, resolved, core.AsUser, createOpts{dryRun: true, asJSON: true}, nil)

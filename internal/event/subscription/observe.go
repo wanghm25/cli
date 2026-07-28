@@ -44,11 +44,11 @@ const (
 // the platform ever relaxes that.
 type Observation struct {
 	Completeness Completeness
-	Matches      []lark.RemoteSubscription
+	Matches      []model.RemoteSubscription
 }
 
 // authorityMatch returns the single authority-narrowed match, or nil.
-func (o Observation) authorityMatch() *lark.RemoteSubscription {
+func (o Observation) authorityMatch() *model.RemoteSubscription {
 	if len(o.Matches) == 0 {
 		return nil
 	}
@@ -59,7 +59,7 @@ func (o Observation) authorityMatch() *lark.RemoteSubscription {
 // walker is the narrow read seam the Observer needs from the gateway: the one
 // bounded, ctx-aware paginated List scan. *lark.Gateway satisfies it.
 type walker interface {
-	WalkSubscriptions(ctx context.Context, params lark.ListParams, visit func(lark.RemoteSubscription) bool) (bool, error)
+	WalkSubscriptions(ctx context.Context, params lark.ListParams, visit func(model.RemoteSubscription) bool) (bool, error)
 }
 
 // Observer reads remote Subscription state through the gateway and narrows it to
@@ -84,10 +84,10 @@ func NewObserver(gw walker) Observer { return Observer{gateway: gw} }
 // Completeness=Indeterminate; anything else (a match found, or every page
 // genuinely read) is Complete.
 func (o Observer) Observe(ctx context.Context, req Request) (Observation, error) {
-	var match *lark.RemoteSubscription
+	var match *model.RemoteSubscription
 	capped, err := o.gateway.WalkSubscriptions(ctx,
 		lark.ListParams{EventType: req.EventType, TargetResource: req.TargetResource},
-		func(sub lark.RemoteSubscription) bool {
+		func(sub model.RemoteSubscription) bool {
 			if authorityMatchesIdentity(sub.Authority, req.Identity) {
 				m := sub
 				match = &m
@@ -101,7 +101,7 @@ func (o Observer) Observe(ctx context.Context, req Request) (Observation, error)
 	obs := Observation{Completeness: Complete}
 	switch {
 	case match != nil:
-		obs.Matches = []lark.RemoteSubscription{*match}
+		obs.Matches = []model.RemoteSubscription{*match}
 	case capped:
 		// No authority match within the pages actually read, and the scan hit
 		// the page cap with more possibly remaining: not confirmed absence.

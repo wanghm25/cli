@@ -15,6 +15,7 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event/app"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
@@ -27,8 +28,8 @@ import (
 // Patch (the actual write, which only changes the subscription's server-side
 // filter). See listSubscriptionsAPI (list.go) for the test-seam rationale.
 type updateSubscriptionAPI interface {
-	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
-	Patch(ctx context.Context, remoteSubscriptionID string, spec larkgw.PatchSpec) (*larkgw.RemoteSubscription, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
+	Patch(ctx context.Context, remoteSubscriptionID string, spec larkgw.PatchSpec) (*model.RemoteSubscription, error)
 }
 
 // updateOpts holds `event subscription update`'s flag values.

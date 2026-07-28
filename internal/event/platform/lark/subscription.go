@@ -9,53 +9,11 @@ import (
 	"github.com/larksuite/cli/internal/event/model"
 )
 
-// RemoteSubscription is the domain projection of a remote Lark Subscription —
-// what callers see instead of larkeventv1.SubscriptionDetail. It carries the
-// fields the read/simple-write callers actually use, with no SDK type in its
-// shape except the CLI-owned *event.Filter (whose projection deliberately stays
-// in package event; see event.FilterFromSDK).
-//
-// It lives here, in the gateway package, rather than in internal/event/model:
-// its Filter field is *event.Filter, and package event imports the SDK, so a
-// model that carried this type would transitively depend on the SDK — which
-// model is verified never to do (and, since event imports model, would form an
-// import cycle). Keeping RemoteSubscription with its projector is also cleanly
-// open-closed: the gateway owns both the SDK type and its domain projection.
-type RemoteSubscription struct {
-	// ID is the remote management-side subscription_id.
-	ID model.RemoteSubscriptionID
-	// EventType is the subscription's OAPI event_type.
-	EventType string
-	// TargetResource is the "<resource>?<selector>" the subscription targets;
-	// empty for a legacy (non-refined) subscription.
-	TargetResource string
-	// Authority is the projected subscription authority (user/app + open_id).
-	Authority model.RemoteAuthority
-
-	// PayloadOptionsPresent reports whether the SDK carried a payload_options
-	// object at all; IncludeResourceData is its include_resource_data field
-	// (nil when payload_options was absent OR carried no include_resource_data).
-	// The two are kept distinct so callers reproduce the exact
-	// present-vs-absent semantics the raw SDK response expressed.
-	PayloadOptionsPresent bool
-	IncludeResourceData   *bool
-
-	// Filter is the server-side event filter as the CLI Filter model. It is
-	// never nil — an unfiltered subscription projects to an empty *event.Filter
-	// (Filter.IsEmpty() == true) — so callers compare/canonicalize it directly.
-	Filter *model.Filter
-
-	// State is the remote subscription state (open vocabulary: "active",
-	// "suspended", "expired", ...).
-	State string
-	// SuspensionReason is suspension.code, present only for a suspended state.
-	SuspensionReason string
-	// ExpireTime/CreateTime/UpdateTime are Unix seconds; nil when the SDK
-	// omitted them.
-	ExpireTime *int
-	CreateTime *int
-	UpdateTime *int
-}
+// The domain projection of a remote Lark Subscription is model.RemoteSubscription
+// (a pure, SDK-free value object). This gateway owns the projection FROM the SDK
+// SubscriptionDetail into that domain type — see ProjectSubscription — but the
+// type itself lives in the domain so subscription / app / status / lifecycle
+// never speak a platform-package type.
 
 // CreateSpec is the domain request for creating a remote Subscription. The
 // gateway projects it into a larkeventv1 Create request body.
@@ -94,22 +52,22 @@ type ListParams struct {
 // the raw pagination signals a caller (e.g. `event subscription list`) surfaces
 // for user-driven paging.
 type SubscriptionPage struct {
-	Items         []RemoteSubscription
+	Items         []model.RemoteSubscription
 	HasMore       bool
 	NextPageToken string
 }
 
 // ProjectSubscription faithfully projects an SDK SubscriptionDetail into the
-// domain RemoteSubscription. A nil detail yields the zero value. It performs NO
-// required-field validation (an empty id projects to an empty ID) — that is the
-// gateway methods' job (requireSubscription), so this projection can be reused
-// for List items and for the reconcile/create details create.go still holds
-// while it lives on the legacy subscription_client (retired in PR2b).
-func ProjectSubscription(d *larkeventv1.SubscriptionDetail) RemoteSubscription {
+// domain model.RemoteSubscription. A nil detail yields the zero value. It
+// performs NO required-field validation (an empty id projects to an empty ID) —
+// that is the gateway methods' job (requireSubscription), so this projection can
+// be reused for List items and for the reconcile/create details create.go still
+// holds while it lives on the legacy subscription_client (retired in PR2b).
+func ProjectSubscription(d *larkeventv1.SubscriptionDetail) model.RemoteSubscription {
 	if d == nil {
-		return RemoteSubscription{}
+		return model.RemoteSubscription{}
 	}
-	sub := RemoteSubscription{
+	sub := model.RemoteSubscription{
 		ID:             model.RemoteSubscriptionID(strVal(d.SubscriptionId)),
 		EventType:      strVal(d.EventType),
 		TargetResource: strVal(d.TargetResource),

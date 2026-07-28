@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
@@ -22,8 +23,8 @@ import (
 // subscription's TTL). See listSubscriptionsAPI (list.go) for the test-seam
 // rationale.
 type renewSubscriptionAPI interface {
-	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
-	Renew(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
+	Renew(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 }
 
 // renewOpts holds `event subscription renew`'s flag values.
@@ -152,7 +153,7 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 // success response with no subscription / an empty remote_subscription_id -> a
 // typed InvalidResponse). Any error it returns (transport, an already-classified
 // business failure, or that validation) is passed through unchanged.
-func doRenewSubscription(ctx context.Context, svc renewSubscriptionAPI, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error) {
+func doRenewSubscription(ctx context.Context, svc renewSubscriptionAPI, remoteSubscriptionID string) (*model.RemoteSubscription, error) {
 	return svc.Renew(ctx, remoteSubscriptionID)
 }
 

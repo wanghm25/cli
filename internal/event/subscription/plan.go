@@ -9,7 +9,7 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/event"
-	lark "github.com/larksuite/cli/internal/event/platform/lark"
+	"github.com/larksuite/cli/internal/event/model"
 )
 
 // SubscriptionPlan is the Planner's classification of an Observation under a
@@ -25,7 +25,7 @@ import (
 type SubscriptionPlan struct {
 	Policy         Policy
 	Action         Action
-	Before         *lark.RemoteSubscription
+	Before         *model.RemoteSubscription
 	Reason         string
 	ConflictFields []errs.InvalidParam
 }
@@ -157,7 +157,7 @@ func (p Planner) Plan(ctx context.Context, obs Observation, policy Policy, req R
 // to auto-reuse. It deliberately does not distinguish a transport failure from a
 // confirmed empty key: retrying re-probes from scratch, and a human needs the
 // same guidance either way.
-func (p Planner) probeEncryptedActiveMatch(ctx context.Context, policy Policy, match *lark.RemoteSubscription) (SubscriptionPlan, error) {
+func (p Planner) probeEncryptedActiveMatch(ctx context.Context, policy Policy, match *model.RemoteSubscription) (SubscriptionPlan, error) {
 	if p.prober == nil {
 		// Fail-closed: a probing Policy must be constructed with a prober.
 		// Silently reusing here would defeat the conflict matrix.
@@ -175,19 +175,19 @@ func (p Planner) probeEncryptedActiveMatch(ctx context.Context, policy Policy, m
 }
 
 // reusePlan builds an ActionReuse plan for a compatible active match.
-func reusePlan(policy Policy, match *lark.RemoteSubscription) SubscriptionPlan {
+func reusePlan(policy Policy, match *model.RemoteSubscription) SubscriptionPlan {
 	return SubscriptionPlan{Policy: policy, Action: ActionReuse, Before: match, Reason: "compatible"}
 }
 
 // blockPlan builds an ActionBlock plan carrying the conflict dimensions.
-func blockPlan(policy Policy, match *lark.RemoteSubscription, reason string, fields []errs.InvalidParam) SubscriptionPlan {
+func blockPlan(policy Policy, match *model.RemoteSubscription, reason string, fields []errs.InvalidParam) SubscriptionPlan {
 	return SubscriptionPlan{Policy: policy, Action: ActionBlock, Before: match, Reason: reason, ConflictFields: fields}
 }
 
 // includeConflict returns the include_resource_data ConflictFields when an
 // existing match's include_resource_data differs from the request, or nil when
 // they agree. The reason names only the boolean flags, never any payload.
-func includeConflict(match *lark.RemoteSubscription, requested bool) []errs.InvalidParam {
+func includeConflict(match *model.RemoteSubscription, requested bool) []errs.InvalidParam {
 	existing := match.PayloadOptionsPresent && match.IncludeResourceData != nil && *match.IncludeResourceData
 	if existing == requested {
 		return nil

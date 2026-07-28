@@ -16,7 +16,7 @@ import (
 	"context"
 
 	"github.com/larksuite/cli/internal/event"
-	lark "github.com/larksuite/cli/internal/event/platform/lark"
+	"github.com/larksuite/cli/internal/event/model"
 	"github.com/larksuite/cli/internal/event/session"
 )
 
@@ -93,7 +93,7 @@ type IdentityGate interface {
 // network call involved. Reactivate/Renew return the refreshed RemoteSubscription
 // to match the gateway's shape; the action discards it (only the error matters).
 type SubscriptionClient interface {
-	Get(ctx context.Context, remoteSubscriptionID string) (*lark.RemoteSubscription, error)
-	Reactivate(ctx context.Context, remoteSubscriptionID string) (*lark.RemoteSubscription, error)
-	Renew(ctx context.Context, remoteSubscriptionID string) (*lark.RemoteSubscription, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
+	Reactivate(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
+	Renew(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 }

@@ -455,8 +455,8 @@ func staleIdentityAdvisory(match, applicable bool) string {
 // supplement can switch from one Get per id to a single bounded List scan when
 // many distinct remote_subscription_ids are present.
 type refinedSubscriptionGetter interface {
-	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
-	WalkSubscriptions(ctx context.Context, params larkgw.ListParams, visit func(larkgw.RemoteSubscription) bool) (bool, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
+	WalkSubscriptions(ctx context.Context, params larkgw.ListParams, visit func(model.RemoteSubscription) bool) (bool, error)
 }
 
 // remoteSupplementListThreshold is supplementRefinedConsumers's dedup/List
@@ -643,7 +643,7 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 		return false, nil
 	}
 
-	var details map[string]larkgw.RemoteSubscription
+	var details map[string]model.RemoteSubscription
 	// complete reports whether the read authoritatively enumerated the account's
 	// subscriptions: only a COMPLETE List scan (no page cap, no error) lets an
 	// unfound id be reported as scope=missing. A per-id Get that fails is NOT
@@ -685,8 +685,8 @@ func supplementRefinedConsumers(ctx context.Context, getter refinedSubscriptionG
 // required-field validation of a malformed/empty response) for one id simply
 // omits it from the returned map — the caller treats a missing entry as "stays
 // local-only", never a failure.
-func getRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) map[string]larkgw.RemoteSubscription {
-	out := make(map[string]larkgw.RemoteSubscription, len(wantIDs))
+func getRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) map[string]model.RemoteSubscription {
+	out := make(map[string]model.RemoteSubscription, len(wantIDs))
 	for id := range wantIDs {
 		sub, err := getter.Get(ctx, id)
 		if err != nil || sub == nil {
@@ -710,11 +710,11 @@ func getRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionG
 // proof the missing ids don't exist, only that they weren't found within the
 // pages read, and the caller must log it rather than silently degrade as if it
 // were a confirmed negative.
-func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) (out map[string]larkgw.RemoteSubscription, capped, complete bool) {
-	out = make(map[string]larkgw.RemoteSubscription, len(wantIDs))
+func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscriptionGetter, wantIDs map[string][]int) (out map[string]model.RemoteSubscription, capped, complete bool) {
+	out = make(map[string]model.RemoteSubscription, len(wantIDs))
 	remaining := len(wantIDs)
 
-	capped, err := getter.WalkSubscriptions(ctx, larkgw.ListParams{}, func(sub larkgw.RemoteSubscription) bool {
+	capped, err := getter.WalkSubscriptions(ctx, larkgw.ListParams{}, func(sub model.RemoteSubscription) bool {
 		if id := sub.ID.String(); id != "" && wantIDs[id] != nil {
 			if _, already := out[id]; !already {
 				out[id] = sub
@@ -739,7 +739,7 @@ func listRemoteSupplementDetails(ctx context.Context, getter refinedSubscription
 // mapRemoteSubscriptionInfo maps one domain RemoteSubscription into the
 // CLI-facing wire shape — shared by both the Get and the List path so they
 // build this identically.
-func mapRemoteSubscriptionInfo(sub larkgw.RemoteSubscription) *protocol.RemoteSubscriptionInfo {
+func mapRemoteSubscriptionInfo(sub model.RemoteSubscription) *protocol.RemoteSubscriptionInfo {
 	info := &protocol.RemoteSubscriptionInfo{State: sub.State}
 	// Reverse-resolve the executable event_key from the already-fetched
 	// event_type + target_resource (no new remote call) so status's

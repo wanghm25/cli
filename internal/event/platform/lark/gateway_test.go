@@ -15,6 +15,7 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/model"
 )
 
 // fakeClient is a network-free stand-in for the identity-bound, already-
@@ -278,7 +279,7 @@ func TestGateway_WalkSubscriptions_StopsEarlyWhenVisitReturnsFalse(t *testing.T)
 		}}, nil
 	}})
 	var seen []string
-	capped, err := g.WalkSubscriptions(context.Background(), ListParams{}, func(s RemoteSubscription) bool {
+	capped, err := g.WalkSubscriptions(context.Background(), ListParams{}, func(s model.RemoteSubscription) bool {
 		seen = append(seen, s.ID.String())
 		return false // stop after the first
 	})
@@ -381,7 +382,7 @@ func TestGateway_WalkSubscriptions_HitsCap(t *testing.T) {
 		}}, nil
 	}})
 	fake := g.client.(*fakeClient)
-	capped, err := g.WalkSubscriptions(context.Background(), ListParams{}, func(RemoteSubscription) bool { return true })
+	capped, err := g.WalkSubscriptions(context.Background(), ListParams{}, func(model.RemoteSubscription) bool { return true })
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

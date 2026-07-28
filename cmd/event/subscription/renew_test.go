@@ -16,25 +16,25 @@ import (
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
-	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	"github.com/larksuite/cli/internal/event/model"
 )
 
 // fakeRenewAPI is a network-free stand-in for the platform/lark gateway's
 // Get+Renew — the renewSubscriptionAPI test seam. The gateway hands back a
 // domain RemoteSubscription (already unwrapped, validated, classified).
 type fakeRenewAPI struct {
-	getSub *larkgw.RemoteSubscription
+	getSub *model.RemoteSubscription
 	getErr error
 
-	renewFunc  func() (*larkgw.RemoteSubscription, error)
+	renewFunc  func() (*model.RemoteSubscription, error)
 	renewCalls int
 }
 
-func (f *fakeRenewAPI) Get(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (f *fakeRenewAPI) Get(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	return f.getSub, f.getErr
 }
 
-func (f *fakeRenewAPI) Renew(_ context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (f *fakeRenewAPI) Renew(_ context.Context, _ string) (*model.RemoteSubscription, error) {
 	f.renewCalls++
 	if f.renewFunc == nil {
 		return subPtr(activeSub("sub_1", false, "user")), nil
@@ -45,7 +45,7 @@ func (f *fakeRenewAPI) Renew(_ context.Context, _ string) (*larkgw.RemoteSubscri
 // ---- doRenewSubscription ----
 
 func TestDoRenewSubscription_CallsRenewAndReturnsDetail(t *testing.T) {
-	fake := &fakeRenewAPI{renewFunc: func() (*larkgw.RemoteSubscription, error) {
+	fake := &fakeRenewAPI{renewFunc: func() (*model.RemoteSubscription, error) {
 		return subPtr(activeSub("sub_1", false, "user")), nil
 	}}
 
@@ -63,7 +63,7 @@ func TestDoRenewSubscription_CallsRenewAndReturnsDetail(t *testing.T) {
 
 func TestDoRenewSubscription_TransportError_PropagatesUnchanged(t *testing.T) {
 	sentinel := errors.New("boom: connection reset")
-	fake := &fakeRenewAPI{renewFunc: func() (*larkgw.RemoteSubscription, error) { return nil, sentinel }}
+	fake := &fakeRenewAPI{renewFunc: func() (*model.RemoteSubscription, error) { return nil, sentinel }}
 
 	_, err := doRenewSubscription(context.Background(), fake, "sub_1")
 	if !errors.Is(err, sentinel) {

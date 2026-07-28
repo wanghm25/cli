@@ -12,6 +12,7 @@ import (
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event"
+	"github.com/larksuite/cli/internal/event/model"
 )
 
 // SubscriptionGateway is the domain-facing surface of the remote Subscription
@@ -27,18 +28,18 @@ type SubscriptionGateway interface {
 	// until visit returns false or the pages are exhausted. capped is true when
 	// the page cap was reached with visit still returning true — NOT a
 	// confirmed "no more results", only "none more within the pages read".
-	WalkSubscriptions(ctx context.Context, params ListParams, visit func(RemoteSubscription) bool) (capped bool, err error)
+	WalkSubscriptions(ctx context.Context, params ListParams, visit func(model.RemoteSubscription) bool) (capped bool, err error)
 	// Get returns one Subscription by remote_subscription_id.
-	Get(ctx context.Context, remoteSubscriptionID string) (*RemoteSubscription, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 	// Create creates a Subscription from spec.
-	Create(ctx context.Context, spec CreateSpec) (*RemoteSubscription, error)
+	Create(ctx context.Context, spec CreateSpec) (*model.RemoteSubscription, error)
 	// Patch applies spec (currently the filter) to a Subscription.
-	Patch(ctx context.Context, remoteSubscriptionID string, spec PatchSpec) (*RemoteSubscription, error)
+	Patch(ctx context.Context, remoteSubscriptionID string, spec PatchSpec) (*model.RemoteSubscription, error)
 	// Renew extends a Subscription's TTL and returns its refreshed state.
-	Renew(ctx context.Context, remoteSubscriptionID string) (*RemoteSubscription, error)
+	Renew(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 	// Reactivate resumes delivery on a suspended Subscription and returns its
 	// refreshed state.
-	Reactivate(ctx context.Context, remoteSubscriptionID string) (*RemoteSubscription, error)
+	Reactivate(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 	// Delete removes a Subscription. It carries no subscription payload, so it
 	// returns only an error.
 	Delete(ctx context.Context, remoteSubscriptionID string) error
@@ -105,7 +106,7 @@ func (g *Gateway) List(ctx context.Context, params ListParams) (*SubscriptionPag
 	if err != nil {
 		return nil, err
 	}
-	page := &SubscriptionPage{Items: []RemoteSubscription{}}
+	page := &SubscriptionPage{Items: []model.RemoteSubscription{}}
 	if resp == nil || resp.Data == nil {
 		return page, nil
 	}
@@ -125,7 +126,7 @@ func (g *Gateway) List(ctx context.Context, params ListParams) (*SubscriptionPag
 // bounded, ctx-aware pager (and its exact cap/early-stop/capped semantics) every
 // other List-scan caller in the event subsystem uses, projecting each SDK item
 // to the domain type before handing it to visit.
-func (g *Gateway) WalkSubscriptions(ctx context.Context, params ListParams, visit func(RemoteSubscription) bool) (bool, error) {
+func (g *Gateway) WalkSubscriptions(ctx context.Context, params ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
 	buildReq := func(pageToken string) *larkeventv1.ListSubscriptionReq {
 		p := params
 		p.PageToken = pageToken
@@ -137,7 +138,7 @@ func (g *Gateway) WalkSubscriptions(ctx context.Context, params ListParams, visi
 }
 
 // Get issues a Get and validates its payload.
-func (g *Gateway) Get(ctx context.Context, remoteSubscriptionID string) (*RemoteSubscription, error) {
+func (g *Gateway) Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error) {
 	resp, err := g.client.Get(ctx, larkeventv1.NewGetSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build())
 	if err != nil {
 		return nil, err
@@ -146,7 +147,7 @@ func (g *Gateway) Get(ctx context.Context, remoteSubscriptionID string) (*Remote
 }
 
 // Create issues a Create from spec and validates its payload.
-func (g *Gateway) Create(ctx context.Context, spec CreateSpec) (*RemoteSubscription, error) {
+func (g *Gateway) Create(ctx context.Context, spec CreateSpec) (*model.RemoteSubscription, error) {
 	req := larkeventv1.NewCreateSubscriptionReqBuilder().Body(buildCreateBody(spec)).Build()
 	resp, err := g.client.Create(ctx, req)
 	if err != nil {
@@ -156,7 +157,7 @@ func (g *Gateway) Create(ctx context.Context, spec CreateSpec) (*RemoteSubscript
 }
 
 // Patch issues a Patch and validates its payload.
-func (g *Gateway) Patch(ctx context.Context, remoteSubscriptionID string, spec PatchSpec) (*RemoteSubscription, error) {
+func (g *Gateway) Patch(ctx context.Context, remoteSubscriptionID string, spec PatchSpec) (*model.RemoteSubscription, error) {
 	req := larkeventv1.NewPatchSubscriptionReqBuilder().
 		SubscriptionId(remoteSubscriptionID).
 		Body(buildPatchBody(spec)).
@@ -183,7 +184,7 @@ func buildPatchBody(spec PatchSpec) *larkeventv1.PatchSubscriptionReqBody {
 }
 
 // Renew issues a Renew and validates its payload.
-func (g *Gateway) Renew(ctx context.Context, remoteSubscriptionID string) (*RemoteSubscription, error) {
+func (g *Gateway) Renew(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error) {
 	resp, err := g.client.Renew(ctx, larkeventv1.NewRenewSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build())
 	if err != nil {
 		return nil, err
@@ -192,7 +193,7 @@ func (g *Gateway) Renew(ctx context.Context, remoteSubscriptionID string) (*Remo
 }
 
 // Reactivate issues a Reactivate and validates its payload.
-func (g *Gateway) Reactivate(ctx context.Context, remoteSubscriptionID string) (*RemoteSubscription, error) {
+func (g *Gateway) Reactivate(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error) {
 	resp, err := g.client.Reactivate(ctx, larkeventv1.NewReactivateSubscriptionReqBuilder().SubscriptionId(remoteSubscriptionID).Build())
 	if err != nil {
 		return nil, err
@@ -226,7 +227,7 @@ func (g *Gateway) GetEncryptKey(ctx context.Context, remoteSubscriptionID string
 // syntactically successful response that carries no subscription, or one whose
 // remote_subscription_id is empty, is a wire anomaly, not real data — it becomes
 // a typed InvalidResponse rather than a silently empty projection.
-func (g *Gateway) requireSubscription(detail *larkeventv1.SubscriptionDetail, op string) (*RemoteSubscription, error) {
+func (g *Gateway) requireSubscription(detail *larkeventv1.SubscriptionDetail, op string) (*model.RemoteSubscription, error) {
 	if detail == nil {
 		return nil, errs.NewInternalError(errs.SubtypeInvalidResponse,
 			"subscription %s reported success but returned no subscription data", op)

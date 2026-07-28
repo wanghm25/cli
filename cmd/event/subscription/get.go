@@ -14,6 +14,7 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
@@ -22,7 +23,7 @@ import (
 // this command calls. See listSubscriptionsAPI (list.go) for the rationale —
 // same test-seam pattern, one method.
 type getSubscriptionAPI interface {
-	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 }
 
 // NewCmdGet builds `event subscription get <remote_subscription_id>`:

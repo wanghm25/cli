@@ -26,7 +26,7 @@ import (
 	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/credential"
 	eventlib "github.com/larksuite/cli/internal/event"
-	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
+	"github.com/larksuite/cli/internal/event/model"
 )
 
 // EventKeyUnavailable is the explicit marker emitted in the event_key field of
@@ -280,7 +280,7 @@ type subscriptionRow struct {
 // event_type: presenting event_type where an executable event_key is expected
 // would hand an AI a string `event schema`/`event consume` cannot accept. The
 // raw event_type stays available in its own event_type field either way.
-func mapRemoteSubscription(sub larkgw.RemoteSubscription) subscriptionRow {
+func mapRemoteSubscription(sub model.RemoteSubscription) subscriptionRow {
 	row := subscriptionRow{
 		RemoteSubscriptionID: sub.ID.String(),
 		EventType:            sub.EventType,
@@ -447,7 +447,7 @@ type mutationResult struct {
 	NextAction           string          `json:"next_action"`
 }
 
-func buildMutationResult(operation string, sub larkgw.RemoteSubscription, nextAction string) *mutationResult {
+func buildMutationResult(operation string, sub model.RemoteSubscription, nextAction string) *mutationResult {
 	row := mapRemoteSubscription(sub)
 	return &mutationResult{
 		Operation:            operation,

@@ -17,13 +17,13 @@ import (
 // items in order, stops as soon as visit returns false (so a found match is never
 // "capped"), and otherwise reports cappedIfExhausted once every item is visited.
 type fakeWalker struct {
-	items           []lark.RemoteSubscription
+	items           []model.RemoteSubscription
 	cappedIfExhaust bool
 	err             error
 	lastParams      lark.ListParams
 }
 
-func (f *fakeWalker) WalkSubscriptions(_ context.Context, params lark.ListParams, visit func(lark.RemoteSubscription) bool) (bool, error) {
+func (f *fakeWalker) WalkSubscriptions(_ context.Context, params lark.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
 	f.lastParams = params
 	if f.err != nil {
 		return false, f.err
@@ -37,7 +37,7 @@ func (f *fakeWalker) WalkSubscriptions(_ context.Context, params lark.ListParams
 }
 
 func TestObserve_AuthorityMatch_Found_Complete(t *testing.T) {
-	w := &fakeWalker{items: []lark.RemoteSubscription{
+	w := &fakeWalker{items: []model.RemoteSubscription{
 		activeSub("sub_other", false, "app"), // wrong authority for AsUser
 		activeSub("sub_1", false, "user"),
 	}}
@@ -58,7 +58,7 @@ func TestObserve_AuthorityMatch_Found_Complete(t *testing.T) {
 }
 
 func TestObserve_AuthorityMismatch_NoMatch_Complete(t *testing.T) {
-	w := &fakeWalker{items: []lark.RemoteSubscription{activeSub("sub_app", false, "app")}}
+	w := &fakeWalker{items: []model.RemoteSubscription{activeSub("sub_app", false, "app")}}
 	obs, err := NewObserver(w).Observe(context.Background(), Request{Identity: core.AsUser})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -69,7 +69,7 @@ func TestObserve_AuthorityMismatch_NoMatch_Complete(t *testing.T) {
 }
 
 func TestObserve_BotMatchesAppAuthority(t *testing.T) {
-	w := &fakeWalker{items: []lark.RemoteSubscription{activeSub("sub_app", false, "app")}}
+	w := &fakeWalker{items: []model.RemoteSubscription{activeSub("sub_app", false, "app")}}
 	obs, err := NewObserver(w).Observe(context.Background(), Request{Identity: core.AsBot})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -80,7 +80,7 @@ func TestObserve_BotMatchesAppAuthority(t *testing.T) {
 }
 
 func TestObserve_NoMatch_Capped_Indeterminate(t *testing.T) {
-	w := &fakeWalker{items: []lark.RemoteSubscription{activeSub("sub_app", false, "app")}, cappedIfExhaust: true}
+	w := &fakeWalker{items: []model.RemoteSubscription{activeSub("sub_app", false, "app")}, cappedIfExhaust: true}
 	obs, err := NewObserver(w).Observe(context.Background(), Request{Identity: core.AsUser})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -94,7 +94,7 @@ func TestObserve_NoMatch_Capped_Indeterminate(t *testing.T) {
 }
 
 func TestObserve_NoMatch_Exhausted_Complete(t *testing.T) {
-	w := &fakeWalker{items: []lark.RemoteSubscription{activeSub("sub_app", false, "app")}, cappedIfExhaust: false}
+	w := &fakeWalker{items: []model.RemoteSubscription{activeSub("sub_app", false, "app")}, cappedIfExhaust: false}
 	obs, err := NewObserver(w).Observe(context.Background(), Request{Identity: core.AsUser})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

@@ -14,6 +14,7 @@ import (
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/output"
 )
@@ -25,7 +26,7 @@ import (
 // subscription in the confirmation-required Hint) and Delete (the actual
 // write). See listSubscriptionsAPI (list.go) for the test-seam rationale.
 type deleteSubscriptionAPI interface {
-	Get(ctx context.Context, remoteSubscriptionID string) (*larkgw.RemoteSubscription, error)
+	Get(ctx context.Context, remoteSubscriptionID string) (*model.RemoteSubscription, error)
 	Delete(ctx context.Context, remoteSubscriptionID string) error
 }
 

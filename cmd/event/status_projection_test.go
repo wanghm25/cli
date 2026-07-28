@@ -13,6 +13,7 @@ import (
 
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
+	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
@@ -31,12 +32,12 @@ import (
 // non-cancelling context that would hang forever) with no Factory/network.
 type blockingGetter struct{ walkStarted chan struct{} }
 
-func (g blockingGetter) Get(ctx context.Context, _ string) (*larkgw.RemoteSubscription, error) {
+func (g blockingGetter) Get(ctx context.Context, _ string) (*model.RemoteSubscription, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
 
-func (g blockingGetter) WalkSubscriptions(ctx context.Context, _ larkgw.ListParams, _ func(larkgw.RemoteSubscription) bool) (bool, error) {
+func (g blockingGetter) WalkSubscriptions(ctx context.Context, _ larkgw.ListParams, _ func(model.RemoteSubscription) bool) (bool, error) {
 	if g.walkStarted != nil {
 		close(g.walkStarted)
 	}
@@ -168,7 +169,7 @@ func TestSupplementRefinedConsumers_CompleteScanMissingID_MarksMissing(t *testin
 	}
 	// A COMPLETE scan (walkCapped=false) that only ever yields unrelated ids.
 	getter := &fakeRefinedGetter{
-		walkItems:  []larkgw.RemoteSubscription{remoteSubID("unrelated_1", "active")},
+		walkItems:  []model.RemoteSubscription{remoteSubID("unrelated_1", "active")},
 		walkCapped: false,
 	}
 

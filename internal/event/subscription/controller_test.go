@@ -10,6 +10,7 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/event/model"
 	lark "github.com/larksuite/cli/internal/event/platform/lark"
 )
 
@@ -17,18 +18,18 @@ import (
 // walkFunc lets a test vary the List result by call (the reconcile-after-failure
 // pass reads a second time); createSpec captures the exact spec create built.
 type fakeGateway struct {
-	walkItems  []lark.RemoteSubscription
+	walkItems  []model.RemoteSubscription
 	walkCapped bool
 	walkErr    error
-	walkFunc   func(call int) ([]lark.RemoteSubscription, bool, error)
+	walkFunc   func(call int) ([]model.RemoteSubscription, bool, error)
 	walkCalls  int
 
 	createSpec  *lark.CreateSpec
-	createResp  *lark.RemoteSubscription
+	createResp  *model.RemoteSubscription
 	createErr   error
 	createCalls int
 
-	reactivateResp  *lark.RemoteSubscription
+	reactivateResp  *model.RemoteSubscription
 	reactivateErr   error
 	reactivateID    string
 	reactivateCalls int
@@ -37,7 +38,7 @@ type fakeGateway struct {
 	encryptErr error
 }
 
-func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ lark.ListParams, visit func(lark.RemoteSubscription) bool) (bool, error) {
+func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ lark.ListParams, visit func(model.RemoteSubscription) bool) (bool, error) {
 	call := g.walkCalls
 	g.walkCalls++
 	items, capped, err := g.walkItems, g.walkCapped, g.walkErr
@@ -55,7 +56,7 @@ func (g *fakeGateway) WalkSubscriptions(_ context.Context, _ lark.ListParams, vi
 	return capped, nil
 }
 
-func (g *fakeGateway) Create(_ context.Context, spec lark.CreateSpec) (*lark.RemoteSubscription, error) {
+func (g *fakeGateway) Create(_ context.Context, spec lark.CreateSpec) (*model.RemoteSubscription, error) {
 	g.createCalls++
 	s := spec
 	g.createSpec = &s
@@ -65,7 +66,7 @@ func (g *fakeGateway) Create(_ context.Context, spec lark.CreateSpec) (*lark.Rem
 	return g.createResp, nil
 }
 
-func (g *fakeGateway) Reactivate(_ context.Context, id string) (*lark.RemoteSubscription, error) {
+func (g *fakeGateway) Reactivate(_ context.Context, id string) (*model.RemoteSubscription, error) {
 	g.reactivateCalls++
 	g.reactivateID = id
 	if g.reactivateErr != nil {
@@ -78,7 +79,7 @@ func (g *fakeGateway) GetEncryptKey(_ context.Context, _ string) (string, error)
 	return g.encryptKey, g.encryptErr
 }
 
-func subPtr(s lark.RemoteSubscription) *lark.RemoteSubscription { return &s }
+func subPtr(s model.RemoteSubscription) *model.RemoteSubscription { return &s }
 
 // ---- Apply: writable actions ----
 
@@ -226,8 +227,8 @@ func TestApply_CreateFails_ManagementReconcileFindsReuse_ReturnsReused(t *testin
 	g := &fakeGateway{
 		createErr: errors.New("duplicate"),
 		// The reconcile pass (walk call 0) finds a raced compatible active match.
-		walkFunc: func(int) ([]lark.RemoteSubscription, bool, error) {
-			return []lark.RemoteSubscription{activeSub("sub_raced", false, "user")}, false, nil
+		walkFunc: func(int) ([]model.RemoteSubscription, bool, error) {
+			return []model.RemoteSubscription{activeSub("sub_raced", false, "user")}, false, nil
 		},
 	}
 	c := NewController(g)
@@ -246,8 +247,8 @@ func TestApply_CreateFails_ManagementReconcileFindsReuse_ReturnsReused(t *testin
 func TestApply_CreateFails_ManagementReconcileFindsBlock_ReturnsPlanBlockedError(t *testing.T) {
 	g := &fakeGateway{
 		createErr: errors.New("duplicate"),
-		walkFunc: func(int) ([]lark.RemoteSubscription, bool, error) {
-			return []lark.RemoteSubscription{activeSub("sub_raced_conflict", true, "user")}, false, nil // include mismatch vs false request
+		walkFunc: func(int) ([]model.RemoteSubscription, bool, error) {
+			return []model.RemoteSubscription{activeSub("sub_raced_conflict", true, "user")}, false, nil // include mismatch vs false request
 		},
 	}
 	c := NewController(g)
@@ -279,8 +280,8 @@ func TestApply_CreateFails_ConsumeBootstrap_NoReconcile_PropagatesError(t *testi
 	g := &fakeGateway{
 		createErr: sentinel,
 		// Even if a compatible match now exists, ConsumeBootstrap must not re-list.
-		walkFunc: func(int) ([]lark.RemoteSubscription, bool, error) {
-			return []lark.RemoteSubscription{activeSub("sub_raced", false, "user")}, false, nil
+		walkFunc: func(int) ([]model.RemoteSubscription, bool, error) {
+			return []model.RemoteSubscription{activeSub("sub_raced", false, "user")}, false, nil
 		},
 	}
 	c := NewController(g)
@@ -296,7 +297,7 @@ func TestApply_CreateFails_ConsumeBootstrap_NoReconcile_PropagatesError(t *testi
 // ---- Plan: Observe+Plan wired through the gateway ----
 
 func TestControllerPlan_Wires_Observe_And_Plan(t *testing.T) {
-	g := &fakeGateway{walkItems: []lark.RemoteSubscription{activeSub("sub_1", false, "user")}}
+	g := &fakeGateway{walkItems: []model.RemoteSubscription{activeSub("sub_1", false, "user")}}
 	plan, err := NewController(g).Plan(context.Background(), ManagementCreate, Request{EventType: "im.message.created_v1", TargetResource: "im.message?chat_id=oc_aaa", Identity: core.AsUser})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
