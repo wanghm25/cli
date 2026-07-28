@@ -98,17 +98,42 @@ var filterMetaRegistry = map[string]FilterMeta{}
 func RegisterFilterMeta(eventType string, meta FilterMeta) {
 	mu.Lock()
 	defer mu.Unlock()
+	if frozen {
+		panic(fmt.Sprintf("RegisterFilterMeta(%q) after the catalog was frozen: every filter capability must be registered at init time, before Freeze", eventType))
+	}
 	if _, exists := filterMetaRegistry[eventType]; exists {
 		panic(fmt.Sprintf("duplicate FilterMeta registration for event_type: %s", eventType))
 	}
-	filterMetaRegistry[eventType] = meta
+	filterMetaRegistry[eventType] = cloneFilterMeta(meta)
 }
 
-// FilterMetaFor returns the filter capability for an event_type. An event_type
-// with no registered capability yields the zero FilterMeta (Supported == false),
-// so a filter against it is rejected fail-closed.
+// FilterMetaFor returns an independent deep copy of the filter capability for an
+// event_type. An event_type with no registered capability yields the zero
+// FilterMeta (Supported == false), so a filter against it is rejected
+// fail-closed. Like Lookup, the returned value is a copy: mutating its
+// Operators/Operands cannot alter the registered capability, and the read is
+// guarded by the registry lock so it is safe under concurrent registration.
 func FilterMetaFor(eventType string) FilterMeta {
-	return filterMetaRegistry[eventType]
+	mu.RLock()
+	defer mu.RUnlock()
+	return cloneFilterMeta(filterMetaRegistry[eventType])
+}
+
+// cloneFilterMeta deep-copies a FilterMeta's slices (LogicOps, Operators, and
+// each Operand's Operators) so neither a stored capability nor a returned one
+// shares mutable state with the other.
+func cloneFilterMeta(m FilterMeta) FilterMeta {
+	m.LogicOps = cloneStrings(m.LogicOps)
+	m.Operators = cloneStrings(m.Operators)
+	if m.Operands != nil {
+		ops := make([]FilterOperandMeta, len(m.Operands))
+		for i, o := range m.Operands {
+			o.Operators = cloneStrings(o.Operators)
+			ops[i] = o
+		}
+		m.Operands = ops
+	}
+	return m
 }
 
 // UnregisterFilterMetaForTest removes one event_type's filter capability — the

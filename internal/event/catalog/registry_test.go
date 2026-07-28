@@ -361,3 +361,144 @@ func TestRegisterKey_RefinedValidation(t *testing.T) {
 		t.Fatalf("refined key not registered correctly: %+v", def)
 	}
 }
+
+// TestLookup_ResultDoesNotAliasRegistry proves the immutable-catalog guarantee
+// (#17): a caller mutating a Lookup result — any slice, map, or the schema Raw
+// bytes — cannot reach back into the registry, so a later Lookup is unaffected.
+// This is what stops a caller from mutating a registered KeyDefinition after
+// RegisterKey validated it.
+func TestLookup_ResultDoesNotAliasRegistry(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+	RegisterKey(KeyDefinition{
+		Key:                   "t.immutable_v1",
+		EventType:             "t.immutable_v1",
+		ResourceType:          "t.immutable",
+		Schema:                SchemaDef{Custom: &SchemaSpec{Raw: json.RawMessage(`{"type":"object"}`)}},
+		AuthTypes:             []string{"user", "bot"},
+		Scopes:                []string{"scope:one"},
+		RequiredConsoleEvents: []string{"e1"},
+		Params:                []ParamDef{{Name: "mode", Type: ParamEnum, Values: []ParamValue{{Value: "a", Desc: "A"}}}},
+		RefinedSubscription:   true,
+		KeyTemplates: []KeyTemplate{{
+			Template: "t.immutable_v1/x-id/{x}", Example: "t.immutable_v1/x-id/x1",
+			SelectorKey: "x_id", PathSegment: "x-id", AuthTypes: []string{"user"},
+		}},
+	})
+
+	first, ok := Lookup("t.immutable_v1")
+	if !ok {
+		t.Fatal("Lookup failed")
+	}
+	// Mutate every mutable reference-typed part of the returned copy.
+	first.Params[0].Name = "HACKED"
+	first.Params[0].Values[0].Value = "HACKED"
+	first.Scopes[0] = "HACKED"
+	first.AuthTypes[0] = "HACKED"
+	first.RequiredConsoleEvents[0] = "HACKED"
+	first.Schema.Custom.Raw[0] = 'X'
+	first.KeyTemplates[0].SelectorKey = "HACKED"
+	first.KeyTemplates[0].AuthTypes[0] = "HACKED"
+
+	second, _ := Lookup("t.immutable_v1")
+	switch {
+	case second.Params[0].Name != "mode":
+		t.Errorf("Params[0].Name mutated via Lookup result: %q", second.Params[0].Name)
+	case second.Params[0].Values[0].Value != "a":
+		t.Errorf("Params[0].Values mutated: %q", second.Params[0].Values[0].Value)
+	case second.Scopes[0] != "scope:one":
+		t.Errorf("Scopes mutated: %q", second.Scopes[0])
+	case second.AuthTypes[0] != "user":
+		t.Errorf("AuthTypes mutated: %q", second.AuthTypes[0])
+	case second.RequiredConsoleEvents[0] != "e1":
+		t.Errorf("RequiredConsoleEvents mutated: %q", second.RequiredConsoleEvents[0])
+	case string(second.Schema.Custom.Raw) != `{"type":"object"}`:
+		t.Errorf("Schema.Custom.Raw mutated: %s", second.Schema.Custom.Raw)
+	case second.KeyTemplates[0].SelectorKey != "x_id":
+		t.Errorf("KeyTemplates[0].SelectorKey mutated: %q", second.KeyTemplates[0].SelectorKey)
+	case second.KeyTemplates[0].AuthTypes[0] != "user":
+		t.Errorf("KeyTemplates[0].AuthTypes mutated: %q", second.KeyTemplates[0].AuthTypes[0])
+	}
+}
+
+// TestListAll_ResultDoesNotAliasRegistry proves the same immutability for the
+// ListAll read path.
+func TestListAll_ResultDoesNotAliasRegistry(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+	RegisterKey(KeyDefinition{
+		Key: "t.listimm", EventType: "t.listimm", Schema: nativeSchema(),
+		AuthTypes: []string{"user"},
+	})
+	all := ListAll()
+	if len(all) != 1 {
+		t.Fatalf("ListAll len = %d, want 1", len(all))
+	}
+	all[0].AuthTypes[0] = "HACKED"
+	if again := ListAll(); again[0].AuthTypes[0] != "user" {
+		t.Errorf("registry AuthTypes mutated via ListAll result: %q", again[0].AuthTypes[0])
+	}
+}
+
+// TestFreeze_RegisterKeyPanics: after Freeze, a late RegisterKey is a fail-fast
+// programming error, not a silent post-registration mutation of the catalog.
+func TestFreeze_RegisterKeyPanics(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+	Freeze()
+	defer mustPanic(t, "after the catalog was frozen")
+	RegisterKey(KeyDefinition{Key: "t.afterfreeze", EventType: "t.afterfreeze", Schema: nativeSchema()})
+}
+
+// TestFreeze_RegisterFilterMetaPanics: the same fail-fast guard covers the
+// filter-meta registry.
+func TestFreeze_RegisterFilterMetaPanics(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+	Freeze()
+	defer mustPanic(t, "after the catalog was frozen")
+	RegisterFilterMeta("t.freeze.meta_v1", FilterMeta{Supported: true})
+}
+
+// TestFreeze_ReadsStillWork: Freeze closes the door on registration only; the
+// read paths keep working (and keep returning independent copies).
+func TestFreeze_ReadsStillWork(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+	RegisterKey(KeyDefinition{Key: "t.frozen.read", EventType: "t.frozen.read", Schema: nativeSchema()})
+	Freeze()
+	if _, ok := Lookup("t.frozen.read"); !ok {
+		t.Fatal("Lookup must still work after Freeze")
+	}
+	if len(ListAll()) == 0 {
+		t.Fatal("ListAll must still work after Freeze")
+	}
+}
+
+// TestFilterMetaFor_ResultDoesNotAliasRegistry proves the filter-meta read is
+// also an immutable copy: mutating the returned Operators/Operands cannot alter
+// the registered capability.
+func TestFilterMetaFor_ResultDoesNotAliasRegistry(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+	const et = "t.filter.immutable_v1"
+	RegisterFilterMeta(et, FilterMeta{
+		Supported: true,
+		LogicOps:  []string{"and"},
+		Operators: []string{"eq"},
+		Operands:  []FilterOperandMeta{{Key: "sender", Operators: []string{"eq"}}},
+	})
+	first := FilterMetaFor(et)
+	first.LogicOps[0] = "HACKED"
+	first.Operators[0] = "HACKED"
+	first.Operands[0].Key = "HACKED"
+	first.Operands[0].Operators[0] = "HACKED"
+
+	second := FilterMetaFor(et)
+	if second.LogicOps[0] != "and" || second.Operators[0] != "eq" {
+		t.Errorf("FilterMeta scalars mutated via result: %+v", second)
+	}
+	if second.Operands[0].Key != "sender" || second.Operands[0].Operators[0] != "eq" {
+		t.Errorf("FilterMeta Operands mutated via result: %+v", second.Operands)
+	}
+}

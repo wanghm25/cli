@@ -10,15 +10,35 @@ import (
 )
 
 var (
-	keys = map[string]*KeyDefinition{}
-	mu   sync.RWMutex
+	keys   = map[string]*KeyDefinition{}
+	frozen bool // guarded by mu; see Freeze
+	mu     sync.RWMutex
 )
 
-// RegisterKey panics on duplicate Key, empty EventType, or schema/process contract violations.
+// Freeze marks the registry immutable: after Freeze, RegisterKey and
+// RegisterFilterMeta panic. Registration is a package-init-time activity — each
+// business layer declares its keys and filter-meta from an init — so Freeze
+// draws an explicit line at the end of that phase, turning a late (and possibly
+// racy) registration into a fail-fast programming-error panic instead of a
+// silent overwrite or an unvalidated definition slipping in after the catalog
+// is in use. It is idempotent and independent of the copy-on-read guarantee:
+// Lookup/ListAll/FilterMetaFor always hand back independent copies, so the
+// catalog is an immutable fact source whether or not Freeze has been called.
+func Freeze() {
+	mu.Lock()
+	defer mu.Unlock()
+	frozen = true
+}
+
+// RegisterKey panics on registration after Freeze, duplicate Key, empty
+// EventType, or schema/process contract violations.
 func RegisterKey(def KeyDefinition) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	if frozen {
+		panic(fmt.Sprintf("RegisterKey(%q) after the catalog was frozen: every key must be registered at init time, before Freeze", def.Key))
+	}
 	if _, exists := keys[def.Key]; exists {
 		panic(fmt.Sprintf("duplicate EventKey: %s", def.Key))
 	}
@@ -132,20 +152,30 @@ func validateRefinedSubscription(def KeyDefinition) {
 	}
 }
 
+// Lookup returns an independent deep copy of the registered definition for key.
+// Mutating the returned value (or anything reachable through it) can never
+// reach back into the registry, so a caller cannot alter a registered
+// KeyDefinition after the fact and bypass RegisterKey's validation — the
+// catalog stays the single, immutable source of truth. See cloneKeyDefinition
+// for exactly which fields are deep-copied vs shared.
 func Lookup(key string) (*KeyDefinition, bool) {
 	mu.RLock()
 	defer mu.RUnlock()
 	def, ok := keys[key]
-	return def, ok
+	if !ok {
+		return nil, false
+	}
+	return cloneKeyDefinition(def), true
 }
 
-// ListAll returns all KeyDefinitions sorted by Key.
+// ListAll returns independent deep copies of all KeyDefinitions sorted by Key.
+// As with Lookup, mutating any returned element cannot affect the registry.
 func ListAll() []*KeyDefinition {
 	mu.RLock()
 	defer mu.RUnlock()
 	result := make([]*KeyDefinition, 0, len(keys))
 	for _, def := range keys {
-		result = append(result, def)
+		result = append(result, cloneKeyDefinition(def))
 	}
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].Key < result[j].Key
@@ -158,6 +188,7 @@ func resetRegistry() {
 	defer mu.Unlock()
 	keys = map[string]*KeyDefinition{}
 	filterMetaRegistry = map[string]FilterMeta{}
+	frozen = false
 }
 
 func ResetRegistryForTest() { resetRegistry() }
