@@ -144,7 +144,7 @@ func TestWriteStatusText_OrphanBlock(t *testing.T) {
 		PID:       70926,
 		UptimeSec: 68400,
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 
 	for _, want := range []string{
@@ -170,7 +170,7 @@ func TestWriteStatusJSON_OrphanFields(t *testing.T) {
 		PID:       70926,
 		UptimeSec: 68400,
 	}}
-	if err := writeStatusJSON(&buf, statuses); err != nil {
+	if err := writeStatusJSON(&buf, statuses, nil); err != nil {
 		t.Fatalf("writeStatusJSON: %v", err)
 	}
 	var payload struct {
@@ -209,7 +209,7 @@ func TestWriteStatusJSON_RunningOmitsOrphanFields(t *testing.T) {
 		UptimeSec: 60,
 		Active:    0,
 	}}
-	if err := writeStatusJSON(&buf, statuses); err != nil {
+	if err := writeStatusJSON(&buf, statuses, nil); err != nil {
 		t.Fatalf("writeStatusJSON: %v", err)
 	}
 	out := buf.String()

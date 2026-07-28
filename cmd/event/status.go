@@ -213,12 +213,21 @@ func runStatus(cmd *cobra.Command, f *cmdutil.Factory, current, asJSON, failOnOr
 		fmt.Fprintln(f.IOStreams.ErrOut, "[event] warning: remote subscription list pagination was capped while supplementing status — some refined consumers may show local-only state even though a matching remote Subscription might still exist beyond the pages read")
 	}
 
+	// Precompute the owner-context map from ALL profiles (LoadMultiAppConfig, NOT
+	// f.Config()'s single resolved app — status spans profiles) so each consumer's
+	// recovery command targets its OWNING profile/identity. Best-effort: a load
+	// error yields an empty map, degrading recovery actions to reason-only rather
+	// than failing this read-only command. The stateless projector only consumes
+	// this precomputed map; it never reads config/session itself.
+	mac, _ := core.LoadMultiAppConfig()
+	oc := buildOwnerContext(mac)
+
 	if asJSON {
-		if err := writeStatusJSON(f.IOStreams.Out, statuses); err != nil {
+		if err := writeStatusJSON(f.IOStreams.Out, statuses, oc); err != nil {
 			return err
 		}
 	} else {
-		writeStatusText(f.IOStreams.Out, statuses)
+		writeStatusText(f.IOStreams.Out, statuses, oc)
 	}
 	return exitForOrphan(statuses, failOnOrphan)
 }
@@ -838,7 +847,7 @@ func humanizeDuration(d time.Duration) string {
 // only: this NEVER labels the consumer
 // as dead/inactive, and next_action is read-only (no action is ever taken by
 // this command).
-func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
+func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo, oc ownerContext) {
 	if !c.RefinedSubscription {
 		return
 	}
@@ -893,7 +902,7 @@ func writeRefinedSubLine(out io.Writer, s appStatus, c protocol.ConsumerInfo) {
 	// The single structured recovery next_action (bus lifecycle token / scope /
 	// identity), rendered as human text here — the SAME projection the JSON
 	// `next_action` object carries, so text and JSON stay consistent.
-	writeNextActionLine(out, StatusProjector{}.nextAction(s, c, StatusProjector{}.consumerScope(s, c)))
+	writeNextActionLine(out, StatusProjector{}.nextAction(s, c, StatusProjector{}.consumerScope(s, c), oc))
 	// decryption advisory + its own read-only next_action for an
 	// encrypted consumer whose resource data cannot currently be decrypted
 	// (kept separate from the structured next_action above).
@@ -955,7 +964,7 @@ func orDash(s string) string {
 	return s
 }
 
-func writeStatusText(out io.Writer, statuses []appStatus) {
+func writeStatusText(out io.Writer, statuses []appStatus, oc ownerContext) {
 	for i, s := range statuses {
 		if i > 0 {
 			fmt.Fprintln(out)
@@ -992,7 +1001,7 @@ func writeStatusText(out io.Writer, statuses []appStatus) {
 				for ci, row := range rows {
 					fmt.Fprint(out, "  ")
 					printTableRow(out, widths, row, colGap)
-					writeRefinedSubLine(out, s, s.Consumers[ci])
+					writeRefinedSubLine(out, s, s.Consumers[ci], oc)
 				}
 			}
 		case stateOrphan:
@@ -1048,7 +1057,7 @@ type consumerView struct {
 	DecryptNextAction string `json:"decrypt_next_action,omitempty"`
 }
 
-func writeStatusJSON(w io.Writer, statuses []appStatus) error {
+func writeStatusJSON(w io.Writer, statuses []appStatus, oc ownerContext) error {
 	type jsonStatus struct {
 		AppID           string         `json:"app_id"`
 		Status          string         `json:"status"`
@@ -1066,7 +1075,7 @@ func writeStatusJSON(w io.Writer, statuses []appStatus) error {
 		if len(s.Consumers) > 0 {
 			consumers = make([]consumerView, 0, len(s.Consumers))
 			for _, c := range s.Consumers {
-				consumers = append(consumers, StatusProjector{}.projectConsumerView(s, c))
+				consumers = append(consumers, StatusProjector{}.projectConsumerView(s, c, oc))
 			}
 		}
 		js := jsonStatus{

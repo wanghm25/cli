@@ -51,3 +51,17 @@ func (c CommandContext) AsFlag() string {
 	}
 	return " --as " + string(c.Identity)
 }
+
+// FlagArgs renders the global flags as discrete argv tokens — ["--profile", P,
+// "--as", I] — for a structured {Command, Args} recovery form (e.g. status's
+// nextActionCommand). Each of profile/identity is omitted when empty.
+func (c CommandContext) FlagArgs() []string {
+	var out []string
+	if c.Profile != "" {
+		out = append(out, "--profile", c.Profile)
+	}
+	if c.Identity != "" {
+		out = append(out, "--as", string(c.Identity))
+	}
+	return out
+}

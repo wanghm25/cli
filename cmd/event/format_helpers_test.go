@@ -124,7 +124,7 @@ func TestWriteStatusText_CoversAllStates(t *testing.T) {
 			},
 		},
 		{AppID: "cli_ORPHANXXXXXXXXXX", State: stateOrphan, PID: 5678, UptimeSec: 3600},
-	})
+	}, nil)
 	out := buf.String()
 	for _, want := range []string{
 		"── cli_NOTRUNNINGXXXXXX ──",
@@ -157,7 +157,7 @@ func TestWriteStatusText_ShowsSubColumn(t *testing.T) {
 				{PID: 1002, EventKey: "mail.x", SubscriptionID: "mail.x:bob", Received: 3, Dropped: 0},
 			},
 		},
-	})
+	}, nil)
 	out := buf.String()
 	if !strings.Contains(out, "SUB") {
 		t.Errorf("missing SUB column header: %s", out)
@@ -183,7 +183,7 @@ func TestWriteStatusText_LegacySubscriptionID_RendersDash(t *testing.T) {
 				{PID: 1001, EventKey: "im.x", SubscriptionID: "", Received: 5},
 			},
 		},
-	})
+	}, nil)
 	out := buf.String()
 	if !strings.Contains(out, "SUB") {
 		t.Errorf("missing SUB header: %s", out)
@@ -206,7 +206,7 @@ func TestWriteStatusText_EventKeyEqualSubscriptionID_RendersDash(t *testing.T) {
 				{PID: 1001, EventKey: "im.x", SubscriptionID: "im.x", Received: 5},
 			},
 		},
-	})
+	}, nil)
 	out := buf.String()
 	if !strings.Contains(out, "SUB") {
 		t.Errorf("missing SUB header: %s", out)
@@ -221,7 +221,7 @@ func TestWriteStatusJSON_OrphanHint(t *testing.T) {
 	if err := writeStatusJSON(&buf, []appStatus{
 		{AppID: "cli_ORPHANXXXXXXXXXX", State: stateOrphan, PID: 99, UptimeSec: 60},
 		{AppID: "cli_RUNNINGXXXXXXXXX", State: stateRunning, PID: 1, UptimeSec: 10, Active: 0},
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("writeStatusJSON: %v", err)
 	}
 	var got struct {

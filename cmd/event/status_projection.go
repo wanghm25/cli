@@ -4,6 +4,8 @@
 package event
 
 import (
+	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/event"
 	"github.com/larksuite/cli/internal/event/protocol"
 )
 
@@ -66,6 +68,78 @@ type nextActionCommand struct {
 	Reason  string   `json:"reason,omitempty"`
 }
 
+// ownerProfile is ONE app's recovery-command context, precomputed by runStatus
+// from LoadMultiAppConfig so the stateless projector can render a consumer's
+// recovery command against its OWNING profile/identity without reading config or
+// session itself.
+type ownerProfile struct {
+	Profile    string // AppConfig.ProfileName (round-trips as a --profile value)
+	UserOpenID string // AppConfig.Users[0].UserOpenId ("" when the profile has no active user)
+}
+
+// ownerContext maps a consumer's owner app_id -> its ownerProfile. An app_id
+// ABSENT from the map (not found, or ambiguous — the same app_id appeared for
+// more than one AppConfig) yields NO executable recovery command (reason-only).
+// It is built once by runStatus (buildOwnerContext) and consumed read-only by
+// the projector — the projector never loads config/session.
+type ownerContext map[string]ownerProfile
+
+// buildOwnerContext precomputes the owner map from ALL apps in the multi-app
+// config (not f.Config()'s single resolved app — status spans profiles). An
+// app_id that appears for more than one AppConfig is dropped as ambiguous, so a
+// consumer owned by it falls to reason-only rather than an ambiguous mapping.
+func buildOwnerContext(cfg *core.MultiAppConfig) ownerContext {
+	if cfg == nil {
+		return ownerContext{}
+	}
+	seen := make(map[string]int, len(cfg.Apps))
+	m := make(ownerContext, len(cfg.Apps))
+	for i := range cfg.Apps {
+		a := &cfg.Apps[i]
+		seen[a.AppId]++
+		userOpenID := ""
+		if len(a.Users) > 0 {
+			userOpenID = a.Users[0].UserOpenId
+		}
+		m[a.AppId] = ownerProfile{Profile: a.ProfileName(), UserOpenID: userOpenID}
+	}
+	for id, n := range seen {
+		if n > 1 {
+			delete(m, id) // ambiguous app_id -> reason-only, never a guessed profile
+		}
+	}
+	return m
+}
+
+// recoveryCommandContext resolves the OWNING profile + identity a consumer's
+// recovery command must run as, per the owner-first rules. It NEVER falls back
+// to the status-invocation profile — an unresolvable owner yields ok=false, so
+// the caller emits a reason-only next action:
+//   - the owner app_id must map unambiguously to a profile (else ok=false);
+//   - a bot owner: profile hit -> {profile, bot};
+//   - a user owner: additionally the mapped profile's active user
+//     (Users[0].UserOpenId) must be non-empty AND equal the consumer's
+//     OwnerUserOpenID -> {profile, user}; otherwise (no active user, or a
+//     mismatch) ok=false;
+//   - any other/absent owner identity: ok=false.
+func recoveryCommandContext(oc ownerContext, c protocol.ConsumerInfo) (event.CommandContext, bool) {
+	entry, found := oc[c.OwnerAppID]
+	if !found {
+		return event.CommandContext{}, false
+	}
+	switch core.Identity(c.OwnerIdentity) {
+	case core.AsBot:
+		return event.CommandContext{Profile: entry.Profile, Identity: core.AsBot}, true
+	case core.AsUser:
+		if entry.UserOpenID == "" || entry.UserOpenID != c.OwnerUserOpenID {
+			return event.CommandContext{}, false
+		}
+		return event.CommandContext{Profile: entry.Profile, Identity: core.AsUser}, true
+	default:
+		return event.CommandContext{}, false
+	}
+}
+
 // StatusProjector is the stateless, read-only projector described in the file
 // header. It is a type (not loose functions) so the read-only projection is a
 // single named owner the command delegates to, and so the "no domain writes"
@@ -108,12 +182,16 @@ func (StatusProjector) consumerScope(s appStatus, c protocol.ConsumerInfo) remot
 // Returns nil when nothing is recommended. decryption guidance is deliberately
 // NOT folded in here — it keeps its own decrypt_advisory/decrypt_next_action
 // fields — so this stays the one lifecycle/identity recovery recommendation.
-func (p StatusProjector) nextAction(s appStatus, c protocol.ConsumerInfo, scope remoteScope) *nextActionCommand {
-	if a := busNextActionCommand(c.NextAction, c.RemoteSubscriptionID, c.EventKey); a != nil {
+func (p StatusProjector) nextAction(s appStatus, c protocol.ConsumerInfo, scope remoteScope, oc ownerContext) *nextActionCommand {
+	// Resolve the consumer's OWNING profile+identity once (owner-first; never the
+	// status-invocation profile). ownerOK gates whether an executable command is
+	// emitted at all — an unresolvable owner yields reason-only.
+	ownerCtx, ownerOK := recoveryCommandContext(oc, c)
+	if a := busNextActionCommand(c.NextAction, c.RemoteSubscriptionID, c.EventKey, ownerCtx, ownerOK); a != nil {
 		return a
 	}
 	if scope == scopeMissing {
-		if cmd := createCommandFor(c.EventKey); cmd != nil {
+		if cmd := createCommandFor(c.EventKey, ownerCtx, ownerOK); cmd != nil {
 			cmd.Reason = "the remote subscription " + orDash(c.RemoteSubscriptionID) +
 				" backing this consumer was not found remotely; recreate it, then restart the consumer"
 			return cmd
@@ -132,22 +210,16 @@ func (p StatusProjector) nextAction(s appStatus, c protocol.ConsumerInfo, scope 
 // bus package. Returns nil for an empty/unrecognized token. rebuild maps to
 // `subscription create <event_key>`; rebind has no single safe command
 // (identity re-bind is a profile/auth decision) so it is reason-only.
-func busNextActionCommand(token, remoteSubscriptionID, eventKey string) *nextActionCommand {
+func busNextActionCommand(token, remoteSubscriptionID, eventKey string, ownerCtx event.CommandContext, ownerOK bool) *nextActionCommand {
 	switch token {
 	case "reactivate":
-		return &nextActionCommand{
-			Command: "lark-cli event subscription reactivate",
-			Args:    []string{remoteSubscriptionID},
-			Reason:  "the remote subscription is suspended; reactivate it to resume delivery",
-		}
+		return recoveryCmd(ownerCtx, ownerOK, "lark-cli event subscription reactivate", remoteSubscriptionID,
+			"the remote subscription is suspended; reactivate it to resume delivery")
 	case "renew":
-		return &nextActionCommand{
-			Command: "lark-cli event subscription renew",
-			Args:    []string{remoteSubscriptionID},
-			Reason:  "the remote subscription is near expiry; renew it to extend its TTL",
-		}
+		return recoveryCmd(ownerCtx, ownerOK, "lark-cli event subscription renew", remoteSubscriptionID,
+			"the remote subscription is near expiry; renew it to extend its TTL")
 	case "rebuild":
-		if cmd := createCommandFor(eventKey); cmd != nil {
+		if cmd := createCommandFor(eventKey, ownerCtx, ownerOK); cmd != nil {
 			cmd.Reason = "the remote subscription is gone (expired or deleted); recreate it, then restart the consumer"
 			return cmd
 		}
@@ -155,26 +227,45 @@ func busNextActionCommand(token, remoteSubscriptionID, eventKey string) *nextAct
 	case "rebind":
 		return &nextActionCommand{Reason: "the consumer's owner identity needs rebinding; switch back to the owning profile or re-authenticate so it can bind and resume delivery"}
 	case "get":
-		return &nextActionCommand{
-			Command: "lark-cli event subscription get",
-			Args:    []string{remoteSubscriptionID},
-			Reason:  "inspect the current remote subscription state before deciding a recovery action",
-		}
+		return recoveryCmd(ownerCtx, ownerOK, "lark-cli event subscription get", remoteSubscriptionID,
+			"inspect the current remote subscription state before deciding a recovery action")
 	default:
 		return nil
 	}
 }
 
-// createCommandFor builds a `subscription create <event_key>` command when
-// eventKey is a usable, executable key, else nil (an empty or unavailable key
-// cannot seed an executable create). The caller sets Reason.
-func createCommandFor(eventKey string) *nextActionCommand {
+// recoveryCmd is the OWNER-FIRST gate for a structured recovery command: it
+// emits an executable {Command, Args} — the positional plus the OWNING
+// --profile/--as (ownerCtx.FlagArgs) — ONLY when the owning profile+identity
+// resolved (ownerOK). Otherwise it emits a reason-only action; it never falls
+// back to the status-invocation profile, since running the recovery as the wrong
+// app/identity would target the wrong subscription.
+func recoveryCmd(ownerCtx event.CommandContext, ownerOK bool, command, positional, reason string) *nextActionCommand {
+	if !ownerOK {
+		return &nextActionCommand{Reason: reason + " — run it as the subscription's OWNING profile/identity (that profile could not be resolved here, so no executable command is offered)"}
+	}
+	return &nextActionCommand{
+		Command: command,
+		Args:    append([]string{positional}, ownerCtx.FlagArgs()...),
+		Reason:  reason,
+	}
+}
+
+// createCommandFor builds a `subscription create <event_key>` command carrying
+// the OWNING --profile/--as when the owner resolved (ownerOK); nil for an empty/
+// unavailable key. When ownerOK is false it returns a bare (Command-less)
+// action for the caller to set Reason on — the same owner-first gate as
+// recoveryCmd: no executable create against an unresolved owning profile.
+func createCommandFor(eventKey string, ownerCtx event.CommandContext, ownerOK bool) *nextActionCommand {
 	if eventKey == "" || eventKey == statusEventKeyUnavailable {
 		return nil
 	}
+	if !ownerOK {
+		return &nextActionCommand{}
+	}
 	return &nextActionCommand{
 		Command: "lark-cli event subscription create",
-		Args:    []string{eventKey},
+		Args:    append([]string{eventKey}, ownerCtx.FlagArgs()...),
 	}
 }
 
@@ -184,14 +275,14 @@ func createCommandFor(eventKey string) *nextActionCommand {
 // and the display-only advisories — computed by reading the collected facts
 // only. The per-dimension Health facts flow through the embedded ConsumerInfo
 // untouched (the projector surfaces them, never rewrites them).
-func (p StatusProjector) projectConsumerView(s appStatus, c protocol.ConsumerInfo) consumerView {
+func (p StatusProjector) projectConsumerView(s appStatus, c protocol.ConsumerInfo, oc ownerContext) consumerView {
 	cv := consumerView{ConsumerInfo: c}
 	if match, applicable := consumerProfileMatch(s, c); applicable {
 		m := match
 		cv.CurrentProfileMatch = &m
 	}
 	cv.Scope = p.consumerScope(s, c)
-	cv.NextAction = p.nextAction(s, c, cv.Scope)
+	cv.NextAction = p.nextAction(s, c, cv.Scope, oc)
 	cv.RemoteDegradedAdvisory = remoteDegradedAdvisory(c)
 	cv.DecryptAdvisory, cv.DecryptNextAction = decryptAdvisory(c)
 	return cv

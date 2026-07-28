@@ -13,10 +13,11 @@ import (
 
 	larkeventv1 "github.com/larksuite/oapi-sdk-go/v3/service/event/v1"
 
+	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/internal/event/model"
 	larkgw "github.com/larksuite/cli/internal/event/platform/lark"
-	subown "github.com/larksuite/cli/internal/event/subscription"
 	"github.com/larksuite/cli/internal/event/protocol"
+	subown "github.com/larksuite/cli/internal/event/subscription"
 )
 
 // The real catalog (im.message.created_v1 refined base + chat-id template, etc.)
@@ -232,7 +233,8 @@ func TestNextAction_BusReactivateToken_StructuredAndConsistentWithText(t *testin
 		Consumers: []protocol.ConsumerInfo{c},
 	}}
 
-	cv := consumerJSONFromStatuses(t, statuses)
+	oc := resolvingOwnerCtx() // owner cli_a / user / ou_1 resolves -> executable
+	cv := consumerJSONWithOwner(t, statuses, oc)
 	na, ok := cv["next_action"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("next_action = %v (%T), want a structured {command,args,reason} object", cv["next_action"], cv["next_action"])
@@ -241,8 +243,10 @@ func TestNextAction_BusReactivateToken_StructuredAndConsistentWithText(t *testin
 		t.Errorf("next_action.command = %v, want lark-cli event subscription reactivate", na["command"])
 	}
 	args, _ := na["args"].([]interface{})
-	if len(args) != 1 || args[0] != "sub_abc123" {
-		t.Errorf("next_action.args = %v, want [sub_abc123] (the remote_subscription_id)", na["args"])
+	// args carry the positional id PLUS the OWNING --profile/--as (owner-first
+	// composability): the recovery command runs against the subscription's owner.
+	if len(args) != 5 || args[0] != "sub_abc123" || args[1] != "--profile" || args[2] != "cli_a" || args[3] != "--as" || args[4] != "user" {
+		t.Errorf("next_action.args = %v, want [sub_abc123 --profile cli_a --as user]", na["args"])
 	}
 	reason, _ := na["reason"].(string)
 	if reason == "" {
@@ -250,7 +254,7 @@ func TestNextAction_BusReactivateToken_StructuredAndConsistentWithText(t *testin
 	}
 
 	var buf bytes.Buffer
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, oc)
 	out := buf.String()
 	if !strings.Contains(out, "next_action:") {
 		t.Errorf("text output missing a next_action line; full output:\n%s", out)
@@ -258,8 +262,8 @@ func TestNextAction_BusReactivateToken_StructuredAndConsistentWithText(t *testin
 	if !strings.Contains(out, reason) {
 		t.Errorf("text next_action must carry the SAME reason as the JSON (%q); full output:\n%s", reason, out)
 	}
-	if !strings.Contains(out, "lark-cli event subscription reactivate sub_abc123") {
-		t.Errorf("text next_action must name the runnable command; full output:\n%s", out)
+	if !strings.Contains(out, "lark-cli event subscription reactivate sub_abc123 --profile cli_a --as user") {
+		t.Errorf("text next_action must name the runnable command with the owning --profile/--as; full output:\n%s", out)
 	}
 }
 
@@ -269,15 +273,22 @@ func TestNextAction_BusReactivateToken_StructuredAndConsistentWithText(t *testin
 func TestNextAction_ScopeMissing_RecommendsRecreate(t *testing.T) {
 	c := refinedConsumer() // EventKey im.message.created_v1/chat-id/oc_xxx, id sub_abc123
 	s := appStatus{AppID: "cli_a", State: stateRunning, RemoteMissing: map[string]bool{"sub_abc123": true}}
-	na := (StatusProjector{}).nextAction(s, c, scopeMissing)
+	na := (StatusProjector{}).nextAction(s, c, scopeMissing, resolvingOwnerCtx())
 	if na == nil {
 		t.Fatal("expected a structured next_action for a missing remote subscription, got nil")
 	}
 	if na.Command != "lark-cli event subscription create" {
 		t.Errorf("command = %q, want lark-cli event subscription create", na.Command)
 	}
-	if len(na.Args) != 1 || na.Args[0] != c.EventKey {
-		t.Errorf("args = %v, want [%s] (the executable event_key)", na.Args, c.EventKey)
+	// The create carries the executable key PLUS the OWNING --profile/--as.
+	want := []string{c.EventKey, "--profile", "cli_a", "--as", "user"}
+	if len(na.Args) != len(want) {
+		t.Fatalf("args = %v, want %v", na.Args, want)
+	}
+	for i, w := range want {
+		if na.Args[i] != w {
+			t.Errorf("args[%d] = %q, want %q (full: %v)", i, na.Args[i], w, na.Args)
+		}
 	}
 	if na.Reason == "" {
 		t.Error("reason must be non-empty")
@@ -293,7 +304,120 @@ func TestNextAction_HealthyVerified_NoRecommendation(t *testing.T) {
 		AppID: "cli_a", State: stateRunning,
 		CurrentIdentityKnown: true, CurrentAppID: "cli_a", CurrentUserOpenID: "ou_1",
 	}
-	if na := (StatusProjector{}).nextAction(s, c, scopeVerified); na != nil {
+	if na := (StatusProjector{}).nextAction(s, c, scopeVerified, resolvingOwnerCtx()); na != nil {
 		t.Errorf("healthy verified owner-matching consumer must have no next_action, got %+v", na)
+	}
+}
+
+// --- owner-first recovery-command gating (LoadMultiAppConfig owner context) ---
+
+// TestBuildOwnerContext_AmbiguousAppIDDropped locks that an app_id appearing for
+// more than one AppConfig is DROPPED (reason-only), never a guessed profile.
+func TestBuildOwnerContext_AmbiguousAppIDDropped(t *testing.T) {
+	cfg := &core.MultiAppConfig{Apps: []core.AppConfig{
+		{AppId: "cli_a", Name: "A", Users: []core.AppUser{{UserOpenId: "ou_1"}}},
+		{AppId: "cli_dup"}, {AppId: "cli_dup"}, // ambiguous
+	}}
+	oc := buildOwnerContext(cfg)
+	if got, ok := oc["cli_a"]; !ok || got.Profile != "A" || got.UserOpenID != "ou_1" {
+		t.Errorf("cli_a = %+v (ok=%v), want {Profile:A UserOpenID:ou_1}", got, ok)
+	}
+	if _, ok := oc["cli_dup"]; ok {
+		t.Error("ambiguous cli_dup must be dropped -> reason-only")
+	}
+}
+
+// TestRecoveryCommandContext_OwnerFirstRules locks the exact owner-first policy:
+// bot needs only a profile hit; user needs a profile hit AND its active-user
+// open_id == OwnerUserOpenID; a foreign app, an ambiguous/absent mapping, no
+// active user, a user mismatch, or an unknown identity all yield ok=false
+// (reason-only). It NEVER falls back to any other profile.
+func TestRecoveryCommandContext_OwnerFirstRules(t *testing.T) {
+	oc := ownerContext{
+		"app_bot":    {Profile: "P_bot"},
+		"app_user":   {Profile: "P_user", UserOpenID: "ou_own"},
+		"app_nouser": {Profile: "P_nu"}, // no active user
+	}
+	cases := []struct {
+		name                string
+		c                   protocol.ConsumerInfo
+		wantOK              bool
+		wantProfile, wantID string
+	}{
+		{"bot hit", protocol.ConsumerInfo{OwnerIdentity: "bot", OwnerAppID: "app_bot"}, true, "P_bot", "bot"},
+		{"user hit + match", protocol.ConsumerInfo{OwnerIdentity: "user", OwnerAppID: "app_user", OwnerUserOpenID: "ou_own"}, true, "P_user", "user"},
+		{"user mismatch", protocol.ConsumerInfo{OwnerIdentity: "user", OwnerAppID: "app_user", OwnerUserOpenID: "ou_other"}, false, "", ""},
+		{"user no active user", protocol.ConsumerInfo{OwnerIdentity: "user", OwnerAppID: "app_nouser", OwnerUserOpenID: "ou_own"}, false, "", ""},
+		{"foreign app", protocol.ConsumerInfo{OwnerIdentity: "bot", OwnerAppID: "app_missing"}, false, "", ""},
+		{"unknown identity", protocol.ConsumerInfo{OwnerIdentity: "weird", OwnerAppID: "app_bot"}, false, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, ok := recoveryCommandContext(oc, tc.c)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v (ctx=%+v)", ok, tc.wantOK, ctx)
+			}
+			if ok && (ctx.Profile != tc.wantProfile || string(ctx.Identity) != tc.wantID) {
+				t.Errorf("ctx = %+v, want {Profile:%s Identity:%s}", ctx, tc.wantProfile, tc.wantID)
+			}
+		})
+	}
+}
+
+// TestNextAction_ForeignOwner_ReasonOnly locks that an unresolvable owner yields
+// a reason-only recovery: NO executable Command/Args and NO --profile leaked —
+// never a fallback to the status-invocation profile.
+func TestNextAction_ForeignOwner_ReasonOnly(t *testing.T) {
+	c := refinedConsumer()
+	c.NextAction = "reactivate"
+	s := appStatus{AppID: "cli_a", State: stateRunning}
+	na := (StatusProjector{}).nextAction(s, c, "", ownerContext{}) // empty map: foreign for all
+	if na == nil {
+		t.Fatal("expected a reason-only next_action, got nil")
+	}
+	if na.Command != "" || len(na.Args) != 0 {
+		t.Errorf("foreign owner must be reason-only, got Command=%q Args=%v", na.Command, na.Args)
+	}
+	if na.Reason == "" {
+		t.Error("reason must be non-empty")
+	}
+	if strings.Contains(na.Reason, "--profile") {
+		t.Errorf("reason must not carry an executable --profile flag: %q", na.Reason)
+	}
+}
+
+// TestNextAction_UserMismatch_ReasonOnly locks the user open_id gate.
+func TestNextAction_UserMismatch_ReasonOnly(t *testing.T) {
+	c := refinedConsumer() // user / cli_a / ou_1
+	c.NextAction = "reactivate"
+	s := appStatus{AppID: "cli_a", State: stateRunning}
+	oc := ownerContext{"cli_a": {Profile: "cli_a", UserOpenID: "ou_DIFFERENT"}}
+	na := (StatusProjector{}).nextAction(s, c, "", oc)
+	if na == nil || na.Command != "" {
+		t.Fatalf("user open_id mismatch must be reason-only, got %+v", na)
+	}
+}
+
+// TestNextAction_BotOwner_ExecutableWithBotFlag locks that a bot owner is
+// executable on a bare profile hit and carries --as bot (no open_id check).
+func TestNextAction_BotOwner_ExecutableWithBotFlag(t *testing.T) {
+	c := refinedConsumer()
+	c.OwnerIdentity = "bot"
+	c.OwnerUserOpenID = ""
+	c.NextAction = "reactivate"
+	s := appStatus{AppID: "cli_a", State: stateRunning}
+	oc := ownerContext{"cli_a": {Profile: "cli_a"}}
+	na := (StatusProjector{}).nextAction(s, c, "", oc)
+	if na == nil || na.Command != "lark-cli event subscription reactivate" {
+		t.Fatalf("bot owner should be executable, got %+v", na)
+	}
+	want := []string{"sub_abc123", "--profile", "cli_a", "--as", "bot"}
+	if len(na.Args) != len(want) {
+		t.Fatalf("args = %v, want %v", na.Args, want)
+	}
+	for i, w := range want {
+		if na.Args[i] != w {
+			t.Errorf("args[%d] = %q, want %q", i, na.Args[i], w)
+		}
 	}
 }

@@ -232,7 +232,7 @@ func TestWriteStatusText_RefinedConsumerSubLine_ShowsRemoteSubIDAndOwner(t *test
 		CurrentIdentityKnown: true, CurrentAppID: "cli_a", CurrentUserOpenID: "ou_1",
 		Consumers: []protocol.ConsumerInfo{refinedConsumer()},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 
 	for _, want := range []string{"remote_subscription_id=sub_abc123", "current_profile_match=true"} {
@@ -255,7 +255,7 @@ func TestWriteStatusText_RefinedConsumerSubLine_MismatchShowsAdvisoryAndNextActi
 		CurrentIdentityKnown: true, CurrentAppID: "cli_a", CurrentUserOpenID: "ou_DIFFERENT",
 		Consumers: []protocol.ConsumerInfo{c},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 
 	for _, want := range []string{"current_profile_match=false", "stale_identity", "next_action"} {
@@ -314,7 +314,7 @@ func TestWriteStatusText_RefinedConsumerSubLine_ShowsRemoteFilterWhenPresent(t *
 		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
 		Consumers: []protocol.ConsumerInfo{c},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 	if !strings.Contains(out, "filter=") || !strings.Contains(out, "message_type") {
 		t.Errorf("output missing the remote filter line; full output:\n%s", out)
@@ -362,7 +362,7 @@ func TestWriteStatusText_DecryptKeyUnavailable_ShowsResourceDataAndAdvisory(t *t
 		CurrentIdentityKnown: true, CurrentAppID: "cli_a", CurrentUserOpenID: "ou_1",
 		Consumers: []protocol.ConsumerInfo{c},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 	for _, want := range []string{"resource_data=unavailable", "decrypt_state=decrypt_key_unavailable", "advisory", "event:encrypt_key:read", "next_action"} {
 		if !strings.Contains(out, want) {
@@ -383,7 +383,7 @@ func TestWriteStatusText_Health_ShownAsAdvisory(t *testing.T) {
 		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
 		Consumers: []protocol.ConsumerInfo{c},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 	if !strings.Contains(out, "bind_failed: uat_unavailable") || !strings.Contains(out, "advisory") {
 		t.Errorf("health fact not shown as advisory; full output:\n%s", out)
@@ -405,7 +405,7 @@ func TestWriteStatusText_MultipleHealthFacts_AllShown(t *testing.T) {
 		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
 		Consumers: []protocol.ConsumerInfo{c},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 	for _, want := range []string{"bind_failed: uat_unavailable", "remote_subscription_suspended", "identity", "subscription"} {
 		if !strings.Contains(out, want) {
@@ -425,7 +425,7 @@ func TestWriteStatusText_LegacyConsumerRow_Unchanged(t *testing.T) {
 			PID: 1, EventKey: "mail.x", SubscriptionID: "mail.x:alice", Received: 3, Dropped: 0,
 		}},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 	for _, unwanted := range []string{"remote_subscription_id", "owner=", "current_profile_match", "advisory"} {
 		if strings.Contains(out, unwanted) {
@@ -443,7 +443,7 @@ func TestWriteStatusJSON_RefinedConsumer_IncludesCurrentProfileMatch(t *testing.
 		CurrentIdentityKnown: true, CurrentAppID: "cli_a", CurrentUserOpenID: "ou_1",
 		Consumers: []protocol.ConsumerInfo{refinedConsumer()},
 	}}
-	if err := writeStatusJSON(&buf, statuses); err != nil {
+	if err := writeStatusJSON(&buf, statuses, nil); err != nil {
 		t.Fatalf("writeStatusJSON: %v", err)
 	}
 	var payload struct {
@@ -476,7 +476,7 @@ func TestWriteStatusJSON_RefinedConsumer_MismatchIncludesNextAction(t *testing.T
 		CurrentIdentityKnown: true, CurrentAppID: "cli_a", CurrentUserOpenID: "ou_DIFFERENT",
 		Consumers: []protocol.ConsumerInfo{refinedConsumer()},
 	}}
-	if err := writeStatusJSON(&buf, statuses); err != nil {
+	if err := writeStatusJSON(&buf, statuses, nil); err != nil {
 		t.Fatalf("writeStatusJSON: %v", err)
 	}
 	var payload struct {
@@ -514,7 +514,7 @@ func TestWriteStatusJSON_LegacyConsumer_OmitsCurrentProfileMatchKey(t *testing.T
 		AppID: "cli_a", State: stateRunning,
 		Consumers: []protocol.ConsumerInfo{{PID: 1, EventKey: "mail.x", Received: 1}},
 	}}
-	if err := writeStatusJSON(&buf, statuses); err != nil {
+	if err := writeStatusJSON(&buf, statuses, nil); err != nil {
 		t.Fatalf("writeStatusJSON: %v", err)
 	}
 	if strings.Contains(buf.String(), "current_profile_match") {
@@ -1012,7 +1012,7 @@ func TestWriteStatusText_RemoteStateSuspended_ShowsDegradedAdvisory(t *testing.T
 		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
 		Consumers: []protocol.ConsumerInfo{c},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 	for _, want := range []string{"remote_state=suspended", "suspended", "app_ticket_expired", "advisory"} {
 		if !strings.Contains(out, want) {
@@ -1029,7 +1029,7 @@ func TestWriteStatusText_RemoteStateExpired_ShowsDegradedAdvisory(t *testing.T) 
 		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
 		Consumers: []protocol.ConsumerInfo{c},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 	for _, want := range []string{"remote_state=expired", "expired", "advisory"} {
 		if !strings.Contains(out, want) {
@@ -1050,7 +1050,7 @@ func TestWriteStatusText_RemoteStateUnknownHealthy_NoDegradedAdvisory(t *testing
 		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
 		Consumers: []protocol.ConsumerInfo{c},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 	if !strings.Contains(out, "remote_state=active") {
 		t.Errorf("output missing remote_state=active; full output:\n%s", out)
@@ -1073,7 +1073,7 @@ func TestWriteStatusText_RemoteDegradedAdvisory_AppendsAlongsideHealth(t *testin
 		AppID: "cli_a", State: stateRunning, PID: 1, Active: 1,
 		Consumers: []protocol.ConsumerInfo{c},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 	for _, want := range []string{"bind_failed: uat_unavailable", "suspended"} {
 		if !strings.Contains(out, want) {
@@ -1088,9 +1088,20 @@ func TestWriteStatusText_RemoteDegradedAdvisory_AppendsAlongsideHealth(t *testin
 // --- writeStatusJSON: --json equivalents -----------------------------------
 
 func consumerJSONFromStatuses(t *testing.T, statuses []appStatus) map[string]interface{} {
+	return consumerJSONWithOwner(t, statuses, nil)
+}
+
+// resolvingOwnerCtx is the owner-context that RESOLVES the standard test
+// consumer (refinedConsumer: owner app cli_a, --as user, open_id ou_1), so its
+// recovery command is executable and carries --profile cli_a --as user.
+func resolvingOwnerCtx() ownerContext {
+	return ownerContext{"cli_a": {Profile: "cli_a", UserOpenID: "ou_1"}}
+}
+
+func consumerJSONWithOwner(t *testing.T, statuses []appStatus, oc ownerContext) map[string]interface{} {
 	t.Helper()
 	var buf bytes.Buffer
-	if err := writeStatusJSON(&buf, statuses); err != nil {
+	if err := writeStatusJSON(&buf, statuses, oc); err != nil {
 		t.Fatalf("writeStatusJSON: %v", err)
 	}
 	var payload struct {
@@ -1226,7 +1237,7 @@ func TestWriteStatusText_StaleIdentityWithFreshMatch_NoContradictoryMismatchLine
 		CurrentIdentityKnown: true, CurrentAppID: "cli_a", CurrentUserOpenID: "ou_1", // matches refinedConsumer()'s owner
 		Consumers: []protocol.ConsumerInfo{c},
 	}}
-	writeStatusText(&buf, statuses)
+	writeStatusText(&buf, statuses, nil)
 	out := buf.String()
 
 	if !strings.Contains(out, "current_profile_match=true") {
