@@ -61,6 +61,46 @@ func TestReducer_DeletedHit_TerminalSurvivesLateActivatedAndUpdated(t *testing.T
 	}
 }
 
+// #12/#20: the summary (remote_state / last_event) is written AFTER reduce and
+// ONLY for events the reducer accepts. A terminal-tombstoned late activated must
+// NOT flip remote_state back to active or overwrite last_event — the summary
+// must keep reflecting the terminal event. (The review noted no test asserted
+// this field before.)
+func TestReducer_TerminalDroppedEvent_DoesNotPolluteSummary(t *testing.T) {
+	hub := NewHub()
+	deps := newTestAction(t, hub, staticCurrent("app1", "ou_alice"), true)
+	c := newLifecycleDispatchTestConn(t, 1, "sub-1", "user", "app1", "ou_alice")
+	hub.RegisterAndIsFirst(c)
+
+	// The terminal deleted_v1 records the summary (deleted_v1 synthesizes state).
+	deleted := lifecycle.LifecycleEvent{EventType: evTypeDeleted, EventID: "evt-del", RemoteSubscriptionID: "sub-1"}
+	if err := deps.action.Handle(context.Background(), deleted); err != nil {
+		t.Fatalf("Handle(deleted): %v", err)
+	}
+	if got := c.RemoteState(); got != "deleted" {
+		t.Fatalf("after deleted: RemoteState() = %q, want deleted", got)
+	}
+	if got := c.LastLifecycleEvent(); got != evTypeDeleted {
+		t.Fatalf("after deleted: LastLifecycleEvent() = %q, want %q", got, evTypeDeleted)
+	}
+
+	// A late activated (state=active) is dropped by terminal protection — its
+	// summary must NEVER be recorded.
+	late := lifecycle.LifecycleEvent{EventType: evTypeActivated, EventID: "evt-late", RemoteSubscriptionID: "sub-1", State: "active"}
+	if err := deps.action.Handle(context.Background(), late); err != nil {
+		t.Fatalf("Handle(late activated): %v", err)
+	}
+	if got := c.RemoteState(); got != "deleted" {
+		t.Errorf("RemoteState() = %q, want deleted (a dropped late activated must NOT flip remote_state back to active)", got)
+	}
+	if got := c.LastLifecycleEvent(); got != evTypeDeleted {
+		t.Errorf("LastLifecycleEvent() = %q, want %q (a dropped event must NOT overwrite last_event)", got, evTypeDeleted)
+	}
+	if got := c.LastLifecycleEventID(); got != "evt-del" {
+		t.Errorf("LastLifecycleEventID() = %q, want evt-del (the dropped evt-late must not be recorded)", got)
+	}
+}
+
 // NEW terminal behavior: expired is ALSO terminal (the reducer's phase store
 // tombstones it, extending the old deleted-only tombstone). A late updated
 // after expired must NOT trigger a reconcile Get — the old code would have.

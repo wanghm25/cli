@@ -220,42 +220,50 @@ func (a *SubscriptionAction) logf(format string, args ...interface{}) {
 // Handle implements Action as an ordered per-remote_subscription_id reducer +
 // effect executor. The steps:
 //
-//  1. Summary is recorded first on every matched conn, hit or miss, eligible or
-//     not (deleted_v1 synthesizes an explicit "deleted" state since its body
-//     carries none).
-//  2. eligibleConns applies the IDENTITY-dimension gate (owner==current): every
+//  1. eligibleConns applies the IDENTITY-dimension gate (owner==current): every
 //     ineligible USER conn is marked stale/unresolved and excluded; bot/legacy
 //     conns are always eligible. This is a pure identity concern, kept out of
 //     the subscription reducer.
-//  3. reduce() — the PURE fold — turns (current phase, event, eligible-intent)
+//  2. reduce() — the PURE fold — turns (current phase, event, eligible-intent)
 //     into (new phase, health decision, single effect). It performs no remote
 //     call and mutates no Conn. Terminal-state priority lives here: a
-//     resurrection against a terminal phase yields a dropped reduction.
-//  4. Handle APPLIES the reduction's Conn mutations (suspension bookkeeping +
+//     resurrection against a terminal phase yields a DROPPED reduction.
+//  3. A DROPPED event is a no-op: it returns here WITHOUT recording the summary,
+//     so a terminal-tombstoned late activated/updated can never flip the status
+//     summary's remote_state back to active or overwrite last_event. The summary
+//     must reflect ONLY events the reducer accepted — hence it is written AFTER
+//     reduce (below), not before it.
+//  4. The summary is recorded on every matched conn, hit or miss, eligible or
+//     not (deleted_v1 synthesizes an explicit "deleted" state since its body
+//     carries none).
+//  5. Handle APPLIES the reduction's Conn mutations (suspension bookkeeping +
 //     the subscription-dimension health decision) and records the new phase.
-//  5. Handle RUNS the returned effect (Reactivate/Renew/Get/release-key). The
+//  6. Handle RUNS the returned effect (Reactivate/Renew/Get/release-key). The
 //     effect issues the single remote call and applies its result-dependent
 //     health — the ONLY place a remote call or a client-driven Conn mutation
 //     happens.
 func (a *SubscriptionAction) Handle(ctx context.Context, le LifecycleEvent) error {
 	conns := a.registry.ConnsByRemoteSubscriptionID(le.RemoteSubscriptionID)
 
+	res := a.eligibleConns(conns)
+	cur := a.phases.phaseOf(le.RemoteSubscriptionID)
+	red := reduce(cur, le, intentOf(res.conns))
+
+	if red.dropped {
+		// Terminal tombstone hit: NOTHING is recorded — not the summary
+		// (remote_state/last_event stay terminal), not the phase, no effect.
+		a.logf("lifecycle: dropping %s for remote_subscription_id=%s (terminal phase — not revived; summary untouched)",
+			le.EventType, le.RemoteSubscriptionID)
+		return nil
+	}
+
+	// Summary reflects only accepted events — recorded AFTER reduce.
 	summaryState := le.State
 	if le.EventType == LifecycleEventTypeDeleted {
 		summaryState = "deleted"
 	}
 	for _, c := range conns {
 		c.SetLifecycleSummary(le.EventType, le.EventID, summaryState)
-	}
-
-	res := a.eligibleConns(conns)
-	cur := a.phases.phaseOf(le.RemoteSubscriptionID)
-	red := reduce(cur, le, intentOf(res.conns))
-
-	if red.dropped {
-		a.logf("lifecycle: dropping %s for remote_subscription_id=%s (terminal phase — not revived)",
-			le.EventType, le.RemoteSubscriptionID)
-		return nil
 	}
 
 	if red.suspension != nil {
