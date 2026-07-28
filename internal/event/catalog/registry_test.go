@@ -97,6 +97,35 @@ func TestRegisterKey_DuplicatePanics(t *testing.T) {
 	RegisterKey(KeyDefinition{Key: "t.dup", EventType: "t.dup", Schema: nativeSchema()})
 }
 
+// TestRegisterFilterMeta_DuplicatePanics (fail-fast #5b): a second FilterMeta
+// registration for an already-registered event_type is a programming error that
+// must fail fast, mirroring RegisterKey — never a silent overwrite.
+func TestRegisterFilterMeta_DuplicatePanics(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+	const et = "t.filter.dup_v1"
+	RegisterFilterMeta(et, FilterMeta{Supported: true})
+	defer mustPanic(t, "duplicate FilterMeta registration for event_type: "+et)
+	RegisterFilterMeta(et, FilterMeta{Supported: true})
+}
+
+// TestUnregisterFilterMetaForTest_AllowsReRegistration: the panic companion lets
+// a test undo a synthetic capability and seed it again (idempotent -count=N).
+func TestUnregisterFilterMetaForTest_AllowsReRegistration(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+	const et = "t.filter.rereg_v1"
+	RegisterFilterMeta(et, FilterMeta{Supported: true})
+	UnregisterFilterMetaForTest(et)
+	if FilterMetaFor(et).Supported {
+		t.Fatal("UnregisterFilterMetaForTest must remove the capability")
+	}
+	RegisterFilterMeta(et, FilterMeta{Supported: true}) // must not panic
+	if !FilterMetaFor(et).Supported {
+		t.Fatal("re-registration after unregister must take effect")
+	}
+}
+
 func TestRegisterKey_EmptyEventTypePanics(t *testing.T) {
 	resetRegistry()
 	defer mustPanic(t, "EventType must not be empty")

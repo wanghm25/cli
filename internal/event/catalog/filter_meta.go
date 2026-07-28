@@ -3,6 +3,8 @@
 
 package catalog
 
+import "fmt"
+
 // Default filter limits shared by every Filter-supporting event_type. The
 // platform caps operator list_value length at 10; a canonical filter payload
 // must fit in 1 KiB. They are exported so the SDK-coupled filter validator in
@@ -87,9 +89,18 @@ var filterMetaRegistry = map[string]FilterMeta{}
 
 // RegisterFilterMeta records the filter capability an event_type accepts. The
 // business layer that owns an event_type calls it (typically from an init) to
-// declare that event_type's operands and operators. A later registration for
-// the same event_type replaces the earlier one.
+// declare that event_type's operands and operators. It panics on a duplicate
+// registration for the same event_type — mirroring RegisterKey, a second
+// registration is a programming error (two owners, or a double init) that would
+// otherwise silently overwrite the first and ship the wrong capability, so it
+// fails fast at startup. A test seeding a synthetic event_type undoes it with
+// UnregisterFilterMetaForTest / ResetRegistryForTest.
 func RegisterFilterMeta(eventType string, meta FilterMeta) {
+	mu.Lock()
+	defer mu.Unlock()
+	if _, exists := filterMetaRegistry[eventType]; exists {
+		panic(fmt.Sprintf("duplicate FilterMeta registration for event_type: %s", eventType))
+	}
 	filterMetaRegistry[eventType] = meta
 }
 
@@ -98,4 +109,14 @@ func RegisterFilterMeta(eventType string, meta FilterMeta) {
 // so a filter against it is rejected fail-closed.
 func FilterMetaFor(eventType string) FilterMeta {
 	return filterMetaRegistry[eventType]
+}
+
+// UnregisterFilterMetaForTest removes one event_type's filter capability — the
+// companion to RegisterFilterMeta's panic-on-duplicate guard, so a test seeding
+// a synthetic capability can undo it (and re-seed on a -count=N rerun) without
+// tripping the duplicate panic.
+func UnregisterFilterMetaForTest(eventType string) {
+	mu.Lock()
+	defer mu.Unlock()
+	delete(filterMetaRegistry, eventType)
 }

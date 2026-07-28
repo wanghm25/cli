@@ -29,7 +29,8 @@ func TestValidate_GoodCatalog(t *testing.T) {
 		Supported: true, LogicOps: []string{"and", "or"}, Operators: []string{"eq", "in"},
 		Operands: []FilterOperandMeta{{Key: "sender", Operators: []string{"eq"}}},
 	})
-	t.Cleanup(func() { RegisterFilterMeta(et, FilterMeta{}) })
+	// resetRegistry (t.Cleanup above) clears filter metas too, so no explicit
+	// meta reset is needed — and re-registering et would trip the duplicate panic.
 
 	if err := Validate(); err != nil {
 		t.Fatalf("well-formed catalog must validate, got: %v", err)
@@ -91,7 +92,8 @@ func TestValidate_CatchesInvalidFilterMeta(t *testing.T) {
 		Supported: true, LogicOps: []string{"and"}, Operators: []string{"eq", "in"},
 		Operands: []FilterOperandMeta{{Key: "sender", Operators: []string{"eq", "regex"}}},
 	})
-	t.Cleanup(func() { RegisterFilterMeta(et, FilterMeta{}) })
+	// resetRegistry (t.Cleanup above) clears filter metas too; re-registering et
+	// here would trip the duplicate-registration panic.
 
 	err := Validate()
 	if err == nil {

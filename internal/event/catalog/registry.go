@@ -157,6 +157,7 @@ func resetRegistry() {
 	mu.Lock()
 	defer mu.Unlock()
 	keys = map[string]*KeyDefinition{}
+	filterMetaRegistry = map[string]FilterMeta{}
 }
 
 func ResetRegistryForTest() { resetRegistry() }
