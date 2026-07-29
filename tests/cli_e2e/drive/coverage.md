@@ -2,13 +2,14 @@
 
 ## Metrics
 - Denominator: 32 leaf commands
-- Covered: 13
-- Coverage: 40.6%
+- Covered: 14
+- Coverage: 43.8%
 
 ## Summary
 - TestDrive_FilesCreateFolderWorkflow: proves `drive files create_folder` in `create_folder as bot`; helper asserts the returned folder token and registers best-effort cleanup via `drive files delete`.
 - TestDrive_StatusWorkflow: proves `drive +status` against a real Drive folder. Seeds the remote side via `drive +upload` (`unchanged.txt`, `modified.txt`, `remote-only.txt`), seeds local files with the matching/diverging contents, and asserts every output bucket (`unchanged`, `modified`, `new_local`, `new_remote`) holds exactly the expected `rel_path` and `file_token`. Cleans up uploaded files and the parent folder via best-effort cleanup hooks.
 - TestDrive_UploadWorkflow: proves `drive +upload` against the real backend in both create and overwrite modes. First uploads a fresh file into a temporary Drive folder, then re-uploads new bytes with `--file-token` against the returned token, asserts the overwrite keeps the token stable, and finally downloads the file to confirm the remote content changed.
+- TestDrive_ImportWorkflow: proves `drive +import` against the real backend. It imports a temporary Markdown file as docx, waits for the async task when needed, verifies the returned document token, and deletes the imported document during cleanup.
 - TestDrive_DuplicateRemoteWorkflow: proves the duplicate-remote workflows against the real backend. One subtest uploads two same-name files into the same Drive folder and asserts `drive +status` and default `drive +pull` both fail with a typed validation error for the duplicate rel_path, while `drive +pull --on-duplicate-remote=rename` succeeds, downloads both files, and writes a hashed renamed sibling locally. The other subtest uploads duplicate remote files, runs `drive +push --on-duplicate-remote=newest --if-exists=overwrite --delete-remote --yes`, and then re-runs `drive +status` to prove the mirror converged to a single unchanged `dup.txt`.
 - TestDrive_ApplyPermissionDryRun / TestDrive_ApplyPermissionDryRunRejectsFullAccess: dry-run coverage for `drive +apply-permission`; asserts URL→type inference for docx/sheet/slides, explicit `--type` overriding URL inference when both a recognized URL and `--type` are supplied, bare-token + explicit `--type` path, request method/URL/type-query/perm/remark body shape, optional `remark` omission when unset, and client-side rejection of `--perm full_access`. Runs without hitting the live API.
 - TestDriveAddCommentDryRun_File / TestDriveAddCommentDryRun_Base: dry-run coverage for `drive +add-comment` on supported Drive file and Base targets; pins the `metas.batch_query -> files/:token/new_comments` file chain, Base `file_type=bitable`, and Base anchor fields.
@@ -34,7 +35,7 @@
 | ✕ | drive +download | shortcut |  | none | no file fixture workflow yet |
 | ✓ | drive +export | shortcut | drive_export_dryrun_test.go::TestDriveExportDryRun_FileNameMetadata + TestDriveExportDryRun_WikiURLPlansResolveBeforeExportTask + TestDriveExportDryRun_WikiTokenTypePlansResolveBeforeExportTask + TestDriveExportDryRun_MarkdownFetchAPI + TestDriveExportDryRun_BitableBaseOnlySchema | `--url`; `--token`; `--doc-type`; `--file-extension`; `--file-name`; `--output-dir`; `--only-schema`; Wiki URL / `--doc-type wiki` resolve step; markdown fetch omits docs fetch `extra_param` | dry-run only; no live export workflow yet |
 | ✕ | drive +export-download | shortcut |  | none | no export-download workflow yet |
-| ✕ | drive +import | shortcut |  | none | no import workflow yet |
+| ✓ | drive +import | shortcut | drive_import_dryrun_test.go::TestDriveImportDryRunFolderTokenWikiProbe + drive_import_workflow_test.go::TestDrive_ImportWorkflow | `--file`; `--type docx`; upload report request shape; async ticket polling; imported token cleanup | dry-run pins the upload/report/import request chain; live workflow imports a real Markdown fixture and deletes the resulting docx |
 | ✕ | drive +move | shortcut |  | none | no move workflow yet |
 | ✓ | drive +pull | shortcut | drive_pull_dryrun_test.go::TestDrive_PullDryRun + drive_duplicate_sync_workflow_test.go::TestDrive_DuplicateRemoteWorkflow | `--local-dir`; `--folder-token`; `--on-duplicate-remote=rename\|newest\|oldest`; `--delete-local --yes` guard | dry-run locks flag/validate shape; live workflow proves duplicate fail-fast and rename recovery |
 | ✓ | drive +push | shortcut | drive_push_dryrun_test.go::TestDrive_PushDryRun + drive_duplicate_sync_workflow_test.go::TestDrive_DuplicateRemoteWorkflow | `--local-dir`; `--folder-token`; `--if-exists`; `--on-duplicate-remote=newest\|oldest`; `--delete-remote --yes` | dry-run locks flag/validate shape; live workflow proves overwrite + duplicate cleanup converges status |
