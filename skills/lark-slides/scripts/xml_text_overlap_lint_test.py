@@ -265,6 +265,27 @@ class XmlTextOverlapLintGeometryTest(unittest.TestCase):
         self.assertEqual(result["summary"]["error_count"], 0)
         self.assertEqual(result["summary"]["warning_count"], 0)
 
+    def test_lint_xml_allows_svg_subtree_inside_embed(self) -> None:
+        result = xml_text_overlap_lint.lint_xml(
+            """
+            <slide xmlns="http://www.larkoffice.com/sml/2.0">
+              <data>
+                <embed topLeftX="80" topLeftY="120" width="240" height="140">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 140">
+                    <rect x="10" y="10" width="220" height="120" rx="12" fill="#EFF6FF"/>
+                    <circle cx="70" cy="70" r="34" fill="#2563EB"/>
+                    <text x="130" y="76" font-size="18" fill="#1E3A8A">SVG OK</text>
+                  </svg>
+                </embed>
+              </data>
+            </slide>
+            """
+        )
+        codes = [issue["code"] for issue in result.get("issues", [])]
+        self.assertNotIn("sxsd_unsupported_tag", codes)
+        self.assertNotIn("sxsd_unsupported_attr", codes)
+        self.assertEqual(result["summary"]["error_count"], 0)
+
     def test_lint_xml_reports_sxsd_unsupported_tag_with_alias_hint(self) -> None:
         cases = [
             ("textbox", '<textbox topLeftX="80" topLeftY="80" width="300" height="60">Text</textbox>', '<shape type="text">'),
@@ -1356,6 +1377,9 @@ class XmlTextOverlapLintGeometryTest(unittest.TestCase):
                 <table id="table" topLeftX="400" topLeftY="60" width="220" height="120"></table>
                 <chart id="chart" topLeftX="640" topLeftY="60" width="220" height="120"/>
                 <whiteboard id="wb" topLeftX="80" topLeftY="220" width="760" height="240"/>
+                <embed id="emb" topLeftX="600" topLeftY="320" width="240" height="140">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 140"><rect x="0" y="0" width="240" height="140"/></svg>
+                </embed>
                 <shape id="missing-height" type="text" topLeftX="80" topLeftY="480" width="320">
                   <content><p>Skipped</p></content>
                 </shape>
@@ -1363,9 +1387,9 @@ class XmlTextOverlapLintGeometryTest(unittest.TestCase):
             </slide>
             """
         )
-        self.assertEqual([element["id"] for element in elements], ["photo", "headline", "table", "chart", "wb"])
-        self.assertEqual([element["kind"] for element in elements], ["img", "shape", "table", "chart", "whiteboard"])
-        self.assertEqual([element["order"] for element in elements], [0, 1, 2, 3, 4])
+        self.assertEqual([element["id"] for element in elements], ["photo", "headline", "table", "chart", "wb", "emb"])
+        self.assertEqual([element["kind"] for element in elements], ["img", "shape", "table", "chart", "whiteboard", "embed"])
+        self.assertEqual([element["order"] for element in elements], [0, 1, 2, 3, 4, 5])
         self.assertEqual(elements[1]["type"], "text")
         self.assertEqual(elements[1]["textType"], "headline")
         self.assertEqual(elements[1]["textAlign"], "center")
@@ -2403,6 +2427,25 @@ class XmlTextOverlapLintDensityTest(unittest.TestCase):
         )
 
         self.assertEqual(result["slides"][0]["issues"], [])
+
+    def test_lint_xml_does_not_report_blank_slide_for_embed_only_content(self) -> None:
+        result = xml_text_overlap_lint.lint_xml(
+            """
+            <slide xmlns="http://www.larkoffice.com/sml/2.0">
+              <data>
+                <embed id="emb" topLeftX="280" topLeftY="130" width="400" height="280">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 280">
+                    <circle cx="200" cy="140" r="100" fill="#2563EB"/>
+                  </svg>
+                </embed>
+              </data>
+            </slide>
+            """
+        )
+
+        self.assertEqual(result["summary"]["error_count"], 0)
+        codes = [issue["code"] for issue in result["slides"][0]["issues"]]
+        self.assertNotIn("blank_slide", codes)
 
     def test_lint_xml_does_not_report_blank_slide_for_line_only_content(self) -> None:
         result = xml_text_overlap_lint.lint_xml(

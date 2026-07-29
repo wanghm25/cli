@@ -403,7 +403,7 @@ def build_sxsd_tag_hint(tag_name: str, supported_tags: set[str]) -> str:
     if alias:
         return f"Use {alias} instead of <{tag_name}>."
     if tag_name == "svg":
-        return 'Inside <whiteboard>, write SVG as <svg xmlns="http://www.w3.org/2000/svg">...</svg>.'
+        return 'Inside <embed> or <whiteboard>, write SVG as <svg xmlns="http://www.w3.org/2000/svg">...</svg>.'
     close_matches = get_close_matches(tag_name, sorted(supported_tags), n=3, cutoff=0.72)
     if close_matches:
         return "Unsupported SXSD tag. Did you mean " + ", ".join(f"<{match}>" for match in close_matches) + "?"
@@ -424,7 +424,7 @@ def build_sxsd_attr_hint(tag_name: str, attr_name: str, allowed_attrs: set[str])
 
 
 def should_skip_sxsd_subtree(element: ET.Element, ancestors: list[str]) -> bool:
-    return "whiteboard" in ancestors and xml_namespace(element.tag) == SVG_NS
+    return ("whiteboard" in ancestors or "embed" in ancestors) and xml_namespace(element.tag) == SVG_NS
 
 
 def should_skip_sxsd_attribute(tag_name: str, attr_name: str) -> bool:
@@ -702,7 +702,7 @@ def parse_presentation(xml: str) -> dict[str, Any]:
 def extract_elements(slide_xml: str) -> list[dict[str, Any]]:
     elements: list[dict[str, Any]] = []
 
-    for match in re.finditer(r"<(shape|img|table|chart|whiteboard)\b([^>]*)>", slide_xml):
+    for match in re.finditer(r"<(shape|img|table|chart|whiteboard|embed)\b([^>]*)>", slide_xml):
         kind, attrs = match.group(1), match.group(2)
         is_self_closing = attrs.rstrip().endswith("/")
         content = ""
@@ -1917,7 +1917,7 @@ def slide_content_visual_bbox(
         # a straight horizontal/vertical line has zero width or height in one axis; clipped_bbox
         # treats zero-area rects as invisible, so pad to its rendered stroke thickness instead.
         return clipped_bbox(line_stroke_bbox(element), slide_bbox)
-    if element["kind"] in {"img", "chart", "table", "whiteboard", "icon", "polyline"}:
+    if element["kind"] in {"img", "chart", "table", "whiteboard", "embed", "icon", "polyline"}:
         return clipped_bbox(element, slide_bbox)
     return None
 
@@ -1955,7 +1955,7 @@ def is_slide_content_present(
 
 
 def is_large_visual_child(element: dict[str, Any], container: dict[str, Any]) -> bool:
-    if element["kind"] not in {"img", "chart", "table", "whiteboard"}:
+    if element["kind"] not in {"img", "chart", "table", "whiteboard", "embed"}:
         return False
     if not is_visually_rendered(element):
         return False
