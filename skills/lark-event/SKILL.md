@@ -1,7 +1,7 @@
 ---
 name: lark-event
 version: 1.0.0
-description: "Lark/Feishu real-time event listening / subscribing / consuming: stream events as NDJSON via `lark-cli event consume <EventKey>` (covers IM messages/reactions/chat changes, Approval status changes, Task updates, VC meeting started/joined/ended, Minutes generated, Whiteboard updated, etc.). Use for Lark bots, real-time message processing, long-running subscribers, streaming webhook/push handlers. Supports `--max-events` / `--timeout` bounded runs and a stderr ready-marker contract — designed for AI agents running as subprocesses."
+description: "Lark/Feishu real-time event listening, subscribing, and NDJSON streaming via `lark-cli event consume <EventKey>`. Use for long-running listeners, bounded event samples, bots, and push handlers. Not for one-time queries of current Approval, Task, IM, or meeting state; use the corresponding domain skill instead."
 metadata:
   requires:
     bins: ["lark-cli"]
@@ -30,11 +30,11 @@ metadata:
 |---|---|
 | `--param key=value` / `-p` | Business params (repeatable; comma-separated for multi-value). Unknown keys fail with valid names listed inline |
 | `--jq <expr>` | jq expression to filter / transform each event; empty output skips the event |
-| `--max-events N` | Exit after N events. Default 0 = unlimited |
+| `--max-events N` | Exit after N successfully emitted events. Default 0 = unlimited. Events skipped by params, processing, or `--jq` do not count|
 | `--timeout D` | Exit after duration D (e.g. `30s`, `2m`). Default 0 = no timeout. Whichever of `--max-events` / `--timeout` fires first wins |
-| `--output-dir <dir>` | Write each event as a file (relative paths only; prevents traversal) |
+| `--output-dir <dir>` | Write one JSON file per emitted event instead of stdout NDJSON (relative paths only) |
 | `--quiet` | Suppress stderr diagnostics. **AI should not use this** — it silences the ready marker |
-| `--as user\|bot\|auto` | Identity for the session (see lark-shared) |
+| `--as user\|bot` | Explicit session identity (recommended for Agents). If omitted, the CLI auto-resolves an identity from the current configuration |
 
 
 ## Examples
@@ -70,10 +70,10 @@ Some EventKeys aren't consumed directly — `list`/`schema` are still the source
 2. If present, read `key_templates[]` from the `schema` output and pick one — `key_templates[].example` is a ready-to-use materialized key (e.g. `im.message.example_v1/chat-id/oc_9f3b1c2d8a`).
 3. Prefer `lark-cli event consume <materialized-key> --dry-run --as ...` (or `lark-cli event subscription create <materialized-key> --dry-run --json`) first — refined consume has write-level remote side effects (it may create/reuse/reactivate a remote resource) even though the command itself reads as "just consume".
 4. Drop `--dry-run` to actually consume — same NDJSON/ready-marker/exit-code contract as any other key.
-5. Manage the remote resource independently of the local consumer via `lark-cli event subscription list|get|create|update|renew|reactivate|delete`, keyed by `remote_subscription_id` (from `create`'s or `list`'s output) — this is a *separate* control plane from the local `event consume` process.
-6. Stop chain: `event stop` (or SIGTERM/stdin-close) only stops the LOCAL streaming process; `event subscription delete <remote_subscription_id> --yes` only removes the REMOTE resource. Neither implies the other — see the reference below for the full teardown sequence.
+5. Use `lark-cli event subscription list|get|create|update|renew|reactivate|delete` to inspect or change the remote resource by `remote_subscription_id`. These commands do not start or stop the local `event consume` process.
+6. To stop one consume process, send SIGTERM; closing stdin also works for an unbounded run. `event stop` targets the shared bus daemon, not one consumer; it refuses active consumers unless `--force`, which may disconnect every consumer on that bus. `event subscription delete <remote_subscription_id> --yes` only removes the REMOTE resource. See the reference below for the full teardown sequence.
 
-Full details (templates, TTL/renew, the `--as` identity gate and `stale_identity`, the automatic lifecycle recovery behavior, the management-plane command/scope/confirmation table, and `--include-resource-data` encryption — user-identity-only, mechanism, key lifecycle, `event:encrypt_key:read` scope, conflict matrix, rotation-via-recreate, and redaction) are in [`references/refined-subscription.md`](references/refined-subscription.md) — read it before using any `event subscription` command or any refined (templated) EventKey.
+Full details (templates, server-side `--filter`, identity selection, management commands/scopes/confirmation, stopping, and `--include-resource-data`) are in [`references/refined-subscription.md`](references/refined-subscription.md) — read it before using any `event subscription` command or refined EventKey.
 
 ## Subprocess contract
 
@@ -101,6 +101,7 @@ On exit, the last stderr line is `[event] exited — received N event(s) in Xs (
 | 2 | JSON error envelope on stderr (no `exited` line) | Validation failure (unknown EventKey, bad `--param` / `--jq`, another bus already connected) |
 | 3 | JSON error envelope on stderr | Auth failure (missing token, missing scopes) |
 | 4 / 5 | JSON error envelope on stderr | Network / internal failure (bus startup, handshake, file I/O) |
+| 10 | `confirmation_required` JSON envelope | A subscription update/delete requires explicit human confirmation before retrying with `--yes` |
 
 Startup and runtime failures emit a structured JSON envelope on stderr: `{"ok":false,"error":{"type","subtype","param","message","hint",...}}` (the envelope may also carry top-level `identity` / `_notice` siblings). Parse `error.type` / `error.subtype` to branch (e.g. `missing_scope` carries a `missing_scopes` list), `error.param` to find the offending flag, and `error.hint` for the recovery action — do not regex-match message text.
 
@@ -168,4 +169,4 @@ Lark-defined semantic tags (**not** JSON Schema's standard `format`). Common val
 | VC         | [`references/lark-event-vc.md`](references/lark-event-vc.md)                 | Catalog of 4 VC EventKeys (`vc.meeting.participant_meeting_started_v1`, `vc.meeting.participant_meeting_joined_v1`, `vc.meeting.participant_meeting_ended_v1`, `vc.note.generated_v1`) + field reference + source type semantics (meeting only) |
 | Minutes    | [`references/lark-event-minutes.md`](references/lark-event-minutes.md)       | Catalog of 1 Minutes EventKey (`minutes.minute.generated_v1`) + field reference + source type semantics (meeting only) |
 | Whiteboard | [`references/lark-event-whiteboard.md`](references/lark-event-whiteboard.md) | Catalog of 1 Board EventKey (`board.whiteboard.updated_v1`) + per-whiteboard subscription model (requires `-p whiteboard_id=<token>`) + payload field reference (whiteboard_id / operator_ids triple-id) |
-| Refined subscriptions | [`references/refined-subscription.md`](references/refined-subscription.md) | Cross-cutting: `key_templates`/materialization/`--dry-run`, TTL/renew, the `--as` identity gate + `stale_identity`, the 6-event lifecycle control plane, the `event subscription` management plane (scope/confirmation table), the stop chain, and `--include-resource-data` encryption (mechanism, key lifecycle, conflict matrix, redaction) |
+| Refined subscriptions | [`references/refined-subscription.md`](references/refined-subscription.md) | Agent guide for `key_templates`, `--dry-run`, server-side Filter, identity selection, Subscription management commands, confirmation, stopping, and `--include-resource-data` |
