@@ -65,19 +65,16 @@ func NewCmdCreate(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "create <refined EventKey>",
 		Short: "Create (or idempotently reuse) a remote event Subscription",
-		Long: `Create a remote Subscription for a materialized refined EventKey (e.g.
-'im.message.example_v1/chat-id/oc_xxx'), or idempotently reuse an existing
-compatible one.
+		Long: `Create a remote Subscription for a materialized refined EventKey.
 
 A bare refined base key (no template segment) is rejected — pass a
 materialized key such as one of the key_templates[].example values from
 'event schema <base> --json'.
 
-IDENTITY: --as user|bot|auto. The resolved identity must be supported by the
-EventKey's matched KeyTemplate SPECIFICALLY (not just the EventKey in
-general) — e.g. the 'owner/me' template only supports --as user even though
-its base key allows user+bot. A mismatch is a typed error naming the
-allowed identities; it never silently falls back to another identity.
+IDENTITY: --as user|bot|auto. For identity requirements, strictly adhere to 
+the KeyTemplate. If the KeyTemplate does not have identity requirements, 
+then adhere to the BaseKey requirements. A mismatch is a typed error naming 
+the allowed identities; it never silently falls back to another identity.
 
 SCOPE: requires BOTH event:subscription:read and event:subscription:write;
 --include-resource-data=true ALSO requires --as user and event:encrypt_key:read
@@ -94,20 +91,13 @@ failed_precondition guiding you to 'get' or 'reactivate' instead.
 NEXT STEP: creating a subscription does not start listening — run 'event
 consume <refined EventKey>' afterwards.
 
-SAFETY: --include-resource-data=true includes resource data in delivered
-events. Resource data is delivered encrypted by the platform and decrypted by
-the CLI before output; users and agents do not manage keys or decryption. A
-failed create never falls back to a subscription without resource data. An
-existing remote subscription with a conflicting include_resource_data setting
-is a typed failed_precondition (human decision: verify it, or delete and
-recreate) — never silently resolved. Use --dry-run to preview the plan
-(parse/identity/scope preflight + a remote read + impact analysis) without
-creating, reusing, or changing anything; create never requires --yes
-(additive and pre-checked for conflicts).`,
-		Example: `  lark-cli event schema im.message.example_v1 --json                                          # find key_templates[].example first
-  lark-cli event subscription create im.message.example_v1/chat-id/oc_xxx --dry-run --as bot --json
-  lark-cli event subscription create im.message.example_v1/chat-id/oc_xxx --as bot --json
-  lark-cli event subscription create im.message.example_v1/owner/me --as user --json               # fixed-value template, user only`,
+SAFETY: --include-resource-data=true includes resource data in delivered events. 
+Resource data is delivered encrypted by the platform and decrypted by the CLI 
+before output; users and agents do not manage keys or decryption. 
+Use --dry-run to preview the plan (parse/identity/scope preflight + a remote 
+read + impact analysis) without creating, reusing, or changing anything; 
+create never requires --yes (additive and pre-checked for conflicts).`,
+
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCreate(cmd, f, args[0], o)
@@ -115,7 +105,7 @@ creating, reusing, or changing anything; create never requires --yes
 	}
 
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
-		"Include resource data in delivered events. Requires --as user and scope event:encrypt_key:read; the platform delivers resource data encrypted and the CLI decrypts it before output.")
+		"This flag requires a refined key and must be user-only; legacy key or --as bot/auto→bot will be rejected. Required scope: event:encrypt_key:read")
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the plan (identity/scope preflight + remote read + impact analysis) without creating, reusing, or changing anything")
 	cmd.Flags().BoolVar(&o.asJSON, "json", false, "Emit the result as JSON (for AI / scripts)")

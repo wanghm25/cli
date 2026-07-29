@@ -46,13 +46,10 @@ SCOPE: event:subscription:read.
 OUTPUT: {remote_subscription_id, event_key, target_resource, identity,
 user_open_id, payload_options, remote{state, expire_time, suspension_reason,
 create_time, update_time}}. identity is the exact --as token ('bot' | 'user');
-user_open_id carries the owning user's open_id. The 'local' field is reserved
-for a future change once
-local-consumer association ('event consume' <-> remote subscription)
-exists; it is always omitted for now.
-
-NEXT STEP: 'lark-cli event status' shows any LOCAL consumer currently bound
-to this same remote_subscription_id, if one is running.
+user_open_id carries the owning user's open_id. The local field is emitted 
+only when a running local event consume process is known to be bound to this 
+remote_subscription_id. Local consumer discovery is best-effort; if no bus 
+is reachable or no matching consumer is found, local is omitted.
 
 SAFETY: read-only; never writes, never requires --yes.`,
 		Example: `  lark-cli event subscription get sub_xxx --as bot --json`,

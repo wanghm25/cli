@@ -39,23 +39,21 @@ func NewCmdStatus(f *cmdutil.Factory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show event bus daemon status for all discovered apps",
-		Long: `Connect to each bus daemon under the config-dir/events/ tree and show PID,
-uptime, and active consumers. Use --current for only the current profile's
-app. Use --json for machine-readable output. Use --fail-on-orphan to exit 2
-when any orphan bus is detected (for health checks).
+		Long: `Connect to each bus daemon under the config-dir/events/ tree and show 
+PID, uptime, and active consumers. Use --current for only the current 
+profile's app. Use --json for machine-readable output. 
+Use --fail-on-orphan to exit 2 when any orphan bus is detected (for health checks).
 
-SCOPE: the local view (bus in-memory state) needs no scope and is always
-shown. For a refined consumer, remote_state/expire_time/
-include_resource_data are additionally supplemented from a live 'subscription
-get' call, but ONLY as a weak, optional dependency: it requires event:subscription:read; 
-a missing scope silently fall back to the local-only view — this never fails the command.
+SCOPE: the local view (bus in-memory state) needs no scope and is always shown. 
+For a refined consumer, remote_state/expire_time/include_resource_data are 
+additionally supplemented from a live 'subscription get' call, but ONLY as a 
+weak, optional dependency: It requires event:subscription:read. 
+When the scope is missing, it silently falls back to the local-only view, 
+which never fails the command.
 
-OUTPUT: current_profile_match/stale_identity are advisory/informational
-only — they never mean "this consumer is dead"; no liveness signal exists
-here. next_action is read-only guidance, never an action this command takes
-itself.
-
-SAFETY: strictly read-only end to end.`,
+OUTPUT: current_profile_match/stale_identity are advisory/informational only — they 
+never mean "this consumer is dead"; no liveness signal exists here. 
+next_action is for reference only. never an action this command takes.`,
 		Example: `  lark-cli event status --json
   lark-cli event status --current --json
   lark-cli event status --fail-on-orphan`,

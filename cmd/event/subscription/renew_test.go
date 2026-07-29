@@ -129,8 +129,8 @@ func TestApplyRenew_Active_CallsRenew(t *testing.T) {
 	}
 }
 
-// TestApplyRenew_ExpiredState_FailsClosed_NoRenewCall locks the P2 fail-closed
-// policy for renew: a state outside {active, suspended} (here expired) returns a
+// TestApplyRenew_ExpiredState_FailsClosed_NoRenewCall locks the fail-closed
+// policy for renew: a non-active state (here expired) returns a
 // failed_precondition and never calls Renew.
 func TestApplyRenew_ExpiredState_FailsClosed_NoRenewCall(t *testing.T) {
 	fake := &fakeRenewAPI{getSub: remotePtr(stateRemote("sub_1", "expired"))}
@@ -145,7 +145,27 @@ func TestApplyRenew_ExpiredState_FailsClosed_NoRenewCall(t *testing.T) {
 		t.Fatalf("err = %v (%T), want a failed_precondition ValidationError", err, err)
 	}
 	if fake.renewCalls != 0 {
-		t.Errorf("renewCalls = %d, want 0: a non-{active,suspended} state must fail closed", fake.renewCalls)
+		t.Errorf("renewCalls = %d, want 0: a non-active state must fail closed", fake.renewCalls)
+	}
+}
+
+// TestApplyRenew_SuspendedState_FailsClosed_NoRenewCall locks that renew is
+// ACTIVE-ONLY: a suspended subscription must be reactivated first, so renewing
+// it fails closed (a failed_precondition, no Renew call).
+func TestApplyRenew_SuspendedState_FailsClosed_NoRenewCall(t *testing.T) {
+	fake := &fakeRenewAPI{getSub: subPtr(suspendedSub("sub_1", "authority_revoked"))}
+	before, err := getSubscription(context.Background(), fake, "sub_1")
+	if err != nil {
+		t.Fatalf("getSubscription: %v", err)
+	}
+
+	err = applyRenew(context.Background(), fake, io.Discard, "sub_1", eventlib.CommandContext{Identity: core.AsUser}, renewOpts{}, before, true)
+	var ve *errs.ValidationError
+	if !errors.As(err, &ve) || ve.Subtype != errs.SubtypeFailedPrecondition {
+		t.Fatalf("err = %v (%T), want a failed_precondition ValidationError", err, err)
+	}
+	if fake.renewCalls != 0 {
+		t.Errorf("renewCalls = %d, want 0: renew is active-only, a suspended subscription must fail closed", fake.renewCalls)
 	}
 }
 

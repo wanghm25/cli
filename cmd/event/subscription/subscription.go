@@ -66,33 +66,18 @@ identity check for them; only 'create' enforces one, since it is the sole
 subcommand that takes an EventKey (see 'event subscription create --help').
 
 SCOPE: list/get need event:subscription:read only. create/update/renew/
-reactivate/delete need BOTH event:subscription:read AND
-event:subscription:write — every one of those always reads remote state
-first (for idempotency / conflict / impact analysis) before it may write,
-so read is required even where the underlying platform call alone would
-not strictly need it.
+reactivate/delete need BOTH event:subscription:read AND event:subscription:write.
 
 SAFETY: 'delete' is a high-risk write on a resource other identities/
 processes may share and requires --yes after a human confirms — without
 it, a typed confirmation-required error (exit code 10); 'update' requires
 --yes when a filter change affects — or, if a discovered local bus cannot be
 queried, cannot be confirmed NOT to affect — a running local consumer (same
-exit code 10), and never prompts otherwise; create/renew/reactivate never
-prompt for confirmation (a renew or reactivate is reversible). Every
-subcommand except list/get
+exit code 10), and never prompts otherwise. Every subcommand except list/get
 supports --dry-run (parse + identity + scope preflight + a remote read +
 impact analysis, zero writes). 'delete' removing the remote Subscription is
-NOT a substitute for stopping a local 'event consume' process still bound
-to it — stop that separately with 'lark-cli event stop'.
+NOT a substitute for stopping a local 'event consume' process.`,
 
-NEXT STEP: after 'create' succeeds, run 'lark-cli event consume <refined
-EventKey>' to actually start receiving events — creating/updating a
-Subscription here never starts, stops, or changes a local consumer.`,
-		Example: `  lark-cli event subscription list --as bot --json
-  lark-cli event subscription get sub_xxx --as bot --json
-  lark-cli event subscription create im.message.example_v1/chat-id/oc_xxx --dry-run --as bot --json
-  lark-cli event subscription update sub_xxx --clear-filter --dry-run --as bot --json
-  lark-cli event subscription delete sub_xxx --dry-run --as bot --json`,
 		SilenceUsage: true,
 	}
 
@@ -460,8 +445,11 @@ func classifyMutation(operation, state string) mutationDecision {
 			return mutationBlocked
 		}
 	case "renew":
+		// Renew extends TTL and is valid ONLY for an active subscription. A
+		// suspended one must be reactivated first (renewing it is fail-closed), and
+		// an expired/unknown one is likewise blocked.
 		switch state {
-		case "active", "suspended":
+		case "active":
 			return mutationProceed
 		default:
 			return mutationBlocked
@@ -476,19 +464,14 @@ func classifyMutation(operation, state string) mutationDecision {
 // runs before the dry-run branch), sharing classifyMutation with the real run so
 // the preview always matches what the real run would do — including a "blocked"
 // plan for a state the real run fails closed on.
-func mutationDryRunPlan(operation, remoteSubscriptionID, state string, cmdCtx eventlib.CommandContext) (plannedAction, nextAction string) {
+func mutationDryRunPlan(operation, remoteSubscriptionID, state string) (plannedAction, nextAction string) {
 	switch classifyMutation(operation, state) {
 	case mutationNoop:
 		return "noop", fmt.Sprintf("remote_subscription_id=%s is already active; no reactivation is needed", remoteSubscriptionID)
 	case mutationBlocked:
 		return "blocked", blockedMutationHint(operation, remoteSubscriptionID, state)
 	}
-	// proceed
-	if operation == "renew" && state == "suspended" {
-		// The reactivate cross-reference is a real runnable command, so it carries
-		// the same owning --profile/--as as the renew (same owner) via cmdCtx.
-		return "renew", fmt.Sprintf("run without --dry-run to renew remote_subscription_id=%s; it stays suspended — run `%s event subscription reactivate %s%s` to resume delivery", remoteSubscriptionID, cmdCtx.CLIHead(), remoteSubscriptionID, cmdCtx.AsFlag())
-	}
+	// proceed: renew/reactivate on their one valid state re-run the same command.
 	return operation, fmt.Sprintf("run without --dry-run to %s remote_subscription_id=%s", operation, remoteSubscriptionID)
 }
 
@@ -500,7 +483,7 @@ func blockedMutationHint(operation, remoteSubscriptionID, state string) string {
 	case "reactivate":
 		return fmt.Sprintf("cannot reactivate remote_subscription_id=%s in state %q — only a suspended subscription can be reactivated; if it has expired, recreate it with `lark-cli event subscription create`", remoteSubscriptionID, stateOrUnknown(state))
 	case "renew":
-		return fmt.Sprintf("cannot renew remote_subscription_id=%s in state %q — only an active or suspended subscription can be renewed; if it has expired, recreate it with `lark-cli event subscription create`", remoteSubscriptionID, stateOrUnknown(state))
+		return fmt.Sprintf("cannot renew remote_subscription_id=%s in state %q — only an active subscription can be renewed; reactivate a suspended one first (`lark-cli event subscription reactivate`), or recreate an expired one with `lark-cli event subscription create`", remoteSubscriptionID, stateOrUnknown(state))
 	default:
 		return fmt.Sprintf("cannot %s remote_subscription_id=%s in state %q", operation, remoteSubscriptionID, stateOrUnknown(state))
 	}

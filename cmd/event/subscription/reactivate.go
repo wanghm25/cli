@@ -53,7 +53,8 @@ func NewCmdReactivate(f *cmdutil.Factory) *cobra.Command {
 		Use:   "reactivate <remote_subscription_id>",
 		Short: "Resume delivery on a suspended remote event Subscription",
 		Long: `Reactivate an existing remote Subscription by its remote_subscription_id,
-resuming delivery after it was suspended.
+resuming delivery after it was suspended. reactivate only resumes remote 
+delivery, it never starts, stops, or changes a local consumer.
 
 IDENTITY: --as user|bot|auto, resolved to one effective identity (no
 per-template check — this command carries no EventKey context).
@@ -64,17 +65,12 @@ for --dry-run.
 
 OUTPUT: {operation, remote_subscription_id, subscription{...}, next_action}.
 
-NEXT STEP: a local 'event consume' process may still need to be (re)started
-separately — reactivate only resumes remote delivery, it never starts,
-stops, or changes a local consumer. Run 'lark-cli event status' to check.
-
 SAFETY: reactivate only resumes remote delivery — it is NOT a high-risk
 confirmation-gated action and does not accept --yes. There is no 'suspend'
 command (the platform exposes none); the only path back from suspended is
 this command. Use --dry-run to preview the plan without reactivating
 anything.`,
-		Example: `  lark-cli event subscription reactivate sub_xxx --dry-run --as bot --json
-  lark-cli event subscription reactivate sub_xxx --as bot --json`,
+
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runReactivate(cmd, f, args[0], o)
@@ -139,7 +135,7 @@ func applyReactivate(ctx context.Context, svc reactivateSubscriptionAPI, out io.
 	if o.dryRun {
 		// Plan from the OBSERVED remote state: an already-active subscription is a
 		// no-op, not a fresh reactivation.
-		plannedAction, nextAction := mutationDryRunPlan("reactivate", remoteSubscriptionID, before.Remote.State, cmdCtx)
+		plannedAction, nextAction := mutationDryRunPlan("reactivate", remoteSubscriptionID, before.Remote.State)
 		result := buildMutationDryRunResult("reactivate", remoteSubscriptionID, cmdCtx.Identity, scopesVerified, before,
 			plannedAction, false, reactivateLocalImpactNote, nextAction)
 		if o.asJSON {

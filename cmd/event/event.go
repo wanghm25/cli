@@ -20,7 +20,7 @@ Two shapes of EventKey:
   - legacy : consume directly, e.g. 'event consume im.message.receive_v1'.
   - refined (per-resource): the key must be materialized with a resource
     selector before it can be consumed or subscribed, e.g.
-    'im.message.receive_v2/chat-id/oc_xxx'. Check 'event schema <key> --json'
+    'im.message.example_v1/chat-id/oc_xxx'. Check 'event schema <key> --json'
     for refined_subscription:true + key_templates before using one.
 
 Subcommands:
@@ -38,12 +38,8 @@ SAFETY: Refined EventKey subscriptions are remote resources. Commands that
 create, update, reactivate, or delete them can affect later consumers. Prefer
 --help or --dry-run first when in doubt.
 
-NEXT STEP: 'lark-cli event list --json' to see what's available, then
+NEXT STEP: 'lark-cli event list' to see what's available, then
 'lark-cli event schema <EventKey> --json' for details.`,
-		Example: `  lark-cli event list --json
-  lark-cli event schema im.message.example_v1 --json
-  lark-cli event consume im.message.example_v1/chat-id/oc_xxx --dry-run --as bot
-  lark-cli event subscription list --as bot --json`,
 		// Without SilenceUsage, RunE errors print the full flag help banner.
 		SilenceUsage: true,
 	}

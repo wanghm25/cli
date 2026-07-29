@@ -90,18 +90,11 @@ The filter is the only field update changes. Pass exactly one of:
 IDENTITY: --as user|bot|auto, resolved to one effective identity (no
 per-template check — this command carries no EventKey context).
 
-SCOPE: requires BOTH event:subscription:read and event:subscription:write:
-this command always reads the current subscription first — to learn the
-event type its --filter is validated against, and to skip a no-op write when
-the requested filter already matches — before it may patch.
+SCOPE: requires BOTH event:subscription:read and event:subscription:write.
 
 OUTPUT: {operation, remote_subscription_id, subscription{...}, next_action}.
 When the requested filter already matches the current one, no write is
 issued and the result reports the unchanged subscription.
-
-NEXT STEP: run 'lark-cli event subscription get <remote_subscription_id>
---json' to confirm the new filter. A running local 'event consume' process
-keeps its current filter until it re-syncs — check 'lark-cli event status'.
 
 SAFETY: a filter change is reversible with another update, so update is a
 plain write in the common case. It requires --yes when a running local
@@ -114,8 +107,7 @@ affected consumers) without patching anything.
 Resource-data delivery (include_resource_data) cannot be changed here at all;
 to change it, delete the subscription and create a new one after human
 confirmation.`,
-		Example: `  lark-cli event subscription update sub_xxx --clear-filter --dry-run --as bot --json
-  lark-cli event subscription update sub_xxx --filter '{"composite_condition":{"logic_op":"and","composite_conditions":[{"condition":{"operand":"message_type","op":"eq","value":"text"}}]}}' --yes --as bot --json`,
+
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runUpdate(cmd, f, args[0], o)

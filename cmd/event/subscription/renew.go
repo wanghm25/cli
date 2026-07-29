@@ -52,7 +52,7 @@ func NewCmdRenew(f *cmdutil.Factory) *cobra.Command {
 		Use:   "renew <remote_subscription_id>",
 		Short: "Renew (extend the TTL of) a remote event Subscription",
 		Long: `Renew an existing remote Subscription by its remote_subscription_id,
-extending its TTL.
+extending its TTL. Only the active state can be renewed.
 
 IDENTITY: --as user|bot|auto, resolved to one effective identity (no
 per-template check — this command carries no EventKey context).
@@ -73,8 +73,7 @@ renewing anything. Note: the bus also renews automatically (best-effort,
 single attempt, no retry) on receiving an expiration reminder for a
 Subscription with a matching active local consumer — see 'lark-cli event
 status' for whether that already happened.`,
-		Example: `  lark-cli event subscription renew sub_xxx --dry-run --as bot --json
-  lark-cli event subscription renew sub_xxx --as bot --json`,
+
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runRenew(cmd, f, args[0], o)
@@ -137,7 +136,7 @@ func runRenew(cmd *cobra.Command, f *cmdutil.Factory, remoteSubscriptionID strin
 func applyRenew(ctx context.Context, svc renewSubscriptionAPI, out io.Writer, remoteSubscriptionID string, cmdCtx eventlib.CommandContext, o renewOpts, before *subscriptionRow, scopesVerified bool) error {
 	if o.dryRun {
 		// Plan from the OBSERVED remote state, not a static assumption.
-		plannedAction, nextAction := mutationDryRunPlan("renew", remoteSubscriptionID, before.Remote.State, cmdCtx)
+		plannedAction, nextAction := mutationDryRunPlan("renew", remoteSubscriptionID, before.Remote.State)
 		result := buildMutationDryRunResult("renew", remoteSubscriptionID, cmdCtx.Identity, scopesVerified, before,
 			plannedAction, false, renewLocalImpactNote, nextAction)
 		if o.asJSON {

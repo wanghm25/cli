@@ -94,25 +94,14 @@ reactivate a Subscription). A legacy key only needs its own declared scopes
 SAFETY: for a refined key, consuming has write-level side effects (create,
 reuse, or reactivate a remote Subscription) even though this command reads
 as pure observe — run with --dry-run first to preview the plan with zero
-writes. Unlike a legacy key, exiting a refined consumer never deletes the
-remote Subscription (there is no cleanup hook): it is TTL-persistent and
-reused by the next matching consume/create — delete it explicitly via
-'event subscription delete' if you no longer want it to exist.
+writes. 
 
-INCLUDE-RESOURCE-DATA: --include-resource-data (default false) mirrors the
-same-named flag on 'event subscription create'. Passing
---include-resource-data=true on a refined key includes resource data in
-delivered events and REQUIRES --as user (resource data is user-only;
---as bot/auto→bot is rejected as invalid_argument). Resource data is delivered
-encrypted by the platform and decrypted by the CLI before output; agents do not
-need to manage keys or decryption. This additionally requires scope
-event:encrypt_key:read on the resolved identity. Passing
---include-resource-data=true on an ORDINARY
-(non-refined) key is always rejected as typed invalid_argument: the flag only
-ever controls a refined key's remote Subscription, so it can never silently
-no-op there.`,
+INCLUDE-RESOURCE-DATA: Include resource data requires that it must be 
+refined key and user-only; legacy key or --as bot/auto→bot will be rejected. 
+the platform delivers resource data encrypted and the CLI decrypts it 
+before output(You don't need to pay attention to this process). Therefore, 
+in case Include resource data, the scope event:encrypt_key:read is required.`,
 		Example: `  lark-cli event consume im.message.receive_v1 --as bot                        # legacy key: unlimited stream
-  lark-cli event schema im.message.example_v1 --json                            # refined key: find its templates first
   lark-cli event consume im.message.example_v1/chat-id/oc_xxx --dry-run --as bot  # preview the refined plan, zero writes
   lark-cli event consume im.message.example_v1/chat-id/oc_xxx --as bot          # apply the plan, then stream`,
 		Args: cobra.ExactArgs(1),
@@ -134,7 +123,7 @@ no-op there.`,
 	cmd.Flags().BoolVar(&o.dryRun, "dry-run", false,
 		"Preview the refined-subscription remote-write plan (probe + plan only) without applying it, starting the bus, or writing anything remote. No-op for legacy (non-refined) EventKeys, which never write remote state at all.")
 	cmd.Flags().BoolVar(&o.includeResourceData, "include-resource-data", false,
-		"Include resource data in delivered events for a refined key. Requires --as user and scope event:encrypt_key:read; the platform delivers resource data encrypted and the CLI decrypts it before output. Always rejected as invalid_argument on an ordinary (non-refined) key.")
+		"This flag requires a refined key and must be user-only; legacy key or --as bot/auto→bot will be rejected. Required scope: event:encrypt_key:read")
 	cmd.Flags().StringVar(&o.filter, "filter", "",
 		"Inline `json` event filter to apply server-side for a refined key; validated against this event type's filter schema (see 'event schema <key> --json'). Omit for no filter. Rejected as invalid_argument on an ordinary (non-refined) key.")
 	// Static default: "write", not "read". A single risk_level annotation
