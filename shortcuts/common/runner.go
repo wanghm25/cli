@@ -868,6 +868,7 @@ func (ctx *RuntimeContext) emitFinalized(
 				return
 			}
 			if ctx.JqExpr != "" {
+				fmt.Fprintln(ctx.IO().ErrOut, "error: jq projection failed after the IM write completed; inspect --jq")
 				ctx.writeIMJQFallback(contractResult)
 				return
 			}

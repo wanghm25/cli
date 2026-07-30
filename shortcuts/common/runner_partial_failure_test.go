@@ -141,11 +141,12 @@ func TestIMContractPartialPresentationFallbackKeepsCountsWithoutItems(t *testing
 	if output.ExitCodeOf(rt.outputErr) != output.ExitAPI {
 		t.Fatalf("output error = %T %v", rt.outputErr, rt.outputErr)
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
+	if !strings.Contains(stderr.String(), "error: jq projection failed after the IM write completed; inspect --jq") {
+		t.Fatalf("stderr did not identify the jq failure: %q", stderr.String())
 	}
-	if strings.Contains(stdout.String(), secret) || strings.Contains(rt.outputErr.Error(), secret) {
-		t.Fatalf("fallback leaked item or jq detail: stdout=%q err=%v", stdout.String(), rt.outputErr)
+	if strings.Contains(stdout.String(), secret) || strings.Contains(stderr.String(), secret) ||
+		strings.Contains(rt.outputErr.Error(), secret) {
+		t.Fatalf("fallback leaked item or jq detail: stdout=%q stderr=%q err=%v", stdout.String(), stderr.String(), rt.outputErr)
 	}
 	var env map[string]any
 	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {

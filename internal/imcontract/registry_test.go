@@ -89,8 +89,8 @@ func TestReadRegistryCoverage(t *testing.T) {
 		t.Fatalf("read contracts = %d, want 24", len(gotKeys))
 	}
 	wantCounts := map[StrategyKind]int{
-		EntityReadKind:      9,
-		CollectionReadKind:  12,
+		EntityReadKind:      8,
+		CollectionReadKind:  13,
 		SearchReadKind:      2,
 		MaterializeReadKind: 1,
 	}
@@ -127,5 +127,15 @@ func TestReadRegistryCoverage(t *testing.T) {
 	}
 	if !slices.Equal(gotKeys, wantKeys) {
 		t.Fatalf("read registry keys differ:\ngot  %v\nwant %v", gotKeys, wantKeys)
+	}
+}
+
+func TestModerationGetUsesCollectionCompletenessContract(t *testing.T) {
+	c, ok := Lookup("im chat.moderation get")
+	if !ok {
+		t.Fatal("moderation get contract missing")
+	}
+	if c.Strategy.Kind != CollectionReadKind || c.HelpPolicy != HelpCompleteness {
+		t.Fatalf("unexpected moderation get contract: %#v", c)
 	}
 }

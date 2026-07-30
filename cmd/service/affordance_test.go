@@ -161,7 +161,7 @@ func TestPrepareMethodHelpPreservesAffordanceAndAddsContractOnce(t *testing.T) {
 		"id": "chat.moderation.update", "path": "chats/{chat_id}/moderation", "httpMethod": "PUT", "description": "Update moderation",
 	}
 	cmd := NewCmdServiceMethod(f, imSpec(), meta.FromMap(m), "update", "chat.moderation", nil)
-	if strings.Contains(cmd.Long, "Guarantee:") {
+	if strings.Contains(cmd.Long, imcontract.HelpAcceptanceOnly.Text()) {
 		t.Fatalf("contract help must stay lazy at build time:\n%s", cmd.Long)
 	}
 
@@ -183,6 +183,28 @@ func TestPrepareMethodHelpPreservesAffordanceAndAddsContractOnce(t *testing.T) {
 	schemaAt := strings.Index(cmd.Long, "Full parameter schema:")
 	if contractAt < 0 || schemaAt < 0 || contractAt > schemaAt {
 		t.Fatalf("contract help must precede schema pointer:\n%s", cmd.Long)
+	}
+}
+
+func TestModerationGetHelpAdvertisesPaginationCompleteness(t *testing.T) {
+	f, _, _, _ := cmdutil.TestFactory(t, testConfig)
+	m := map[string]interface{}{
+		"id": "chat.moderation.get", "path": "chats/{chat_id}/moderation", "httpMethod": "GET",
+		"description": "Get moderation", "risk": "read",
+		"parameters": map[string]interface{}{
+			"chat_id":    map[string]interface{}{"type": "string", "location": "path", "required": true},
+			"page_token": map[string]interface{}{"type": "string", "location": "query"},
+		},
+	}
+	cmd := NewCmdServiceMethod(f, imSpec(), meta.FromMap(m), "get", "chat.moderation", nil)
+	if flag := cmd.Flags().Lookup("page-all"); flag == nil || flag.Hidden {
+		t.Fatalf("moderation get must expose --page-all: %#v", flag)
+	}
+	if !PrepareMethodHelp(cmd, nil) {
+		t.Fatal("PrepareMethodHelp returned false")
+	}
+	if !strings.Contains(cmd.Long, imcontract.HelpCompleteness.Text()) {
+		t.Fatalf("moderation get help omitted completeness contract:\n%s", cmd.Long)
 	}
 }
 

@@ -382,6 +382,15 @@ func buildMethodCommand(ctx context.Context, f *cmdutil.Factory, spec methodComm
 
 func serviceMethodRun(opts *ServiceMethodOptions) error {
 	f := opts.Factory
+	contract, contractFound := imcontract.Lookup(opts.ContractKey)
+	contractManagedWrite := contractFound && contract.Strategy.Kind.IsWrite()
+	contractManagedRead := contractFound && contract.Strategy.Kind.IsRead()
+	if contractManagedRead && opts.PageAll &&
+		contract.Strategy.Kind != imcontract.CollectionReadKind &&
+		contract.Strategy.Kind != imcontract.SearchReadKind {
+		return newIMReadPageAllValidationError()
+	}
+
 	opts.As = f.ResolveAs(opts.Ctx, opts.Cmd, opts.As)
 
 	if err := f.CheckStrictMode(opts.Ctx, opts.As); err != nil {
@@ -401,9 +410,6 @@ func serviceMethodRun(opts *ServiceMethodOptions) error {
 	if err := output.ValidateJqFlags(opts.JqExpr, opts.Output, opts.Format); err != nil {
 		return err
 	}
-	contract, contractFound := imcontract.Lookup(opts.ContractKey)
-	contractManagedWrite := contractFound && contract.Strategy.Kind.IsWrite()
-	contractManagedRead := contractFound && contract.Strategy.Kind.IsRead()
 	if contractManagedWrite && opts.Output != "" {
 		return errs.NewValidationError(errs.SubtypeInvalidArgument,
 			"--output is not supported for contract-managed IM write commands").
@@ -577,6 +583,12 @@ func servicePaginateIMRead(
 	format output.Format,
 	session *imcontract.ReadSession,
 ) error {
+	if session == nil {
+		return errs.NewInternalError(errs.SubtypeInvalidResponse, "IM paginated read requires a read session")
+	}
+	if !session.RequiresPagination() {
+		return newIMReadPageAllValidationError()
+	}
 	pagOpts := client.PaginationOptions{
 		PageLimit:          opts.PageLimit,
 		PageDelay:          opts.PageDelay,
@@ -595,6 +607,13 @@ func servicePaginateIMRead(
 		return err
 	}
 	return writeIMReadResult(opts, format, result, merged)
+}
+
+func newIMReadPageAllValidationError() error {
+	return errs.NewValidationError(
+		errs.SubtypeInvalidArgument,
+		"--page-all is not valid for this IM read command",
+	).WithParam("--page-all")
 }
 
 func streamIMReadPages(
@@ -811,6 +830,7 @@ func handleIMWriteContractResponse(
 			return writeIMContentSafetyFallback(opts, result)
 		}
 		if opts.JqExpr != "" {
+			writeIMJQDiagnostic(opts.Factory.IOStreams.ErrOut)
 			return writeIMJQFallback(opts, result)
 		}
 		return emitErr
@@ -867,6 +887,10 @@ func writeIMJQFallback(opts *ServiceMethodOptions, result imcontract.Result) err
 		return err
 	}
 	return signal
+}
+
+func writeIMJQDiagnostic(errOut io.Writer) {
+	fmt.Fprintln(errOut, "error: jq projection failed after the IM write completed; inspect --jq")
 }
 
 func writeIMContentSafetyFallback(opts *ServiceMethodOptions, result imcontract.Result) error {

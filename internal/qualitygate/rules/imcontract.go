@@ -18,6 +18,10 @@ const (
 	expectedIMLeafCommands = 60
 )
 
+var acceptanceOnlyCommandAllowlist = map[imcatalog.ContractKey]struct{}{
+	"im chat.moderation update": {},
+}
+
 func CheckIMContractCoverage(commandIndex manifest.Manifest, contracts []imcatalog.Contract) []report.Diagnostic {
 	leafKeys := imLeafCommandKeys(commandIndex)
 	leafSet := make(map[string]struct{}, len(leafKeys))
@@ -34,6 +38,27 @@ func CheckIMContractCoverage(commandIndex manifest.Manifest, contracts []imcatal
 	}
 
 	var diags []report.Diagnostic
+	for allowedKey := range acceptanceOnlyCommandAllowlist {
+		key := string(allowedKey)
+		if _, ok := leafSet[key]; !ok {
+			diags = append(diags, imContractDiagnostic(
+				key,
+				"acceptance_only allowlist key does not match a runnable IM leaf command",
+			))
+		}
+		contract, ok := contractSet[key]
+		if !ok {
+			diags = append(diags, imContractDiagnostic(
+				key,
+				"acceptance_only allowlist key has no completion contract",
+			))
+		} else if contract.Strategy.Kind != imcatalog.AcceptanceOnlyKind {
+			diags = append(diags, imContractDiagnostic(
+				key,
+				fmt.Sprintf("acceptance_only allowlist entry is stale for strategy kind %q", contract.Strategy.Kind),
+			))
+		}
+	}
 	if len(leafKeys) != expectedIMLeafCommands {
 		diags = append(diags, imContractDiagnostic(
 			"",
@@ -80,6 +105,17 @@ func validateIMContractShape(contract imcatalog.Contract, command manifest.Comma
 	}
 
 	switch kind {
+	case imcatalog.AcceptanceOnlyKind:
+		if contract.ReplayMode != imcatalog.ReplayForbidden {
+			messages = append(messages, fmt.Sprintf(
+				"acceptance_only requires replay mode %q, got %q",
+				imcatalog.ReplayForbidden,
+				contract.ReplayMode,
+			))
+		}
+		if _, ok := acceptanceOnlyCommandAllowlist[contract.Key]; !ok {
+			messages = append(messages, "acceptance_only is not allowed for this IM command")
+		}
 	case imcatalog.RequiredResultKind:
 		if message := validateRequiredSpec(contract.Strategy.Required); message != "" {
 			messages = append(messages, message)

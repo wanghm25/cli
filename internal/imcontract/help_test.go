@@ -32,6 +32,7 @@ func TestRegistryHelpPolicies(t *testing.T) {
 	}{
 		{"im +chat-list", HelpCompleteness},
 		{"im +messages-search", HelpCompleteness},
+		{"im chat.moderation get", HelpCompleteness},
 		{"im +messages-send", ""},
 		{"im messages merge_forward", ""},
 		{"im chat.moderation update", HelpAcceptanceOnly},

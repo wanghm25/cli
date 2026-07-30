@@ -127,6 +127,59 @@ func TestIMContractCoverageRejectsUnknownKindAndNonIMKey(t *testing.T) {
 	}
 }
 
+func TestIMContractCoverageRestrictsAcceptanceOnlyContracts(t *testing.T) {
+	if len(acceptanceOnlyCommandAllowlist) != 1 {
+		t.Fatalf("acceptance-only allowlist = %#v, want only moderation update", acceptanceOnlyCommandAllowlist)
+	}
+	if _, ok := acceptanceOnlyCommandAllowlist["im chat.moderation update"]; !ok {
+		t.Fatalf("acceptance-only allowlist = %#v, want moderation update", acceptanceOnlyCommandAllowlist)
+	}
+
+	index, contracts := completeIMCoverageFixture()
+	if diags := CheckIMContractCoverage(index, contracts); len(diags) != 0 {
+		t.Fatalf("valid acceptance-only contract rejected: %#v", diags)
+	}
+
+	allowed := len(contracts) - 1
+	contracts[allowed].ReplayMode = imcatalog.ReplaySafe
+	if diags := CheckIMContractCoverage(index, contracts); !hasIMContractDiagnostic(
+		diags,
+		"im chat.moderation update",
+		"requires replay mode \"forbidden\"",
+	) {
+		t.Fatalf("replay-safe acceptance-only contract was not rejected: %#v", diags)
+	}
+
+	index, contracts = completeIMCoverageFixture()
+	index.Commands[0].Risk = "write"
+	contracts[0].Strategy = imcatalog.Strategy{Kind: imcatalog.AcceptanceOnlyKind}
+	contracts[0].ReplayMode = imcatalog.ReplayForbidden
+	if diags := CheckIMContractCoverage(index, contracts); !hasIMContractDiagnostic(
+		diags,
+		index.Commands[0].Path,
+		"is not allowed for this IM command",
+	) {
+		t.Fatalf("non-allowlisted acceptance-only contract was not rejected: %#v", diags)
+	}
+
+	index, contracts = completeIMCoverageFixture()
+	contracts[len(contracts)-1] = imcatalog.Contract{
+		Key: "im chat.moderation update",
+		Strategy: imcatalog.Strategy{
+			Kind:     imcatalog.RequiredResultKind,
+			Required: imcatalog.RequiredSpec{Shape: imcatalog.RequiredNestedString, Field: "data"},
+		},
+		ReplayMode: imcatalog.ReplayForbidden,
+	}
+	if diags := CheckIMContractCoverage(index, contracts); !hasIMContractDiagnostic(
+		diags,
+		"im chat.moderation update",
+		"allowlist entry is stale",
+	) {
+		t.Fatalf("stale acceptance-only allowlist was not rejected: %#v", diags)
+	}
+}
+
 func TestIMContractCoverageRejectsIncompleteAndContradictoryEvidence(t *testing.T) {
 	index, contracts := completeIMCoverageFixture()
 	index.Commands[0].Risk = "write"
@@ -200,10 +253,21 @@ func completeIMCoverageFixture() (manifest.Manifest, []imcatalog.Contract) {
 	contracts := make([]imcatalog.Contract, 0, expectedIMLeafCommands)
 	for i := 0; i < expectedIMLeafCommands; i++ {
 		key := fmt.Sprintf("im resource command%02d", i)
-		index.Commands = append(index.Commands, manifest.Command{Path: key, Domain: "im", Runnable: true, Risk: "read"})
-		contracts = append(contracts, imcatalog.Contract{
+		risk := "read"
+		contract := imcatalog.Contract{
 			Key: imcatalog.ContractKey(key), Strategy: imcatalog.Strategy{Kind: imcatalog.EntityReadKind},
-		})
+		}
+		if i == expectedIMLeafCommands-1 {
+			key = "im chat.moderation update"
+			risk = "write"
+			contract = imcatalog.Contract{
+				Key:        imcatalog.ContractKey(key),
+				Strategy:   imcatalog.Strategy{Kind: imcatalog.AcceptanceOnlyKind},
+				ReplayMode: imcatalog.ReplayForbidden,
+			}
+		}
+		index.Commands = append(index.Commands, manifest.Command{Path: key, Domain: "im", Runnable: true, Risk: risk})
+		contracts = append(contracts, contract)
 	}
 	return index, contracts
 }

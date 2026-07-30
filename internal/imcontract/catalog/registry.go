@@ -118,7 +118,7 @@ func buildContracts() map[ContractKey]Contract {
 		read("im +threads-messages-list", CollectionReadKind),
 		read("im chat.members bots", EntityReadKind),
 		read("im chat.members get", CollectionReadKind),
-		read("im chat.moderation get", EntityReadKind),
+		read("im chat.moderation get", CollectionReadKind),
 		read("im messages read_users", CollectionReadKind),
 		read("im pins list", CollectionReadKind),
 		read("im reactions list", CollectionReadKind),

@@ -18,8 +18,10 @@ import (
 
 	"github.com/larksuite/cli/errs"
 	extcs "github.com/larksuite/cli/extension/contentsafety"
+	extcred "github.com/larksuite/cli/extension/credential"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/credential"
 	"github.com/larksuite/cli/internal/httpmock"
 	"github.com/larksuite/cli/internal/imcontract"
 	"github.com/larksuite/cli/internal/meta"
@@ -31,6 +33,18 @@ import (
 
 var testConfig = &core.CliConfig{
 	AppID: "test-app", AppSecret: "test-secret", Brand: core.BrandFeishu,
+}
+
+type panicCredentialProvider struct{}
+
+func (panicCredentialProvider) Name() string { return "panic-if-called" }
+
+func (panicCredentialProvider) ResolveAccount(context.Context) (*extcred.Account, error) {
+	panic("credential resolution must not run")
+}
+
+func (panicCredentialProvider) ResolveToken(context.Context, extcred.TokenSpec) (*extcred.Token, error) {
+	panic("credential resolution must not run")
 }
 
 func driveSpec() meta.Service {
@@ -1255,7 +1269,7 @@ func TestIMContractManagedWriteJQFailureUsesCompletionFallback(t *testing.T) {
 
 	err := cmd.Execute()
 	assertIMPresentationFallback(t, stdout, stderr, err, output.ExitAPI, "api", "unknown",
-		"Output failed after the IM write completed", "complete", secret)
+		"Output failed after the IM write completed", "complete", secret, true)
 }
 
 func TestIMContractManagedWriteContentSafetyUsesCompletionFallback(t *testing.T) {
@@ -1284,7 +1298,7 @@ func TestIMContractManagedWriteContentSafetyUsesCompletionFallback(t *testing.T)
 
 	err := root.Execute()
 	assertIMPresentationFallback(t, stdout, stderr, err, output.ExitContentSafety, "policy", "content_safety",
-		"Output blocked after the IM write completed", "complete", secret)
+		"Output blocked after the IM write completed", "complete", secret, false)
 }
 
 func assertIMPresentationFallback(
@@ -1293,12 +1307,17 @@ func assertIMPresentationFallback(
 	err error,
 	exit int,
 	category, subtype, message, status, secret string,
+	wantJQError bool,
 ) {
 	t.Helper()
 	if err == nil || output.ExitCodeOf(err) != exit {
 		t.Fatalf("error = %T %v, exit=%d want %d", err, err, output.ExitCodeOf(err), exit)
 	}
-	if stderr.Len() != 0 {
+	if wantJQError && !strings.Contains(stderr.String(),
+		"error: jq projection failed after the IM write completed; inspect --jq") {
+		t.Fatalf("stderr did not identify the jq failure: %q", stderr.String())
+	}
+	if !wantJQError && stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	if strings.Contains(stdout.String(), secret) || strings.Contains(stderr.String(), secret) ||
@@ -1486,6 +1505,65 @@ func TestGeneratedIMWriteRejectsPageAll(t *testing.T) {
 	}
 }
 
+func TestGeneratedIMEntityReadRejectsPageAllBeforeAPI(t *testing.T) {
+	// No HTTP stub is registered. The validation result therefore also proves
+	// the hidden pagination flag is rejected before any API request is sent.
+	f, _, _, _ := cmdutil.TestFactory(t, testConfig)
+	method := meta.FromMap(map[string]any{
+		"id": "chats.get", "path": "chats/{chat_id}", "httpMethod": "GET",
+		"risk": "read", "accessTokens": []any{"tenant"},
+		"parameters": map[string]any{
+			"chat_id": map[string]any{"type": "string", "location": "path", "required": true},
+		},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), method, "get", "chats", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--params", `{"chat_id":"oc_x"}`, "--page-all"})
+
+	err := cmd.Execute()
+	p, ok := errs.ProblemOf(err)
+	var validation *errs.ValidationError
+	if !ok || p.Category != errs.CategoryValidation ||
+		p.Message != "--page-all is not valid for this IM read command" ||
+		!errors.As(err, &validation) || validation.Param != "--page-all" {
+		t.Fatalf("error = %T %#v", err, p)
+	}
+}
+
+func TestIMNonPaginatedReadRejectsPageAllBeforeIdentityResolution(t *testing.T) {
+	f, _, _, _ := cmdutil.TestFactory(t, testConfig)
+	f.Credential = credential.NewCredentialProvider(
+		[]extcred.Provider{panicCredentialProvider{}},
+		nil,
+		nil,
+		nil,
+	)
+	f.Config = func() (*core.CliConfig, error) {
+		t.Fatal("config resolution must not run")
+		return nil, nil
+	}
+
+	for _, key := range []imcontract.ContractKey{
+		"im chats get",
+		"im +messages-resources-download",
+	} {
+		t.Run(string(key), func(t *testing.T) {
+			err := serviceMethodRun(&ServiceMethodOptions{
+				Factory:     f,
+				Ctx:         context.Background(),
+				ContractKey: key,
+				PageAll:     true,
+			})
+			p, ok := errs.ProblemOf(err)
+			var validation *errs.ValidationError
+			if !ok || p.Category != errs.CategoryValidation ||
+				p.Message != "--page-all is not valid for this IM read command" ||
+				!errors.As(err, &validation) || validation.Param != "--page-all" {
+				t.Fatalf("error = %T %#v", err, p)
+			}
+		})
+	}
+}
+
 func TestGeneratedIMWriteRejectsOutputBeforeAPI(t *testing.T) {
 	// No HTTP stub is registered. Reaching the transport would therefore
 	// produce a different error, so the typed validation result also proves
@@ -1620,6 +1698,46 @@ func TestGeneratedIMCollectionPageAllLateErrorKeepsPartialJSON(t *testing.T) {
 	}
 }
 
+func TestGeneratedIMModerationPageAllLateErrorKeepsPartialJSON(t *testing.T) {
+	f, stdout, stderr, reg := cmdutil.TestFactory(t, testConfig)
+	reg.Register(&httpmock.Stub{
+		URL: "/open-apis/im/v1/chats/oc_x/moderation",
+		Body: map[string]any{"code": 0, "data": map[string]any{
+			"moderation_setting": "moderator_list",
+			"items":              []any{map[string]any{"user_id": "ou_a"}},
+			"has_more":           true,
+			"page_token":         "next",
+		}},
+	})
+	reg.Register(&httpmock.Stub{
+		URL:  "/open-apis/im/v1/chats/oc_x/moderation",
+		Body: map[string]any{"code": 230027, "msg": "not authorized"},
+	})
+	cmd := NewCmdServiceMethod(f, imSpec(), generatedIMModerationGetMethod(), "get", "chat.moderation", nil)
+	cmd.SetArgs([]string{"--as", "bot", "--params", `{"chat_id":"oc_x"}`, "--page-all", "--page-limit", "0", "--page-delay", "-1"})
+
+	err := cmd.Execute()
+	var partial *output.PartialFailureError
+	if !errors.As(err, &partial) || partial.Code != output.ExitAuth {
+		t.Fatalf("error = %T %v", err, err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %s", stderr.String())
+	}
+	var env map[string]any
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &env); jsonErr != nil {
+		t.Fatal(jsonErr)
+	}
+	items := env["data"].(map[string]any)["items"].([]any)
+	metaOut := env["meta"].(map[string]any)
+	problem := env["error"].(map[string]any)
+	if len(items) != 1 || env["ok"] != false ||
+		metaOut["complete"] != false || metaOut["stop_reason"] != "api_error" ||
+		problem["type"] != "authorization" {
+		t.Fatalf("unexpected envelope: %#v", env)
+	}
+}
+
 func TestGeneratedIMCollectionPageAllJSON5xxUsesHTTPStatus(t *testing.T) {
 	f, stdout, stderr, reg := cmdutil.TestFactory(t, testConfig)
 	reg.Register(&httpmock.Stub{
@@ -1694,6 +1812,17 @@ func generatedIMReadUsersMethod() meta.Method {
 		"risk": "read", "accessTokens": []any{"tenant"},
 		"parameters": map[string]any{
 			"message_id": map[string]any{"type": "string", "location": "path", "required": true},
+			"page_token": map[string]any{"type": "string", "location": "query"},
+		},
+	})
+}
+
+func generatedIMModerationGetMethod() meta.Method {
+	return meta.FromMap(map[string]any{
+		"id": "chat.moderation.get", "path": "chats/{chat_id}/moderation", "httpMethod": "GET",
+		"risk": "read", "accessTokens": []any{"tenant"},
+		"parameters": map[string]any{
+			"chat_id":    map[string]any{"type": "string", "location": "path", "required": true},
 			"page_token": map[string]any{"type": "string", "location": "query"},
 		},
 	})

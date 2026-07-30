@@ -190,12 +190,12 @@ func TestIMContractWriteJQRuntimeFailureUsesBufferedCompletionFallback(t *testin
 	if output.ExitCodeOf(rctx.outputErr) != output.ExitAPI {
 		t.Fatalf("output error = %T %v", rctx.outputErr, rctx.outputErr)
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
+	if !strings.Contains(stderr.String(), "error: jq projection failed after the IM write completed; inspect --jq") {
+		t.Fatalf("stderr did not identify the jq failure: %q", stderr.String())
 	}
 	if strings.Contains(stdout.String(), "safe-prefix") || strings.Contains(stdout.String(), secret) ||
-		strings.Contains(rctx.outputErr.Error(), secret) {
-		t.Fatalf("jq output leaked before failure: stdout=%q err=%v", stdout.String(), rctx.outputErr)
+		strings.Contains(stderr.String(), secret) || strings.Contains(rctx.outputErr.Error(), secret) {
+		t.Fatalf("jq output leaked before failure: stdout=%q stderr=%q err=%v", stdout.String(), stderr.String(), rctx.outputErr)
 	}
 	var env map[string]any
 	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
