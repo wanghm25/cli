@@ -1,5 +1,7 @@
 # lark-slides xml_presentation.slide create
 
+> **优先用 shortcut**：日常场景请使用 [`slides +add-slide`](lark-slides-add-slide.md) —— 它直接接受 token / slides URL / wiki URL，参数是普通 flag 而不是 `--params` JSON 串。只有本页列出的、shortcut 未覆盖的参数才需要直接调原生接口。
+
 ## 用途
 
 在指定的 XML 演示文稿中创建新的幻灯片页面，通常用于给 `slides +create` 创建出的空白 PPT 逐页补充内容。
@@ -166,9 +168,9 @@ lark-cli slides xml_presentation.slide create --as user \
 | `<note>` | 演讲者备注 |
 
 > [!IMPORTANT]
-> **本地图片必须先上传**：`xml_presentation.slide.create` 不识别 `@./local.png` 占位符（那是 `+create --slides` 的语法糖）。直接调本接口添加带图新页时，必须先用 [`slides +media-upload`](lark-slides-media-upload.md) 拿到 `file_token`，再写进 `<img src="<file_token>">`。
+> **本地图片必须先上传**：`xml_presentation.slide.create` 不识别 `@./local.png` 占位符，直接调本接口时必须先用 [`slides +media-upload`](lark-slides-media-upload.md) 拿到 `file_token`，再写进 `<img src="<file_token>">`。
 >
-> 如果是从零开始建带图 PPT，**强烈建议改用 [`slides +create --slides '[...]'`](lark-slides-create.md#本地图片path-占位符)** 一步搞定（自动上传 + 替换 token）。
+> 占位符是 shortcut 的能力：给已有 PPT 加带图新页用 [`+add-slide`](lark-slides-add-slide.md)，从零建带图 PPT 用 [`+create --slides`](lark-slides-create.md#本地图片path-占位符)，都会自动上传并替换 token。
 
 ## 常见错误
 

@@ -1,5 +1,7 @@
 # lark-slides xml_presentation.slide delete
 
+> **优先用 shortcut**：日常场景请使用 [`slides +delete-slide`](lark-slides-delete-slide.md) —— 它直接接受 token / slides URL / wiki URL，参数是普通 flag 而不是 `--params` JSON 串。只有本页列出的、shortcut 未覆盖的参数才需要直接调原生接口。
+
 ## 用途
 
 删除指定 XML 演示文稿中的幻灯片页面。
@@ -84,16 +86,14 @@ lark-cli slides xml_presentation.slide delete --as user --params '{"xml_presenta
 |--------|------|----------|
 | 404 | 演示文稿不存在 | 检查 `xml_presentation_id` 是否正确 |
 | 404 | 幻灯片不存在 | 检查 `slide_id` 是否正确，或该幻灯片已被删除 |
-| 400 | 无法删除唯一幻灯片 | 演示文稿至少保留一页幻灯片 |
 | 403 | 权限不足 | 检查是否拥有 `slides:presentation:update` 或 `slides:presentation:write_only` scope |
 
 ## 注意事项
 
 1. **执行前必做**: 使用 `lark-cli schema slides.xml_presentation.slide.delete` 查看最新的参数结构
 2. **删除不可逆**: 删除操作无法撤销，请确保已备份重要内容
-3. **至少保留一页**: 演示文稿必须至少保留一页幻灯片，删除最后一页会报错
-4. **版本控制**: 如果依赖版本号并发控制，删除前先确认 `revision_id`
-5. **获取 slide_id**: 创建幻灯片时请保存返回值；仅靠 `get` 返回的 XML 无法直接推导服务端 short ID
+3. **版本控制**: 如果依赖版本号并发控制，删除前先确认 `revision_id`
+4. **获取 slide_id**: 创建幻灯片时请保存返回值；仅靠 `get` 返回的 XML 无法直接推导服务端 short ID
 
 ## 如何获取 slide_id
 
