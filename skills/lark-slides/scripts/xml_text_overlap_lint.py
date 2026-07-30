@@ -67,6 +67,8 @@ LINE_TEXT_GRAZE_MIN_PX = 2.0
 LINE_TEXT_GRAZE_FONT_RATIO = 0.12
 # A line whose effective stroke alpha is below this is not visibly rendered, so it cannot occlude text.
 LINE_MIN_VISIBLE_ALPHA = 0.08
+TEXT_CONTAINER_ASSOCIATION_TOLERANCE = 2
+MIN_TEXT_CONTAINER_AREA = 4_000
 # Sub-pixel canvas overflow is floating-point rounding noise (e.g. rotated-bbox math), not a
 # visible defect; keep this well under 1px so real overflow is still always caught.
 CANVAS_OVERFLOW_TOLERANCE = 0.5
@@ -1978,6 +1980,160 @@ def is_visually_rendered(element: dict[str, Any]) -> bool:
     return element.get("alpha", 1) > 0
 
 
+def text_container_overflow(
+    container: dict[str, Any], text: dict[str, Any]
+) -> dict[str, dict[str, int | float]] | None:
+    container_right = container["x"] + container["width"]
+    container_bottom = container["y"] + container["height"]
+    text_right = text["x"] + text["width"]
+    text_bottom = text["y"] + text["height"]
+
+    text_visual_bbox = estimate_text_visual_bbox(text)
+    if text_visual_bbox is None:
+        return None
+
+    visual_right = text_visual_bbox["x"] + text_visual_bbox["width"]
+    visual_bottom = text_visual_bbox["y"] + text_visual_bbox["height"]
+    declared_overflows = {
+        "left": container["x"] - text["x"],
+        "top": container["y"] - text["y"],
+        "right": text_right - container_right,
+        "bottom": text_bottom - container_bottom,
+    }
+    horizontally_associated = (
+        text_right > container["x"]
+        and text["x"] < container_right
+        and not (
+            declared_overflows["left"] > TEXT_CONTAINER_ASSOCIATION_TOLERANCE
+            and declared_overflows["right"] > TEXT_CONTAINER_ASSOCIATION_TOLERANCE
+        )
+    )
+    vertically_associated = (
+        text_bottom > container["y"]
+        and text["y"] < container_bottom
+        and not (
+            declared_overflows["top"] > TEXT_CONTAINER_ASSOCIATION_TOLERANCE
+            and declared_overflows["bottom"] > TEXT_CONTAINER_ASSOCIATION_TOLERANCE
+        )
+    )
+    visual_overflows = {
+        "left": container["x"] - text_visual_bbox["x"],
+        "top": container["y"] - text_visual_bbox["y"],
+        "right": visual_right - container_right,
+        "bottom": visual_bottom - container_bottom,
+    }
+    visual_crosses_boundary = {
+        "left": text_visual_bbox["x"] <= container["x"] <= visual_right,
+        "top": text_visual_bbox["y"] <= container["y"] <= visual_bottom,
+        "right": text_visual_bbox["x"] <= container_right <= visual_right,
+        "bottom": text_visual_bbox["y"] <= container_bottom <= visual_bottom,
+    }
+    max_horizontal_overflow = max(24, text["width"] * 0.75)
+    max_vertical_overflow = max(24, text["height"] * 0.75)
+    side_is_associated = {
+        "left": (
+            vertically_associated
+            and text_right > container["x"]
+            and text_right <= container_right + TEXT_CONTAINER_ASSOCIATION_TOLERANCE
+        ),
+        "top": (
+            horizontally_associated
+            and text_bottom > container["y"]
+            and text_bottom <= container_bottom + TEXT_CONTAINER_ASSOCIATION_TOLERANCE
+        ),
+        "right": (
+            vertically_associated
+            and text["x"] >= container["x"] - TEXT_CONTAINER_ASSOCIATION_TOLERANCE
+            and text["x"] < container_right
+        ),
+        "bottom": (
+            horizontally_associated
+            and text["y"] >= container["y"] - TEXT_CONTAINER_ASSOCIATION_TOLERANCE
+            and text["y"] < container_bottom
+        ),
+    }
+    max_overflow = {
+        "left": max_horizontal_overflow,
+        "top": max_vertical_overflow,
+        "right": max_horizontal_overflow,
+        "bottom": max_vertical_overflow,
+    }
+
+    reported_sides = [
+        side
+        for side in ("left", "top", "right", "bottom")
+        if side_is_associated[side]
+        and 0 <= declared_overflows[side] <= max_overflow[side]
+        and visual_overflows[side] >= 0
+        and visual_crosses_boundary[side]
+    ]
+    if not reported_sides:
+        return None
+    return {
+        "visual": {side: visual_overflows[side] for side in reported_sides},
+        "declared": {side: declared_overflows[side] for side in reported_sides},
+    }
+
+
+def detect_text_outside_containers(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    containers = [
+        element
+        for element in elements
+        if element["kind"] == "shape"
+        and element["type"] == "rect"
+        and is_visually_rendered(element)
+        and element_area(element) >= MIN_TEXT_CONTAINER_AREA
+    ]
+    for text in (
+        element
+        for element in elements
+        if is_text_element(element)
+        and is_visually_rendered(element)
+        and has_text_content(element)
+        and not is_decorative_text(element)
+        and not is_vertical_text(element)
+    ):
+        candidates = [
+            (container, text_container_overflow(container, text))
+            for container in containers
+            if container["order"] < text["order"]
+        ]
+        candidates = [(container, overflow) for container, overflow in candidates if overflow is not None]
+        if not candidates:
+            continue
+        container, overflow = min(candidates, key=lambda candidate: element_area(candidate[0]))
+        visual_overflow = overflow["visual"]
+        declared_overflow = overflow["declared"]
+        touched_sides = [side for side, value in visual_overflow.items() if math.isclose(value, 0, abs_tol=1e-9)]
+        crossed_sides = [side for side, value in visual_overflow.items() if value > 0]
+        boundary_description = []
+        if touched_sides:
+            boundary_description.append(f'touches the {"/".join(touched_sides)} edge')
+        if crossed_sides:
+            boundary_description.append(f'extends outside the {"/".join(crossed_sides)} edge')
+        issues.append(
+            {
+                "level": "error",
+                "code": "text_outside_container",
+                "elements": [container["id"], text["id"]],
+                "measurement": {
+                    "overflow": {side: round(value, 3) for side, value in visual_overflow.items()},
+                    "declared_overflow": {side: round(value, 3) for side, value in declared_overflow.items()},
+                },
+                "message": (
+                    f'estimated text in shape {text["id"]} {" and ".join(boundary_description)} '
+                    f'of candidate container {container["id"]}'
+                ),
+                "hint": (
+                    "Resize the container, move the text, or reduce/reflow the text so it stays inside the card. "
+                    "Inspect the rendered slide after fixing the static error."
+                ),
+            }
+        )
+    return issues
+
+
 def visual_bbox(element: dict[str, Any], container: dict[str, Any]) -> dict[str, int | float] | None:
     if not is_visually_rendered(element):
         return None
@@ -2217,6 +2373,10 @@ RULE_METADATA: dict[str, dict[str, Any]] = {
     "bbox_overlap": {
         "name": "text_visual_bounds_do_not_overlap",
         "comparison": "intersection_area == 0",
+    },
+    "text_outside_container": {
+        "name": "text_stays_inside_candidate_container",
+        "comparison": "estimated_visual_overflow[left,top,right,bottom] < 0",
     },
     "text_may_overflow_shape": {
         "name": "estimated_text_fits_declared_shape",
@@ -2515,6 +2675,7 @@ def lint_xml(xml: str, source_path: str | None = None) -> dict[str, Any]:
         raw_issues = [
             *geometry["issues"],
             *extra_overflow_issues,
+            *detect_text_outside_containers(density_elements),
             *detect_blank_slide(
                 density_elements,
                 slide_number,

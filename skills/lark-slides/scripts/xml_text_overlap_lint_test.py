@@ -663,6 +663,230 @@ class XmlTextOverlapLintGeometryTest(unittest.TestCase):
         self.assertEqual(result["slides"][0]["issues"][0]["level"], "error")
         self.assertEqual(result["slides"][0]["issues"][0]["elements"], ["source"])
 
+    def test_lint_xml_errors_when_estimated_text_crosses_card_bottom(self) -> None:
+        result = xml_text_overlap_lint.lint_xml(
+            """
+            <slide xmlns="http://www.larkoffice.com/sml/2.0">
+              <data>
+                <shape id="card" type="rect" topLeftX="60" topLeftY="370" width="280" height="100"/>
+                <shape id="caption" type="text" topLeftX="80" topLeftY="455" width="240" height="20">
+                  <content fontSize="13"><p>接种流感疫苗，做好日常防护</p></content>
+                </shape>
+              </data>
+            </slide>
+            """
+        )
+
+        issues = [issue for issue in result["slides"][0]["issues"] if issue["code"] == "text_outside_container"]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["level"], "error")
+        self.assertEqual(issues[0]["elements"], ["card", "caption"])
+        self.assertEqual(issues[0]["measurement"]["overflow"], {"bottom": 2.8})
+        self.assertEqual(issues[0]["measurement"]["declared_overflow"], {"bottom": 5})
+        self.assertFalse(result["summary"]["release_ready"])
+
+    def test_lint_xml_errors_when_estimated_text_crosses_card_top(self) -> None:
+        result = xml_text_overlap_lint.lint_xml(
+            """
+            <slide xmlns="http://www.larkoffice.com/sml/2.0">
+              <data>
+                <shape id="card" type="rect" topLeftX="100" topLeftY="100" width="200" height="100"/>
+                <shape id="caption" type="text" topLeftX="130" topLeftY="95" width="140" height="20">
+                  <content fontSize="20"><p>顶部溢出</p></content>
+                </shape>
+              </data>
+            </slide>
+            """
+        )
+
+        issues = [issue for issue in result["slides"][0]["issues"] if issue["code"] == "text_outside_container"]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["elements"], ["card", "caption"])
+        self.assertEqual(issues[0]["measurement"]["overflow"], {"top": 5})
+        self.assertEqual(issues[0]["measurement"]["declared_overflow"], {"top": 5})
+
+    def test_lint_xml_errors_when_estimated_text_crosses_card_left(self) -> None:
+        result = xml_text_overlap_lint.lint_xml(
+            """
+            <slide xmlns="http://www.larkoffice.com/sml/2.0">
+              <data>
+                <shape id="card" type="rect" topLeftX="100" topLeftY="100" width="200" height="100"/>
+                <shape id="caption" type="text" topLeftX="95" topLeftY="140" width="40" height="20">
+                  <content fontSize="20" wrap="false"><p>左</p></content>
+                </shape>
+              </data>
+            </slide>
+            """
+        )
+
+        issues = [issue for issue in result["slides"][0]["issues"] if issue["code"] == "text_outside_container"]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["elements"], ["card", "caption"])
+        self.assertEqual(issues[0]["measurement"]["overflow"], {"left": 5})
+        self.assertEqual(issues[0]["measurement"]["declared_overflow"], {"left": 5})
+
+    def test_lint_xml_errors_when_estimated_text_crosses_card_right(self) -> None:
+        result = xml_text_overlap_lint.lint_xml(
+            """
+            <slide xmlns="http://www.larkoffice.com/sml/2.0">
+              <data>
+                <shape id="card" type="rect" topLeftX="100" topLeftY="100" width="200" height="100"/>
+                <shape id="caption" type="text" topLeftX="285" topLeftY="140" width="20" height="20">
+                  <content fontSize="20" wrap="false"><p>右</p></content>
+                </shape>
+              </data>
+            </slide>
+            """
+        )
+
+        issues = [issue for issue in result["slides"][0]["issues"] if issue["code"] == "text_outside_container"]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["elements"], ["card", "caption"])
+        self.assertEqual(issues[0]["measurement"]["overflow"], {"right": 5})
+        self.assertEqual(issues[0]["measurement"]["declared_overflow"], {"right": 5})
+
+    def test_lint_xml_errors_when_estimated_text_crosses_card_corners(self) -> None:
+        result = xml_text_overlap_lint.lint_xml(
+            """
+            <presentation xmlns="http://www.larkoffice.com/sml/2.0" width="960" height="540">
+              <slide><data>
+                <shape id="card-tl" type="rect" topLeftX="100" topLeftY="100" width="200" height="100"/>
+                <shape id="caption-tl" type="text" topLeftX="95" topLeftY="95" width="20" height="20">
+                  <content fontSize="20" wrap="false"><p>角</p></content>
+                </shape>
+              </data></slide>
+              <slide><data>
+                <shape id="card-tr" type="rect" topLeftX="100" topLeftY="100" width="200" height="100"/>
+                <shape id="caption-tr" type="text" topLeftX="285" topLeftY="95" width="20" height="20">
+                  <content fontSize="20" wrap="false"><p>角</p></content>
+                </shape>
+              </data></slide>
+              <slide><data>
+                <shape id="card-bl" type="rect" topLeftX="100" topLeftY="100" width="200" height="100"/>
+                <shape id="caption-bl" type="text" topLeftX="95" topLeftY="185" width="20" height="20">
+                  <content fontSize="20" wrap="false"><p>角</p></content>
+                </shape>
+              </data></slide>
+              <slide><data>
+                <shape id="card-br" type="rect" topLeftX="100" topLeftY="100" width="200" height="100"/>
+                <shape id="caption-br" type="text" topLeftX="285" topLeftY="185" width="20" height="20">
+                  <content fontSize="20" wrap="false"><p>角</p></content>
+                </shape>
+              </data></slide>
+            </presentation>
+            """
+        )
+
+        overflow_sides = [
+            set(next(issue for issue in slide["issues"] if issue["code"] == "text_outside_container")["measurement"]["overflow"])
+            for slide in result["slides"]
+        ]
+        self.assertEqual(
+            overflow_sides,
+            [{"left", "top"}, {"top", "right"}, {"left", "bottom"}, {"right", "bottom"}],
+        )
+
+    def test_lint_xml_ignores_frame_contact_when_glyphs_do_not_reach_container(self) -> None:
+        result = xml_text_overlap_lint.lint_xml(
+            """
+            <presentation xmlns="http://www.larkoffice.com/sml/2.0" width="960" height="540">
+              <slide><data>
+                <shape id="card-left" type="rect" topLeftX="100" topLeftY="100" width="200" height="100"/>
+                <shape id="caption-left" type="text" topLeftX="80" topLeftY="140" width="21" height="20">
+                  <content fontSize="10" wrap="false"><p>A</p></content>
+                </shape>
+              </data></slide>
+              <slide><data>
+                <shape id="card-top" type="rect" topLeftX="100" topLeftY="100" width="200" height="100"/>
+                <shape id="caption-top" type="text" topLeftX="140" topLeftY="80" width="20" height="21">
+                  <content fontSize="10"><p>A</p></content>
+                </shape>
+              </data></slide>
+              <slide><data>
+                <shape id="card-right" type="rect" topLeftX="100" topLeftY="100" width="200" height="100"/>
+                <shape id="caption-right" type="text" topLeftX="299" topLeftY="140" width="21" height="20">
+                  <content fontSize="10" wrap="false" textAlign="right"><p>A</p></content>
+                </shape>
+              </data></slide>
+              <slide><data>
+                <shape id="card-bottom" type="rect" topLeftX="100" topLeftY="100" width="200" height="100"/>
+                <shape id="caption-bottom" type="text" topLeftX="140" topLeftY="199" width="20" height="21">
+                  <content fontSize="10" verticalAlign="bottom"><p>A</p></content>
+                </shape>
+              </data></slide>
+            </presentation>
+            """
+        )
+
+        self.assertTrue(
+            all(
+                not any(issue["code"] == "text_outside_container" for issue in slide["issues"])
+                for slide in result["slides"]
+            )
+        )
+
+    def test_lint_xml_errors_on_card_bottom_contact_and_chooses_smallest_container(self) -> None:
+        result = xml_text_overlap_lint.lint_xml(
+            """
+            <slide xmlns="http://www.larkoffice.com/sml/2.0">
+              <data>
+                <shape id="background" type="rect" topLeftX="0" topLeftY="0" width="960" height="540"/>
+                <shape id="card" type="rect" topLeftX="60" topLeftY="100" width="280" height="100"/>
+                <shape id="caption" type="text" topLeftX="80" topLeftY="184" width="240" height="20">
+                  <content fontSize="10" verticalAlign="middle"><p>边界接触</p></content>
+                </shape>
+              </data>
+            </slide>
+            """
+        )
+
+        issues = [issue for issue in result["slides"][0]["issues"] if issue["code"] == "text_outside_container"]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["elements"], ["card", "caption"])
+        self.assertEqual(issues[0]["measurement"]["overflow"], {"bottom": 0})
+
+    def test_lint_xml_allows_crossing_text_box_when_centered_glyphs_stay_inside_card(self) -> None:
+        result = xml_text_overlap_lint.lint_xml(
+            """
+            <slide xmlns="http://www.larkoffice.com/sml/2.0">
+              <data>
+                <shape id="card" type="rect" topLeftX="300" topLeftY="245" width="360" height="120"/>
+                <shape id="caption" type="text" topLeftX="330" topLeftY="285" width="300" height="85">
+                  <content fontSize="19" bold="true" textAlign="center" verticalAlign="middle">
+                    <p>OVERFLOW 5 px</p>
+                  </content>
+                </shape>
+              </data>
+            </slide>
+            """
+        )
+
+        self.assertFalse(
+            any(issue["code"] == "text_outside_container" for issue in result["slides"][0]["issues"])
+        )
+
+    def test_lint_xml_does_not_infer_container_from_wrong_order_or_horizontal_mismatch(self) -> None:
+        result = xml_text_overlap_lint.lint_xml(
+            """
+            <slide xmlns="http://www.larkoffice.com/sml/2.0">
+              <data>
+                <shape id="before-card-text" type="text" topLeftX="80" topLeftY="184" width="240" height="20">
+                  <content fontSize="10"><p>卡片在文字上层</p></content>
+                </shape>
+                <shape id="later-card" type="rect" topLeftX="60" topLeftY="100" width="280" height="100"/>
+                <shape id="narrow-card" type="rect" topLeftX="400" topLeftY="100" width="200" height="100"/>
+                <shape id="wide-text" type="text" topLeftX="380" topLeftY="184" width="240" height="20">
+                  <content fontSize="10"><p>没有被水平包住</p></content>
+                </shape>
+              </data>
+            </slide>
+            """
+        )
+
+        self.assertFalse(
+            any(issue["code"] == "text_outside_container" for issue in result["slides"][0]["issues"])
+        )
+
     def test_lint_xml_reports_text_out_of_canvas_and_warns_for_text_height(self) -> None:
         result = xml_text_overlap_lint.lint_xml(
             """
@@ -2331,7 +2555,11 @@ class XmlTextOverlapLintDensityTest(unittest.TestCase):
         )
 
         self_issue = self_only["slides"][0]["issues"][0]
-        mixed_issue = with_overlapping_child["slides"][0]["issues"][0]
+        mixed_issue = next(
+            issue
+            for issue in with_overlapping_child["slides"][0]["issues"]
+            if issue["code"] == "sparse_container_content"
+        )
         self.assertEqual(
             mixed_issue["measurement"]["visible_content_area"],
             self_issue["measurement"]["visible_content_area"],
