@@ -27,10 +27,9 @@ type MessageMentionResult struct {
 	RetryScope            string                       `json:"retry_scope"`
 }
 
-// BuildMessageMentionResult reconciles the structured mention request with the
-// OpenAPI mentions evidence. Exact open_id matches can be confirmed, but an
-// absent ID stays unattributed until a sandbox protocol test proves that
-// response omissions map reliably to individual failed mentions.
+// BuildMessageMentionResult compares the structured mention request with the
+// returned mention entries. Exact open_id matches are confirmed; unmatched or
+// ambiguous entries remain unattributed and never authorize replay.
 func BuildMessageMentionResult(request MessageMentionRequest, response any) MessageMentionResult {
 	requested := append([]string(nil), request.IDs...)
 	result := MessageMentionResult{
@@ -98,10 +97,8 @@ func BuildMessageMentionResult(request MessageMentionRequest, response any) Mess
 		if len(unresolved) > 0 {
 			result.UnattributedRequested = unresolved
 		} else {
-			// When every requested ID appears confirmed but the response also
-			// contains contradictory evidence, do not put the same IDs in both
-			// confirmed and unattributed sets. Treat the entire mapping as
-			// untrusted until the protocol is proven.
+			// Do not place the same IDs in both confirmed and unattributed
+			// sets when extra entries make the result ambiguous.
 			result.Confirmed = []MessageMentionConfirmation{}
 			result.UnattributedRequested = append([]string(nil), requested...)
 		}

@@ -47,7 +47,7 @@ func TestBuildMessageMentionResult(t *testing.T) {
 			wantAll:       "not_requested",
 		},
 		{
-			name:    "missing open id stays unattributed without protocol proof",
+			name:    "missing open id stays unattributed",
 			request: MessageMentionRequest{IDs: []string{"ou_alpha", "ou_beta"}},
 			response: []any{
 				map[string]any{"key": "@_user_1", "id": "ou_alpha", "id_type": "open_id"},
