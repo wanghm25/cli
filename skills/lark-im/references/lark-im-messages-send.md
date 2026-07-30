@@ -1,6 +1,6 @@
 # im +messages-send
 
-> **Prerequisite:** Read [`../lark-shared/SKILL.md`](../../lark-shared/SKILL.md) first to understand authentication, global parameters, and safety rules.
+> **Prerequisite:** Before executing this command, ensure [`../lark-shared/SKILL.md`](../../lark-shared/SKILL.md) has been read once in the current task for authentication, global parameters, and safety rules. Do not reread it if already loaded.
 
 Send a message to a group chat or a direct message conversation. Supports both user identity (`--as user`) and bot identity (`--as bot`).
 

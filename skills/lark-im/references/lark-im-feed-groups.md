@@ -1,6 +1,6 @@
 # im feed.groups
 
-> **Prerequisite:** Read [`../lark-shared/SKILL.md`](../../lark-shared/SKILL.md) first to understand authentication, global parameters, and safety rules.
+> **Prerequisite:** Before executing this command, ensure [`../lark-shared/SKILL.md`](../../lark-shared/SKILL.md) has been read once in the current task for authentication, global parameters, and safety rules. Do not reread it if already loaded.
 
 This reference is the shared annotation target for the IM feed-group (tag) APIs: it documents what each method does, the `--params` / `--data` request and response shapes, and the enum surface used in payloads. The full method list is in [Command Overview](#command-overview) below.
 

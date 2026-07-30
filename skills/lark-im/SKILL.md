@@ -1,7 +1,7 @@
 ---
 name: lark-im
 version: 1.0.0
-description: "飞书即时通讯：收发消息和管理群聊。发送和回复消息、搜索聊天记录、管理群聊成员、上传下载图片和文件（支持大文件分片下载）、管理表情回复、发送应用内/短信/电话加急、发送和处理交互卡片（Interactive Card）、监听卡片按钮回调（card.action.trigger）。当用户需要发消息、查看或搜索聊天记录、下载聊天中的文件、查看群成员、搜索群、创建群聊或话题群、管理标记数据、管理 Feed 置顶（添加/移除/查询置顶会话）、管理标签数据、处理卡片回调时使用。"
+description: "飞书即时通讯（IM）：收发/回复/转发/搜索消息，管理群聊、话题、成员、附件、@、表情、已读、标记、加急、Feed 与交互卡片。用于执行 IM 操作、选择具体 lark-cli 命令/OpenAPI，或判断 IM 结果的完成、完整和重试状态。仅人员/组织查询及文档、邮件、任务、审批、日历、会议、通用事件由对应 Skill 负责；复合任务中负责最终 IM 动作。"
 metadata:
   requires:
     bins: ["lark-cli"]
@@ -10,7 +10,7 @@ metadata:
 
 # im (v1)
 
-**CRITICAL — 开始前 MUST 先用 Read 工具读取 [`../lark-shared/SKILL.md`](../lark-shared/SKILL.md)，其中包含认证、权限处理**
+仅回答 IM 能力或命令路由且不执行时，直接使用本 Skill 的 Intent Routing。执行真实命令，或处理认证、身份、权限和公共信封前，若本任务尚未读取过 [`../lark-shared/SKILL.md`](../lark-shared/SKILL.md)，则必须先读取；已经读取时不得重复。
 
 ## Core Concepts
 
@@ -81,9 +81,11 @@ Card messages (`interactive` type) are not yet supported for compact conversion 
 
 - For reads, when `meta.complete` is present it is authoritative: consume IDs and resources directly when `true`; when `false`, perform only the recovery named by that response's `hint`.
 - For writes, when `data.completion` or `data.mention_result` is present, decide recovery only from that result's `retry_scope`. `partial` and `accepted_unverified` are not proof of full business completion, and display-layer errors must not trigger replay of an already completed write.
+- For errors and follow-up actions, explicit structured fields are the recovery authority: retry requires `retryable:true`, and a missing recovery field grants no retry permission. When the response or requested outcome requires more evidence, continue from returned IDs and hints instead of restarting discovery.
 
 ### Intent Routing
 
+- Resolve each request to the most specific available shortcut, typed method, or documented escape hatch. If invocation details are not already available, read the single most relevant leaf help/reference once and reuse it for the task; do not read one leaf per step or guess flags.
 - Send or reply with an @mention through `+messages-send` or `+messages-reply`; use their structured mention inputs and read the leaf reference/help for exact flags. Do not hand-write text/post `<at>` tags. Card-native `<at id=...>` remains card-only.
 - For message search, user identity uses `+messages-search`. Bot identity cannot use it: resolve the chat with `+chat-search --as bot`, then read it with `+chat-messages-list --as bot`.
 - For app, SMS, or phone urgency on an already-sent bot message, use the matching typed raw method: `im messages urgent_app`, `urgent_sms`, or `urgent_phone`. The bot must be the original sender and still be in the conversation.
