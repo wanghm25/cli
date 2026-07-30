@@ -1,7 +1,7 @@
 ---
 name: lark-doc
 version: 2.0.0
-description: "飞书云文档（Docx / Wiki 文档）：读取和编辑飞书文档内容。当用户给出文档 URL 或 token，或需要查看、创建、编辑文档、插入或下载文档图片附件时使用。文档中嵌入的电子表格、多维表格、画板，先用本 skill 提取 token 再切到对应 skill。当用户给出 doubao.com 的 /docx/ 或 /wiki/ URL/token 时，也应直接使用本 skill；路由依据是 URL 路径模式和 token，而不是域名。不负责文档评论管理，也不负责表格或 Base 的数据操作。当用户明确要操作飞书思维笔记时，也使用本 skill。"
+description: "飞书云文档（Docx）：仅用于明确 Docx 资源：/docx/ URL、Docx token，或上游已确认 obj_type=docx。读取、创建和编辑 Docx 文档内容，插入或下载文档图片附件。文档中嵌入电子表格、多维表格或画板时，提取 token 后切换到对应 Skill。当用户给出 doubao.com 的 /docx/ URL/token 时，也应直接使用本 Skill；路由依据是 URL 路径模式和 token，而不是域名。不负责文档评论管理，也不负责表格或 Base 的数据操作。当用户明确要操作飞书思维笔记时，也使用本 Skill。"
 metadata:
   requires:
     bins: ["lark-cli"]
@@ -23,8 +23,9 @@ lark-cli docs +update --doc "文档URL或token" --command append --content '<p>�
 
 **CRITICAL — 执行对应操作前，MUST 先用 Read 工具读取以下文件，缺一不可：**
 1. [`../lark-shared/SKILL.md`](../lark-shared/SKILL.md) — 认证、权限处理、全局参数（所有操作通用）
-2. **读取文档（`docs +fetch`）** → 必读 [`lark-doc-fetch.md`](references/lark-doc-fetch.md)（`--scope` / `--detail` 选择、局部读取策略、`<fragment>` / `<excerpt>` 输出结构）
-3. **创建或编辑文档内容** → 必读 [`lark-doc-xml.md`](references/lark-doc-xml.md)（XML 语法规则，仅当用户明确要求 Markdown 时改读 [`lark-doc-md.md`](references/lark-doc-md.md)）和必读 [`lark-doc-style.md`](references/style/lark-doc-style.md)（写作原则：默认段落、按体裁、组件克制）；从零创建时加读 [`lark-doc-create-workflow.md`](references/style/lark-doc-create-workflow.md)；编辑已有文档时加读 [`lark-doc-update.md`](references/lark-doc-update.md) 和 [`lark-doc-update-workflow.md`](references/style/lark-doc-update-workflow.md)
+2. 用户给出 `/wiki/` URL/token 并要求总结、读取、编辑等内容操作时，当前任务仍处于资源路由阶段：停止读取本 skill 的后续 reference，切到 [`lark-wiki`](../lark-wiki/SKILL.md) 使用 `wiki +node-get` 获取 `obj_type` / `obj_token`；仅当结果为 `docx` 或 `mindnote` 时才回到本 skill，`mindnote` 使用 `obj_token` 作为 `--mindnote-id` 并走思维笔记链路。
+3. **读取文档（`docs +fetch`）** → 必读 [`lark-doc-fetch.md`](references/lark-doc-fetch.md)（`--scope` / `--detail` 选择、局部读取策略、`<fragment>` / `<excerpt>` 输出结构）
+4. **创建或编辑文档内容** → 必读 [`lark-doc-xml.md`](references/lark-doc-xml.md)（XML 语法规则，仅当用户明确要求 Markdown 时改读 [`lark-doc-md.md`](references/lark-doc-md.md)）和必读 [`lark-doc-style.md`](references/style/lark-doc-style.md)（写作原则：默认段落、按体裁、组件克制）；从零创建时加读 [`lark-doc-create-workflow.md`](references/style/lark-doc-create-workflow.md)；编辑已有文档时加读 [`lark-doc-update.md`](references/lark-doc-update.md) 和 [`lark-doc-update-workflow.md`](references/style/lark-doc-update-workflow.md)
 
 **未读完以上文件就执行相应操作会导致参数选择错误或格式错误。**
 
