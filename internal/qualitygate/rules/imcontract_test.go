@@ -87,7 +87,7 @@ func TestIMContractCoverageRejectsRiskAndStrategyShapeMismatches(t *testing.T) {
 			CollectionField: "",
 		},
 	}
-	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	diags := CheckIMContractCoverage(index, contracts)
 	if !hasIMContractDiagnostic(diags, index.Commands[0].Path, "requires command risk read") {
 		t.Fatalf("read/write risk diagnostic absent: %#v", diags)
 	}
@@ -106,7 +106,7 @@ func TestIMContractCoverageAllowsMaterializeReadToWriteLocalOutput(t *testing.T)
 		Key:      contracts[0].Key,
 		Strategy: imcatalog.Strategy{Kind: imcatalog.MaterializeReadKind},
 	}
-	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	diags := CheckIMContractCoverage(index, contracts)
 	for _, diagnostic := range diags {
 		if diagnostic.CommandPath == index.Commands[0].Path &&
 			strings.Contains(diagnostic.Message, "risk") {
@@ -120,7 +120,7 @@ func TestIMContractCoverageRejectsUnknownKindAndNonIMKey(t *testing.T) {
 	contracts[0] = imcatalog.Contract{
 		Key: "docs resource command00", Strategy: imcatalog.Strategy{Kind: imcatalog.StrategyKind("mystery")},
 	}
-	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	diags := CheckIMContractCoverage(index, contracts)
 	if !hasIMContractDiagnostic(diags, "docs resource command00", "must start with") ||
 		!hasIMContractDiagnostic(diags, "docs resource command00", "unknown strategy kind") {
 		t.Fatalf("unknown/non-IM diagnostics absent: %#v", diags)
@@ -159,7 +159,7 @@ func TestIMContractCoverageRejectsIncompleteAndContradictoryEvidence(t *testing.
 		},
 	}
 
-	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	diags := CheckIMContractCoverage(index, contracts)
 	if !hasIMContractDiagnostic(diags, index.Commands[0].Path, "failure[0] evidence requires an ID field") {
 		t.Fatalf("failure shape diagnostic absent: %#v", diags)
 	}
@@ -183,7 +183,7 @@ func TestIMContractCoverageRejectsFieldsFromAnotherStrategyKind(t *testing.T) {
 	}}
 	contracts[2].Strategy.CollectionField = "items"
 
-	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	diags := CheckIMContractCoverage(index, contracts)
 	if !hasIMContractDiagnostic(diags, index.Commands[0].Path, "entity_read must not set strategy field required") {
 		t.Fatalf("entity/required contradiction absent: %#v", diags)
 	}
