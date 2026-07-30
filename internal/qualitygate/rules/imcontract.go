@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	imcatalog "github.com/larksuite/cli/internal/imcontract/catalog"
 	"github.com/larksuite/cli/internal/qualitygate/manifest"
@@ -19,7 +18,7 @@ const (
 	expectedIMLeafCommands = 60
 )
 
-func CheckIMContractCoverage(commandIndex manifest.Manifest, contracts []imcatalog.Contract, _ time.Time) []report.Diagnostic {
+func CheckIMContractCoverage(commandIndex manifest.Manifest, contracts []imcatalog.Contract) []report.Diagnostic {
 	leafKeys := imLeafCommandKeys(commandIndex)
 	leafSet := make(map[string]struct{}, len(leafKeys))
 	for _, key := range leafKeys {
@@ -46,12 +45,6 @@ func CheckIMContractCoverage(commandIndex manifest.Manifest, contracts []imcatal
 		key := string(contract.Key)
 		if _, ok := leafSet[key]; !ok {
 			diags = append(diags, imContractDiagnostic(key, "IM contract key does not match a runnable leaf command"))
-		}
-		if contract.Strategy.Kind != imcatalog.ExemptionKind {
-			continue
-		}
-		if contract.Exemption == nil {
-			diags = append(diags, imContractDiagnostic(key, "IM contract exemption marker is missing"))
 		}
 	}
 	return diags

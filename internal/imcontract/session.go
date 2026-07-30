@@ -94,7 +94,7 @@ func (s *Session) FinalizeSuccess(data any) (Result, error) {
 		return result, nil
 	case ResponseSetAssertionKind:
 		return finalizeAssertion(s, data)
-	case ExemptionKind:
+	case AcceptanceOnlyKind:
 		m, err := checkedResponse(data)
 		if err != nil {
 			return Result{}, err

@@ -6,7 +6,6 @@ package imcontract
 import (
 	"slices"
 	"testing"
-	"time"
 )
 
 func TestWriteRegistryCoverage(t *testing.T) {
@@ -27,14 +26,14 @@ func TestWriteRegistryCoverage(t *testing.T) {
 		BatchPartialKind:               11,
 		RequiredResultBatchPartialKind: 1,
 		ResponseSetAssertionKind:       2,
-		ExemptionKind:                  1,
+		AcceptanceOnlyKind:             1,
 	}
 	for kind, n := range want {
 		if counts[kind] != n {
 			t.Errorf("%s = %d, want %d", kind, counts[kind], n)
 		}
 	}
-	if err := ValidateRegistry(time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC)); err != nil {
+	if err := ValidateRegistry(); err != nil {
 		t.Fatal(err)
 	}
 	wantKeys := []ContractKey{
@@ -65,10 +64,14 @@ func TestWriteRegistryCoverage(t *testing.T) {
 	}
 }
 
-func TestModerationExemption(t *testing.T) {
+func TestModerationAcceptanceOnlyContract(t *testing.T) {
 	c, ok := Lookup("im chat.moderation update")
-	if !ok || c.Exemption == nil {
-		t.Fatal("moderation exemption missing")
+	if !ok {
+		t.Fatal("moderation contract missing")
+	}
+	if c.Strategy.Kind != AcceptanceOnlyKind || c.ReplayMode != ReplayForbidden ||
+		c.HelpPolicy != HelpAcceptanceOnly {
+		t.Fatalf("unexpected moderation contract: %#v", c)
 	}
 }
 

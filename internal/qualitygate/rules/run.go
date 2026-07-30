@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	imcatalog "github.com/larksuite/cli/internal/imcontract/catalog"
 	qdiff "github.com/larksuite/cli/internal/qualitygate/diff"
@@ -45,7 +44,7 @@ func Run(ctx context.Context, opts Options) ([]report.Diagnostic, facts.Facts, e
 	if err := validateCommandIndexCoversManifest(m, commandIndex); err != nil {
 		return nil, facts.Facts{}, err
 	}
-	imContractDiags := CheckIMContractCoverage(commandIndex, imcatalog.All(), time.Now())
+	imContractDiags := CheckIMContractCoverage(commandIndex, imcatalog.All())
 	changed, err := qdiff.ChangedFiles(ctx, opts.Repo, opts.ChangedFrom)
 	if err != nil {
 		return nil, facts.Facts{}, err

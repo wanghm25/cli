@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	imcatalog "github.com/larksuite/cli/internal/imcontract/catalog"
 	"github.com/larksuite/cli/internal/qualitygate/manifest"
@@ -53,11 +52,7 @@ func TestExportedCommandIndexMatchesIMContractCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collectCommandIndex() error = %v", err)
 	}
-	if diags := rules.CheckIMContractCoverage(
-		index,
-		imcatalog.All(),
-		time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC),
-	); len(diags) != 0 {
+	if diags := rules.CheckIMContractCoverage(index, imcatalog.All()); len(diags) != 0 {
 		t.Fatalf("exported IM contract diagnostics = %#v", diags)
 	}
 }

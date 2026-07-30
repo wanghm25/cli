@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	imcatalog "github.com/larksuite/cli/internal/imcontract/catalog"
 	qdiff "github.com/larksuite/cli/internal/qualitygate/diff"
@@ -34,24 +33,12 @@ func TestIMContractCoverageReportsMissingAndStaleKeys(t *testing.T) {
 	contracts = append(contracts, imcatalog.Contract{
 		Key: "im stale command", Strategy: imcatalog.Strategy{Kind: imcatalog.EntityReadKind},
 	})
-	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	diags := CheckIMContractCoverage(index, contracts)
 	if !hasIMContractDiagnostic(diags, "im resource command00", "no completion contract") {
 		t.Fatalf("missing-command diagnostic absent: %#v", diags)
 	}
 	if !hasIMContractDiagnostic(diags, "im stale command", "does not match") {
 		t.Fatalf("stale-key diagnostic absent: %#v", diags)
-	}
-}
-
-func TestIMContractCoverageReportsMissingExemptionMarker(t *testing.T) {
-	index, contracts := completeIMCoverageFixture()
-	contracts[0] = imcatalog.Contract{
-		Key:      contracts[0].Key,
-		Strategy: imcatalog.Strategy{Kind: imcatalog.ExemptionKind},
-	}
-	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
-	if !hasIMContractDiagnostic(diags, string(contracts[0].Key), "exemption marker is missing") {
-		t.Fatalf("missing exemption marker diagnostic absent: %#v", diags)
 	}
 }
 
@@ -62,7 +49,7 @@ func TestIMContractCoverageReportsMissingIMDomain(t *testing.T) {
 	if leaves := imLeafCommandKeys(index); len(leaves) != 0 {
 		t.Fatalf("IM leaves = %#v, want none", leaves)
 	}
-	diags := CheckIMContractCoverage(index, imcatalog.All(), time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	diags := CheckIMContractCoverage(index, imcatalog.All())
 	if !hasIMContractDiagnostic(diags, "", "IM leaf command count is 0, want 60") {
 		t.Fatalf("missing-domain diagnostic absent: %#v", diags)
 	}

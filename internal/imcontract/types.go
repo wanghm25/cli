@@ -13,7 +13,6 @@ type PartialRecoveryMode = catalog.PartialRecoveryMode
 type AssertionMode = catalog.AssertionMode
 type Strategy = catalog.Strategy
 type HelpPolicy = catalog.HelpPolicy
-type Exemption = catalog.Exemption
 type Contract = catalog.Contract
 
 type requiredSpec = catalog.RequiredSpec
@@ -29,7 +28,7 @@ const (
 	BatchPartialKind               = catalog.BatchPartialKind
 	RequiredResultBatchPartialKind = catalog.RequiredResultBatchPartialKind
 	ResponseSetAssertionKind       = catalog.ResponseSetAssertionKind
-	ExemptionKind                  = catalog.ExemptionKind
+	AcceptanceOnlyKind             = catalog.AcceptanceOnlyKind
 
 	ReplayForbidden          = catalog.ReplayForbidden
 	ReplaySafe               = catalog.ReplaySafe

@@ -6,7 +6,6 @@ package catalog
 import (
 	"fmt"
 	"sort"
-	"time"
 )
 
 func ack(key string) Contract {
@@ -249,9 +248,8 @@ func buildContracts() map[ContractKey]Contract {
 		},
 		{
 			Key:        "im chat.moderation update",
-			Strategy:   Strategy{Kind: ExemptionKind},
+			Strategy:   Strategy{Kind: AcceptanceOnlyKind},
 			ReplayMode: ReplayForbidden,
-			Exemption:  &Exemption{},
 		},
 	}
 	out := make(map[ContractKey]Contract, len(all))
@@ -263,7 +261,7 @@ func buildContracts() map[ContractKey]Contract {
 		switch {
 		case c.Strategy.Kind == CollectionReadKind || c.Strategy.Kind == SearchReadKind:
 			c.HelpPolicy = HelpCompleteness
-		case c.Strategy.Kind == ExemptionKind:
+		case c.Strategy.Kind == AcceptanceOnlyKind:
 			c.HelpPolicy = HelpAcceptanceOnly
 		}
 		out[c.Key] = c
@@ -289,13 +287,10 @@ func All() []Contract {
 	return out
 }
 
-func ValidateRegistry(_ time.Time) error {
+func ValidateRegistry() error {
 	for key, c := range contracts {
 		if key == "" || c.Strategy.Kind == "" {
 			return fmt.Errorf("invalid IM contract %q", key)
-		}
-		if c.Strategy.Kind == ExemptionKind && c.Exemption == nil {
-			return fmt.Errorf("IM contract exemption missing for %q", key)
 		}
 	}
 	return nil

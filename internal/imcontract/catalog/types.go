@@ -18,13 +18,13 @@ const (
 	BatchPartialKind               StrategyKind = "batch_partial"
 	RequiredResultBatchPartialKind StrategyKind = "required_result_batch_partial"
 	ResponseSetAssertionKind       StrategyKind = "response_set_assertion"
-	ExemptionKind                  StrategyKind = "exemption"
+	AcceptanceOnlyKind             StrategyKind = "acceptance_only"
 )
 
 func (k StrategyKind) IsWrite() bool {
 	switch k {
 	case AuthoritativeAckKind, RequiredResultKind, BatchPartialKind,
-		RequiredResultBatchPartialKind, ResponseSetAssertionKind, ExemptionKind:
+		RequiredResultBatchPartialKind, ResponseSetAssertionKind, AcceptanceOnlyKind:
 		return true
 	default:
 		return false
@@ -129,13 +129,10 @@ func (p HelpPolicy) Text() string {
 	}
 }
 
-type Exemption struct{}
-
 type Contract struct {
 	Key             ContractKey
 	Strategy        Strategy
 	ReplayMode      ReplayMode
 	PartialRecovery PartialRecoveryMode
 	HelpPolicy      HelpPolicy
-	Exemption       *Exemption
 }

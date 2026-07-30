@@ -3,11 +3,7 @@
 
 package imcontract
 
-import (
-	"time"
-
-	"github.com/larksuite/cli/internal/imcontract/catalog"
-)
+import "github.com/larksuite/cli/internal/imcontract/catalog"
 
 func Lookup(key ContractKey) (Contract, bool) {
 	return catalog.Lookup(key)
@@ -17,8 +13,8 @@ func All() []Contract {
 	return catalog.All()
 }
 
-func ValidateRegistry(now time.Time) error {
-	return catalog.ValidateRegistry(now)
+func ValidateRegistry() error {
+	return catalog.ValidateRegistry()
 }
 
 func stringsFrom(field string) evidenceSpec {
