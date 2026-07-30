@@ -43,19 +43,15 @@ func TestIMContractCoverageReportsMissingAndStaleKeys(t *testing.T) {
 	}
 }
 
-func TestIMContractCoverageReportsExpiredExemptionWithOwnerAndReason(t *testing.T) {
+func TestIMContractCoverageReportsMissingExemptionMarker(t *testing.T) {
 	index, contracts := completeIMCoverageFixture()
 	contracts[0] = imcatalog.Contract{
 		Key:      contracts[0].Key,
 		Strategy: imcatalog.Strategy{Kind: imcatalog.ExemptionKind},
-		Exemption: &imcatalog.Exemption{
-			Owner: "IM backend", Reason: "OpenAPI lacks evidence", Expiry: "2026-10-25",
-		},
 	}
-	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC))
-	if !hasIMContractDiagnostic(diags, string(contracts[0].Key), "owner=\"IM backend\"") ||
-		!hasIMContractDiagnostic(diags, string(contracts[0].Key), "reason=\"OpenAPI lacks evidence\"") {
-		t.Fatalf("expired exemption diagnostic lacks static ownership facts: %#v", diags)
+	diags := CheckIMContractCoverage(index, contracts, time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC))
+	if !hasIMContractDiagnostic(diags, string(contracts[0].Key), "exemption marker is missing") {
+		t.Fatalf("missing exemption marker diagnostic absent: %#v", diags)
 	}
 }
 

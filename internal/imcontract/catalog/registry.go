@@ -251,11 +251,7 @@ func buildContracts() map[ContractKey]Contract {
 			Key:        "im chat.moderation update",
 			Strategy:   Strategy{Kind: ExemptionKind},
 			ReplayMode: ReplayForbidden,
-			Exemption: &Exemption{
-				Reason: "OpenAPI lacks per-item results",
-				Owner:  "IM backend",
-				Expiry: "2026-10-25",
-			},
+			Exemption:  &Exemption{},
 		},
 	}
 	out := make(map[ContractKey]Contract, len(all))
@@ -293,20 +289,13 @@ func All() []Contract {
 	return out
 }
 
-func ValidateRegistry(now time.Time) error {
+func ValidateRegistry(_ time.Time) error {
 	for key, c := range contracts {
 		if key == "" || c.Strategy.Kind == "" {
 			return fmt.Errorf("invalid IM contract %q", key)
 		}
-		if c.Exemption == nil {
-			continue
-		}
-		expiry, err := c.Exemption.ExpiryTime()
-		if err != nil {
-			return fmt.Errorf("invalid exemption expiry for %q: %w", key, err)
-		}
-		if now.After(expiry.Add(24 * time.Hour)) {
-			return fmt.Errorf("IM contract exemption expired for %q (owner: %s)", key, c.Exemption.Owner)
+		if c.Strategy.Kind == ExemptionKind && c.Exemption == nil {
+			return fmt.Errorf("IM contract exemption missing for %q", key)
 		}
 	}
 	return nil

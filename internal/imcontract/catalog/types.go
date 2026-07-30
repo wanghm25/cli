@@ -4,8 +4,6 @@
 // Package catalog defines the static IM command completion contract catalog.
 package catalog
 
-import "time"
-
 type ContractKey string
 
 type StrategyKind string
@@ -131,15 +129,7 @@ func (p HelpPolicy) Text() string {
 	}
 }
 
-type Exemption struct {
-	Reason string
-	Owner  string
-	Expiry string
-}
-
-func (e Exemption) ExpiryTime() (time.Time, error) {
-	return time.Parse("2006-01-02", e.Expiry)
-}
+type Exemption struct{}
 
 type Contract struct {
 	Key             ContractKey

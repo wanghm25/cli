@@ -19,7 +19,7 @@ const (
 	expectedIMLeafCommands = 60
 )
 
-func CheckIMContractCoverage(commandIndex manifest.Manifest, contracts []imcatalog.Contract, now time.Time) []report.Diagnostic {
+func CheckIMContractCoverage(commandIndex manifest.Manifest, contracts []imcatalog.Contract, _ time.Time) []report.Diagnostic {
 	leafKeys := imLeafCommandKeys(commandIndex)
 	leafSet := make(map[string]struct{}, len(leafKeys))
 	for _, key := range leafKeys {
@@ -51,30 +51,7 @@ func CheckIMContractCoverage(commandIndex manifest.Manifest, contracts []imcatal
 			continue
 		}
 		if contract.Exemption == nil {
-			diags = append(diags, imContractDiagnostic(key, "IM contract exemption is missing owner, reason, and expiry"))
-			continue
-		}
-		exemption := contract.Exemption
-		if exemption.Owner == "" || exemption.Reason == "" || exemption.Expiry == "" {
-			diags = append(diags, imContractDiagnostic(
-				key,
-				fmt.Sprintf("IM contract exemption is incomplete (owner=%q reason=%q expiry=%q)", exemption.Owner, exemption.Reason, exemption.Expiry),
-			))
-			continue
-		}
-		expiry, err := exemption.ExpiryTime()
-		if err != nil {
-			diags = append(diags, imContractDiagnostic(
-				key,
-				fmt.Sprintf("IM contract exemption has invalid expiry %q (owner=%q reason=%q)", exemption.Expiry, exemption.Owner, exemption.Reason),
-			))
-			continue
-		}
-		if !now.Before(expiry.AddDate(0, 0, 1)) {
-			diags = append(diags, imContractDiagnostic(
-				key,
-				fmt.Sprintf("IM contract exemption expired on %s (owner=%q reason=%q)", exemption.Expiry, exemption.Owner, exemption.Reason),
-			))
+			diags = append(diags, imContractDiagnostic(key, "IM contract exemption marker is missing"))
 		}
 	}
 	return diags

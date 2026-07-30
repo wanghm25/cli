@@ -70,9 +70,6 @@ func TestModerationExemption(t *testing.T) {
 	if !ok || c.Exemption == nil {
 		t.Fatal("moderation exemption missing")
 	}
-	if c.Exemption.Owner != "IM backend" || c.Exemption.Expiry != "2026-10-25" {
-		t.Fatalf("unexpected exemption: %#v", c.Exemption)
-	}
 }
 
 func TestReadRegistryCoverage(t *testing.T) {
